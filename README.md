@@ -97,7 +97,7 @@ docker build -t claudebox .
     `--rm` (ephemeral — the container and its logs are removed on exit):
 
     ```bash
-    docker run --rm -it --env-file .env -v /path/to/your/repo:/repo:ro claudebox
+    docker run --rm -it --env-file .env -v /path/to/your/repo:/repo:ro --cap-drop ALL --security-opt no-new-privileges --pids-limit 512 --memory 4g claudebox
     ```
 
 On startup the reviewer makes a cheap **local clone** of `/repo` into its own
