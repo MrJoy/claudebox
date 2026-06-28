@@ -1,8 +1,10 @@
 # claudebox — autonomous PR reviewer
 
-A Docker image that runs a hands-off pull-request reviewer.
+Using a different model to review code than the model that wrote it produces a better quality of result by avoiding group-think.  Copilot is nicely integrated into Github, allowing for automated back-and-forth between the model writing the code and the model reviewing it -- but Copilot is not the most effective reviewer model available.
 
-It bundles the **Claude Code CLI** and the **GitHub CLI**. Claude Code talks  directly to **Ollama Cloud** (via its native Anthropic-compatible API — no  proxy, and no local `ollama` binary needed) and runs in non-interactive "YOLO"  mode on a loop, reviewing open PRs and posting findings as comments.
+This is a Docker image that runs a hands-off pull-request reviewer, using the claude CLI infrastructure with non-Anthropic models.  By default it runs glm-5.2, which I've found to be impressively thorough compared to both Copilot and GPT 5.5.
+
+The container bundles the **Claude Code CLI** and the **GitHub CLI**. Claude Code talks directly to **Ollama Cloud** (via its native Anthropic-compatible API — no  proxy, and no local `ollama` binary needed) and runs in non-interactive "YOLO" mode on a loop, reviewing open PRs and posting findings as comments.
 
 It is designed so the loop *cannot cause damage*:
 
