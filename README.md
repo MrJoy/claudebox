@@ -17,7 +17,7 @@ It is designed so the loop *cannot cause damage*:
 The image points Claude Code at Ollama Cloud with these environment variables (set automatically by the entrypoint):
 
 | Variable | Value |
-|---|---|
+| --- | --- |
 | `ANTHROPIC_BASE_URL` | `https://ollama.com` |
 | `ANTHROPIC_AUTH_TOKEN` | your `OLLAMA_API_KEY` |
 | `ANTHROPIC_API_KEY` | `""` (blanked to avoid conflicts) |
@@ -27,7 +27,7 @@ All model tiers are mapped to the one Ollama model on purpose: the backend has n
 
 The reviewer runs as **one continuous, stateful Claude session**. The first pass starts a new session; every later pass `--resume`s it, so Claude remembers what it already reviewed and avoids duplicate comments:
 
-```
+```bash
 # first pass — new session
 claude -p --output-format stream-json --verbose --dangerously-skip-permissions \
   --model "$REVIEW_MODEL" "$REVIEW_PROMPT"
@@ -54,7 +54,7 @@ docker build -t claudebox .
    - Contents: **Read**
    - Pull requests: **Read and write** (read PRs/diffs, post comments)
    - Issues: **Read and write** (PR comments use the issues API)
-2. Get an Ollama Cloud API key: https://ollama.com/settings/keys
+2. Get an Ollama Cloud API key from the [Ollama settings page](https://ollama.com/settings/keys)
 3. Fill in env vars (copy `.env.example` to `.env`):
 
     ```bash
