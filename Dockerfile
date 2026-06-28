@@ -1,0 +1,60 @@
+# syntax=docker/dockerfile:1
+#
+# PR-reviewer image: Claude Code CLI + GitHub CLI.
+#
+# At runtime Claude Code talks directly to Ollama Cloud's Anthropic-compatible
+# endpoint (no proxy, and no local ollama binary needed) and runs in
+# non-interactive "YOLO" mode against a read-only copy of a repo, posting review
+# comments via a privilege-minimized GitHub token. See README.md for usage.
+
+FROM node:22-bookworm-slim
+
+# --- OS packages -----------------------------------------------------------
+# git + ca-certificates: clone/fetch over https; jq/curl: scripting; gnupg:
+# verifying the GitHub CLI apt repo key.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      git \
+      gnupg \
+      jq \
+ && rm -rf /var/lib/apt/lists/*
+
+# --- GitHub CLI (official apt repo) ----------------------------------------
+RUN mkdir -p /etc/apt/keyrings \
+ && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+ && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends gh \
+ && rm -rf /var/lib/apt/lists/*
+
+# --- Claude Code CLI -------------------------------------------------------
+RUN npm install -g @anthropic-ai/claude-code
+
+# --- Non-root user ---------------------------------------------------------
+# Claude Code refuses --dangerously-skip-permissions when running as root, so
+# the loop must run unprivileged. This is also a defense-in-depth boundary.
+RUN useradd --create-home --shell /bin/bash reviewer
+
+# Keep the auto-updater quiet/offline; the pinned version is what we ship.
+ENV DISABLE_AUTOUPDATER=1 \
+    REPO_PATH=/repo \
+    WORK_DIR=/home/reviewer/work \
+    REVIEW_INTERVAL_SECONDS=300 \
+    REVIEW_MODEL=glm-5.2:cloud
+
+COPY --chown=reviewer:reviewer entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+USER reviewer
+WORKDIR /home/reviewer
+
+# Pre-accept onboarding so headless runs never block on a first-run prompt.
+RUN printf '{"hasCompletedOnboarding": true, "bypassPermissionsModeAccepted": true}\n' \
+      > /home/reviewer/.claude.json
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
