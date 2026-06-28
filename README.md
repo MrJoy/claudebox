@@ -76,10 +76,12 @@ docker build -t claudebox .
     cp .env.example .env   # then edit
     ```
 
-4. Run, mounting your **primary repo read-only** at `/repo`:
+4. Run, mounting your **primary repo read-only** at `/repo`. It's a long-running
+   unattended service, so run it **detached** (`-d`), give it a **name** so you
+   can attach to its logs, and let it **restart** if it crashes:
 
     ```bash
-    docker run --rm \
+    docker run -d --name claudebox --restart unless-stopped \
       --env-file .env \
       -v /path/to/your/repo:/repo:ro \
       --cap-drop ALL \
@@ -87,6 +89,15 @@ docker build -t claudebox .
       --pids-limit 512 \
       --memory 4g \
       claudebox
+
+    docker logs -f claudebox   # watch it (see Monitoring)
+    ```
+
+    For a quick one-off test you can instead run it in the foreground with
+    `--rm` (ephemeral — the container and its logs are removed on exit):
+
+    ```bash
+    docker run --rm -it --env-file .env -v /path/to/your/repo:/repo:ro claudebox
     ```
 
 On startup the reviewer makes a cheap **local clone** of `/repo` into its own
@@ -104,38 +115,22 @@ initial download.
 
 ### Recommended hardening
 
-Because the loop runs unattended in YOLO mode, run the container locked down:
+Because the loop runs unattended in YOLO mode, the command above locks the
+container down. What each flag buys you:
 
-```bash
-docker run --rm \
-  --env-file .env \
-  -v /path/to/your/repo:/repo:ro \
-  --cap-drop ALL \
-  --security-opt no-new-privileges \
-  --pids-limit 512 \
-  --memory 4g \
-  claudebox
-```
+- `--cap-drop ALL` — drop all Linux capabilities; the reviewer needs none.
+- `--security-opt no-new-privileges` — block privilege escalation via setuid.
+- `--pids-limit 512` — cap runaway process spawning.
+- `--memory 4g` — bound memory use.
 
-(Don't add `--read-only` to the root filesystem: the loop needs to write its
-working copy under the user's home.)
+Don't add `--read-only` to the root filesystem: the loop needs to write its
+working copy under the user's home.
 
 ## Monitoring
 
 The reviewer logs its whole heartbeat — and a live play-by-play of each pass — to
-stdout. Give the container a **name** and run it **detached** so you can attach to
-its logs (and so they survive if it exits; `--rm` deletes the container and its
-logs on exit):
-
-```bash
-docker run -d --name claudebox \
-  --env-file .env \
-  -v /path/to/your/repo:/repo:ro \
-  --cap-drop ALL --security-opt no-new-privileges \
-  claudebox
-```
-
-Then watch it:
+stdout. The detached, **named** container from [Run](#run) (`--name claudebox`)
+is what makes its logs attachable:
 
 ```bash
 docker logs -f claudebox          # follow live
