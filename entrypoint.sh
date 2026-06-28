@@ -94,28 +94,60 @@ cd "$WORK_REPO"
 SESSION_ID=""
 PASSES_THIS_SESSION=0
 
+# Pretty-print Claude's stream-json (one JSON event per line) into readable,
+# live log lines: assistant text, tool calls, tool results, and the final
+# result. fromjson? tolerates any non-JSON line instead of aborting the stream.
+format_stream() {
+  jq -j --unbuffered -R '
+    (fromjson? // empty) as $e | $e
+    | if .type == "system" and .subtype == "init" then
+        "  ▸ session \(.session_id) started\n"
+      elif .type == "assistant" then
+        ( .message.content[]?
+          | if .type == "text" then (.text | select(length > 0) | "\(.)\n")
+            elif .type == "tool_use" then "  → \(.name): \(.input | tojson | .[0:200])\n"
+            else empty end )
+      elif .type == "user" then
+        ( .message.content[]?
+          | if .type == "tool_result" then
+              ( (.content | if type == "array" then (map(.text? // "") | join(" ")) else tostring end))
+              | gsub("[\\n\\t ]+"; " ") | "  ← \(.[0:200])\n"
+            else empty end )
+      elif .type == "result" then
+        "  ✓ result (\(.subtype // "")): \((.result // "") | .[0:800])\n"
+      else empty end
+  '
+}
+
 # Run one review pass. Starts a new session unless SESSION_ID is set, in which
-# case it resumes that one. Captures/refreshes SESSION_ID from the JSON output.
-# Returns non-zero on failure (caller clears SESSION_ID to start fresh).
+# case it resumes that one. Streams events live to the log (so `docker logs -f`
+# shows the play-by-play) while teeing the raw stream to a temp file to recover
+# the session id. Returns non-zero on failure (caller clears SESSION_ID).
 run_pass() {
-  local prompt="$1" out rc errfile sid result
-  errfile="$(mktemp)"
+  local prompt="$1" rc errfile rawfile sid
+  errfile="$(mktemp)"; rawfile="$(mktemp)"
+  # set +e around the pipeline so a formatter hiccup can't abort the script and
+  # so we can read Claude's own exit code via PIPESTATUS[0] (not tee's/jq's).
+  set +e
   if [ -n "$SESSION_ID" ]; then
-    out="$(claude -p --resume "$SESSION_ID" --output-format json \
-            --dangerously-skip-permissions --model "$REVIEW_MODEL" "$prompt" 2>"$errfile")"; rc=$?
+    claude -p --resume "$SESSION_ID" --output-format stream-json --verbose \
+      --dangerously-skip-permissions --model "$REVIEW_MODEL" "$prompt" \
+      2>"$errfile" | stdbuf -oL tee "$rawfile" | format_stream
   else
-    out="$(claude -p --output-format json \
-            --dangerously-skip-permissions --model "$REVIEW_MODEL" "$prompt" 2>"$errfile")"; rc=$?
+    claude -p --output-format stream-json --verbose \
+      --dangerously-skip-permissions --model "$REVIEW_MODEL" "$prompt" \
+      2>"$errfile" | stdbuf -oL tee "$rawfile" | format_stream
   fi
+  rc=${PIPESTATUS[0]}
+  set -e
   if [ "$rc" -ne 0 ]; then
     log "WARN: claude exited $rc:"; tail -n 5 "$errfile" >&2
-    rm -f "$errfile"; return "$rc"
+    rm -f "$errfile" "$rawfile"; return "$rc"
   fi
-  rm -f "$errfile"
-  sid="$(printf '%s' "$out" | jq -r '.session_id // empty' 2>/dev/null || true)"
+  # session_id appears in the init and result events; take the last one seen.
+  sid="$(jq -r -R '(fromjson? // empty) | select(.session_id) | .session_id' "$rawfile" 2>/dev/null | tail -n 1 || true)"
   [ -n "$sid" ] && SESSION_ID="$sid"
-  result="$(printf '%s' "$out" | jq -r '.result // empty' 2>/dev/null || true)"
-  if [ -n "$result" ]; then log "Pass result:"; printf '%s\n' "$result"; fi
+  rm -f "$errfile" "$rawfile"
   return 0
 }
 

@@ -35,13 +35,17 @@ starts a new session; every later pass `--resume`s it, so Claude remembers what
 it already reviewed and avoids duplicate comments:
 
 ```
-# first pass — new session, capture its id
-claude -p --output-format json --dangerously-skip-permissions \
+# first pass — new session
+claude -p --output-format stream-json --verbose --dangerously-skip-permissions \
   --model "$REVIEW_MODEL" "$REVIEW_PROMPT"
 # later passes — resume the same session
-claude -p --resume "$SESSION_ID" --output-format json \
+claude -p --resume "$SESSION_ID" --output-format stream-json --verbose \
   --dangerously-skip-permissions --model "$REVIEW_MODEL" "$FOLLOWUP_PROMPT"
 ```
+
+Each pass streams as `stream-json`; the entrypoint pretty-prints the events live
+to its log (so `docker logs -f` shows the play-by-play) and recovers the session
+id from the stream to resume next pass.
 
 The entrypoint shell is the supervisor: it controls cadence (`git fetch`, then a
 review pass, then sleep) and relaunches a fresh session if a pass fails. Claude
@@ -115,6 +119,55 @@ docker run --rm \
 
 (Don't add `--read-only` to the root filesystem: the loop needs to write its
 working copy under the user's home.)
+
+## Monitoring
+
+The reviewer logs its whole heartbeat — and a live play-by-play of each pass — to
+stdout. Give the container a **name** and run it **detached** so you can attach to
+its logs (and so they survive if it exits; `--rm` deletes the container and its
+logs on exit):
+
+```bash
+docker run -d --name claudebox \
+  --env-file .env \
+  -v /path/to/your/repo:/repo:ro \
+  --cap-drop ALL --security-opt no-new-privileges \
+  claudebox
+```
+
+Then watch it:
+
+```bash
+docker logs -f claudebox          # follow live
+docker logs --tail 100 claudebox  # last 100 lines
+docker logs --since 10m claudebox # last 10 minutes
+```
+
+Each cycle you'll see the scaffolding (`Fetching latest refs…`, `Starting review
+pass (new|resuming session <id>)…`, `Review pass complete (session <id>, pass
+N)`, rotations, `Sleeping Ns…`, and `WARN:` lines on failures) interleaved with
+the streamed pass detail:
+
+```
+  ▸ session <id> started
+  → Bash: {"command":"gh pr list ..."}
+  ← <tool result, truncated>
+  ✓ result (success): <Claude's summary of the pass>
+```
+
+Other useful views:
+
+```bash
+docker exec -it claudebox bash    # poke around inside:
+#   gh auth status                          # token working?
+#   gh pr list                              # what it sees
+#   git -C ~/work/repo log --oneline -5     # working-clone state
+docker stats claudebox            # CPU / memory / network
+```
+
+The real deliverable, of course, is on GitHub — the comments it posts. Watch
+those with `gh pr list --repo owner/repo` and
+`gh pr view <num> --repo owner/repo --comments`.
 
 ## Configuration
 
