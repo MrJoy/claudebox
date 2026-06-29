@@ -13,6 +13,71 @@ die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 : "${GITHUB_TOKEN:?set GITHUB_TOKEN (privilege-minimized: read repo/PRs, write PR comments)}"
 : "${GITHUB_REPOSITORY:?set GITHUB_REPOSITORY in owner/repo form}"
 
+# --- Hardening checks ------------------------------------------------------
+# The loop runs unattended in YOLO mode (--dangerously-skip-permissions), so it
+# must not be able to cause damage. Verify the container was launched with the
+# security boundaries the README requires and refuse to run if a security-
+# critical one is missing. Resource bounds (pids/memory) only cap runaway use,
+# not damage, and detecting them reliably varies across cgroup v1/v2, so a
+# missing one is just a warning. Set ALLOW_UNHARDENED=1 to downgrade the hard
+# failures to warnings (e.g. a non-Docker runtime, or a deliberate test).
+ALLOW_UNHARDENED="${ALLOW_UNHARDENED:-0}"
+hardening_failed=0
+
+# Record an unmet security requirement. We collect all of them and decide
+# whether to abort afterwards, so one run reports every problem at once.
+require() {
+  if [ "$ALLOW_UNHARDENED" = "1" ]; then
+    log "WARN (unhardened, ignored via ALLOW_UNHARDENED): $*"
+  else
+    log "HARDENING ERROR: $*"
+    hardening_failed=1
+  fi
+}
+
+# Warn if no pids/memory limit is in effect. Best-effort: tries cgroup v2 then
+# v1, and stays quiet if it can't tell (better than a false alarm).
+check_resource_limit() {
+  local name=$1 v2=$2 v1=$3 unlimited=$4 v
+  if [ -r "$v2" ]; then v="$(cat "$v2")"
+  elif [ -r "$v1" ]; then v="$(cat "$v1")"
+  else log "WARN: cannot determine $name limit; consider setting it."; return 0; fi
+  case "$v" in
+    "$unlimited") log "WARN: no $name limit set; a runaway pass could exhaust host resources." ;;
+    # cgroup v1 reports "unlimited" memory as a huge sentinel rather than 'max'.
+    ''|*[!0-9]*) ;;
+    *) if [ "$v" -ge 9223372036854000000 ]; then
+         log "WARN: no $name limit set; a runaway pass could exhaust host resources."
+       fi ;;
+  esac
+  # Always succeed: a "limit is fine" result must not leak a non-zero exit
+  # status, or `set -e` would abort the script on a correctly-limited container.
+  return 0
+}
+
+# Unprivileged user. Claude Code also refuses --dangerously-skip-permissions as
+# root, but check explicitly for a clear message (e.g. if run with --user root).
+[ "$(id -u)" != "0" ] || require "running as root; run as an unprivileged user (don't override the image's 'reviewer' user with --user root)."
+
+# no-new-privileges and dropped capabilities both read from /proc/self/status.
+if [ -r /proc/self/status ]; then
+  nnp="$(awk '/^NoNewPrivs:/ {print $2}' /proc/self/status)"
+  capbnd="$(awk '/^CapBnd:/ {print $2}' /proc/self/status)"
+  # Set by --security-opt no-new-privileges; blocks regaining privilege via setuid.
+  [ "$nnp" = "1" ] || require "no-new-privileges is not set; run with --security-opt no-new-privileges."
+  # --cap-drop ALL empties the bounding set; a default container keeps a non-zero set.
+  { [ -z "$capbnd" ] || [ "$capbnd" = "0000000000000000" ]; } || require "Linux capabilities are not all dropped (CapBnd=$capbnd); run with --cap-drop ALL."
+else
+  log "WARN: cannot read /proc/self/status; skipping no-new-privileges and capability checks."
+fi
+
+check_resource_limit pids   /sys/fs/cgroup/pids.max   /sys/fs/cgroup/pids/pids.max                max
+check_resource_limit memory /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory/memory.limit_in_bytes max
+
+if [ "$hardening_failed" = "1" ]; then
+  die "container is not hardened (see errors above). Re-run with the flags in README 'Run', or set ALLOW_UNHARDENED=1 to override."
+fi
+
 # --- Defaults --------------------------------------------------------------
 REPO_PATH="${REPO_PATH:-/repo}"
 WORK_DIR="${WORK_DIR:-$HOME/work}"

@@ -33,6 +33,8 @@ The design is built entirely around one constraint: **the loop runs unattended i
 2. **Read-only source** — the user's repo is mounted at `/repo:ro`. `entrypoint.sh` makes a cheap **local clone** (`git clone --local --no-hardlinks`) into a writable working dir and only ever touches the clone. `--no-hardlinks` is mandatory: a bind mount is a different device, so the default hardlinking clone fails with "Invalid cross-device link". If no git repo is mounted, it falls back to a network clone of `GITHUB_REPOSITORY`.
 3. **Privilege-minimized GitHub token** — read repo/PRs + write PR comments only; no push/merge/admin. This is the real safety boundary; the README stresses verifying it before running unattended.
 
+`entrypoint.sh` enforces boundaries 1–2 at startup (a "Hardening checks" block): it `die`s if running as root, if `no-new-privileges` isn't set (`NoNewPrivs` in `/proc/self/status`), or if capabilities aren't all dropped (`CapBnd` non-zero). Missing `--pids-limit`/`--memory` only warn (resource bounds, not safety, and detection differs across cgroup v1/v2). `ALLOW_UNHARDENED=1` downgrades the hard failures to warnings for non-Docker runtimes or tests. The token (boundary 3) can't be introspected, so it isn't checked.
+
 ### Two pieces working together
 
 - **`entrypoint.sh` is the supervisor.** It does auth setup (`gh`/`git`), wires the Claude-Code→Ollama env, prepares the working clone, then runs the review loop: `git fetch` → one review pass → sleep. It controls cadence and crash-recovery; Claude itself decides *what* to review.
@@ -51,7 +53,7 @@ The design is built entirely around one constraint: **the loop runs unattended i
 
 ## Configuration
 
-All config is via environment variables (`.env.example` documents them). Required: `OLLAMA_API_KEY`, `GITHUB_TOKEN`, `GITHUB_REPOSITORY`. Optional: `REVIEW_MODEL`, `REVIEW_INTERVAL_SECONDS`, `MAX_PASSES_PER_SESSION`, and the prompt overrides `REVIEW_PROMPT` (new session) / `FOLLOWUP_PROMPT` (resumed passes). Default prompts live in `entrypoint.sh`.
+All config is via environment variables (`.env.example` documents them). Required: `OLLAMA_API_KEY`, `GITHUB_TOKEN`, `GITHUB_REPOSITORY`. Optional: `REVIEW_MODEL`, `REVIEW_INTERVAL_SECONDS`, `MAX_PASSES_PER_SESSION`, `ALLOW_UNHARDENED`, and the prompt overrides `REVIEW_PROMPT` (new session) / `FOLLOWUP_PROMPT` (resumed passes). Default prompts live in `entrypoint.sh`.
 
 ## Gotchas when editing
 

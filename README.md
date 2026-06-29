@@ -88,7 +88,7 @@ The mount is optional: if you omit it, the reviewer does a full network clone of
 
 > **Note:** mount the *primary* repo, not a `git worktree` of it. A worktree keeps its objects in the parent repo and only holds a link back to it, so a worktree mounted on its own is structurally unusable inside the container.
 
-### Recommended hardening
+### Hardening (enforced)
 
 Because the loop runs unattended in YOLO mode, the command above locks the container down. What each flag buys you:
 
@@ -96,6 +96,8 @@ Because the loop runs unattended in YOLO mode, the command above locks the conta
 - `--security-opt no-new-privileges` — block privilege escalation via setuid.
 - `--pids-limit 512` — cap runaway process spawning.
 - `--memory 4g` — bound memory use.
+
+The entrypoint **verifies these on startup** and refuses to run if a security boundary is missing: it aborts when running as root, or without `no-new-privileges`, or without `--cap-drop ALL`. The two resource bounds (`--pids-limit`, `--memory`) only print a `WARN` if absent, since they cap runaway use rather than form a safety boundary. To run somewhere these checks don't apply (e.g. a non-Docker runtime, or a deliberate test), set `ALLOW_UNHARDENED=1` to downgrade the hard failures to warnings.
 
 Don't add `--read-only` to the root filesystem: the loop needs to write its working copy under the user's home.
 
