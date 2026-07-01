@@ -88,11 +88,11 @@ REVIEW_MODEL="${REVIEW_MODEL:-glm-5.2:cloud}"
 # growth of a long-lived resumed session's context. 0 = never rotate.
 MAX_PASSES_PER_SESSION="${MAX_PASSES_PER_SESSION:-0}"
 case "$MAX_PASSES_PER_SESSION" in ''|*[!0-9]*) die "MAX_PASSES_PER_SESSION must be a non-negative integer";; esac
-DEFAULT_PROMPT="Please review open PRs to find unreviewed PRs, or PRs in need of re-review. Perform a thorough review / re-review of all such PRs. Pay particular attention to test quality/robustness, security, correctness, and architectural coherence/consistency. Post findings as comments on the PR, one comment per finding. Be sure you're looking at the most recent commit on the branch."
+DEFAULT_PROMPT="Please review open PRs to find unreviewed PRs, PRs in need of re-review, or PRs where your assistance has been requested (look for comments addressing 'claudebox'). Perform a thorough review / re-review of all such PRs. Pay particular attention to test quality/robustness, security, correctness, and architectural coherence/consistency. Post findings as comments on the PR, one comment per finding. Be sure you're looking at the most recent commit on the branch. Sign your comments with '-claudebox'."
 REVIEW_PROMPT="${REVIEW_PROMPT:-$DEFAULT_PROMPT}"
 # Prompt used on resumed passes (the session already holds context from prior
 # passes, so this nudges it to re-check rather than re-introduce the task).
-DEFAULT_FOLLOWUP="I've fetched the latest refs. Re-check the repository for new or updated PRs since your last pass, and any PRs still needing review, applying the same review standard. Only post findings you haven't already raised. Be sure you're looking at the most recent commit on each branch."
+DEFAULT_FOLLOWUP="I've fetched the latest refs. Re-check the repository for new or updated PRs since your last pass, any PRs still needing review, or PRs where your assistance has been requested (look for comments addressing 'claudebox'). Apply the same review standard. Only post findings that haven't already raised. Be sure you're looking at the most recent commit on each branch. Sign your comments with '-claudebox'."
 FOLLOWUP_PROMPT="${FOLLOWUP_PROMPT:-$DEFAULT_FOLLOWUP}"
 
 # --- GitHub auth (gh + git) ------------------------------------------------
