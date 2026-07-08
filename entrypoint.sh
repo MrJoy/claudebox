@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 #
 # PR-reviewer loop. Configures auth, prepares a writable working copy of the
-# (read-only) seed repo, points Claude Code at Ollama Cloud, then repeatedly
-# runs a non-interactive review pass until the container is stopped.
+# (read-only) seed repo, points Claude Code at the configured model provider
+# (Ollama Cloud, Anthropic, or any Anthropic-compatible endpoint), then
+# repeatedly runs a non-interactive review pass until the container is stopped.
 set -euo pipefail
 
 log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 # --- Required configuration ------------------------------------------------
-: "${OLLAMA_API_KEY:?set OLLAMA_API_KEY (from https://ollama.com/settings/keys)}"
+# Provider-specific credentials are validated in "Backend selection" below.
 : "${GITHUB_TOKEN:?set GITHUB_TOKEN (privilege-minimized: read repo/PRs, write PR comments)}"
 : "${GITHUB_REPOSITORY:?set GITHUB_REPOSITORY in owner/repo form}"
 
@@ -83,7 +84,8 @@ REPO_PATH="${REPO_PATH:-/repo}"
 WORK_DIR="${WORK_DIR:-$HOME/work}"
 WORK_REPO="$WORK_DIR/repo"
 REVIEW_INTERVAL_SECONDS="${REVIEW_INTERVAL_SECONDS:-300}"
-REVIEW_MODEL="${REVIEW_MODEL:-glm-5.2:cloud}"
+# REVIEW_MODEL's default depends on the provider; it is resolved in the
+# "Backend selection" block below.
 # Rotate to a fresh session after this many successful passes, to cap the
 # growth of a long-lived resumed session's context. 0 = never rotate.
 MAX_PASSES_PER_SESSION="${MAX_PASSES_PER_SESSION:-0}"
@@ -104,16 +106,59 @@ git config --global user.name  "PR Reviewer (bot)"
 git config --global user.email "pr-reviewer@localhost"
 git config --global --add safe.directory "$WORK_REPO"
 
-# --- Claude Code -> Ollama Cloud -------------------------------------------
-# Ollama serves a native Anthropic-compatible API at https://ollama.com, so no
-# translation proxy is needed. The key MUST be ANTHROPIC_AUTH_TOKEN (not
-# ANTHROPIC_API_KEY). We point EVERY model tier at the one Ollama model: the
-# backend has no Anthropic models, so if a subagent or alias asks for Opus/
-# Sonnet/Haiku and that tier isn't overridden, Claude Code errors out on an
-# unknown model. Mapping them all to $REVIEW_MODEL keeps any such request valid.
-export ANTHROPIC_BASE_URL="https://ollama.com"
-export ANTHROPIC_AUTH_TOKEN="$OLLAMA_API_KEY"
-export ANTHROPIC_API_KEY=""
+# --- Backend selection (Claude Code -> model provider) ---------------------
+# Claude Code speaks the Anthropic API. PROVIDER picks where those requests go:
+#   ollama    - Ollama Cloud's native Anthropic-compatible API (default).
+#   anthropic - Anthropic's own API.
+#   custom    - any other Anthropic-compatible endpoint you point us at.
+# Whichever backend is chosen, we pin EVERY model tier to the single
+# $REVIEW_MODEL. A non-Anthropic backend has no Opus/Sonnet/Haiku models, so if
+# a subagent or alias requests an un-overridden tier, Claude Code errors out on
+# an unknown model; mapping them all to $REVIEW_MODEL keeps any request valid.
+# (On Anthropic this also guarantees one model does every bit of the work.)
+PROVIDER="${PROVIDER:-ollama}"
+
+case "$PROVIDER" in
+  ollama)
+    # Ollama serves a native Anthropic-compatible API; auth MUST go through
+    # ANTHROPIC_AUTH_TOKEN (a Bearer token), not ANTHROPIC_API_KEY.
+    : "${OLLAMA_API_KEY:?set OLLAMA_API_KEY (from https://ollama.com/settings/keys), or choose a different PROVIDER}"
+    export ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-https://ollama.com}"
+    export ANTHROPIC_AUTH_TOKEN="$OLLAMA_API_KEY"
+    export ANTHROPIC_API_KEY=""
+    REVIEW_MODEL="${REVIEW_MODEL:-glm-5.2:cloud}"
+    ;;
+  anthropic)
+    # Anthropic's own API: authenticate with the native x-api-key credential and
+    # let Claude Code use its default endpoint. Blank any stray Bearer token so
+    # auth is unambiguous.
+    : "${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY (from https://console.anthropic.com/) for PROVIDER=anthropic}"
+    export ANTHROPIC_AUTH_TOKEN=""
+    REVIEW_MODEL="${REVIEW_MODEL:-claude-opus-4-8}"
+    ;;
+  custom)
+    # Any other Anthropic-compatible endpoint. The caller supplies the URL and a
+    # model the endpoint serves; there is no sensible default for either.
+    : "${ANTHROPIC_BASE_URL:?set ANTHROPIC_BASE_URL to your endpoint for PROVIDER=custom}"
+    : "${REVIEW_MODEL:?set REVIEW_MODEL to a model your endpoint serves for PROVIDER=custom}"
+    export ANTHROPIC_BASE_URL
+    # Accept whichever auth style the endpoint expects: ANTHROPIC_AUTH_TOKEN
+    # sends "Authorization: Bearer" (most gateways/compatible services),
+    # ANTHROPIC_API_KEY sends Anthropic's native "x-api-key". Require one.
+    if [ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]; then
+      export ANTHROPIC_API_KEY=""
+    elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+      export ANTHROPIC_AUTH_TOKEN=""
+    else
+      die "PROVIDER=custom needs an auth credential: set ANTHROPIC_AUTH_TOKEN (Bearer) or ANTHROPIC_API_KEY (x-api-key)."
+    fi
+    ;;
+  *)
+    die "unknown PROVIDER='$PROVIDER'; use one of: ollama, anthropic, custom."
+    ;;
+esac
+
+# Pin every model tier to the one review model (see the note above).
 export ANTHROPIC_MODEL="$REVIEW_MODEL"
 export ANTHROPIC_DEFAULT_FABLE_MODEL="$REVIEW_MODEL"
 export ANTHROPIC_DEFAULT_OPUS_MODEL="$REVIEW_MODEL"
@@ -146,7 +191,7 @@ fi
 git -C "$WORK_REPO" remote set-url origin "https://github.com/${GITHUB_REPOSITORY}.git" \
   || git -C "$WORK_REPO" remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
 
-log "Reviewer ready. repo=$GITHUB_REPOSITORY model=$REVIEW_MODEL interval=${REVIEW_INTERVAL_SECONDS}s"
+log "Reviewer ready. repo=$GITHUB_REPOSITORY provider=$PROVIDER model=$REVIEW_MODEL interval=${REVIEW_INTERVAL_SECONDS}s"
 
 # --- Review loop -----------------------------------------------------------
 # One continuous, *stateful* Claude session: the first pass starts a new session

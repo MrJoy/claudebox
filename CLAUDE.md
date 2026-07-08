@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Docker image that runs an unattended PR reviewer. It bundles the **Claude Code CLI** and the **GitHub CLI**, points Claude Code at **Ollama Cloud** (a non-Anthropic model, default `glm-5.2:cloud`), and loops over a repo's open PRs in headless "YOLO" mode, posting one comment per finding. The premise: a different model reviewing than the one that wrote the code avoids group-think.
+A Docker image that runs an unattended PR reviewer. It bundles the **Claude Code CLI** and the **GitHub CLI**, points Claude Code at a configurable model provider — **Ollama Cloud** by default (`glm-5.2:cloud`), or **Anthropic** or any **Anthropic-compatible** endpoint via the `PROVIDER` env var — and loops over a repo's open PRs in headless "YOLO" mode, posting one comment per finding. The premise: a different model reviewing than the one that wrote the code avoids group-think (which is why Ollama is the default and reviewing Claude-authored code with `PROVIDER=anthropic` re-introduces the group-think the tool exists to avoid).
 
 There is no application code, build system, or test suite — the entire project is three files: `Dockerfile`, `entrypoint.sh`, and `README.md`. `entrypoint.sh` is where essentially all the logic lives.
 
@@ -37,15 +37,21 @@ The design is built entirely around one constraint: **the loop runs unattended i
 
 ### Two pieces working together
 
-- **`entrypoint.sh` is the supervisor.** It does auth setup (`gh`/`git`), wires the Claude-Code→Ollama env, prepares the working clone, then runs the review loop: `git fetch` → one review pass → sleep. It controls cadence and crash-recovery; Claude itself decides *what* to review.
+- **`entrypoint.sh` is the supervisor.** It does auth setup (`gh`/`git`), wires the Claude-Code→provider env, prepares the working clone, then runs the review loop: `git fetch` → one review pass → sleep. It controls cadence and crash-recovery; Claude itself decides *what* to review.
 
 - **One continuous, stateful Claude session.** The first pass starts a new `claude -p` session and the script recovers its `session_id` from the `stream-json` output; every later pass `--resume`s that id so Claude remembers what it already reviewed and won't re-raise findings. A failed pass clears `SESSION_ID`, so the next cycle starts fresh (and may re-comment once — accepted noise). `MAX_PASSES_PER_SESSION` optionally rotates to a fresh session to bound context growth.
 
   Why not Claude Code's `/loop`? `/loop` needs a live interactive session; headless `-p` exits after each response. The shell loop + `--resume` gives the same continuous, context-retaining behavior while staying headless and crash-safe.
 
-### The all-tiers-mapped-to-one-model trick
+### Backend selection & the all-tiers-mapped-to-one-model trick
 
-`entrypoint.sh` points **every** model env var (`ANTHROPIC_MODEL`, `..._DEFAULT_OPUS/SONNET/HAIKU_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`) at the single `$REVIEW_MODEL`. The Ollama backend has no Anthropic models, so if a subagent or alias requested an un-overridden Opus/Sonnet/Haiku tier, Claude Code would error on an unknown model. Auth uses `ANTHROPIC_AUTH_TOKEN` (**not** `ANTHROPIC_API_KEY`, which is blanked) against `ANTHROPIC_BASE_URL=https://ollama.com`. There is no fallback to Anthropic — a wrong model name is a hard error.
+A `PROVIDER` env var (default `ollama`) selects the backend in a `case` block in `entrypoint.sh`; each arm validates that provider's credential and wires the Claude Code env:
+
+- `ollama` — `ANTHROPIC_BASE_URL=https://ollama.com`, auth via `ANTHROPIC_AUTH_TOKEN=$OLLAMA_API_KEY` (**not** `ANTHROPIC_API_KEY`, which is blanked). Default `REVIEW_MODEL=glm-5.2:cloud`.
+- `anthropic` — Anthropic's default endpoint (base URL left unset), auth via `ANTHROPIC_API_KEY` (`x-api-key`; a stray `ANTHROPIC_AUTH_TOKEN` is blanked). Default `REVIEW_MODEL=claude-opus-4-8`.
+- `custom` — caller supplies `ANTHROPIC_BASE_URL`, `REVIEW_MODEL`, and exactly one of `ANTHROPIC_AUTH_TOKEN` (Bearer) or `ANTHROPIC_API_KEY` (x-api-key); the other is blanked. No model default.
+
+Regardless of provider, a shared block then points **every** model env var (`ANTHROPIC_MODEL`, `..._DEFAULT_FABLE/OPUS/SONNET/HAIKU_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`) at the single `$REVIEW_MODEL`. On non-Anthropic backends this is required — they have no Opus/Sonnet/Haiku models, so an un-overridden tier requested by a subagent or alias would error on an unknown model; on Anthropic it's a deliberate simplification (one model does everything). There is **no** fallback: a wrong model name is a hard error, never a silent switch to another model. `REVIEW_MODEL`'s default is provider-specific and resolved in the entrypoint, so it is intentionally **not** baked into the Dockerfile `ENV`.
 
 ### Log formatting
 
@@ -53,7 +59,7 @@ The design is built entirely around one constraint: **the loop runs unattended i
 
 ## Configuration
 
-All config is via environment variables (`.env.example` documents them). Required: `OLLAMA_API_KEY`, `GITHUB_TOKEN`, `GITHUB_REPOSITORY`. Optional: `REVIEW_MODEL`, `REVIEW_INTERVAL_SECONDS`, `MAX_PASSES_PER_SESSION`, `ALLOW_UNHARDENED`, and the prompt overrides `REVIEW_PROMPT` (new session) / `FOLLOWUP_PROMPT` (resumed passes). Default prompts live in `entrypoint.sh`.
+All config is via environment variables (`.env.example` documents them). Always required: `GITHUB_TOKEN`, `GITHUB_REPOSITORY`. Provider selection: `PROVIDER` (default `ollama`) plus that provider's credential — `OLLAMA_API_KEY` (ollama), `ANTHROPIC_API_KEY` (anthropic), or `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_API_KEY` (custom); see "Backend selection" above. Optional: `REVIEW_MODEL` (provider-specific default, but required for `custom`), `REVIEW_INTERVAL_SECONDS`, `MAX_PASSES_PER_SESSION`, `ALLOW_UNHARDENED`, and the prompt overrides `REVIEW_PROMPT` (new session) / `FOLLOWUP_PROMPT` (resumed passes). Default prompts live in `entrypoint.sh`.
 
 ## Gotchas when editing
 

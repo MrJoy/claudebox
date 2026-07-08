@@ -2,8 +2,8 @@
 #
 # PR-reviewer image: Claude Code CLI + GitHub CLI.
 #
-# At runtime Claude Code talks directly to Ollama Cloud's Anthropic-compatible
-# endpoint (no proxy, and no local ollama binary needed) and runs in
+# At runtime Claude Code talks to the configured model provider (Ollama Cloud,
+# Anthropic, or any Anthropic-compatible endpoint — no proxy needed) and runs in
 # non-interactive "YOLO" mode against a read-only copy of a repo, posting review
 # comments via a privilege-minimized GitHub token. See README.md for usage.
 
@@ -41,11 +41,13 @@ RUN npm install -g @anthropic-ai/claude-code
 RUN useradd --create-home --shell /bin/bash reviewer
 
 # Keep the auto-updater quiet/offline; the pinned version is what we ship.
+# REVIEW_MODEL is intentionally NOT baked here: its default is provider-specific
+# and resolved by entrypoint.sh, so leaving it unset lets each provider's
+# default apply.
 ENV DISABLE_AUTOUPDATER=1 \
     REPO_PATH=/repo \
     WORK_DIR=/home/reviewer/work \
-    REVIEW_INTERVAL_SECONDS=300 \
-    REVIEW_MODEL=glm-5.2:cloud
+    REVIEW_INTERVAL_SECONDS=300
 
 COPY --chown=reviewer:reviewer entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh

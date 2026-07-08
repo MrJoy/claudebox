@@ -2,9 +2,11 @@
 
 Using a different model to review code than the model that wrote it produces a better quality of result by avoiding group-think.  Copilot is nicely integrated into Github, allowing for automated back-and-forth between the model writing the code and the model reviewing it -- but Copilot is not the most effective reviewer model available.
 
-This is a Docker image that runs a hands-off pull-request reviewer, using the claude CLI infrastructure with non-Anthropic models.  By default it runs glm-5.2, which I've found to be impressively thorough compared to both Copilot and GPT 5.5.
+This is a Docker image that runs a hands-off pull-request reviewer, built on the claude CLI infrastructure. It can point Claude Code at whichever backend you like: **Ollama Cloud** (the default — no API costs beyond your Ollama plan, and a *different* model than the one that wrote the code), **Anthropic's own API**, or **any other Anthropic-compatible endpoint**. Out of the box it runs glm-5.2 on Ollama Cloud, which I've found to be impressively thorough compared to both Copilot and GPT 5.5.
 
-The container bundles the **Claude Code CLI** and the **GitHub CLI**. Claude Code talks directly to **Ollama Cloud** (via its native Anthropic-compatible API — no  proxy, and no local `ollama` binary needed) and runs in non-interactive "YOLO" mode on a loop, reviewing open PRs and posting findings as comments.
+The container bundles the **Claude Code CLI** and the **GitHub CLI**. Claude Code talks directly to the configured provider (via the Anthropic-compatible API — no proxy, and no local `ollama` binary needed) and runs in non-interactive "YOLO" mode on a loop, reviewing open PRs and posting findings as comments.
+
+> **Group-think caveat:** the value of an independent reviewer comes from it being a *different* model than the one that wrote the code. Pointing this at Anthropic to review Claude-authored PRs re-introduces the group-think this tool exists to avoid. Anthropic and custom providers are there for reviewing code written by other tools, or when you simply prefer a specific model.
 
 It is designed so the loop *cannot cause damage*:
 
@@ -12,18 +14,23 @@ It is designed so the loop *cannot cause damage*:
 - Makes a cheap **local clone** of a **read-only** mount of your primary repo and works only in that clone, so your source is never modified.
 - Uses a **privilege-minimized GitHub token** that can read the repo/PRs and write PR comments — nothing else (no push, merge, or admin).
 
+## Choosing a provider
+
+Set `PROVIDER` (default `ollama`) to pick the backend. The entrypoint validates the credentials that provider needs and wires the corresponding Claude Code environment variables for you:
+
+| `PROVIDER` | Credential you set | Endpoint | Default `REVIEW_MODEL` |
+| --- | --- | --- | --- |
+| `ollama` *(default)* | `OLLAMA_API_KEY` | `https://ollama.com` | `glm-5.2:cloud` |
+| `anthropic` | `ANTHROPIC_API_KEY` | Anthropic's default | `claude-opus-4-8` |
+| `custom` | `ANTHROPIC_AUTH_TOKEN` *or* `ANTHROPIC_API_KEY` | your `ANTHROPIC_BASE_URL` | *(none — you must set `REVIEW_MODEL`)* |
+
+- **`ollama`** — Ollama Cloud's native Anthropic-compatible API. Auth goes through `ANTHROPIC_AUTH_TOKEN` (a Bearer token), so `ANTHROPIC_API_KEY` is blanked.
+- **`anthropic`** — Anthropic's own API, authenticated with the native `ANTHROPIC_API_KEY` (`x-api-key`). Leaves the base URL at Anthropic's default.
+- **`custom`** — any other Anthropic-compatible endpoint. Set `ANTHROPIC_BASE_URL`, a `REVIEW_MODEL` the endpoint serves, and whichever auth the endpoint expects: `ANTHROPIC_AUTH_TOKEN` for a Bearer header (most gateways/compatible services) or `ANTHROPIC_API_KEY` for `x-api-key`.
+
+Whichever provider you pick, the entrypoint pins **every** model tier (`ANTHROPIC_MODEL` and each `..._DEFAULT_OPUS/SONNET/HAIKU/FABLE_MODEL`, plus the legacy `..._SMALL_FAST_MODEL`) to your one `REVIEW_MODEL`. On a non-Anthropic backend that's required: it has no Opus/Sonnet/Haiku models, so if a subagent or alias requested an un-overridden tier, Claude Code would error out on an unknown model. On Anthropic it's a deliberate simplification — one model does every part of the review, including any subagent work.
+
 ## How it works
-
-The image points Claude Code at Ollama Cloud with these environment variables (set automatically by the entrypoint):
-
-| Variable | Value |
-| --- | --- |
-| `ANTHROPIC_BASE_URL` | `https://ollama.com` |
-| `ANTHROPIC_AUTH_TOKEN` | your `OLLAMA_API_KEY` |
-| `ANTHROPIC_API_KEY` | `""` (blanked to avoid conflicts) |
-| `ANTHROPIC_MODEL` + every tier (`..._DEFAULT_OPUS/SONNET/HAIKU_MODEL`, `..._SMALL_FAST_MODEL`) | your `REVIEW_MODEL` |
-
-All model tiers are mapped to the one Ollama model on purpose: the backend has no Anthropic models, so if a subagent or alias requests Opus/Sonnet/Haiku and that tier weren't overridden, Claude Code would error out on an unknown model.
 
 The reviewer runs as **one continuous, stateful Claude session**. The first pass starts a new session; every later pass `--resume`s it, so Claude remembers what it already reviewed and avoids duplicate comments:
 
@@ -54,7 +61,10 @@ docker build -t claudebox .
    - Contents: **Read**
    - Pull requests: **Read and write** (read PRs/diffs, post comments)
    - Issues: **Read and write** (PR comments use the issues API)
-2. Get an Ollama Cloud API key from the [Ollama settings page](https://ollama.com/settings/keys)
+2. Get the credential for your provider:
+   - **Ollama Cloud** (default): an API key from the [Ollama settings page](https://ollama.com/settings/keys) → `OLLAMA_API_KEY`.
+   - **Anthropic**: an API key from the [Anthropic Console](https://console.anthropic.com/) → `ANTHROPIC_API_KEY`, and set `PROVIDER=anthropic`.
+   - **Custom endpoint**: set `PROVIDER=custom`, `ANTHROPIC_BASE_URL`, a `REVIEW_MODEL`, and `ANTHROPIC_AUTH_TOKEN` (or `ANTHROPIC_API_KEY`). See [Choosing a provider](#choosing-a-provider).
 3. Fill in env vars (copy `.env.example` to `.env`):
 
     ```bash
@@ -134,15 +144,19 @@ The real deliverable, of course, is on GitHub — the comments it posts. Watch t
 
 ## Configuration
 
-All configuration is via environment variables — see `.env.example`. Required:
+All configuration is via environment variables — see `.env.example`. Always required:
 
-- `OLLAMA_API_KEY`
 - `GITHUB_TOKEN`
 - `GITHUB_REPOSITORY`
 
+Provider selection and its credential (see [Choosing a provider](#choosing-a-provider)):
+
+- `PROVIDER` — `ollama` (default), `anthropic`, or `custom`
+- The credential for that provider: `OLLAMA_API_KEY` (ollama), `ANTHROPIC_API_KEY` (anthropic), or `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_API_KEY` (custom)
+
 Optional:
 
-- `REVIEW_MODEL`
+- `REVIEW_MODEL` (provider-specific default; **required** for `PROVIDER=custom`)
 - `REVIEW_INTERVAL_SECONDS`
 - `REVIEW_PROMPT` (first pass, new session)
 - `FOLLOWUP_PROMPT` (resumed passes)
@@ -150,7 +164,7 @@ Optional:
 
 ## Notes & caveats
 
-- **Model names move fast.** The `:cloud` suffix is stable, but exact versions change. Browse current options at [Ollama's model registry](https://ollama.com/search?c=cloud) and set `REVIEW_MODEL` accordingly. If the model name is wrong, Claude Code errors out — it does **not** fall back to Anthropic's API.
+- **Model names move fast, and there is no fallback.** `REVIEW_MODEL` must name a model your chosen provider actually serves; a wrong name is a hard error, not a silent fall-through to some other model. For Ollama the `:cloud` suffix is stable but exact versions change — browse [Ollama's model registry](https://ollama.com/search?c=cloud). For Anthropic, see the current model IDs in the [Anthropic docs](https://docs.anthropic.com/en/docs/about-claude/models).
 - The token is the real safety boundary. Verify it has no write access beyond PR comments before running unattended.
 - Because passes share one resumed session, the reviewer remembers what it reviewed earlier and won't re-raise the same findings. If a pass fails it starts a fresh session next cycle (losing that in-session memory), so it may occasionally re-comment after a failure — harmless, just noise.
 - Session context grows over time. Set `MAX_PASSES_PER_SESSION` to rotate to a fresh session every N passes and bound that growth (the trade-off: the new session forgets earlier passes, so it may re-raise findings once after a rotation). Left at `0`, the session runs unbounded until the container restarts.

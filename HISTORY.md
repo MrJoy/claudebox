@@ -2,6 +2,8 @@
 
 ## 0.0.3 - Unreleased
 
+* Generalize the backend beyond Ollama Cloud: a new `PROVIDER` env var (`ollama` | `anthropic` | `custom`) selects the model provider. `ollama` remains the default, so existing configs are unchanged; `anthropic` targets Anthropic's own API, and `custom` targets any Anthropic-compatible endpoint. Every model tier is still pinned to the one `REVIEW_MODEL`.
+* Move the provider-specific `REVIEW_MODEL` default out of the Dockerfile so each provider can supply its own (ollama: `glm-5.2:cloud`, anthropic: `claude-opus-4-8`).
 * Tweak the default prompt to encourage a slightly bigger-picture perspective.
 
 ## 0.0.2 - 2026-07-01
