@@ -1,5 +1,9 @@
 # History
 
+## 0.0.3 - Unreleased
+
+* Tweak the default prompt to encourage a slightly bigger-picture perspective.
+
 ## 0.0.2 - 2026-07-01
 
 * Add verbiage to prompts to allow addressing claudebox to force a re-review.
