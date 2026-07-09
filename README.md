@@ -33,10 +33,11 @@ Set `PROVIDER` (default `ollama`) to pick the backend. The entrypoint validates 
 With `PROVIDER=anthropic` you can authenticate the reviewer with the same subscription/OAuth credentials `claude` already uses on your machine, instead of a separate API key. The container has its own home and can't see your host credentials automatically, so pick one of:
 
 - **Long-lived token (recommended, cross-platform).** On your host run `claude setup-token` (needs a Pro/Max/Team/Enterprise plan) and pass the result as `CLAUDE_CODE_OAUTH_TOKEN` in your `.env`. This is Anthropic's supported headless/CI path and works regardless of host OS.
-- **Mount your credentials (Linux host only).** Bind-mount your host `~/.claude` into the reviewer's home so Claude Code finds `~/.claude/.credentials.json` itself:
+- **Mount your credentials (Linux host only).** Bind-mount your host `~/.claude` into the reviewer's home so Claude Code finds `~/.claude/.credentials.json` itself — the launcher's `--mount-claude` flag does exactly this:
 
     ```bash
-    -v "$HOME/.claude:/home/reviewer/.claude"   # NOT :ro — see below
+    ./claudebox.sh run --repo /path/to/repo --mount-claude
+    # which adds:  -v "$HOME/.claude:/home/reviewer/.claude"   # NOT :ro — see below
     ```
 
   Caveats: mount it **read-write** (Claude Code refreshes the token and a `:ro` mount fails on refresh); the 0600 file must be readable by the container's `reviewer` user; and a **macOS** host keeps these credentials in the Keychain, not a file, so there's nothing to mount — use the token instead.
@@ -62,10 +63,26 @@ The entrypoint shell is the supervisor: it controls cadence (`git fetch`, then a
 
 > Why not `/loop`? Claude Code's `/loop` needs a live *interactive* session — scheduled wake-ups only fire while a session is running and idle, and headless `-p` mode exits after each response. The shell loop + `--resume` gives the same continuous, context-retaining behavior while staying headless and crash-safe.
 
+## The `claudebox.sh` launcher
+
+`claudebox.sh` wraps the whole lifecycle — build, run, logs, shell, stop, status — and bakes in the required hardening flags so you can't forget them. It's the easiest way to drive the container; `docker` is always there if you'd rather do it by hand ([Run](#run) shows the raw commands).
+
+```bash
+./claudebox.sh --help                          # self-describing reference
+./claudebox.sh build
+./claudebox.sh run --repo /path/to/your/repo   # detached + hardened
+./claudebox.sh run --repo /path/to/your/repo --mount-claude   # reuse your `claude` login
+./claudebox.sh logs                            # follow the play-by-play
+./claudebox.sh test --repo /path/to/your/repo  # one-off, foreground, --rm
+./claudebox.sh stop
+```
+
+Add `--dry-run` to any command to print the exact `docker` invocation without running it. The sections below document the underlying `docker` commands the launcher assembles.
+
 ## Build
 
 ```bash
-docker build -t claudebox .
+./claudebox.sh build     # or: docker build -t claudebox .
 ```
 
 ## Run
@@ -84,7 +101,14 @@ docker build -t claudebox .
     cp .env.example .env   # then edit
     ```
 
-4. Run, mounting your **primary repo read-only** at `/repo`. It's a long-running unattended service, so run it **detached** (`-d`), give it a **name** so you can attach to its logs, and let it **restart** if it crashes:
+4. Run, mounting your **primary repo read-only** at `/repo`. It's a long-running unattended service, so run it **detached** (`-d`), give it a **name** so you can attach to its logs, and let it **restart** if it crashes. Easiest via the launcher:
+
+    ```bash
+    ./claudebox.sh run --repo /path/to/your/repo
+    ./claudebox.sh logs                            # watch it (see Monitoring)
+    ```
+
+    which is exactly this `docker run`:
 
     ```bash
     docker run -d --name claudebox --restart unless-stopped \
@@ -99,9 +123,11 @@ docker build -t claudebox .
     docker logs -f claudebox   # watch it (see Monitoring)
     ```
 
-    For a quick one-off test you can instead run it in the foreground with `--rm` (ephemeral — the container and its logs are removed on exit):
+    For a quick one-off test, run it in the foreground with `--rm` (ephemeral — the container and its logs are removed on exit):
 
     ```bash
+    ./claudebox.sh test --repo /path/to/your/repo
+    # equivalently:
     docker run --rm -it --env-file .env -v /path/to/your/repo:/repo:ro --cap-drop ALL --security-opt no-new-privileges --pids-limit 512 --memory 4g claudebox
     ```
 
@@ -126,10 +152,10 @@ Don't add `--read-only` to the root filesystem: the loop needs to write its work
 
 ## Monitoring
 
-The reviewer logs its whole heartbeat — and a live play-by-play of each pass — to stdout. The detached, **named** container from [Run](#run) (`--name claudebox`) is what makes its logs attachable:
+The reviewer logs its whole heartbeat — and a live play-by-play of each pass — to stdout. The detached, **named** container from [Run](#run) (`--name claudebox`) is what makes its logs attachable. `./claudebox.sh logs` / `shell` / `status` cover the common views; the raw commands:
 
 ```bash
-docker logs -f claudebox          # follow live
+docker logs -f claudebox          # follow live  (./claudebox.sh logs)
 docker logs --tail 100 claudebox  # last 100 lines
 docker logs --since 10m claudebox # last 10 minutes
 ```

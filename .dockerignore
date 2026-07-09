@@ -3,3 +3,5 @@
 .env
 .env.*
 !.env.example
+# Host-side launcher; the image only needs entrypoint.sh.
+claudebox.sh

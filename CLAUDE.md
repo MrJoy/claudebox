@@ -6,24 +6,33 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Docker image that runs an unattended PR reviewer. It bundles the **Claude Code CLI** and the **GitHub CLI**, points Claude Code at a configurable model provider — **Ollama Cloud** by default (`glm-5.2:cloud`), or **Anthropic** or any **Anthropic-compatible** endpoint via the `PROVIDER` env var — and loops over a repo's open PRs in headless "YOLO" mode, posting one comment per finding. The premise: a different model reviewing than the one that wrote the code avoids group-think (which is why Ollama is the default and reviewing Claude-authored code with `PROVIDER=anthropic` re-introduces the group-think the tool exists to avoid).
 
-There is no application code, build system, or test suite — the entire project is three files: `Dockerfile`, `entrypoint.sh`, and `README.md`. `entrypoint.sh` is where essentially all the logic lives.
+There is no application code, build system, or test suite. The project is a handful of files: `Dockerfile`, `entrypoint.sh` (where essentially all the runtime logic lives), `claudebox.sh` (a host-side launcher wrapping `docker build`/`run` and the lifecycle commands), `README.md`, `.env.example`, and `HISTORY.md`.
 
 ## Commands
 
+The `claudebox.sh` launcher wraps all of this (`build`, `run`, `test`, `logs`, `shell`, `stop`, `status`) and injects the required hardening flags; `./claudebox.sh --help` is the reference, and `--dry-run` prints the docker command any subcommand would run:
+
+```bash
+./claudebox.sh build
+./claudebox.sh run --repo /path/to/your/repo    # detached + hardened
+./claudebox.sh run --repo /path/to/your/repo --mount-claude   # reuse host `claude` login
+./claudebox.sh logs                             # watch the live play-by-play
+./claudebox.sh test --repo /path/to/your/repo   # one-off, foreground, --rm
+```
+
+The equivalent raw docker (what the launcher assembles):
+
 ```bash
 docker build -t claudebox .
-
-# Run (detached, hardened) — see README "Run" for the full flag set
 docker run -d --name claudebox --restart unless-stopped --env-file .env \
   -v /path/to/your/repo:/repo:ro \
   --cap-drop ALL --security-opt no-new-privileges --pids-limit 512 --memory 4g \
   claudebox
-
-docker logs -f claudebox        # watch the live play-by-play
+docker logs -f claudebox
 docker exec -it claudebox bash  # poke around inside (gh auth status, gh pr list, etc.)
 ```
 
-There is no linter or test runner. To test changes to `entrypoint.sh`, rebuild and run; `bash -n entrypoint.sh` syntax-checks it without Docker.
+There is no linter or test runner. Syntax-check the shell without Docker via `bash -n entrypoint.sh` / `bash -n claudebox.sh`. `claudebox.sh` runs on the **host**, where macOS ships **bash 3.2** — so keep it 3.2-safe (e.g. expand possibly-empty arrays as `${arr[@]+"${arr[@]}"}`, not `"${arr[@]}"`, which trips `set -u`). `entrypoint.sh` runs inside the image (modern bash).
 
 ## Architecture
 
