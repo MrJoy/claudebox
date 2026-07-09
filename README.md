@@ -21,12 +21,25 @@ Set `PROVIDER` (default `ollama`) to pick the backend. The entrypoint validates 
 | `PROVIDER` | Credential you set | Endpoint | Default `REVIEW_MODEL` |
 | --- | --- | --- | --- |
 | `ollama` *(default)* | `OLLAMA_API_KEY` | `https://ollama.com` | `glm-5.2:cloud` |
-| `anthropic` | `ANTHROPIC_API_KEY` | Anthropic's default | `claude-opus-4-8` |
+| `anthropic` | `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, *or* mounted creds | Anthropic's default | `claude-opus-4-8` |
 | `custom` | `ANTHROPIC_AUTH_TOKEN` *or* `ANTHROPIC_API_KEY` | your `ANTHROPIC_BASE_URL` | *(none — you must set `REVIEW_MODEL`)* |
 
 - **`ollama`** — Ollama Cloud's native Anthropic-compatible API. Auth goes through `ANTHROPIC_AUTH_TOKEN` (a Bearer token), so `ANTHROPIC_API_KEY` is blanked.
-- **`anthropic`** — Anthropic's own API, authenticated with the native `ANTHROPIC_API_KEY` (`x-api-key`). Leaves the base URL at Anthropic's default.
+- **`anthropic`** — Anthropic's own API, at its default endpoint. You don't have to paste an API key: the entrypoint takes the first credential it finds, in this order — `ANTHROPIC_API_KEY` (console key), else `CLAUDE_CODE_OAUTH_TOKEN`, else a mounted credentials file — and only errors if none exists. See [Reusing your existing `claude` login](#reusing-your-existing-claude-login).
 - **`custom`** — any other Anthropic-compatible endpoint. Set `ANTHROPIC_BASE_URL`, a `REVIEW_MODEL` the endpoint serves, and whichever auth the endpoint expects: `ANTHROPIC_AUTH_TOKEN` for a Bearer header (most gateways/compatible services) or `ANTHROPIC_API_KEY` for `x-api-key`.
+
+### Reusing your existing `claude` login
+
+With `PROVIDER=anthropic` you can authenticate the reviewer with the same subscription/OAuth credentials `claude` already uses on your machine, instead of a separate API key. The container has its own home and can't see your host credentials automatically, so pick one of:
+
+- **Long-lived token (recommended, cross-platform).** On your host run `claude setup-token` (needs a Pro/Max/Team/Enterprise plan) and pass the result as `CLAUDE_CODE_OAUTH_TOKEN` in your `.env`. This is Anthropic's supported headless/CI path and works regardless of host OS.
+- **Mount your credentials (Linux host only).** Bind-mount your host `~/.claude` into the reviewer's home so Claude Code finds `~/.claude/.credentials.json` itself:
+
+    ```bash
+    -v "$HOME/.claude:/home/reviewer/.claude"   # NOT :ro — see below
+    ```
+
+  Caveats: mount it **read-write** (Claude Code refreshes the token and a `:ro` mount fails on refresh); the 0600 file must be readable by the container's `reviewer` user; and a **macOS** host keeps these credentials in the Keychain, not a file, so there's nothing to mount — use the token instead.
 
 Whichever provider you pick, the entrypoint pins **every** model tier (`ANTHROPIC_MODEL` and each `..._DEFAULT_OPUS/SONNET/HAIKU/FABLE_MODEL`, plus the legacy `..._SMALL_FAST_MODEL`) to your one `REVIEW_MODEL`. On a non-Anthropic backend that's required: it has no Opus/Sonnet/Haiku models, so if a subagent or alias requested an un-overridden tier, Claude Code would error out on an unknown model. On Anthropic it's a deliberate simplification — one model does every part of the review, including any subagent work.
 
@@ -63,7 +76,7 @@ docker build -t claudebox .
    - Issues: **Read and write** (PR comments use the issues API)
 2. Get the credential for your provider:
    - **Ollama Cloud** (default): an API key from the [Ollama settings page](https://ollama.com/settings/keys) → `OLLAMA_API_KEY`.
-   - **Anthropic**: an API key from the [Anthropic Console](https://console.anthropic.com/) → `ANTHROPIC_API_KEY`, and set `PROVIDER=anthropic`.
+   - **Anthropic**: set `PROVIDER=anthropic` and provide either an API key from the [Anthropic Console](https://console.anthropic.com/) → `ANTHROPIC_API_KEY`, or reuse your existing `claude` login → [Reusing your existing `claude` login](#reusing-your-existing-claude-login).
    - **Custom endpoint**: set `PROVIDER=custom`, `ANTHROPIC_BASE_URL`, a `REVIEW_MODEL`, and `ANTHROPIC_AUTH_TOKEN` (or `ANTHROPIC_API_KEY`). See [Choosing a provider](#choosing-a-provider).
 3. Fill in env vars (copy `.env.example` to `.env`):
 
@@ -152,7 +165,7 @@ All configuration is via environment variables — see `.env.example`. Always re
 Provider selection and its credential (see [Choosing a provider](#choosing-a-provider)):
 
 - `PROVIDER` — `ollama` (default), `anthropic`, or `custom`
-- The credential for that provider: `OLLAMA_API_KEY` (ollama), `ANTHROPIC_API_KEY` (anthropic), or `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_API_KEY` (custom)
+- The credential for that provider: `OLLAMA_API_KEY` (ollama); for anthropic one of `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` / a mounted `~/.claude` (see [Reusing your existing `claude` login](#reusing-your-existing-claude-login)); or `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_API_KEY` (custom)
 
 Optional:
 

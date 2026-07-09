@@ -129,11 +129,35 @@ case "$PROVIDER" in
     REVIEW_MODEL="${REVIEW_MODEL:-glm-5.2:cloud}"
     ;;
   anthropic)
-    # Anthropic's own API: authenticate with the native x-api-key credential and
-    # let Claude Code use its default endpoint. Blank any stray Bearer token so
-    # auth is unambiguous.
-    : "${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY (from https://console.anthropic.com/) for PROVIDER=anthropic}"
-    export ANTHROPIC_AUTH_TOKEN=""
+    # Anthropic's own API, using its default endpoint (base URL left unset).
+    # Credential resolution, in precedence order — we take the first available so
+    # you don't have to paste an API key if `claude` already has a login:
+    #   1. ANTHROPIC_API_KEY        - explicit console key (x-api-key).
+    #   2. CLAUDE_CODE_OAUTH_TOKEN  - long-lived subscription token; mint one on
+    #                                 the host with `claude setup-token`. This is
+    #                                 the portable, cross-platform headless path.
+    #   3. a mounted credentials file - the SAME creds `claude` uses outside the
+    #                                 container. Mount the host's ~/.claude into
+    #                                 the reviewer's home; mount it READ-WRITE so
+    #                                 Claude Code can refresh the token (a :ro
+    #                                 mount fails on refresh), and note a macOS
+    #                                 host keeps these in the Keychain, not a file.
+    # An EMPTY ANTHROPIC_API_KEY outranks the OAuth token in Claude Code's
+    # precedence, so for paths 2/3 we `unset` (not blank) the header vars to make
+    # sure nothing shadows the credential we actually want used.
+    creds_file="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
+    if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+      export ANTHROPIC_AUTH_TOKEN=""   # explicit key wins; drop any stray Bearer
+      log "PROVIDER=anthropic: authenticating with ANTHROPIC_API_KEY."
+    elif [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+      unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+      log "PROVIDER=anthropic: authenticating with CLAUDE_CODE_OAUTH_TOKEN."
+    elif [ -r "$creds_file" ]; then
+      unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+      log "PROVIDER=anthropic: authenticating with mounted credentials at $creds_file."
+    else
+      die "PROVIDER=anthropic needs a credential. Provide one of: ANTHROPIC_API_KEY (https://console.anthropic.com/); CLAUDE_CODE_OAUTH_TOKEN (run 'claude setup-token' on your host); or mount your host ~/.claude (read-write) so $creds_file exists."
+    fi
     REVIEW_MODEL="${REVIEW_MODEL:-claude-opus-4-8}"
     ;;
   custom)
