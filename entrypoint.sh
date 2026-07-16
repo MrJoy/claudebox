@@ -118,6 +118,12 @@ git config --global --add safe.directory "$WORK_REPO"
 # (On Anthropic this also guarantees one model does every bit of the work.)
 PROVIDER="${PROVIDER:-ollama}"
 
+echo
+echo
+echo "Using provider: ${PROVIDER}"
+echo
+echo
+
 case "$PROVIDER" in
   ollama)
     # Ollama serves a native Anthropic-compatible API; auth MUST go through
