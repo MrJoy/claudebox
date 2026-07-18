@@ -40,6 +40,14 @@ RUN npm install -g @anthropic-ai/claude-code
 # the loop must run unprivileged. This is also a defense-in-depth boundary.
 RUN useradd --create-home --shell /bin/bash reviewer
 
+# Pre-create the top-level roots that host repo paths live under, owned by
+# `reviewer`, so `--export-sessions` can clone the working copy at the *host*
+# path (session-folder alignment). The unprivileged user can't create a new
+# top-level dir under `/`, and can't drop from root under --cap-drop ALL, so
+# only the first path component must pre-exist and be writable — `mkdir -p`
+# creates the rest. /Users covers macOS hosts, /home covers Linux hosts.
+RUN mkdir -p /Users /home && chown reviewer:reviewer /Users /home
+
 # Keep the auto-updater quiet/offline; the pinned version is what we ship.
 # REVIEW_MODEL is intentionally NOT baked here: its default is provider-specific
 # and resolved by entrypoint.sh, so leaving it unset lets each provider's
@@ -55,8 +63,13 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 USER reviewer
 WORKDIR /home/reviewer
 
-# Pre-accept onboarding so headless runs never block on a first-run prompt.
-RUN printf '{"hasCompletedOnboarding": true, "bypassPermissionsModeAccepted": true}\n' \
+# Pre-accept onboarding so headless runs never block on a first-run prompt, and
+# pre-create ~/.claude/projects owned by `reviewer`. The latter matters for
+# --export-sessions: it bind-mounts a single host folder at
+# ~/.claude/projects/<encoded>, and if that parent didn't already exist Docker
+# would create it root-owned, blocking Claude Code's other writes under ~/.claude.
+RUN mkdir -p /home/reviewer/.claude/projects \
+ && printf '{"hasCompletedOnboarding": true, "bypassPermissionsModeAccepted": true}\n' \
       > /home/reviewer/.claude.json
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
