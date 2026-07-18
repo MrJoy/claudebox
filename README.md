@@ -72,12 +72,40 @@ The entrypoint shell is the supervisor: it controls cadence (`git fetch`, then a
 ./claudebox.sh build
 ./claudebox.sh run --repo /path/to/your/repo   # detached + hardened
 ./claudebox.sh run --repo /path/to/your/repo --mount-claude   # reuse your `claude` login
+./claudebox.sh run --repo /path/to/your/repo --export-sessions   # export transcripts to host ~/.claude
 ./claudebox.sh logs                            # follow the play-by-play
 ./claudebox.sh test --repo /path/to/your/repo  # one-off, foreground, --rm
 ./claudebox.sh stop
 ```
 
 Add `--dry-run` to any command to print the exact `docker` invocation without running it. The sections below document the underlying `docker` commands the launcher assembles.
+
+### Exporting review sessions to your host
+
+By default the reviewer's Claude Code transcripts live on the container's
+ephemeral filesystem and vanish when it's removed. `--export-sessions` writes
+them to your host `~/.claude` instead, filed under the **same** project folder
+your host `claude` uses for this repo — so you can compare in-container review
+sessions against your own sessions for the repo (e.g. in a session-viewer tool)
+and have them grouped together.
+
+```bash
+./claudebox.sh run --repo /path/to/your/repo --export-sessions
+```
+
+It works by two coupled steps: it bind-mounts your host
+`~/.claude/projects/<repo-folder>` into the container read-write, and it runs
+the review clone at your repo's *host path* inside the container so Claude Code
+encodes the session folder to that same `<repo-folder>` name. It therefore
+requires a mounted repo (it can't be combined with `--no-repo`). If you're
+already using `--mount-claude`, all of `~/.claude` is mounted, so the narrow
+mount is skipped and only the path alignment is added.
+
+> **Safety trade-off:** this bind-mounts one host session folder **read-write**
+> into a container running in YOLO mode — the container can read and rewrite
+> *this repo's* transcripts. The mount is deliberately narrow (just this one
+> repo's folder), so every other project's transcripts stay untouched. It's
+> off by default; enable it only when you want the export.
 
 ## Build
 
@@ -200,6 +228,7 @@ Optional:
 - `REVIEW_PROMPT` (first pass, new session)
 - `FOLLOWUP_PROMPT` (resumed passes)
 - `MAX_PASSES_PER_SESSION` (rotate to a fresh session every N passes; `0` = never)
+- `--export-sessions` (launcher flag, not an env var) — export review transcripts to the host and align the session folder; see [Exporting review sessions to your host](#exporting-review-sessions-to-your-host)
 
 ## Notes & caveats
 
