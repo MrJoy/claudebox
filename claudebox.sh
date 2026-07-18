@@ -20,6 +20,7 @@ ENV_FILE=".env"
 REPO="$PWD"
 MOUNT_REPO=1
 MOUNT_CLAUDE=0
+EXPORT_SESSIONS=0
 RESTART=1
 MEMORY="4g"
 PIDS="512"
@@ -51,6 +52,12 @@ OPTIONS
                     container, so PROVIDER=anthropic can reuse your existing
                     `claude` login instead of an API key. Linux host only — a
                     macOS host keeps credentials in the Keychain, not a file.
+  --export-sessions Export the container's Claude Code review transcripts to
+                    your host ~/.claude and file them under the SAME project
+                    folder your host uses for this repo (so in- and out-of-
+                    container sessions line up). Requires a mounted repo.
+                    Bind-mounts only this one repo's ~/.claude/projects folder
+                    read-write; see README for the safety trade-off.
   --name NAME       Container name (default: claudebox).
   --image NAME      Image tag to build/run (default: claudebox).
   --memory SIZE     Memory limit (default: 4g).
@@ -88,6 +95,7 @@ while [ $# -gt 0 ]; do
     --no-repo)     MOUNT_REPO=0 ;;
     --env-file)    ENV_FILE="${2:?--env-file requires a PATH}"; shift ;;
     --mount-claude) MOUNT_CLAUDE=1 ;;
+    --export-sessions) EXPORT_SESSIONS=1 ;;
     --name)        NAME="${2:?--name requires a value}"; shift ;;
     --image)       IMAGE="${2:?--image requires a value}"; shift ;;
     --memory)      MEMORY="${2:?--memory requires a value}"; shift ;;
@@ -129,6 +137,29 @@ build_run_flags() {
     [ -d "$HOME/.claude" ] || die "--mount-claude: '$HOME/.claude' does not exist (log in with 'claude' first, or use a token)."
     [ -f "$HOME/.claude/.credentials.json" ] || log "WARN: $HOME/.claude/.credentials.json not found; if you're on macOS your login lives in the Keychain (not a file) — use CLAUDE_CODE_OAUTH_TOKEN instead."
     RUN_FLAGS+=(-v "$HOME/.claude:/home/reviewer/.claude")
+  fi
+
+  if [ "$EXPORT_SESSIONS" = 1 ]; then
+    # Aligning the in-container path to the host repo path is what makes a
+    # narrow per-repo mount land, so a mounted repo is required.
+    [ "$MOUNT_REPO" = 1 ] || die "--export-sessions needs a mounted repo (it aligns the in-container path to the host repo path); drop --no-repo."
+    local repo_abs_es encoded_es
+    repo_abs_es="$(cd "$REPO" && pwd)"
+    # Claude Code names the session project folder after the cwd with every
+    # non-alphanumeric char mapped 1:1 to '-'. Reproduce that so we mount the
+    # exact folder Claude will write to.
+    encoded_es="$(printf '%s' "$repo_abs_es" | sed 's/[^a-zA-Z0-9]/-/g')"
+    RUN_FLAGS+=(-e "HOST_REPO_PATH=$repo_abs_es")
+    if [ "$MOUNT_CLAUDE" = 1 ]; then
+      # --mount-claude already mounts all of ~/.claude read-write, so the
+      # narrow projects mount would be redundant; alignment via the env is enough.
+      log "NOTE: --export-sessions with --mount-claude: ~/.claude is already mounted; skipping the narrow projects mount."
+    else
+      # Pre-create the host source dir (user-owned) so Docker binds it rather
+      # than creating a root-owned one. Skip the side effect on --dry-run.
+      [ "$DRY_RUN" = 1 ] || mkdir -p "$HOME/.claude/projects/$encoded_es"
+      RUN_FLAGS+=(-v "$HOME/.claude/projects/$encoded_es:/home/reviewer/.claude/projects/$encoded_es")
+    fi
   fi
 
   # Hardening: the entrypoint's startup checks refuse to run without these.
