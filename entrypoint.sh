@@ -81,8 +81,26 @@ fi
 
 # --- Defaults --------------------------------------------------------------
 REPO_PATH="${REPO_PATH:-/repo}"
-WORK_DIR="${WORK_DIR:-$HOME/work}"
-WORK_REPO="$WORK_DIR/repo"
+# Working-clone location. Normally a private dir under $HOME. With
+# --export-sessions the launcher sets HOST_REPO_PATH to the *host's* repo path
+# and bind-mounts ~/.claude/projects/<encoded> from the host; cloning and
+# running the review at that same path makes Claude Code encode the session
+# project folder identically to the host, so transcripts file under the shared
+# folder. mkdir here both creates the path and proves it's writable — if it
+# isn't (an exotic host root not pre-created in the image; see Dockerfile), we
+# warn and fall back to the default so the loop still runs (sessions just won't
+# line up).
+if [ -n "${HOST_REPO_PATH:-}" ] && mkdir -p "$HOST_REPO_PATH" 2>/dev/null; then
+  WORK_REPO="$HOST_REPO_PATH"
+  WORK_DIR="$(dirname "$HOST_REPO_PATH")"
+elif [ -n "${HOST_REPO_PATH:-}" ]; then
+  log "WARN: HOST_REPO_PATH=$HOST_REPO_PATH is not creatable here; sessions won't line up. Using the default work dir."
+  WORK_DIR="${WORK_DIR:-$HOME/work}"
+  WORK_REPO="$WORK_DIR/repo"
+else
+  WORK_DIR="${WORK_DIR:-$HOME/work}"
+  WORK_REPO="$WORK_DIR/repo"
+fi
 REVIEW_INTERVAL_SECONDS="${REVIEW_INTERVAL_SECONDS:-300}"
 # REVIEW_MODEL's default depends on the provider; it is resolved in the
 # "Backend selection" block below.
