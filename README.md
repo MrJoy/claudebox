@@ -107,6 +107,12 @@ mount is skipped and only the path alignment is added.
 > repo's folder), so every other project's transcripts stay untouched. It's
 > off by default; enable it only when you want the export.
 
+> **Host caveat:** this reliably works on **macOS/Windows Docker Desktop**,
+> which squashes bind-mount ownership to your host user. On a **native Linux
+> host**, the container's `reviewer` user (uid 1001) may not be able to write
+> to a host folder owned by your uid, so the export can silently fail to
+> write — same caveat as `--mount-claude`.
+
 ## Build
 
 ```bash

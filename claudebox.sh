@@ -58,6 +58,9 @@ OPTIONS
                     container sessions line up). Requires a mounted repo.
                     Bind-mounts only this one repo's ~/.claude/projects folder
                     read-write; see README for the safety trade-off.
+                    Reliable on macOS/Windows Docker Desktop; on a native
+                    Linux host a UID mismatch may block the write — see
+                    README.
   --name NAME       Container name (default: claudebox).
   --image NAME      Image tag to build/run (default: claudebox).
   --memory SIZE     Memory limit (default: 4g).
@@ -143,13 +146,12 @@ build_run_flags() {
     # Aligning the in-container path to the host repo path is what makes a
     # narrow per-repo mount land, so a mounted repo is required.
     [ "$MOUNT_REPO" = 1 ] || die "--export-sessions needs a mounted repo (it aligns the in-container path to the host repo path); drop --no-repo."
-    local repo_abs_es encoded_es
-    repo_abs_es="$(cd "$REPO" && pwd)"
+    local encoded_es
     # Claude Code names the session project folder after the cwd with every
     # non-alphanumeric char mapped 1:1 to '-'. Reproduce that so we mount the
     # exact folder Claude will write to.
-    encoded_es="$(printf '%s' "$repo_abs_es" | sed 's/[^a-zA-Z0-9]/-/g')"
-    RUN_FLAGS+=(-e "HOST_REPO_PATH=$repo_abs_es")
+    encoded_es="$(printf '%s' "$repo_abs" | sed 's/[^a-zA-Z0-9]/-/g')"
+    RUN_FLAGS+=(-e "HOST_REPO_PATH=$repo_abs")
     if [ "$MOUNT_CLAUDE" = 1 ]; then
       # --mount-claude already mounts all of ~/.claude read-write, so the
       # narrow projects mount would be redundant; alignment via the env is enough.
