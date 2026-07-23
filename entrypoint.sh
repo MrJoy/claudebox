@@ -56,6 +56,66 @@ check_resource_limit() {
   return 0
 }
 
+# --- PR selection ----------------------------------------------------------
+# Which PRs to review is chosen by exactly one selector env var. These helpers
+# validate that choice and enumerate the candidate PR numbers each cycle.
+
+# True (exit 0) when $1 is a truthy flag value: 1 / true / yes (any case).
+pr_truthy() {
+  case "$(printf '%s' "${1:-}" | tr 'A-Z' 'a-z')" in
+    1|true|yes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Split a comma/whitespace-separated list of PR numbers into one-per-line,
+# validating each is a positive integer (die otherwise). Word-splitting on the
+# unquoted expansion does the comma->space splitting.
+parse_pr_ids() {
+  local raw="$1" tok
+  for tok in $(printf '%s' "$raw" | tr ',' ' '); do
+    case "$tok" in
+      ''|*[!0-9]*) die "PR_IDS contains a non-numeric value: '$tok' (expected e.g. 12,15,20)" ;;
+      *) printf '%s\n' "$tok" ;;
+    esac
+  done
+}
+
+# Determine the active selector; die unless EXACTLY ONE is provided. Sets the
+# global PR_SELECTOR to one of: all | assignee | ids | search.
+resolve_pr_selection() {
+  local n=0
+  PR_SELECTOR=""
+  if pr_truthy "${PR_ALL:-}";        then n=$((n + 1)); PR_SELECTOR="all"; fi
+  if [ -n "${PR_ASSIGNEE:-}" ];      then n=$((n + 1)); PR_SELECTOR="assignee"; fi
+  if [ -n "${PR_IDS:-}" ];           then n=$((n + 1)); PR_SELECTOR="ids"; fi
+  if [ -n "${PR_SEARCH:-}" ];        then n=$((n + 1)); PR_SELECTOR="search"; fi
+  if [ "$n" -eq 0 ]; then
+    die "no PR selector set; provide exactly one of PR_ALL, PR_ASSIGNEE, PR_IDS, PR_SEARCH (launcher: --all / --assignee / --prs / --search)."
+  fi
+  if [ "$n" -gt 1 ]; then
+    die "multiple PR selectors set; provide exactly one of PR_ALL, PR_ASSIGNEE, PR_IDS, PR_SEARCH."
+  fi
+  # Validate the ID list up front so a bad value fails fast, not every cycle.
+  [ "$PR_SELECTOR" = "ids" ] && parse_pr_ids "$PR_IDS" >/dev/null
+  return 0
+}
+
+# Echo candidate PR numbers (one per line) for the active selector.
+enumerate_candidate_prs() {
+  case "$PR_SELECTOR" in
+    all)      gh pr list -R "$GITHUB_REPOSITORY" --state open --limit 100 --json number --jq '.[].number' ;;
+    assignee) gh pr list -R "$GITHUB_REPOSITORY" --state open --assignee "$PR_ASSIGNEE" --limit 100 --json number --jq '.[].number' ;;
+    search)   gh pr list -R "$GITHUB_REPOSITORY" --search "$PR_SEARCH" --limit 100 --json number --jq '.[].number' ;;
+    ids)      parse_pr_ids "$PR_IDS" ;;
+  esac
+}
+
+# Substitute the {{PR}} token in a prompt template with a PR number.
+render_prompt() {
+  printf '%s' "${1//\{\{PR\}\}/$2}"
+}
+
 # Unprivileged user. Claude Code also refuses --dangerously-skip-permissions as
 # root, but check explicitly for a clear message (e.g. if run with --user root).
 [ "$(id -u)" != "0" ] || require "running as root; run as an unprivileged user (don't override the image's 'reviewer' user with --user root)."
@@ -108,12 +168,22 @@ REVIEW_INTERVAL_SECONDS="${REVIEW_INTERVAL_SECONDS:-300}"
 # growth of a long-lived resumed session's context. 0 = never rotate.
 MAX_PASSES_PER_SESSION="${MAX_PASSES_PER_SESSION:-0}"
 case "$MAX_PASSES_PER_SESSION" in ''|*[!0-9]*) die "MAX_PASSES_PER_SESSION must be a non-negative integer";; esac
-DEFAULT_PROMPT="Please review open PRs to find unreviewed PRs, PRs in need of re-review, or PRs where your assistance has been requested (look for comments addressing 'claudebox'). Perform a thorough review / re-review of all such PRs. Pay particular attention to test quality/robustness, security, correctness, and architectural coherence/consistency. Also consider whether the approach the PR is taking is prudent and robust in light of the issue being addressed. Post findings as comments on the PR, one comment per finding. Be sure you're looking at the most recent commit on the branch. Sign your comments with '-claudebox'."
+# Prompts are PR-scoped: the harness runs one session per PR and substitutes the
+# {{PR}} token with that PR's number. REVIEW_PROMPT starts a PR's session;
+# FOLLOWUP_PROMPT is used when resuming it on a later cycle. Custom overrides use
+# the same {{PR}} token.
+DEFAULT_PROMPT="Perform a thorough review of pull request #{{PR}} in this repository. Inspect it with \`gh pr view {{PR}}\` and \`gh pr diff {{PR}}\`, and be sure you're looking at the most recent commit on its branch. Pay particular attention to test quality/robustness, security, correctness, and architectural coherence/consistency, and whether the approach the PR takes is prudent and robust in light of the issue it addresses. Post findings as comments on the PR, one comment per finding. Sign your comments with '-claudebox'."
 REVIEW_PROMPT="${REVIEW_PROMPT:-$DEFAULT_PROMPT}"
-# Prompt used on resumed passes (the session already holds context from prior
-# passes, so this nudges it to re-check rather than re-introduce the task).
-DEFAULT_FOLLOWUP="I've fetched the latest refs. Re-check the repository for new or updated PRs since your last pass, any PRs still needing review, or PRs where your assistance has been requested (look for comments addressing 'claudebox'). Apply the same review standard. Only post findings that haven't already raised. Be sure you're looking at the most recent commit on each branch. Sign your comments with '-claudebox'."
+# Prompt used when RESUMING a PR's session (it already holds context from prior
+# passes on that PR, so this nudges a re-check rather than re-introducing the task).
+DEFAULT_FOLLOWUP="I've fetched the latest refs. Re-check pull request #{{PR}} for new commits or changes since your last review of it. Apply the same review standard, and only post findings you haven't already raised on this PR. Be sure you're looking at the most recent commit on its branch. Sign your comments with '-claudebox'."
 FOLLOWUP_PROMPT="${FOLLOWUP_PROMPT:-$DEFAULT_FOLLOWUP}"
+
+# Validate PR selection now (fail fast, before auth/clone), and warn if a prompt
+# template won't name the PR.
+resolve_pr_selection
+case "$REVIEW_PROMPT"   in *'{{PR}}'*) : ;; *) log "WARN: REVIEW_PROMPT has no {{PR}} token; reviews won't name the specific PR." ;; esac
+case "$FOLLOWUP_PROMPT" in *'{{PR}}'*) : ;; *) log "WARN: FOLLOWUP_PROMPT has no {{PR}} token; reviews won't name the specific PR." ;; esac
 
 # --- GitHub auth (gh + git) ------------------------------------------------
 # gh reads GH_TOKEN from the environment; setup-git makes git reuse it for
@@ -250,8 +320,11 @@ log "Reviewer ready. repo=$GITHUB_REPOSITORY provider=$PROVIDER model=$REVIEW_MO
 # (a fresh session) if a pass fails. Headless + all permissions skipped is safe:
 # unprivileged user, minimized token, read-only seed.
 cd "$WORK_REPO"
-SESSION_ID=""
-PASSES_THIS_SESSION=0
+# Per-PR state: session id and successful-pass count, keyed by PR number. These
+# are in-memory only, so a container restart re-reviews each PR once (may
+# re-comment once) — the same trade-off the old single-session design had.
+declare -A PR_SESSION=()
+declare -A PR_PASSES=()
 
 # Pretty-print Claude's stream-json (one JSON event per line) into readable,
 # live log lines: assistant text, tool calls, tool results, and the final
@@ -282,14 +355,19 @@ format_stream() {
 # case it resumes that one. Streams events live to the log (so `docker logs -f`
 # shows the play-by-play) while teeing the raw stream to a temp file to recover
 # the session id. Returns non-zero on failure (caller clears SESSION_ID).
+# Run one review pass for $1=prompt, resuming $2=session id when non-empty.
+# On success sets RUN_PASS_SESSION_ID to the recovered id (falling back to the
+# passed id) and returns 0; returns claude's exit code on failure.
+RUN_PASS_SESSION_ID=""
 run_pass() {
-  local prompt="$1" rc errfile rawfile sid
+  local prompt="$1" sid="$2" rc errfile rawfile got
+  RUN_PASS_SESSION_ID="$sid"
   errfile="$(mktemp)"; rawfile="$(mktemp)"
   # set +e around the pipeline so a formatter hiccup can't abort the script and
   # so we can read Claude's own exit code via PIPESTATUS[0] (not tee's/jq's).
   set +e
-  if [ -n "$SESSION_ID" ]; then
-    claude -p --resume "$SESSION_ID" --output-format stream-json --verbose \
+  if [ -n "$sid" ]; then
+    claude -p --resume "$sid" --output-format stream-json --verbose \
       --dangerously-skip-permissions --model "$REVIEW_MODEL" "$prompt" \
       2>"$errfile" | stdbuf -oL tee "$rawfile" | format_stream
   else
@@ -304,8 +382,8 @@ run_pass() {
     rm -f "$errfile" "$rawfile"; return "$rc"
   fi
   # session_id appears in the init and result events; take the last one seen.
-  sid="$(jq -r -R '(fromjson? // empty) | select(.session_id) | .session_id' "$rawfile" 2>/dev/null | tail -n 1 || true)"
-  [ -n "$sid" ] && SESSION_ID="$sid"
+  got="$(jq -r -R '(fromjson? // empty) | select(.session_id) | .session_id' "$rawfile" 2>/dev/null | tail -n 1 || true)"
+  [ -n "$got" ] && RUN_PASS_SESSION_ID="$got"
   rm -f "$errfile" "$rawfile"
   return 0
 }
@@ -314,27 +392,43 @@ while true; do
   log "Fetching latest refs..."
   git fetch --all --prune --quiet || log "WARN: git fetch failed; continuing"
 
-  if [ -z "$SESSION_ID" ]; then
-    log "Starting review pass (new session)..."
-    PROMPT="$REVIEW_PROMPT"
-    PASSES_THIS_SESSION=0
+  # Re-enumerate every cycle so newly-matching PRs get picked up (PR_IDS is a
+  # fixed set). Read the numbers into an array.
+  prs=()
+  while IFS= read -r _n; do [ -n "$_n" ] && prs+=("$_n"); done < <(enumerate_candidate_prs || true)
+
+  if [ "${#prs[@]}" -eq 0 ]; then
+    log "No candidate PRs for selector '$PR_SELECTOR'."
   else
-    log "Starting review pass (resuming session $SESSION_ID)..."
-    PROMPT="$FOLLOWUP_PROMPT"
+    log "Candidate PRs ($PR_SELECTOR): ${prs[*]}"
   fi
 
-  if run_pass "$PROMPT"; then
-    PASSES_THIS_SESSION=$((PASSES_THIS_SESSION + 1))
-    log "Review pass complete (session $SESSION_ID, pass $PASSES_THIS_SESSION)."
-    # Rotate to a fresh session once the cap is hit, to bound context growth.
-    if [ "$MAX_PASSES_PER_SESSION" -gt 0 ] && [ "$PASSES_THIS_SESSION" -ge "$MAX_PASSES_PER_SESSION" ]; then
-      log "Reached MAX_PASSES_PER_SESSION=$MAX_PASSES_PER_SESSION; rotating to a fresh session next cycle."
-      SESSION_ID=""
+  # Review each PR in its own session, sequentially (they share the one clone).
+  for pr in ${prs[@]+"${prs[@]}"}; do
+    sid="${PR_SESSION[$pr]:-}"
+    if [ -z "$sid" ]; then
+      log "Reviewing PR #$pr (new session)..."
+      prompt="$(render_prompt "$REVIEW_PROMPT" "$pr")"
+    else
+      log "Reviewing PR #$pr (resuming session $sid)..."
+      prompt="$(render_prompt "$FOLLOWUP_PROMPT" "$pr")"
     fi
-  else
-    log "WARN: review pass failed; starting a fresh session next cycle."
-    SESSION_ID=""
-  fi
+
+    if run_pass "$prompt" "$sid"; then
+      PR_SESSION[$pr]="$RUN_PASS_SESSION_ID"
+      PR_PASSES[$pr]=$(( ${PR_PASSES[$pr]:-0} + 1 ))
+      log "PR #$pr review complete (session ${PR_SESSION[$pr]}, pass ${PR_PASSES[$pr]})."
+      # Rotate this PR's session once its cap is hit, to bound context growth.
+      if [ "$MAX_PASSES_PER_SESSION" -gt 0 ] && [ "${PR_PASSES[$pr]}" -ge "$MAX_PASSES_PER_SESSION" ]; then
+        log "PR #$pr reached MAX_PASSES_PER_SESSION=$MAX_PASSES_PER_SESSION; rotating its session next cycle."
+        unset 'PR_SESSION[$pr]'
+        PR_PASSES[$pr]=0
+      fi
+    else
+      log "WARN: PR #$pr review failed; starting a fresh session for it next cycle."
+      unset 'PR_SESSION[$pr]'
+    fi
+  done
 
   log "Sleeping ${REVIEW_INTERVAL_SECONDS}s..."
   sleep "$REVIEW_INTERVAL_SECONDS"
