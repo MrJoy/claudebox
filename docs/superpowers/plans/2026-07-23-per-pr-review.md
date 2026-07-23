@@ -659,7 +659,7 @@ All config is via environment variables (`.env.example` documents them). Always 
 ```
   (If the CLAUDE.md wording has drifted from these exact strings, locate the corresponding sentence/bullet and apply the equivalent change.)
 
-- [ ] **Step 7: Add a `HISTORY.md` changelog entry.** `HISTORY.md` is a version changelog (newest first; top entry is `## 0.0.3 - 2026-07-17`). Insert a new `## Unreleased` section immediately after the `# History` title line and before `## 0.0.3 - 2026-07-17`:
+- [ ] **Step 7: `HISTORY.md` changelog entry — ALREADY DONE.** The `## Unreleased` changelog entry was added and committed out-of-band (commit d67a8b2) at the user's request, before this task runs. Do NOT edit `HISTORY.md` in this task. Just confirm it is present: `grep -q '## Unreleased' HISTORY.md && echo "HISTORY ok"`. If for some reason it is absent, insert this after the `# History` title line and before `## 0.0.3 - 2026-07-17`:
 ```
 ## Unreleased
 
@@ -685,8 +685,8 @@ Expected: `launcher OK`, `.env.example token OK`, `README selectors OK`, the fou
 
 ```bash
 cd /Users/jonathonfrisby/mrjoy/claudebox
-git add README.md .env.example CLAUDE.md HISTORY.md
-git commit -m "docs: per-PR sessions and PR targeting (README/.env.example/CLAUDE.md/HISTORY.md)
+git add README.md .env.example CLAUDE.md
+git commit -m "docs: per-PR sessions and PR targeting (README/.env.example/CLAUDE.md)
 
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_015B4nPWbXrMg1D5bMFLZpYa"
