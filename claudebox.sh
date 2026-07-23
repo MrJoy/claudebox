@@ -108,6 +108,7 @@ while [ $# -gt 0 ]; do
     --memory)      MEMORY="${2:?--memory requires a value}"; shift ;;
     --pids)        PIDS="${2:?--pids requires a value}"; shift ;;
     --no-restart)  RESTART=0 ;;
+    --tail)        TAIL=1 ;;
     --dry-run)     DRY_RUN=1 ;;
     -h|--help)     usage; exit 0 ;;
     --)            shift; EXTRA=("$@"); break ;;
@@ -243,7 +244,16 @@ case "$COMMAND" in
     restart_flags=()
     [ "$RESTART" = 1 ] && restart_flags=(--restart unless-stopped)
     show_and_run docker run -d --name "$NAME" ${restart_flags[@]+"${restart_flags[@]}"} "${RUN_FLAGS[@]}" "$IMAGE" ${EXTRA[@]+"${EXTRA[@]}"}
-    [ "$DRY_RUN" = 1 ] || log "Started '$NAME'. Follow it with: ./claudebox.sh logs (from here), or re-run with --tail."
+    if [ "$TAIL" = 1 ]; then
+      # Follow the logs just like the `logs` command. Ctrl-C stops following but
+      # leaves the detached container running.
+      show_and_run docker logs -f "$NAME"
+    else
+      # Echo how the launcher was actually invoked ($0) rather than a hardcoded
+      # ./claudebox.sh — the operator typically runs it from a repo worktree, not
+      # from the claudebox dir, so a literal ./ path would be wrong.
+      [ "$DRY_RUN" = 1 ] || log "Started '$NAME'. Follow it with: $0 logs (from this dir), or re-run with --tail."
+    fi
     ;;
   test)
     build_run_flags
