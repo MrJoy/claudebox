@@ -1,5 +1,12 @@
 # History
 
+## Unreleased
+
+* Review each PR in its own Claude Code session. The harness now enumerates candidate PRs and iterates, giving each PR an independent, resumable session so re-reviews avoid duplicate comments per PR. `MAX_PASSES_PER_SESSION` now applies per PR.
+* Add PR targeting — choose exactly one of: all open PRs (`--all` / `PR_ALL`), open PRs assigned to a user (`--assignee` / `PR_ASSIGNEE`), a specific set of PR numbers (`--prs` / `PR_IDS`), or a `gh` search query (`--search` / `PR_SEARCH`). Zero or more than one is a startup error.
+* Prompts are now PR-scoped: `REVIEW_PROMPT` (session start) and `FOLLOWUP_PROMPT` (resume) substitute a `{{PR}}` token with the PR number; custom prompts use the same token.
+* Launcher: infer the env file (`.env.claudebox` preferred over `.env`) and repo from the current directory, derive a per-repo container name `claudebox--<org>--<repo>` so several claudeboxes can run at once, announce those inferences loudly, and add `--tail` to follow logs right after `run`.
+
 ## 0.0.3 - 2026-07-17
 
 * Generalize the backend beyond Ollama Cloud: a new `PROVIDER` env var (`ollama` | `anthropic` | `custom`) selects the model provider. `ollama` remains the default, so existing configs are unchanged; `anthropic` targets Anthropic's own API, and `custom` targets any Anthropic-compatible endpoint. Every model tier is still pinned to the one `REVIEW_MODEL`.
