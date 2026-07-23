@@ -289,6 +289,7 @@ while true; do
     else
       log "WARN: PR #$pr review failed; starting a fresh session for it next cycle."
       unset 'PR_SESSION[$pr]'
+      PR_PASSES[$pr]=0
     fi
   done
 
