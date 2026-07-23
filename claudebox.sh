@@ -30,6 +30,14 @@ PIDS="512"
 TAIL=0
 DRY_RUN=0
 
+# PR selectors (mutually exclusive; passed through to the container as -e VARs).
+PR_ALL=0
+PR_ASSIGNEE=""
+PR_IDS=""
+PR_SEARCH=""
+PR_SEL_COUNT=0
+PR_SEL_NAMES=""
+
 usage() {
   cat <<'EOF'
 claudebox — launcher for the unattended PR-reviewer container.
@@ -77,6 +85,14 @@ OPTIONS
   --no-restart      Don't pass --restart unless-stopped to `run`.
   --tail            After `run` starts the container, follow its logs (like the
                     `logs` command). Ctrl-C stops following; the container runs on.
+  --all             Review all open PRs.
+  --assignee LOGIN  Review open PRs assigned to this GitHub user.
+  --prs LIST        Review exactly these PR numbers (comma/space list, e.g.
+                    12,15,20).
+  --search QUERY    Review PRs matching this gh search query (e.g.
+                    "is:open label:needs-review"). You control state via the
+                    query. Provide exactly ONE of --all/--assignee/--prs/--search
+                    (here or via PR_* in the env file).
   --dry-run         Print the docker command instead of executing it.
   -h, --help        Show this help.
 
@@ -92,6 +108,9 @@ EXAMPLES
   ./claudebox.sh run --repo ~/src/myrepo
   ./claudebox.sh run --repo ~/src/myrepo --mount-claude      # anthropic OAuth reuse
   cd ~/src/myrepo && claudebox run --tail                    # infer env+repo+name, then follow logs
+  claudebox run --all --tail                                 # review every open PR
+  claudebox run --assignee alice                             # PRs assigned to alice
+  claudebox run --prs 12,15,20                               # just these PRs
   ./claudebox.sh test --repo ~/src/myrepo                    # one-off foreground run
   ./claudebox.sh logs
   ./claudebox.sh stop
@@ -117,6 +136,10 @@ while [ $# -gt 0 ]; do
     --pids)        PIDS="${2:?--pids requires a value}"; shift ;;
     --no-restart)  RESTART=0 ;;
     --tail)        TAIL=1 ;;
+    --all)         PR_ALL=1;      PR_SEL_COUNT=$((PR_SEL_COUNT + 1)); PR_SEL_NAMES="$PR_SEL_NAMES --all" ;;
+    --assignee)    PR_ASSIGNEE="${2:?--assignee requires a LOGIN}"; PR_SEL_COUNT=$((PR_SEL_COUNT + 1)); PR_SEL_NAMES="$PR_SEL_NAMES --assignee"; shift ;;
+    --prs)         PR_IDS="${2:?--prs requires a comma/space list of PR numbers}"; PR_SEL_COUNT=$((PR_SEL_COUNT + 1)); PR_SEL_NAMES="$PR_SEL_NAMES --prs"; shift ;;
+    --search)      PR_SEARCH="${2:?--search requires a gh search query}"; PR_SEL_COUNT=$((PR_SEL_COUNT + 1)); PR_SEL_NAMES="$PR_SEL_NAMES --search"; shift ;;
     --dry-run)     DRY_RUN=1 ;;
     -h|--help)     usage; exit 0 ;;
     --)            shift; EXTRA=("$@"); break ;;
@@ -127,6 +150,11 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$COMMAND" ] || { usage; exit 2; }
+
+# Selector flags are mutually exclusive (the entrypoint is authoritative and
+# also errors when none/multiple are set via the env file; this is the friendly
+# early check for CLI flags). Zero flags is fine here — the env file may set one.
+[ "$PR_SEL_COUNT" -le 1 ] || die "multiple PR selector flags given ($(echo "$PR_SEL_NAMES" | xargs)); provide exactly one of --all, --assignee, --prs, --search."
 
 # --- Inference pipeline (announced loudly) ---------------------------------
 # Print a visually distinct banner for each value we INFER (never for values
@@ -245,6 +273,18 @@ build_run_flags() {
 
   # Hardening: the entrypoint's startup checks refuse to run without these.
   RUN_FLAGS+=(--cap-drop ALL --security-opt no-new-privileges --pids-limit "$PIDS" --memory "$MEMORY")
+
+  # Pass any given PR selector through to the container. (An env-file value of
+  # the same var is overridden by this -e; two selectors reaching the container
+  # is what the entrypoint rejects.)
+  [ "$PR_ALL" = 1 ]     && RUN_FLAGS+=(-e "PR_ALL=1")
+  [ -n "$PR_ASSIGNEE" ] && RUN_FLAGS+=(-e "PR_ASSIGNEE=$PR_ASSIGNEE")
+  [ -n "$PR_IDS" ]      && RUN_FLAGS+=(-e "PR_IDS=$PR_IDS")
+  [ -n "$PR_SEARCH" ]   && RUN_FLAGS+=(-e "PR_SEARCH=$PR_SEARCH")
+  true  # keep the function's exit status 0: the last `[ ... ] && ...` above
+        # would otherwise make build_run_flags itself fail under `set -e`
+        # whenever PR_SEARCH is unset (the test-then-&& idiom is only safe
+        # when it's NOT the final statement executed).
 }
 
 case "$COMMAND" in
