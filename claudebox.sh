@@ -167,13 +167,17 @@ derive_name() {
   if [ -f "$ENV_FILE" ]; then
     slug="$(sed -n -E 's/^[[:space:]]*GITHUB_REPOSITORY[[:space:]]*=[[:space:]]*//p' "$ENV_FILE" \
             | tail -n1 | sed -E 's/^["'\'']//; s/["'\'']?[[:space:]]*$//')"
+    # Only accept a well-formed org/repo (same guard as the git-remote path
+    # below); this rejects e.g. a value with a trailing inline comment and lets
+    # derivation fall through to the git remote rather than build a bad name.
+    printf '%s' "$slug" | grep -qE '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$' || slug=""
     [ -n "$slug" ] && src="env file $ENV_FILE"
   fi
   if [ -z "$slug" ]; then
     url="$(git -C "$REPO" remote get-url origin 2>/dev/null || true)"
     if [ -n "$url" ]; then
       slug="$(printf '%s' "$url" | sed -E 's#^git@[^:]+:##; s#^[a-zA-Z]+://[^/]+/##; s#\.git$##')"
-      printf '%s' "$slug" | grep -qE '^[^/]+/[^/]+$' || slug=""
+      printf '%s' "$slug" | grep -qE '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$' || slug=""
       [ -n "$slug" ] && src="git remote of $REPO"
     fi
   fi

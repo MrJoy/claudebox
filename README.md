@@ -78,7 +78,7 @@ The entrypoint shell is the supervisor: it controls cadence (`git fetch`, then a
 ./claudebox.sh stop
 ```
 
-**Per-repo config & naming.** Run the launcher from inside a repo's worktree and it
+**Per-repo config & naming.** Run the launcher from inside a repo's working copy and it
 infers everything from the cwd, announcing each inference loudly:
 
 - **Env file:** it auto-selects `.env.claudebox` (preferred) or `.env` from the current
@@ -89,7 +89,7 @@ infers everything from the cwd, announcing each inference loudly:
   env file) or the repo's git `origin` remote — e.g. `claudebox--mrjoy--hordes-of-orcs-next`.
   This is what lets several claudeboxes run at once, one per repo. Override with `--name`.
 
-The same inference runs for `logs`, `shell`, `stop`, and `status`, so from a repo's worktree
+The same inference runs for `logs`, `shell`, `stop`, and `status`, so from a repo's working copy
 `claudebox logs` / `stop` target that repo's container with no flags. Add `--tail` to `run`
 to start the container and immediately follow its logs.
 
