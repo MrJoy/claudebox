@@ -51,7 +51,9 @@ OPTIONS
                     The reviewer local-clones this as a seed; omit with --no-repo
                     to have it network-clone GITHUB_REPOSITORY instead.
   --no-repo         Don't mount a repo; the reviewer clones over the network.
-  --env-file PATH   Env file passed to the container (default: ./.env).
+  --env-file PATH   Env file passed to the container. Default: auto-select from
+                    the cwd, preferring .env.claudebox over .env (so a repo can
+                    carry its own claudebox creds without touching its .env).
   --mount-claude    Also bind-mount your ~/.claude (READ-WRITE) into the
                     container, so PROVIDER=anthropic can reuse your existing
                     `claude` login instead of an API key. Linux host only — a
@@ -65,11 +67,16 @@ OPTIONS
                     Reliable on macOS/Windows Docker Desktop; on a native
                     Linux host a UID mismatch may block the write — see
                     README.
-  --name NAME       Container name (default: claudebox).
+  --name NAME       Container name. Default: derived as claudebox--<org>--<repo>
+                    from GITHUB_REPOSITORY (env file) or the repo's git origin
+                    remote, so each repo gets its own container and several can
+                    run at once.
   --image NAME      Image tag to build/run (default: claudebox).
   --memory SIZE     Memory limit (default: 4g).
   --pids N          PID limit (default: 512).
   --no-restart      Don't pass --restart unless-stopped to `run`.
+  --tail            After `run` starts the container, follow its logs (like the
+                    `logs` command). Ctrl-C stops following; the container runs on.
   --dry-run         Print the docker command instead of executing it.
   -h, --help        Show this help.
 
@@ -84,6 +91,7 @@ EXAMPLES
   ./claudebox.sh build
   ./claudebox.sh run --repo ~/src/myrepo
   ./claudebox.sh run --repo ~/src/myrepo --mount-claude      # anthropic OAuth reuse
+  cd ~/src/myrepo && claudebox run --tail                    # infer env+repo+name, then follow logs
   ./claudebox.sh test --repo ~/src/myrepo                    # one-off foreground run
   ./claudebox.sh logs
   ./claudebox.sh stop

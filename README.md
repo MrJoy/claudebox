@@ -78,6 +78,21 @@ The entrypoint shell is the supervisor: it controls cadence (`git fetch`, then a
 ./claudebox.sh stop
 ```
 
+**Per-repo config & naming.** Run the launcher from inside a repo's worktree and it
+infers everything from the cwd, announcing each inference loudly:
+
+- **Env file:** it auto-selects `.env.claudebox` (preferred) or `.env` from the current
+  directory, so a repo can carry its own claudebox credentials in `.env.claudebox` without
+  disturbing the project's own `.env`. Override with `--env-file PATH`.
+- **Repo:** defaults to the current directory (override with `--repo PATH`).
+- **Container name:** derived as `claudebox--<org>--<repo>` from `GITHUB_REPOSITORY` (in the
+  env file) or the repo's git `origin` remote — e.g. `claudebox--mrjoy--hordes-of-orcs-next`.
+  This is what lets several claudeboxes run at once, one per repo. Override with `--name`.
+
+The same inference runs for `logs`, `shell`, `stop`, and `status`, so from a repo's worktree
+`claudebox logs` / `stop` target that repo's container with no flags. Add `--tail` to `run`
+to start the container and immediately follow its logs.
+
 Add `--dry-run` to any command to print the exact `docker` invocation without running it. The sections below document the underlying `docker` commands the launcher assembles.
 
 ### Exporting review sessions to your host
@@ -186,7 +201,7 @@ Don't add `--read-only` to the root filesystem: the loop needs to write its work
 
 ## Monitoring
 
-The reviewer logs its whole heartbeat — and a live play-by-play of each pass — to stdout. The detached, **named** container from [Run](#run) (`--name claudebox`) is what makes its logs attachable. `./claudebox.sh logs` / `shell` / `status` cover the common views; the raw commands:
+The reviewer logs its whole heartbeat — and a live play-by-play of each pass — to stdout. The detached, **named** container from [Run](#run) (named `claudebox--<org>--<repo>`) is what makes its logs attachable. `./claudebox.sh logs` / `shell` / `status` re-derive that name from the cwd, so they cover the common views with no flags; the raw commands:
 
 ```bash
 docker logs -f claudebox          # follow live  (./claudebox.sh logs)
