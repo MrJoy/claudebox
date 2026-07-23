@@ -247,9 +247,9 @@ Optional:
 
 - `REVIEW_MODEL` (provider-specific default; **required** for `PROVIDER=custom`)
 - `REVIEW_INTERVAL_SECONDS`
-- `REVIEW_PROMPT` (first pass, new session)
-- `FOLLOWUP_PROMPT` (resumed passes)
-- `MAX_PASSES_PER_SESSION` (rotate to a fresh session every N passes; `0` = never)
+- `REVIEW_PROMPT` (a PR's first review, new session; uses the `{{PR}}` token)
+- `FOLLOWUP_PROMPT` (a PR's resumed review; uses the `{{PR}}` token)
+- `MAX_PASSES_PER_SESSION` (rotate a PR's session to a fresh one every N passes, per PR; `0` = never)
 - `--export-sessions` (launcher flag, not an env var) — export review transcripts to the host and align the session folder; see [Exporting review sessions to your host](#exporting-review-sessions-to-your-host)
 
 ### PR selection
@@ -269,5 +269,5 @@ Set **exactly one** of these (or pass the matching launcher flag). Zero or more 
 
 - **Model names move fast, and there is no fallback.** `REVIEW_MODEL` must name a model your chosen provider actually serves; a wrong name is a hard error, not a silent fall-through to some other model. For Ollama the `:cloud` suffix is stable but exact versions change — browse [Ollama's model registry](https://ollama.com/search?c=cloud). For Anthropic, see the current model IDs in the [Anthropic docs](https://docs.anthropic.com/en/docs/about-claude/models).
 - The token is the real safety boundary. Verify it has no write access beyond PR comments before running unattended.
-- Because passes share one resumed session, the reviewer remembers what it reviewed earlier and won't re-raise the same findings. If a pass fails it starts a fresh session next cycle (losing that in-session memory), so it may occasionally re-comment after a failure — harmless, just noise.
-- Session context grows over time. Set `MAX_PASSES_PER_SESSION` to rotate to a fresh session every N passes and bound that growth (the trade-off: the new session forgets earlier passes, so it may re-raise findings once after a rotation). Left at `0`, the session runs unbounded until the container restarts.
+- Because each PR is reviewed in its own resumed session, the reviewer remembers what it already flagged on that PR and won't re-raise the same findings. If a PR's pass fails it starts a fresh session for that PR next cycle (losing that in-session memory), so it may occasionally re-comment on it after a failure — harmless, just noise. The PR→session map is in-memory, so a container restart can likewise re-review each PR once.
+- Each PR's session context grows over time. Set `MAX_PASSES_PER_SESSION` to rotate a PR's session to a fresh one every N passes and bound that growth (the trade-off: the new session forgets that PR's earlier passes, so it may re-raise findings once after a rotation). Left at `0`, each PR's session runs unbounded until the container restarts.
