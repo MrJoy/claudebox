@@ -87,11 +87,16 @@ commands are printed and neither is executed.
 
 ### 6. Subcommand targeting via the same inference
 
-The env-file → repo → name derivation pipeline runs for `run`, `test`, `logs`, `shell`,
-`stop`, and `status` — every command **except** `build` (which needs neither an env file
-nor a container name). As a result, from a repo's worktree, `./claudebox.sh logs`,
-`stop`, `status`, and `shell` all target that repo's container with no extra flags.
-`--repo`, `--name`, and `--env-file` override the inference for any of them.
+Env-file and repo resolution run for every command **except** `build` (which needs
+neither). **Container-name derivation** additionally runs for `run`, `logs`, `shell`,
+`stop`, and `status` — the commands that address a container by name. As a result, from a
+repo's worktree, `./claudebox.sh logs`, `stop`, `status`, and `shell` all target that
+repo's container with no extra flags. `--repo`, `--name`, and `--env-file` override the
+inference for any of them.
+
+`test` is deliberately excluded from name derivation: it runs ephemerally in the
+foreground with `--rm` and is never addressed by name, so it stays unnamed (status quo).
+It still resolves and announces the env file and repo.
 
 ## Order of operations (per invocation)
 
@@ -99,9 +104,11 @@ After argument parsing, and for every command except `build`:
 
 1. Resolve the env file (auto-select unless `--env-file` given; announce if inferred).
 2. Resolve the repo (default `$PWD`; announce if inferred).
-3. Derive the container name (unless `--name` given; announce with its source; die if no
-   source yields org/repo).
-4. Run the command as today, using the resolved `ENV_FILE`, `REPO`, and `NAME`.
+3. Derive the container name — for `run`/`logs`/`shell`/`stop`/`status` only, and only
+   unless `--name` given; announce with its source; die if no source yields org/repo.
+   (`test` skips this step.)
+4. Run the command as today, using the resolved `ENV_FILE`, `REPO`, and (where derived)
+   `NAME`.
 
 Name derivation must gracefully tolerate a **missing** env file (subcommands like `logs`
 don't require the env file to exist): a missing/incomplete env file simply falls through
