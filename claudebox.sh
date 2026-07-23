@@ -15,15 +15,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # --- Defaults (override via flags) -----------------------------------------
 IMAGE="claudebox"
-NAME="claudebox"
-ENV_FILE=".env"
+NAME=""              # empty => derive claudebox--<org>--<repo>
+NAME_EXPLICIT=0
+ENV_FILE=""          # empty => auto-select .env.claudebox / .env from cwd
+ENV_FILE_EXPLICIT=0
 REPO="$PWD"
+REPO_EXPLICIT=0
 MOUNT_REPO=1
 MOUNT_CLAUDE=0
 EXPORT_SESSIONS=0
 RESTART=1
 MEMORY="4g"
 PIDS="512"
+TAIL=0
 DRY_RUN=0
 
 usage() {
@@ -94,12 +98,12 @@ while [ $# -gt 0 ]; do
     build|run|test|logs|shell|stop|status)
       [ -z "$COMMAND" ] || die "more than one command given ('$COMMAND' and '$1')."
       COMMAND="$1" ;;
-    --repo)        REPO="${2:?--repo requires a PATH}"; MOUNT_REPO=1; shift ;;
+    --repo)        REPO="${2:?--repo requires a PATH}"; MOUNT_REPO=1; REPO_EXPLICIT=1; shift ;;
     --no-repo)     MOUNT_REPO=0 ;;
-    --env-file)    ENV_FILE="${2:?--env-file requires a PATH}"; shift ;;
+    --env-file)    ENV_FILE="${2:?--env-file requires a PATH}"; ENV_FILE_EXPLICIT=1; shift ;;
     --mount-claude) MOUNT_CLAUDE=1 ;;
     --export-sessions) EXPORT_SESSIONS=1 ;;
-    --name)        NAME="${2:?--name requires a value}"; shift ;;
+    --name)        NAME="${2:?--name requires a value}"; NAME_EXPLICIT=1; shift ;;
     --image)       IMAGE="${2:?--image requires a value}"; shift ;;
     --memory)      MEMORY="${2:?--memory requires a value}"; shift ;;
     --pids)        PIDS="${2:?--pids requires a value}"; shift ;;
@@ -114,6 +118,68 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$COMMAND" ] || { usage; exit 2; }
+
+# --- Inference pipeline (announced loudly) ---------------------------------
+# Print a visually distinct banner for each value we INFER (never for values
+# the operator gave explicitly). Goes to stderr like log().
+announce() {
+  log ""
+  log ">>> claudebox: $*"
+}
+
+# Auto-select the env file from the cwd unless --env-file was given.
+# Prefer .env.claudebox so we never co-opt a project's own .env.
+resolve_env_file() {
+  [ "$ENV_FILE_EXPLICIT" = 1 ] && return 0
+  if [ -f ".env.claudebox" ]; then
+    ENV_FILE=".env.claudebox"
+    announce "env file: .env.claudebox (preferred over .env)"
+  elif [ -f ".env" ]; then
+    ENV_FILE=".env"
+    announce "env file: .env (no .env.claudebox in cwd)"
+  else
+    ENV_FILE=".env"   # nominal default; build_run_flags reports if it's needed & missing
+  fi
+}
+
+# REPO already defaults to $PWD; just announce when it was inferred (and a repo
+# is actually being mounted).
+resolve_repo() {
+  [ "$REPO_EXPLICIT" = 1 ] && return 0
+  [ "$MOUNT_REPO" = 1 ] || return 0
+  announce "repo: $REPO (inferred from current directory)"
+}
+
+# Derive NAME=claudebox--<org>--<repo> from GITHUB_REPOSITORY in the env file,
+# else the repo's git 'origin' remote, else die. Skipped when --name was given.
+derive_name() {
+  [ "$NAME_EXPLICIT" = 1 ] && return 0
+  local slug="" src="" url=""
+  if [ -f "$ENV_FILE" ]; then
+    slug="$(sed -n -E 's/^[[:space:]]*GITHUB_REPOSITORY[[:space:]]*=[[:space:]]*//p' "$ENV_FILE" \
+            | tail -n1 | sed -E 's/^["'\'']//; s/["'\'']?[[:space:]]*$//')"
+    [ -n "$slug" ] && src="env file $ENV_FILE"
+  fi
+  if [ -z "$slug" ]; then
+    url="$(git -C "$REPO" remote get-url origin 2>/dev/null || true)"
+    if [ -n "$url" ]; then
+      slug="$(printf '%s' "$url" | sed -E 's#^git@[^:]+:##; s#^[a-zA-Z]+://[^/]+/##; s#\.git$##')"
+      printf '%s' "$slug" | grep -qE '^[^/]+/[^/]+$' || slug=""
+      [ -n "$slug" ] && src="git remote of $REPO"
+    fi
+  fi
+  [ -n "$slug" ] || die "can't determine org/repo for the container name (no GITHUB_REPOSITORY in '$ENV_FILE' and no usable git 'origin' remote in '$REPO'). Pass --name, or set GITHUB_REPOSITORY."
+  NAME="claudebox--$(printf '%s' "$slug" | sed 's#/#--#g')"
+  announce "container name: $NAME (from $src)"
+}
+
+# Run the resolution appropriate to the command. build needs nothing; test is
+# ephemeral/unnamed so it skips name derivation.
+case "$COMMAND" in
+  build) : ;;
+  test)  resolve_env_file; resolve_repo ;;
+  *)     resolve_env_file; resolve_repo; derive_name ;;
+esac
 
 # Print a command (quoted so it's copy-pasteable) and then run it — unless
 # --dry-run, in which case only print. This is what makes the launcher
@@ -177,7 +243,7 @@ case "$COMMAND" in
     restart_flags=()
     [ "$RESTART" = 1 ] && restart_flags=(--restart unless-stopped)
     show_and_run docker run -d --name "$NAME" ${restart_flags[@]+"${restart_flags[@]}"} "${RUN_FLAGS[@]}" "$IMAGE" ${EXTRA[@]+"${EXTRA[@]}"}
-    [ "$DRY_RUN" = 1 ] || log "Started '$NAME'. Follow it with: ./claudebox.sh logs --name $NAME"
+    [ "$DRY_RUN" = 1 ] || log "Started '$NAME'. Follow it with: ./claudebox.sh logs (from here), or re-run with --tail."
     ;;
   test)
     build_run_flags
