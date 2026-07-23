@@ -46,20 +46,20 @@ Whichever provider you pick, the entrypoint pins **every** model tier (`ANTHROPI
 
 ## How it works
 
-The reviewer runs as **one continuous, stateful Claude session**. The first pass starts a new session; every later pass `--resume`s it, so Claude remembers what it already reviewed and avoids duplicate comments:
+The reviewer runs **one Claude session per PR**. Each cycle the entrypoint enumerates the candidate PRs (see [PR selection](#pr-selection)), then reviews each one in its own session: a PR's first review starts a new session with `REVIEW_PROMPT`; later cycles `--resume` that PR's session with `FOLLOWUP_PROMPT`, so Claude remembers what it already flagged on that PR and avoids duplicate comments. The PR number is substituted into the prompt's `{{PR}}` token.
 
 ```bash
-# first pass — new session
+# a PR's first review — new session
 claude -p --output-format stream-json --verbose --dangerously-skip-permissions \
-  --model "$REVIEW_MODEL" "$REVIEW_PROMPT"
-# later passes — resume the same session
-claude -p --resume "$SESSION_ID" --output-format stream-json --verbose \
-  --dangerously-skip-permissions --model "$REVIEW_MODEL" "$FOLLOWUP_PROMPT"
+  --model "$REVIEW_MODEL" "${REVIEW_PROMPT//\{\{PR\}\}/$pr}"
+# later cycles — resume that PR's session
+claude -p --resume "${PR_SESSION[$pr]}" --output-format stream-json --verbose \
+  --dangerously-skip-permissions --model "$REVIEW_MODEL" "${FOLLOWUP_PROMPT//\{\{PR\}\}/$pr}"
 ```
 
-Each pass streams as `stream-json`; the entrypoint pretty-prints the events live to its log (so `docker logs -f` shows the play-by-play) and recovers the session id from the stream to resume next pass.
+Each pass streams as `stream-json`; the entrypoint pretty-prints the events live to its log (so `docker logs -f` shows the play-by-play) and recovers the session id from the stream to resume that PR next cycle.
 
-The entrypoint shell is the supervisor: it controls cadence (`git fetch`, then a review pass, then sleep) and relaunches a fresh session if a pass fails. Claude itself uses `gh`/`git` to enumerate open PRs, check out the latest commits, and post one comment per finding.
+The entrypoint shell is the supervisor: it controls cadence (`git fetch`, enumerate PRs, review each sequentially, then sleep), keeps an in-memory PR→session map, and starts a fresh session for a PR if its pass fails (so it may re-comment once on that PR). Claude itself uses `gh`/`git` to inspect the PR, check out the latest commit, and post one comment per finding. `MAX_PASSES_PER_SESSION` rotates a PR's session after N passes to bound its context growth (per PR).
 
 > Why not `/loop`? Claude Code's `/loop` needs a live *interactive* session — scheduled wake-ups only fire while a session is running and idle, and headless `-p` mode exits after each response. The shell loop + `--resume` gives the same continuous, context-retaining behavior while staying headless and crash-safe.
 
@@ -236,6 +236,7 @@ All configuration is via environment variables — see `.env.example`. Always re
 
 - `GITHUB_TOKEN`
 - `GITHUB_REPOSITORY`
+- exactly one PR selector (see [PR selection](#pr-selection) below)
 
 Provider selection and its credential (see [Choosing a provider](#choosing-a-provider)):
 
@@ -250,6 +251,19 @@ Optional:
 - `FOLLOWUP_PROMPT` (resumed passes)
 - `MAX_PASSES_PER_SESSION` (rotate to a fresh session every N passes; `0` = never)
 - `--export-sessions` (launcher flag, not an env var) — export review transcripts to the host and align the session folder; see [Exporting review sessions to your host](#exporting-review-sessions-to-your-host)
+
+### PR selection
+
+Set **exactly one** of these (or pass the matching launcher flag). Zero or more than one is a startup error:
+
+| Env var | Launcher flag | Reviews |
+|---|---|---|
+| `PR_ALL=1` | `--all` | all open PRs |
+| `PR_ASSIGNEE=login` | `--assignee login` | open PRs assigned to that user |
+| `PR_IDS=12,15,20` | `--prs 12,15,20` | exactly those PR numbers |
+| `PR_SEARCH="is:open label:x"` | `--search "…"` | PRs matching a gh search query (you control state) |
+
+`REVIEW_PROMPT`/`FOLLOWUP_PROMPT` use a `{{PR}}` token (substituted with the PR number), and `MAX_PASSES_PER_SESSION` applies per PR.
 
 ## Notes & caveats
 

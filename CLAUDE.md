@@ -46,9 +46,9 @@ The design is built entirely around one constraint: **the loop runs unattended i
 
 ### Two pieces working together
 
-- **`entrypoint.sh` is the supervisor.** It does auth setup (`gh`/`git`), wires the Claude-Code→provider env, prepares the working clone, then runs the review loop: `git fetch` → one review pass → sleep. It controls cadence and crash-recovery; Claude itself decides *what* to review.
+- **`entrypoint.sh` is the supervisor.** It does auth setup (`gh`/`git`), wires the Claude-Code→provider env, prepares the working clone, then runs the review loop: `git fetch` → enumerate candidate PRs → review each PR sequentially → sleep. It controls cadence, PR selection, and crash-recovery; Claude reviews the one PR it's handed.
 
-- **One continuous, stateful Claude session.** The first pass starts a new `claude -p` session and the script recovers its `session_id` from the `stream-json` output; every later pass `--resume`s that id so Claude remembers what it already reviewed and won't re-raise findings. A failed pass clears `SESSION_ID`, so the next cycle starts fresh (and may re-comment once — accepted noise). `MAX_PASSES_PER_SESSION` optionally rotates to a fresh session to bound context growth.
+- **One Claude session per PR.** The harness enumerates candidate PRs from exactly one selector (`PR_ALL`/`PR_ASSIGNEE`/`PR_IDS`/`PR_SEARCH`; zero or multiple is a hard error) and reviews each in its own session, keyed in an in-memory `PR_SESSION` map. A PR's first review starts a new `claude -p` session (recovering its `session_id` from the `stream-json` output); later cycles `--resume` that PR's id so it won't re-raise findings on that PR. Prompts are `{{PR}}`-templated (`REVIEW_PROMPT` on start, `FOLLOWUP_PROMPT` on resume). A failed pass drops that PR's session id, so its next cycle starts fresh (and may re-comment once — accepted noise). `MAX_PASSES_PER_SESSION` optionally rotates a PR's session to bound context growth (per PR). The map is in-memory, so a container restart may re-review each PR once.
 
   Why not Claude Code's `/loop`? `/loop` needs a live interactive session; headless `-p` exits after each response. The shell loop + `--resume` gives the same continuous, context-retaining behavior while staying headless and crash-safe.
 
@@ -68,7 +68,7 @@ Regardless of provider, a shared block then points **every** model env var (`ANT
 
 ## Configuration
 
-All config is via environment variables (`.env.example` documents them). Always required: `GITHUB_TOKEN`, `GITHUB_REPOSITORY`. Provider selection: `PROVIDER` (default `ollama`) plus that provider's credential — `OLLAMA_API_KEY` (ollama), `ANTHROPIC_API_KEY` (anthropic), or `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_API_KEY` (custom); see "Backend selection" above. Optional: `REVIEW_MODEL` (provider-specific default, but required for `custom`), `REVIEW_INTERVAL_SECONDS`, `MAX_PASSES_PER_SESSION`, `ALLOW_UNHARDENED`, and the prompt overrides `REVIEW_PROMPT` (new session) / `FOLLOWUP_PROMPT` (resumed passes). Default prompts live in `entrypoint.sh`.
+All config is via environment variables (`.env.example` documents them). Always required: `GITHUB_TOKEN`, `GITHUB_REPOSITORY`, and exactly one PR selector (`PR_ALL`/`PR_ASSIGNEE`/`PR_IDS`/`PR_SEARCH`). Provider selection: `PROVIDER` (default `ollama`) plus that provider's credential — `OLLAMA_API_KEY` (ollama), `ANTHROPIC_API_KEY` (anthropic), or `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_API_KEY` (custom); see "Backend selection" above. Optional: `REVIEW_MODEL` (provider-specific default, but required for `custom`), `REVIEW_INTERVAL_SECONDS`, `MAX_PASSES_PER_SESSION`, `ALLOW_UNHARDENED`, and the prompt overrides `REVIEW_PROMPT` (new session) / `FOLLOWUP_PROMPT` (resumed passes). Default prompts live in `entrypoint.sh`.
 
 ## Gotchas when editing
 
