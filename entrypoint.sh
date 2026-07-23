@@ -312,12 +312,12 @@ git -C "$WORK_REPO" remote set-url origin "https://github.com/${GITHUB_REPOSITOR
 log "Reviewer ready. repo=$GITHUB_REPOSITORY provider=$PROVIDER model=$REVIEW_MODEL interval=${REVIEW_INTERVAL_SECONDS}s"
 
 # --- Review loop -----------------------------------------------------------
-# One continuous, *stateful* Claude session: the first pass starts a new session
-# and we capture its id; every later pass --resumes that id so Claude remembers
-# what it already reviewed (avoids duplicate comments). /loop can't be used here
-# because it needs a live interactive session, which headless `-p` mode isn't.
-# This shell acts as the supervisor: it controls cadence and relaunches Claude
-# (a fresh session) if a pass fails. Headless + all permissions skipped is safe:
+# One Claude session PER PR. Each cycle the supervisor fetches refs, enumerates
+# the candidate PRs (per the active selector), and reviews each in its own
+# session: a new session for a PR not seen yet, or --resume of that PR's session
+# (tracked in the in-memory PR_SESSION map) so Claude won't re-raise findings on
+# it. /loop can't be used here because it needs a live interactive session,
+# which headless `-p` mode isn't. Headless + all permissions skipped is safe:
 # unprivileged user, minimized token, read-only seed.
 cd "$WORK_REPO"
 # Per-PR state: session id and successful-pass count, keyed by PR number. These
@@ -351,10 +351,6 @@ format_stream() {
   '
 }
 
-# Run one review pass. Starts a new session unless SESSION_ID is set, in which
-# case it resumes that one. Streams events live to the log (so `docker logs -f`
-# shows the play-by-play) while teeing the raw stream to a temp file to recover
-# the session id. Returns non-zero on failure (caller clears SESSION_ID).
 # Run one review pass for $1=prompt, resuming $2=session id when non-empty.
 # On success sets RUN_PASS_SESSION_ID to the recovered id (falling back to the
 # passed id) and returns 0; returns claude's exit code on failure.
@@ -427,6 +423,7 @@ while true; do
     else
       log "WARN: PR #$pr review failed; starting a fresh session for it next cycle."
       unset 'PR_SESSION[$pr]'
+      PR_PASSES[$pr]=0
     fi
   done
 
