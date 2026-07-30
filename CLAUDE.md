@@ -68,7 +68,13 @@ Regardless of provider, a shared block then points **every** model env var (`ANT
 
 ## Configuration
 
-All config is via environment variables (`.env.example` documents them). Always required: `GITHUB_TOKEN`, `GITHUB_REPOSITORY`, and exactly one PR selector (`PR_ALL`/`PR_ASSIGNEE`/`PR_IDS`/`PR_SEARCH`). Provider selection: `PROVIDER` (default `ollama`) plus that provider's credential — `OLLAMA_API_KEY` (ollama), `ANTHROPIC_API_KEY` (anthropic), or `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_API_KEY` (custom); see "Backend selection" above. Optional: `REVIEW_MODEL` (provider-specific default, but required for `custom`), `REVIEW_INTERVAL_SECONDS`, `MAX_PASSES_PER_SESSION`, `ALLOW_UNHARDENED`, and the prompt overrides `REVIEW_PROMPT` (new session) / `FOLLOWUP_PROMPT` (resumed passes). Default prompts live in `entrypoint.sh`.
+All config is via environment variables (`.env.example` documents them). Always required: `GITHUB_TOKEN`, `GITHUB_REPOSITORY`, and exactly one PR selector (`PR_ALL`/`PR_ASSIGNEE`/`PR_IDS`/`PR_SEARCH`). Provider selection: `PROVIDER` (default `ollama`) plus that provider's credential — `OLLAMA_API_KEY` (ollama), `ANTHROPIC_API_KEY` (anthropic), or `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_API_KEY` (custom); see "Backend selection" above. Optional: `REVIEW_MODEL` (provider-specific default, but required for `custom`), `REVIEW_INTERVAL_SECONDS`, `MAX_PASSES_PER_SESSION`, `ALLOW_UNHARDENED`, `LINEAR_API_KEY` (see "Optional Linear context" above), and the prompt overrides `REVIEW_PROMPT` (new session) / `FOLLOWUP_PROMPT` (resumed passes). Default prompts live in `entrypoint.sh`.
+
+### Optional Linear context
+
+`LINEAR_API_KEY` (optional) gives the reviewer read access to the Linear ticket a PR references. `write_mcp_config` generates `$HOME/mcp.json` (mode 600, built with `jq --arg` so a hostile key can't break the JSON) pointing at `https://mcp.linear.app/mcp` with the key as an `Authorization: Bearer` header — Linear accepts an API key in place of interactive OAuth, which is what keeps the loop headless. `linear_stanza` appends the "check the ticket and its comments" instruction to `DEFAULT_PROMPT`/`DEFAULT_FOLLOWUP` **only**, so an operator-supplied `REVIEW_PROMPT`/`FOLLOWUP_PROMPT` reaches Claude verbatim. Docs tell operators to use a read-only key: in YOLO mode a write-capable key would let the unattended reviewer mutate tickets, and like `GITHUB_TOKEN` its scope can't be checked from inside.
+
+`CLAUDE_MCP_ARGS` carries the MCP flags for both `claude -p` call sites and always includes **`--strict-mcp-config`**, Linear or not. That's load-bearing: `/repo` is untrusted, and without it a reviewed repo shipping a `.mcp.json` could get MCP servers of its choosing loaded into a `--dangerously-skip-permissions` session.
 
 ## Gotchas when editing
 
