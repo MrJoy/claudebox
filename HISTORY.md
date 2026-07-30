@@ -1,6 +1,6 @@
 # History
 
-## Unreleased
+## 0.0.4 - 2026-07-30
 
 * Review each PR in its own Claude Code session. The harness now enumerates candidate PRs and iterates, giving each PR an independent, resumable session so re-reviews avoid duplicate comments per PR. `MAX_PASSES_PER_SESSION` now applies per PR.
 * Add PR targeting — choose exactly one of: all open PRs (`--all` / `PR_ALL`), open PRs assigned to a user (`--assignee` / `PR_ASSIGNEE`), a specific set of PR numbers (`--prs` / `PR_IDS`), or a `gh` search query (`--search` / `PR_SEARCH`). Zero or more than one is a startup error.
