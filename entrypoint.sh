@@ -116,6 +116,40 @@ render_prompt() {
   printf '%s' "${1//\{\{PR\}\}/$2}"
 }
 
+# --- Optional Linear context ------------------------------------------------
+# LINEAR_API_KEY (optional) lets the reviewer read the Linear ticket a PR claims
+# to implement. Linear's MCP server accepts an API key passed straight through as
+# `Authorization: Bearer <key>` (https://linear.app/docs/mcp) instead of the
+# interactive OAuth flow, so the unattended loop stays headless. Use a READ-ONLY
+# key: this loop runs with --dangerously-skip-permissions, so a write-capable key
+# would let it mutate your tickets. Same trust model as GITHUB_TOKEN — the key's
+# scope can't be checked from in here, so it's on the operator.
+
+# Echo the review-prompt stanza that puts the Linear tools to work, or nothing
+# when Linear isn't configured. Leading space: it's appended to a prompt.
+linear_stanza() {
+  [ -n "${LINEAR_API_KEY:-}" ] || return 0
+  printf '%s' " If the PR title, body, or branch name references a Linear ticket, look that ticket up with the Linear MCP tools and read both its description and its comments — comments often carry later feedback, scope changes, and revised requirements that the description doesn't. Judge the change against what the ticket actually asks for, and raise any divergence from its stated requirements or acceptance criteria as a finding like any other. If no ticket is referenced, or you can't resolve the reference, review the code as usual — a missing ticket is not itself a finding."
+}
+
+# Write the MCP server config to $1 and return 0, or return 1 when there's
+# nothing to configure. jq --arg does the JSON escaping so a key containing a
+# quote or backslash can't produce a broken file. umask in a subshell makes the
+# file 600 at creation, so the key is never briefly world-readable.
+write_mcp_config() {
+  [ -n "${LINEAR_API_KEY:-}" ] || return 1
+  ( umask 077
+    jq -n --arg key "$LINEAR_API_KEY" '{
+      mcpServers: {
+        linear: {
+          type: "http",
+          url: "https://mcp.linear.app/mcp",
+          headers: { Authorization: ("Bearer " + $key) }
+        }
+      }
+    }' >"$1" )
+}
+
 # Unprivileged user. Claude Code also refuses --dangerously-skip-permissions as
 # root, but check explicitly for a clear message (e.g. if run with --user root).
 [ "$(id -u)" != "0" ] || require "running as root; run as an unprivileged user (don't override the image's 'reviewer' user with --user root)."
@@ -173,10 +207,16 @@ case "$MAX_PASSES_PER_SESSION" in ''|*[!0-9]*) die "MAX_PASSES_PER_SESSION must 
 # FOLLOWUP_PROMPT is used when resuming it on a later cycle. Custom overrides use
 # the same {{PR}} token.
 DEFAULT_PROMPT="Perform a thorough review of pull request #{{PR}} in this repository. Inspect it with \`gh pr view {{PR}}\` and \`gh pr diff {{PR}}\`, and be sure you're looking at the most recent commit on its branch. Pay particular attention to test quality/robustness, security, correctness, and architectural coherence/consistency, and whether the approach the PR takes is prudent and robust in light of the issue it addresses. Post findings as comments on the PR, one comment per finding. Sign your comments with '-claudebox'."
-REVIEW_PROMPT="${REVIEW_PROMPT:-$DEFAULT_PROMPT}"
 # Prompt used when RESUMING a PR's session (it already holds context from prior
 # passes on that PR, so this nudges a re-check rather than re-introducing the task).
 DEFAULT_FOLLOWUP="I've fetched the latest refs. Re-check pull request #{{PR}} for new commits or changes since your last review of it. Apply the same review standard, and only post findings you haven't already raised on this PR. Be sure you're looking at the most recent commit on its branch. Sign your comments with '-claudebox'."
+# Linear context is added to the DEFAULTS only: an operator who supplied their own
+# prompt gets exactly that prompt, unedited. No-op when LINEAR_API_KEY is unset.
+_linear_stanza="$(linear_stanza)"
+DEFAULT_PROMPT="${DEFAULT_PROMPT}${_linear_stanza}"
+DEFAULT_FOLLOWUP="${DEFAULT_FOLLOWUP}${_linear_stanza}"
+unset _linear_stanza
+REVIEW_PROMPT="${REVIEW_PROMPT:-$DEFAULT_PROMPT}"
 FOLLOWUP_PROMPT="${FOLLOWUP_PROMPT:-$DEFAULT_FOLLOWUP}"
 
 # Validate PR selection now (fail fast, before auth/clone), and warn if a prompt
@@ -285,6 +325,19 @@ export ANTHROPIC_DEFAULT_HAIKU_MODEL="$REVIEW_MODEL"
 # Deprecated alias for the small/fast model; set too for older code paths.
 export ANTHROPIC_SMALL_FAST_MODEL="$REVIEW_MODEL"
 
+# --- MCP servers -----------------------------------------------------------
+# --strict-mcp-config is passed ALWAYS: /repo is untrusted input, and without it
+# a repo under review that ships its own .mcp.json could get MCP servers of its
+# choosing loaded into a --dangerously-skip-permissions session. Strict mode
+# means the reviewer loads only what we generate here, or nothing at all.
+CLAUDE_MCP_ARGS=(--strict-mcp-config)
+MCP_CONFIG_FILE="$HOME/mcp.json"
+rm -f "$MCP_CONFIG_FILE"
+if write_mcp_config "$MCP_CONFIG_FILE"; then
+  CLAUDE_MCP_ARGS+=(--mcp-config "$MCP_CONFIG_FILE")
+  log "Linear MCP enabled (expects a READ-ONLY Linear API key)."
+fi
+
 # --- Prepare a writable working copy ---------------------------------------
 # REPO_PATH is the user's primary repo, mounted read-only. We make a cheap LOCAL
 # clone of it: git copies the local object store rather than pulling over the
@@ -364,11 +417,13 @@ run_pass() {
   set +e
   if [ -n "$sid" ]; then
     claude -p --resume "$sid" --output-format stream-json --verbose \
-      --dangerously-skip-permissions --model "$REVIEW_MODEL" "$prompt" \
+      --dangerously-skip-permissions --model "$REVIEW_MODEL" \
+      "${CLAUDE_MCP_ARGS[@]}" "$prompt" \
       2>"$errfile" | stdbuf -oL tee "$rawfile" | format_stream
   else
     claude -p --output-format stream-json --verbose \
-      --dangerously-skip-permissions --model "$REVIEW_MODEL" "$prompt" \
+      --dangerously-skip-permissions --model "$REVIEW_MODEL" \
+      "${CLAUDE_MCP_ARGS[@]}" "$prompt" \
       2>"$errfile" | stdbuf -oL tee "$rawfile" | format_stream
   fi
   rc=${PIPESTATUS[0]}
