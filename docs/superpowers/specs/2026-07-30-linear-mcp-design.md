@@ -11,7 +11,8 @@ Inside claudebox neither that configuration nor its credentials exist, so the un
 reviewer cannot see the ticket a PR claims to implement. The host OAuth token lives in the
 macOS Keychain, not a file, so `--mount-claude` does not carry it in.
 
-Separately: PR enumeration can hand the reviewer a **merged** PR, which should never happen.
+(A suspected second problem — the reviewer picking up a merged/closed PR — turned out to be a
+stale container image, not a code defect. See Non-goals.)
 
 ## Decisions
 
@@ -85,32 +86,14 @@ The stanza instructs the reviewer to:
 - proceed with the normal review if no ticket is referenced or the reference cannot be
   resolved — a missing ticket is not itself a finding.
 
-### 4. Never review merged PRs
-
-`enumerate_candidate_prs()` today:
-
-| selector | current | gap |
-| --- | --- | --- |
-| `all` | `gh pr list --state open` | none |
-| `assignee` | `gh pr list --state open --assignee` | none |
-| `search` | `gh pr list --search "$PR_SEARCH"` | no state filter — a search can match merged PRs |
-| `ids` | literal list | an explicitly listed id may be merged |
-
-The rule is **exclude merged**, not *force open*: forcing `--state open` onto `search` would
-silently override the operator's query, which is surprising and limiting (a query deliberately
-scoped to closed-but-unmerged PRs is legitimate). Only `MERGED` is filtered; `OPEN` and
-`CLOSED` remain the operator's choice.
-
-Fixes:
-
-- `search`: request `--json number,state` and drop entries whose `state` is `MERGED`
-  (`--jq '.[] | select(.state != "MERGED") | .number'`). No extra API calls.
-- `ids`: check each id's state (`gh pr view -R "$GITHUB_REPOSITORY" <n> --json state`) and skip
-  `MERGED` ones, with one log line naming the id. Id lists are short, so the per-id call is
-  cheap; it runs each cycle, so a PR merged mid-run drops out on the next cycle.
-
 ## Non-goals
 
+- **Any change to PR enumeration.** The reported symptom (a closed PR reviewed while an open
+  one was skipped) was traced to a stale image — the container ran an `entrypoint.sh` built
+  2026-07-09, before per-PR support landed, so `PR_ASSIGNEE` was ignored and the old
+  single-session prompt let Claude choose PRs itself. `enumerate_candidate_prs()` on current
+  `main` needs no change: `all` and `assignee` already filter server-side to open PRs, and
+  `search`/`ids` intentionally honor exactly what the operator asked for.
 - Generic multi-server MCP config passthrough.
 - Reusing the host's MCP OAuth tokens (Keychain extraction) or a one-time in-container OAuth
   flow with persistent state — both rejected in favor of the API key.
@@ -125,7 +108,5 @@ Fixes:
 - With a read-only key set: `mcp.json` exists with mode `600`; the key does not appear in
   `claudebox logs`; a review of a PR whose title references a ticket shows Linear MCP tool
   calls in the streamed log.
-- `ids` selector given a merged PR number logs a skip and reviews nothing; given one merged and
-  one open id, reviews only the open one.
-- `search` selector with a query matching a merged PR and an open PR yields only the open one;
-  a query scoped to closed-but-unmerged PRs still returns them.
+- PR enumeration is unchanged; `--assignee` targeting is confirmed working once the image is
+  rebuilt from current `main`.
