@@ -1,4 +1,4 @@
-# Linear MCP passthrough (+ merged-PR exclusion) — design
+# Linear MCP passthrough — design
 
 **Date:** 2026-07-30
 **Status:** approved, ready for implementation plan
@@ -10,9 +10,6 @@ Outside the container, the host has a Linear MCP server configured (project-scop
 Inside claudebox neither that configuration nor its credentials exist, so the unattended
 reviewer cannot see the ticket a PR claims to implement. The host OAuth token lives in the
 macOS Keychain, not a file, so `--mount-claude` does not carry it in.
-
-(A suspected second problem — the reviewer picking up a merged/closed PR — turned out to be a
-stale container image, not a code defect. See Non-goals.)
 
 ## Decisions
 
@@ -88,12 +85,6 @@ The stanza instructs the reviewer to:
 
 ## Non-goals
 
-- **Any change to PR enumeration.** The reported symptom (a closed PR reviewed while an open
-  one was skipped) was traced to a stale image — the container ran an `entrypoint.sh` built
-  2026-07-09, before per-PR support landed, so `PR_ASSIGNEE` was ignored and the old
-  single-session prompt let Claude choose PRs itself. `enumerate_candidate_prs()` on current
-  `main` needs no change: `all` and `assignee` already filter server-side to open PRs, and
-  `search`/`ids` intentionally honor exactly what the operator asked for.
 - Generic multi-server MCP config passthrough.
 - Reusing the host's MCP OAuth tokens (Keychain extraction) or a one-time in-container OAuth
   flow with persistent state — both rejected in favor of the API key.
@@ -108,5 +99,5 @@ The stanza instructs the reviewer to:
 - With a read-only key set: `mcp.json` exists with mode `600`; the key does not appear in
   `claudebox logs`; a review of a PR whose title references a ticket shows Linear MCP tool
   calls in the streamed log.
-- PR enumeration is unchanged; `--assignee` targeting is confirmed working once the image is
-  rebuilt from current `main`.
+- With an explicit `REVIEW_PROMPT` override plus a key set: the prompt sent to Claude is the
+  override verbatim, with no Linear stanza appended.
