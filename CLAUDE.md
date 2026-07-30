@@ -82,3 +82,4 @@ All config is via environment variables (`.env.example` documents them). Always 
 - Mount the **primary** repo, not a `git worktree` of it — a worktree keeps objects in its parent and is structurally unusable mounted alone.
 - Model versions move fast; the `:cloud` suffix is stable but exact version strings drift (browse https://ollama.com/search?c=cloud).
 - The auto-updater is disabled (`DISABLE_AUTOUPDATER=1`) and onboarding is pre-accepted via a baked `~/.claude.json` so headless runs never block on a first-run prompt.
+- `--mcp-config` is variadic, so the `--` before the prompt in `run_pass` is load-bearing — without it the CLI parses the prompt as another config path.

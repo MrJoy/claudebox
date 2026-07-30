@@ -268,11 +268,13 @@ Set **exactly one** of these (or pass the matching launcher flag). Zero or more 
 
 ### Linear ticket context
 
-Set `LINEAR_API_KEY` and the reviewer also reads the Linear ticket a PR references — its description *and* its comments, where later feedback and revised requirements usually live — and raises divergence from what the ticket asked for as a finding, alongside the usual code findings. Unset, nothing about the review changes.
+Set `LINEAR_API_KEY` and the reviewer also reads the Linear ticket a PR references — its description *and* its comments, where later feedback and revised requirements usually live — and raises divergence from what the ticket asked for as a finding, alongside the usual code findings. Unset, nothing about the review changes. This only happens with the default `REVIEW_PROMPT`/`FOLLOWUP_PROMPT`, though: the Linear instructions are appended to those defaults, not injected independently, so if you override either prompt, your prompt runs verbatim with the Linear MCP server available but no instruction to use it — tell the reviewer yourself to consult the ticket if you want that behavior with a custom prompt.
 
 Get a key from **Settings → Security & access → Personal API keys**. Linear's MCP server accepts an API key straight through as an `Authorization: Bearer` header ([Linear docs](https://linear.app/docs/mcp)), so there is no interactive OAuth step and the loop stays headless.
 
 > **Use a read-only key.** Linear lets you restrict a personal API key to `Read`. The reviewer runs with `--dangerously-skip-permissions`, so a write-capable key would let an unattended session modify your tickets. Like `GITHUB_TOKEN`, the key's scope can't be inspected from inside the container — minimizing it is on you.
+
+Read-only bounds what the reviewer can change, not what it can see: a personal API key is scoped to your whole Linear workspace, not to the one ticket a PR claims to reference. The reviewer already treats PR titles, bodies, and diffs as untrusted input, and it can post PR comments — so Linear ticket content becomes a second untrusted input channel into a permission-skipped session, and a hostile or careless PR body can in principle steer it into reading unrelated tickets and pasting their contents into a comment on a possibly-public PR. Don't enable `LINEAR_API_KEY` on repos that take PRs from untrusted contributors, and prefer a key from an account with minimal Linear visibility over your main one.
 
 The entrypoint writes the key into a generated MCP config at `$HOME/mcp.json` (mode `600`) and passes it to Claude Code with `--mcp-config`. Every review pass also runs with `--strict-mcp-config`, whether or not Linear is configured: `/repo` is untrusted input, and strict mode means a repository that ships its own `.mcp.json` can't get MCP servers of its choosing loaded into a permission-skipped session.
 

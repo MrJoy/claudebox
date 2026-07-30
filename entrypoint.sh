@@ -133,18 +133,20 @@ linear_stanza() {
 }
 
 # Write the MCP server config to $1 and return 0, or return 1 when there's
-# nothing to configure. jq --arg does the JSON escaping so a key containing a
-# quote or backslash can't produce a broken file. umask in a subshell makes the
-# file 600 at creation, so the key is never briefly world-readable.
+# nothing to configure. The key is passed via env.LINEAR_API_KEY (not --arg)
+# so it never appears in the jq argv/`ps` output; jq's JSON string handling
+# still does the escaping, so a key containing a quote or backslash can't
+# produce a broken file. umask in a subshell makes the file 600 at creation,
+# so the key is never briefly world-readable.
 write_mcp_config() {
   [ -n "${LINEAR_API_KEY:-}" ] || return 1
   ( umask 077
-    jq -n --arg key "$LINEAR_API_KEY" '{
+    LINEAR_API_KEY="$LINEAR_API_KEY" jq -n '{
       mcpServers: {
         linear: {
           type: "http",
           url: "https://mcp.linear.app/mcp",
-          headers: { Authorization: ("Bearer " + $key) }
+          headers: { Authorization: ("Bearer " + env.LINEAR_API_KEY) }
         }
       }
     }' >"$1" )
@@ -418,12 +420,12 @@ run_pass() {
   if [ -n "$sid" ]; then
     claude -p --resume "$sid" --output-format stream-json --verbose \
       --dangerously-skip-permissions --model "$REVIEW_MODEL" \
-      "${CLAUDE_MCP_ARGS[@]}" "$prompt" \
+      "${CLAUDE_MCP_ARGS[@]}" -- "$prompt" \
       2>"$errfile" | stdbuf -oL tee "$rawfile" | format_stream
   else
     claude -p --output-format stream-json --verbose \
       --dangerously-skip-permissions --model "$REVIEW_MODEL" \
-      "${CLAUDE_MCP_ARGS[@]}" "$prompt" \
+      "${CLAUDE_MCP_ARGS[@]}" -- "$prompt" \
       2>"$errfile" | stdbuf -oL tee "$rawfile" | format_stream
   fi
   rc=${PIPESTATUS[0]}
