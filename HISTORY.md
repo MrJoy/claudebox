@@ -8,6 +8,7 @@
 * Launcher: infer the env file (`.env.claudebox` preferred over `.env`) and repo from the current directory, derive a per-repo container name `claudebox--<org>--<repo>` so several claudeboxes can run at once, announce those inferences loudly, and add `--tail` to follow logs right after `run`.
 * Optional Linear ticket context: set `LINEAR_API_KEY` and the reviewer reads the Linear ticket a PR references — description and comments — and flags where the change diverges from what the ticket asked for. Use a read-only key; the reviewer runs with permissions skipped.
 * Always run review passes with `--strict-mcp-config`, so a repository under review can't inject MCP servers of its own choosing into a permission-skipped session.
+* Add `REVIEW_PROMPT_SUFFIX`/`FOLLOWUP_PROMPT_SUFFIX` to append extra instructions to whichever prompt is in effect (default or an operator override), without replacing it.
 
 ## 0.0.3 - 2026-07-17
 

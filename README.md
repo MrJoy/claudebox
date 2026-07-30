@@ -49,12 +49,16 @@ Whichever provider you pick, the entrypoint pins **every** model tier (`ANTHROPI
 The reviewer runs **one Claude session per PR**. Each cycle the entrypoint enumerates the candidate PRs (see [PR selection](#pr-selection)), then reviews each one in its own session: a PR's first review starts a new session with `REVIEW_PROMPT`; later cycles `--resume` that PR's session with `FOLLOWUP_PROMPT`, so Claude remembers what it already flagged on that PR and avoids duplicate comments. The PR number is substituted into the prompt's `{{PR}}` token.
 
 ```bash
+# CLAUDE_MCP_ARGS is always (--strict-mcp-config), plus (--mcp-config "$MCP_CONFIG_FILE")
+# when LINEAR_API_KEY is set. The "--" is load-bearing: --mcp-config is variadic, so
+# without it the prompt would be parsed as another MCP config path.
+
 # a PR's first review — new session
 claude -p --output-format stream-json --verbose --dangerously-skip-permissions \
-  --model "$REVIEW_MODEL" "${REVIEW_PROMPT//\{\{PR\}\}/$pr}"
+  --model "$REVIEW_MODEL" "${CLAUDE_MCP_ARGS[@]}" -- "${REVIEW_PROMPT//\{\{PR\}\}/$pr}"
 # later cycles — resume that PR's session
 claude -p --resume "${PR_SESSION[$pr]}" --output-format stream-json --verbose \
-  --dangerously-skip-permissions --model "$REVIEW_MODEL" "${FOLLOWUP_PROMPT//\{\{PR\}\}/$pr}"
+  --dangerously-skip-permissions --model "$REVIEW_MODEL" "${CLAUDE_MCP_ARGS[@]}" -- "${FOLLOWUP_PROMPT//\{\{PR\}\}/$pr}"
 ```
 
 Each pass streams as `stream-json`; the entrypoint pretty-prints the events live to its log (so `docker logs -f` shows the play-by-play) and recovers the session id from the stream to resume that PR next cycle.
@@ -249,6 +253,7 @@ Optional:
 - `REVIEW_INTERVAL_SECONDS`
 - `REVIEW_PROMPT` (a PR's first review, new session; uses the `{{PR}}` token)
 - `FOLLOWUP_PROMPT` (a PR's resumed review; uses the `{{PR}}` token)
+- `REVIEW_PROMPT_SUFFIX` / `FOLLOWUP_PROMPT_SUFFIX` (append extra instructions to the corresponding prompt — default or overridden; also supports the `{{PR}}` token)
 - `MAX_PASSES_PER_SESSION` (rotate a PR's session to a fresh one every N passes, per PR; `0` = never)
 - `LINEAR_API_KEY` (optional Linear ticket context; use a **read-only** key — see [Linear ticket context](#linear-ticket-context))
 - `--export-sessions` (launcher flag, not an env var) — export review transcripts to the host and align the session folder; see [Exporting review sessions to your host](#exporting-review-sessions-to-your-host)
@@ -268,7 +273,7 @@ Set **exactly one** of these (or pass the matching launcher flag). Zero or more 
 
 ### Linear ticket context
 
-Set `LINEAR_API_KEY` and the reviewer also reads the Linear ticket a PR references — its description *and* its comments, where later feedback and revised requirements usually live — and raises divergence from what the ticket asked for as a finding, alongside the usual code findings. Unset, nothing about the review changes. This only happens with the default `REVIEW_PROMPT`/`FOLLOWUP_PROMPT`, though: the Linear instructions are appended to those defaults, not injected independently, so if you override either prompt, your prompt runs verbatim with the Linear MCP server available but no instruction to use it — tell the reviewer yourself to consult the ticket if you want that behavior with a custom prompt.
+Set `LINEAR_API_KEY` and the reviewer also reads the Linear ticket a PR references — its description *and* its comments, where later feedback and revised requirements usually live — and raises divergence from what the ticket asked for as a finding, alongside the usual code findings. Unset, nothing about the review changes. This only happens with the default `REVIEW_PROMPT`/`FOLLOWUP_PROMPT`, though: the Linear instructions are appended to those defaults, not injected independently, so if you override either prompt, your prompt runs verbatim with the Linear MCP server available but no instruction to use it — tell the reviewer yourself to consult the ticket if you want that behavior with a custom prompt. If you just want to add your own instructions on top of the defaults (Linear stanza included), `REVIEW_PROMPT_SUFFIX`/`FOLLOWUP_PROMPT_SUFFIX` are the cleaner route — they append to whichever prompt is in effect instead of replacing it.
 
 Get a key from **Settings → Security & access → Personal API keys**. Linear's MCP server accepts an API key straight through as an `Authorization: Bearer` header ([Linear docs](https://linear.app/docs/mcp)), so there is no interactive OAuth step and the loop stays headless.
 

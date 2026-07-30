@@ -220,6 +220,11 @@ DEFAULT_FOLLOWUP="${DEFAULT_FOLLOWUP}${_linear_stanza}"
 unset _linear_stanza
 REVIEW_PROMPT="${REVIEW_PROMPT:-$DEFAULT_PROMPT}"
 FOLLOWUP_PROMPT="${FOLLOWUP_PROMPT:-$DEFAULT_FOLLOWUP}"
+# Suffixes append to whichever prompt is now in effect (default or operator
+# override) — unlike the Linear stanza above, they apply either way. A single
+# space joins them since the prompts above end in '.'.
+[ -n "${REVIEW_PROMPT_SUFFIX:-}" ]   && REVIEW_PROMPT="${REVIEW_PROMPT} ${REVIEW_PROMPT_SUFFIX}"
+[ -n "${FOLLOWUP_PROMPT_SUFFIX:-}" ] && FOLLOWUP_PROMPT="${FOLLOWUP_PROMPT} ${FOLLOWUP_PROMPT_SUFFIX}"
 
 # Validate PR selection now (fail fast, before auth/clone), and warn if a prompt
 # template won't name the PR.
