@@ -90,19 +90,24 @@ The stanza instructs the reviewer to:
 `enumerate_candidate_prs()` today:
 
 | selector | current | gap |
-|---|---|---|
+| --- | --- | --- |
 | `all` | `gh pr list --state open` | none |
 | `assignee` | `gh pr list --state open --assignee` | none |
-| `search` | `gh pr list --search "$PR_SEARCH"` | no state filter — a search can match merged/closed PRs |
-| `ids` | literal list | an explicitly listed id may be merged/closed |
+| `search` | `gh pr list --search "$PR_SEARCH"` | no state filter — a search can match merged PRs |
+| `ids` | literal list | an explicitly listed id may be merged |
+
+The rule is **exclude merged**, not *force open*: forcing `--state open` onto `search` would
+silently override the operator's query, which is surprising and limiting (a query deliberately
+scoped to closed-but-unmerged PRs is legitimate). Only `MERGED` is filtered; `OPEN` and
+`CLOSED` remain the operator's choice.
 
 Fixes:
 
-- `search`: add `--state open`. If an operator's query itself says `is:merged`, the result is
-  an empty candidate set rather than a merged PR — the safe failure.
+- `search`: request `--json number,state` and drop entries whose `state` is `MERGED`
+  (`--jq '.[] | select(.state != "MERGED") | .number'`). No extra API calls.
 - `ids`: check each id's state (`gh pr view -R "$GITHUB_REPOSITORY" <n> --json state`) and skip
-  anything that is not `OPEN`, with one log line naming the id and its state. Id lists are
-  short, so the per-id call is cheap; it runs each cycle so a PR merged mid-run drops out.
+  `MERGED` ones, with one log line naming the id. Id lists are short, so the per-id call is
+  cheap; it runs each cycle, so a PR merged mid-run drops out on the next cycle.
 
 ## Non-goals
 
@@ -122,4 +127,5 @@ Fixes:
   calls in the streamed log.
 - `ids` selector given a merged PR number logs a skip and reviews nothing; given one merged and
   one open id, reviews only the open one.
-- `search` selector with a query matching a merged PR yields no candidates.
+- `search` selector with a query matching a merged PR and an open PR yields only the open one;
+  a query scoped to closed-but-unmerged PRs still returns them.
