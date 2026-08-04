@@ -9,6 +9,49 @@ set -euo pipefail
 log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
+# --- Quoted-value repair ---------------------------------------------------
+# `docker run --env-file` does NOT do shell-style quote processing: it takes
+# everything after the '=' literally. So a perfectly natural-looking line
+#
+#   ANTHROPIC_BASE_URL="https://gateway.example/v1/acct/gw/anthropic"
+#
+# yields a value that literally starts and ends with a double quote, and the
+# failure lands far away and late — Claude Code appends /v1/messages to it and
+# every request dies on an unparseable URL, long after startup. Values that beg
+# to be quoted (a URL, a header with a space and a colon, a search query) are the
+# ones most likely to hit this. Strip one matched surrounding pair and say so
+# rather than failing: the operator's intent is never "include these quotes".
+strip_surrounding_quotes() {
+  local name val
+  for name in "$@"; do
+    val="${!name:-}"
+    case "$val" in
+      '"'*'"'|"'"*"'") ;;
+      *) continue ;;
+    esac
+    export "$name=${val:1:${#val}-2}"
+    log "WARN: $name was wrapped in quotes; stripping them. (docker --env-file keeps quotes literally, so drop them from your env file.)"
+  done
+}
+
+# Fail at startup on a base URL that plainly isn't one, rather than letting every
+# request fail later with an opaque error from the HTTP client.
+check_url() {
+  case "${2:-}" in
+    http://*|https://*) return 0 ;;
+    *) die "$1 must be an http(s) URL; got '${2:-}'." ;;
+  esac
+}
+
+# Do this before anything reads these values.
+strip_surrounding_quotes \
+  PROVIDER GATEWAY_UPSTREAM REVIEW_MODEL \
+  ANTHROPIC_BASE_URL ANTHROPIC_BEDROCK_BASE_URL ANTHROPIC_VERTEX_BASE_URL \
+  ANTHROPIC_VERTEX_PROJECT_ID CLOUD_ML_REGION ANTHROPIC_CUSTOM_HEADERS \
+  ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN OLLAMA_API_KEY \
+  GITHUB_TOKEN GITHUB_REPOSITORY LINEAR_API_KEY \
+  PR_ASSIGNEE PR_IDS PR_SEARCH
+
 # --- Required configuration ------------------------------------------------
 # Provider-specific credentials are validated in "Backend selection" below.
 : "${GITHUB_TOKEN:?set GITHUB_TOKEN (privilege-minimized: read repo/PRs, write PR comments)}"
@@ -274,6 +317,7 @@ case "$PROVIDER" in
     # ANTHROPIC_AUTH_TOKEN (a Bearer token), not ANTHROPIC_API_KEY.
     : "${OLLAMA_API_KEY:?set OLLAMA_API_KEY (from https://ollama.com/settings/keys), or choose a different PROVIDER}"
     export ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-https://ollama.com}"
+    check_url ANTHROPIC_BASE_URL "$ANTHROPIC_BASE_URL"
     export ANTHROPIC_AUTH_TOKEN="$OLLAMA_API_KEY"
     export ANTHROPIC_API_KEY=""
     REVIEW_MODEL="${REVIEW_MODEL:-glm-5.2:cloud}"
@@ -315,6 +359,7 @@ case "$PROVIDER" in
     # model the endpoint serves; there is no sensible default for either.
     : "${ANTHROPIC_BASE_URL:?set ANTHROPIC_BASE_URL to your endpoint for PROVIDER=custom}"
     : "${REVIEW_MODEL:?set REVIEW_MODEL to a model your endpoint serves for PROVIDER=custom}"
+    check_url ANTHROPIC_BASE_URL "$ANTHROPIC_BASE_URL"
     export ANTHROPIC_BASE_URL
     # Accept whichever auth style the endpoint expects: ANTHROPIC_AUTH_TOKEN
     # sends "Authorization: Bearer" (most gateways/compatible services),
@@ -376,6 +421,7 @@ case "$PROVIDER" in
         : "${ANTHROPIC_BASE_URL:?set ANTHROPIC_BASE_URL to the anthropic endpoint of your gateway (https://gateway.ai.cloudflare.com/v1/<ACCOUNT_ID>/<GATEWAY_ID>/anthropic) for GATEWAY_UPSTREAM=anthropic}"
         reject_conflicting_switch CLAUDE_CODE_USE_BEDROCK "${CLAUDE_CODE_USE_BEDROCK:-}" bedrock
         reject_conflicting_switch CLAUDE_CODE_USE_VERTEX  "${CLAUDE_CODE_USE_VERTEX:-}"  vertex
+        check_url ANTHROPIC_BASE_URL "$ANTHROPIC_BASE_URL"
         export ANTHROPIC_BASE_URL
         if [ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]; then
           export ANTHROPIC_API_KEY=""
@@ -392,6 +438,7 @@ case "$PROVIDER" in
         reject_cloud_auth CLAUDE_CODE_SKIP_BEDROCK_AUTH "${CLAUDE_CODE_SKIP_BEDROCK_AUTH:-}" AWS
         # In Bedrock mode the Anthropic-API vars are dead weight at best; drop them
         # so a leftover key can't muddy which endpoint is really in use.
+        check_url ANTHROPIC_BEDROCK_BASE_URL "$ANTHROPIC_BEDROCK_BASE_URL"
         unset ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
         export ANTHROPIC_BEDROCK_BASE_URL
         export CLAUDE_CODE_USE_BEDROCK=1
@@ -404,6 +451,7 @@ case "$PROVIDER" in
         : "${ANTHROPIC_CUSTOM_HEADERS:?GATEWAY_UPSTREAM=vertex authenticates to the gateway with a header and nothing else (Claude Code skips its own Vertex auth): set $cf_headers_hint}"
         reject_conflicting_switch CLAUDE_CODE_USE_BEDROCK "${CLAUDE_CODE_USE_BEDROCK:-}" bedrock
         reject_cloud_auth CLAUDE_CODE_SKIP_VERTEX_AUTH "${CLAUDE_CODE_SKIP_VERTEX_AUTH:-}" GCP
+        check_url ANTHROPIC_VERTEX_BASE_URL "$ANTHROPIC_VERTEX_BASE_URL"
         unset ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
         export ANTHROPIC_VERTEX_BASE_URL ANTHROPIC_VERTEX_PROJECT_ID CLOUD_ML_REGION
         export CLAUDE_CODE_USE_VERTEX=1

@@ -256,6 +256,36 @@ refuses "custom headers must look like a header" "ANTHROPIC_CUSTOM_HEADERS" \
 # --- unknown provider -------------------------------------------------------
 refuses "unknown PROVIDER" "unknown PROVIDER" -- PROVIDER=azure
 
+# --- quoted values ----------------------------------------------------------
+# `docker --env-file` keeps quotes literally, so a quoted line in an env file
+# arrives with the quotes as part of the value. These assert we repair that
+# instead of shipping a nonsense URL/header to the provider.
+wires "quoted base URL is unwrapped" \
+  PROVIDER=cloudflare GATEWAY_UPSTREAM=anthropic REVIEW_MODEL=m \
+  ANTHROPIC_BASE_URL='"https://gw.test/v1/acct/gw/anthropic"' ANTHROPIC_API_KEY='"cftok"' \
+  -- ANTHROPIC_BASE_URL=https://gw.test/v1/acct/gw/anthropic ANTHROPIC_API_KEY=cftok
+wires "single-quoted values are unwrapped too" \
+  PROVIDER=ollama OLLAMA_API_KEY="'k'" ANTHROPIC_CUSTOM_HEADERS="'$CF_HDR'" \
+  -- ANTHROPIC_AUTH_TOKEN=k "ANTHROPIC_CUSTOM_HEADERS=$CF_HDR"
+# Quotes only come off in matched pairs — a value that merely contains one is
+# left alone.
+wires "an interior quote is left alone" \
+  PROVIDER=custom ANTHROPIC_BASE_URL=https://example.test/ REVIEW_MODEL=m ANTHROPIC_AUTH_TOKEN='ab"cd' \
+  -- 'ANTHROPIC_AUTH_TOKEN=ab"cd'
+refuses "quoted vertex project id still fails on a bad URL" "must be an http(s) URL" \
+  -- PROVIDER=cloudflare GATEWAY_UPSTREAM=vertex REVIEW_MODEL=m \
+     ANTHROPIC_VERTEX_BASE_URL=gw.test/v1 ANTHROPIC_VERTEX_PROJECT_ID='"proj"' \
+     CLOUD_ML_REGION=us-east5 ANTHROPIC_CUSTOM_HEADERS="$CF_HDR"
+
+# --- base URLs must be URLs -------------------------------------------------
+refuses "custom: base URL with no scheme" "must be an http(s) URL" \
+  -- PROVIDER=custom ANTHROPIC_BASE_URL=example.test REVIEW_MODEL=m ANTHROPIC_AUTH_TOKEN=k
+refuses "cloudflare/bedrock: base URL with no scheme" "must be an http(s) URL" \
+  -- PROVIDER=cloudflare GATEWAY_UPSTREAM=bedrock REVIEW_MODEL=m \
+     ANTHROPIC_BEDROCK_BASE_URL=gw.test/aws-bedrock/ ANTHROPIC_CUSTOM_HEADERS="$CF_HDR"
+refuses "ollama: overridden base URL must still be a URL" "must be an http(s) URL" \
+  -- PROVIDER=ollama OLLAMA_API_KEY=k ANTHROPIC_BASE_URL=ollama.com
+
 # --- Result -----------------------------------------------------------------
 printf '\n%d passed, %d failed' "$PASS" "$FAIL"
 [ "$SKIP" -gt 0 ] && printf ', %d skipped (filter: %s)' "$SKIP" "$FILTER"

@@ -30,6 +30,8 @@ Set `PROVIDER` (default `ollama`) to pick the backend. The entrypoint validates 
 - **`custom`** — any other Anthropic-compatible endpoint. Set `ANTHROPIC_BASE_URL`, a `REVIEW_MODEL` the endpoint serves, and whichever auth the endpoint expects: `ANTHROPIC_AUTH_TOKEN` for a Bearer header (most gateways/compatible services) or `ANTHROPIC_API_KEY` for `x-api-key`.
 - **`cloudflare`** — a [Cloudflare AI Gateway](https://developers.cloudflare.com/ai-gateway/integrations/coding-agents/claude-code/) fronting Anthropic, Amazon Bedrock, or Google Vertex AI. See [Cloudflare AI Gateway](#cloudflare-ai-gateway).
 
+> **Don't quote values in your env file.** `docker run --env-file` isn't a shell — it keeps everything after the `=` literally, so `ANTHROPIC_BASE_URL="https://…"` yields a value that really begins and ends with a quote, and Claude Code then fails on an unparseable URL at *request* time. Values with spaces or colons (`ANTHROPIC_CUSTOM_HEADERS`, `PR_SEARCH`) need no quoting. The entrypoint strips a matched surrounding pair and warns, and rejects a base URL that isn't `http(s)://` at startup, but the habit is the thing to fix. Shell quoting *is* required for launcher flags like `--search "is:open label:x"`, which is a different context.
+
 Any provider also honors **`ANTHROPIC_CUSTOM_HEADERS`** (`Name: value`, one header per line), which Claude Code sends on every request to the provider. It's how a gateway token travels; required for two of the `cloudflare` upstreams, optional everywhere else.
 
 ### Cloudflare AI Gateway
@@ -305,7 +307,7 @@ Set **exactly one** of these (or pass the matching launcher flag). Zero or more 
 | `PR_ALL=1` | `--all` | all open PRs |
 | `PR_ASSIGNEE=login` | `--assignee login` | open PRs assigned to that user |
 | `PR_IDS=12,15,20` | `--prs 12,15,20` | exactly those PR numbers |
-| `PR_SEARCH="is:open label:x"` | `--search "…"` | PRs matching a gh search query (you control state) |
+| `PR_SEARCH=is:open label:x` | `--search "…"` | PRs matching a gh search query (you control state) |
 
 `REVIEW_PROMPT`/`FOLLOWUP_PROMPT` use a `{{PR}}` token (substituted with the PR number), and `MAX_PASSES_PER_SESSION` applies per PR.
 
