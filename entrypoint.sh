@@ -416,19 +416,27 @@ case "$PROVIDER" in
     case "$GATEWAY_UPSTREAM" in
       anthropic)
         # The gateway's Anthropic endpoint speaks the plain Anthropic API, so this
-        # is the ordinary base-URL-plus-credential shape. Cloudflare's docs reuse
-        # the gateway token as ANTHROPIC_API_KEY; a Bearer token works too.
+        # is the ordinary base-URL-plus-credential shape — with one sharp edge.
+        # Anthropic authenticates API keys via x-api-key ONLY; Authorization:
+        # Bearer is accepted there just for OAuth subscription tokens. So unlike
+        # PROVIDER=custom, the two auth styles are NOT interchangeable here: a
+        # console key placed in ANTHROPIC_AUTH_TOKEN starts up fine, then every
+        # request comes back {"type":"authentication_error","message":"x-api-key
+        # header is required"} — which Claude Code reports as "Invalid API key",
+        # pointing at the key's value rather than the variable it's sitting in.
+        # Bearer stays permitted (an OAuth token is legitimate), but say so.
         : "${ANTHROPIC_BASE_URL:?set ANTHROPIC_BASE_URL to the anthropic endpoint of your gateway (https://gateway.ai.cloudflare.com/v1/<ACCOUNT_ID>/<GATEWAY_ID>/anthropic) for GATEWAY_UPSTREAM=anthropic}"
         reject_conflicting_switch CLAUDE_CODE_USE_BEDROCK "${CLAUDE_CODE_USE_BEDROCK:-}" bedrock
         reject_conflicting_switch CLAUDE_CODE_USE_VERTEX  "${CLAUDE_CODE_USE_VERTEX:-}"  vertex
         check_url ANTHROPIC_BASE_URL "$ANTHROPIC_BASE_URL"
         export ANTHROPIC_BASE_URL
-        if [ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]; then
-          export ANTHROPIC_API_KEY=""
-        elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+        if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
           export ANTHROPIC_AUTH_TOKEN=""
+        elif [ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]; then
+          export ANTHROPIC_API_KEY=""
+          log "WARN: GATEWAY_UPSTREAM=anthropic is authenticating with ANTHROPIC_AUTH_TOKEN (Authorization: Bearer). Anthropic accepts Bearer only for OAuth subscription tokens; a console API key MUST go in ANTHROPIC_API_KEY instead, or every request fails with 'x-api-key header is required' (surfaced as 'Invalid API key')."
         else
-          die "GATEWAY_UPSTREAM=anthropic needs a credential: set ANTHROPIC_API_KEY (x-api-key — Cloudflare's docs reuse the gateway token here) or ANTHROPIC_AUTH_TOKEN (Bearer). If your gateway is authenticated, also set $cf_headers_hint."
+          die "GATEWAY_UPSTREAM=anthropic needs a credential: set ANTHROPIC_API_KEY to an Anthropic API key (sent as x-api-key — this is the upstream credential, NOT your gateway token, which belongs in ANTHROPIC_CUSTOM_HEADERS). ANTHROPIC_AUTH_TOKEN (Bearer) works only for an OAuth subscription token. If your gateway is authenticated, also set $cf_headers_hint."
         fi
         ;;
       bedrock)

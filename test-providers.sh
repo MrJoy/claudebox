@@ -130,6 +130,10 @@ wires() {
   fi
   local expect missing=""
   for expect in "$@"; do
+    # A LOG:<substring> expectation checks the run's log instead of the env dump.
+    case "$expect" in
+      LOG:*) grep -qF "${expect#LOG:}" "$OUT" || missing="$missing [log missing: ${expect#LOG:}]"; continue ;;
+    esac
     grep -qxF "ENV $expect" "$DUMP" || missing="$missing $expect(was: $(grep "^ENV ${expect%%=*}=" "$DUMP" | sed 's/^ENV //'))"
   done
   if [ -n "$missing" ]; then
@@ -190,6 +194,17 @@ refuses "cloudflare/anthropic: no base URL" "ANTHROPIC_BASE_URL" \
   -- PROVIDER=cloudflare GATEWAY_UPSTREAM=anthropic REVIEW_MODEL=m ANTHROPIC_API_KEY=k
 refuses "cloudflare/anthropic: no credential" "needs a credential" \
   -- PROVIDER=cloudflare GATEWAY_UPSTREAM=anthropic REVIEW_MODEL=m ANTHROPIC_BASE_URL=https://gw.test/anthropic
+# Anthropic authenticates API keys with x-api-key only, so on this upstream the
+# two auth styles are NOT interchangeable: x-api-key wins, and a lone Bearer
+# earns a warning naming the error it otherwise produces at request time.
+wires "cloudflare/anthropic: x-api-key wins over a stray Bearer" \
+  PROVIDER=cloudflare GATEWAY_UPSTREAM=anthropic REVIEW_MODEL=m \
+  ANTHROPIC_BASE_URL=https://gw.test/anthropic ANTHROPIC_API_KEY=realkey ANTHROPIC_AUTH_TOKEN=stray \
+  -- ANTHROPIC_API_KEY=realkey ANTHROPIC_AUTH_TOKEN=
+wires "cloudflare/anthropic: Bearer-only warns about x-api-key" \
+  PROVIDER=cloudflare GATEWAY_UPSTREAM=anthropic REVIEW_MODEL=m \
+  ANTHROPIC_BASE_URL=https://gw.test/anthropic ANTHROPIC_AUTH_TOKEN=tok \
+  -- ANTHROPIC_AUTH_TOKEN=tok ANTHROPIC_API_KEY= "LOG:x-api-key header is required"
 
 # --- cloudflare/bedrock -----------------------------------------------------
 wires "cloudflare/bedrock: switches set, stale Anthropic vars dropped" \

@@ -40,11 +40,13 @@ Any provider also honors **`ANTHROPIC_CUSTOM_HEADERS`** (`Name: value`, one head
 
 | `GATEWAY_UPSTREAM` | Set these | Example `REVIEW_MODEL` |
 | --- | --- | --- |
-| `anthropic` | `ANTHROPIC_BASE_URL` (`…/<GATEWAY_ID>/anthropic`) + `ANTHROPIC_API_KEY` *or* `ANTHROPIC_AUTH_TOKEN` | `claude-opus-4-8` |
+| `anthropic` | `ANTHROPIC_BASE_URL` (`…/<GATEWAY_ID>/anthropic`) + `ANTHROPIC_API_KEY` (an **Anthropic** key — see below) | `claude-opus-4-8` |
 | `bedrock` | `ANTHROPIC_BEDROCK_BASE_URL` (`…/aws-bedrock/bedrock-runtime/<AWS_REGION>/`) + `ANTHROPIC_CUSTOM_HEADERS` | `us.anthropic.claude-opus-4-5-v1:0` |
 | `vertex` | `ANTHROPIC_VERTEX_BASE_URL` (`…/google-vertex-ai/v1`) + `ANTHROPIC_VERTEX_PROJECT_ID` + `CLOUD_ML_REGION` + `ANTHROPIC_CUSTOM_HEADERS` | `claude-opus-4-5@20251101` |
 
 This is a **gateway-only** path, deliberately: the gateway holds the cloud credentials and Claude Code skips its own AWS/GCP auth, so the entrypoint sets `CLAUDE_CODE_USE_BEDROCK`/`CLAUDE_CODE_USE_VERTEX` and `CLAUDE_CODE_SKIP_BEDROCK_AUTH`/`CLAUDE_CODE_SKIP_VERTEX_AUTH` itself. Don't set those four yourself — a value that contradicts your `GATEWAY_UPSTREAM`, or one asking Claude Code to authenticate to AWS/GCP directly, is a startup error rather than something quietly overridden. There are no AWS or GCP credentials in this container and nothing mounts any, so on `bedrock` and `vertex` the `cf-aig-authorization` header **is** the only credential — hence `ANTHROPIC_CUSTOM_HEADERS` being required there. For the same reason, those two arms drop any `ANTHROPIC_BASE_URL`/`ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` left in the environment, so a stale key can't confuse which endpoint is really in use.
+
+On the `anthropic` upstream, `ANTHROPIC_API_KEY` and `ANTHROPIC_CUSTOM_HEADERS` are **two different credentials**: the first is an Anthropic API key for the upstream, the second is the gateway token. Cloudflare's page shows the gateway token reused as `ANTHROPIC_API_KEY`, which works only if the gateway has a stored provider key to inject — otherwise Anthropic answers `x-api-key header is required`, which Claude Code reports as the misleading "Invalid API key". Note also that `ANTHROPIC_AUTH_TOKEN` is *not* an equivalent alternative here the way it is for `PROVIDER=custom`: Anthropic accepts `Authorization: Bearer` only for OAuth subscription tokens, so a console key put there starts up cleanly and then fails every request. The entrypoint warns if you do that.
 
 ```bash
 PROVIDER=cloudflare
