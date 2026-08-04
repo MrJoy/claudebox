@@ -32,11 +32,25 @@ Set `PROVIDER` (default `ollama`) to pick the backend. The entrypoint validates 
 
 > **Don't quote values in your env file.** `docker run --env-file` isn't a shell — it keeps everything after the `=` literally, so `ANTHROPIC_BASE_URL="https://…"` yields a value that really begins and ends with a quote, and Claude Code then fails on an unparseable URL at *request* time. Values with spaces or colons (`ANTHROPIC_CUSTOM_HEADERS`, `PR_SEARCH`) need no quoting. The entrypoint strips a matched surrounding pair and warns, and rejects a base URL that isn't `http(s)://` at startup, but the habit is the thing to fix. Shell quoting *is* required for launcher flags like `--search "is:open label:x"`, which is a different context.
 
-Any provider also honors **`ANTHROPIC_CUSTOM_HEADERS`** (`Name: value`, one header per line), which Claude Code sends on every request to the provider. It's how a gateway token travels; required for two of the `cloudflare` upstreams, optional everywhere else.
+Any provider also honors **`ANTHROPIC_CUSTOM_HEADERS`**, which Claude Code sends on every request to the provider. It's how a gateway token travels; required for two of the `cloudflare` upstreams, optional everywhere else.
+
+Claude Code wants **one header per line**, which an env file cannot express — it's strictly one `KEY=VALUE` per line, with no continuation and no escape processing. So write several headers either way, and the entrypoint assembles the real multi-line value:
+
+```bash
+# a literal backslash-n between headers...
+ANTHROPIC_CUSTOM_HEADERS=cf-aig-gateway-id: my-gw\ncf-aig-authorization: Bearer <CF_AIG_TOKEN>
+
+# ...or one numbered variable each (up to _20). Mixing both is fine; the
+# numbered ones are appended after the unnumbered one, in index order.
+ANTHROPIC_CUSTOM_HEADERS_1=cf-aig-gateway-id: my-gw
+ANTHROPIC_CUSTOM_HEADERS_2=cf-aig-authorization: Bearer <CF_AIG_TOKEN>
+```
+
+Only the two-character sequence `\n` is translated — a `\t` or `\\` inside a token is left exactly as written. Each resulting line must look like `Name: value`; one that doesn't is a startup error naming the offending header (never its value, which is a credential).
 
 ### Cloudflare AI Gateway
 
-`PROVIDER=cloudflare` points the reviewer at an AI Gateway, and `GATEWAY_UPSTREAM` says which upstream that gateway fronts — Claude Code speaks to each of the three differently. `REVIEW_MODEL` is always required, because each upstream names models its own way.
+`PROVIDER=cloudflare` points the reviewer at an AI Gateway, and `GATEWAY_UPSTREAM` says which upstream that gateway fronts — Claude Code speaks to each of the three differently. It defaults to `anthropic`, the one upstream where it changes nothing; name `bedrock` or `vertex` explicitly, since each reads a different base-URL variable and switches the wire protocol. `REVIEW_MODEL` is always required, because each upstream names models its own way.
 
 | `GATEWAY_UPSTREAM` | Set these | Example `REVIEW_MODEL` |
 | --- | --- | --- |

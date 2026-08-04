@@ -288,6 +288,65 @@ git config --global user.name  "PR Reviewer (bot)"
 git config --global user.email "pr-reviewer@localhost"
 git config --global --add safe.directory "$WORK_REPO"
 
+# --- Extra request headers -------------------------------------------------
+# Claude Code's ANTHROPIC_CUSTOM_HEADERS adds headers to every provider request,
+# as "Name: value", and takes SEVERAL headers as a multi-line value. A multi-line
+# value is inexpressible in an env file: `docker run --env-file` is strictly one
+# KEY=VALUE per line, with no continuation and no escape processing. So accept two
+# spellings that each fit on one line and assemble the real multi-line value here:
+#
+#   ANTHROPIC_CUSTOM_HEADERS=cf-aig-gateway-id: default\ncf-aig-authorization: Bearer t
+#   ANTHROPIC_CUSTOM_HEADERS_1=cf-aig-gateway-id: default
+#   ANTHROPIC_CUSTOM_HEADERS_2=cf-aig-authorization: Bearer t
+#
+# Numbered values are appended after the unnumbered one, in index order, so the
+# two forms can be mixed. Some secondhand sources say Claude Code also accepts
+# comma-separated headers; that is undocumented, and a header value may legitimately
+# contain a comma, so we translate to the multi-line form it definitely takes
+# rather than passing a comma-joined string through.
+CUSTOM_HEADER_MAX=20
+
+# Echo the assembled multi-line header block (empty when none is configured).
+build_custom_headers() {
+  local out i name val last=0 noncontiguous=0
+  # The unnumbered var is already de-quoted with the rest of the config above.
+  out="${ANTHROPIC_CUSTOM_HEADERS:-}"
+  # Translate ONLY the two-character sequence \n. printf '%b' would be shorter but
+  # also eats \t, \\ and \xNN, which could quietly mangle a token in a header value.
+  out="${out//\\n/$'\n'}"
+  for ((i = 1; i <= CUSTOM_HEADER_MAX; i++)); do
+    name="ANTHROPIC_CUSTOM_HEADERS_$i"
+    # >&2 because this function's stdout IS the assembled header block: a warning
+    # on stdout would be captured into a header value.
+    strip_surrounding_quotes "$name" >&2
+    val="${!name:-}"
+    [ -n "$val" ] || continue
+    # A gap (…_1 and _3 set, no _2) is usually a typo. Use every value we found
+    # regardless — dropping one silently would be worse — but say something.
+    [ "$i" -gt $((last + 1)) ] && noncontiguous=1
+    last=$i
+    out="${out:+$out$'\n'}${val//\\n/$'\n'}"
+  done
+  [ "$noncontiguous" = 1 ] && log "WARN: ANTHROPIC_CUSTOM_HEADERS_* indices skip a number; all of them are still being sent, but check for a typo." >&2
+  printf '%s' "$out"
+}
+
+_custom_headers="$(build_custom_headers)"
+if [ -n "$_custom_headers" ]; then
+  # Validate each header separately: one bad line among several would otherwise
+  # surface as a provider 4xx with no hint which header caused it. Header values
+  # are credentials, so failures name the header but never the whole value.
+  while IFS= read -r _h; do
+    [ -n "$_h" ] || continue
+    case "$_h" in
+      *:*) ;;
+      *) die "ANTHROPIC_CUSTOM_HEADERS entry '${_h%%[[:space:]]*}…' is not 'Name: value' (no ':'). Separate several headers with a literal \\n, or use ANTHROPIC_CUSTOM_HEADERS_1, _2, …" ;;
+    esac
+  done <<<"$_custom_headers"
+  export ANTHROPIC_CUSTOM_HEADERS="$_custom_headers"
+fi
+unset _custom_headers _h
+
 # --- Backend selection (Claude Code -> model provider) ---------------------
 # Claude Code speaks the Anthropic API. PROVIDER picks where those requests go:
 #   ollama     - Ollama Cloud's native Anthropic-compatible API (default).
@@ -384,7 +443,13 @@ case "$PROVIDER" in
     # to support. The CLAUDE_CODE_USE_* / CLAUDE_CODE_SKIP_*_AUTH switches are
     # therefore ours to set, not the operator's; we only validate that nothing in
     # the environment contradicts the upstream they picked.
-    : "${GATEWAY_UPSTREAM:?set GATEWAY_UPSTREAM to one of: anthropic, bedrock, vertex (which upstream your Cloudflare AI Gateway fronts)}"
+    #
+    # Optional, defaulting to anthropic: that arm is the one where GATEWAY_UPSTREAM
+    # changes nothing (a gateway URL in ANTHROPIC_BASE_URL, an Anthropic key, no
+    # switches to flip), so requiring it there is a question with only one sensible
+    # answer. bedrock and vertex do have to be asked for by name — each reads a
+    # different base-URL variable and sets switches that change the wire protocol.
+    GATEWAY_UPSTREAM="${GATEWAY_UPSTREAM:-anthropic}"
     # Each upstream names models its own way (Anthropic IDs vs. Bedrock's
     # us.anthropic.*-v1:0 vs. Vertex's claude-*@date), so no default is right
     # more than a third of the time.
@@ -476,18 +541,6 @@ case "$PROVIDER" in
     die "unknown PROVIDER='$PROVIDER'; use one of: ollama, anthropic, custom, cloudflare."
     ;;
 esac
-
-# Extra HTTP headers on every request to the provider, "Name: value" per line
-# (Claude Code's own ANTHROPIC_CUSTOM_HEADERS). Required by, and documented for,
-# the authenticated-gateway arms above, but honored on any provider — a gateway
-# can sit in front of a custom or Ollama endpoint just as well. Its value is a
-# credential, so it is validated but never logged.
-if [ -n "${ANTHROPIC_CUSTOM_HEADERS:-}" ]; then
-  case "$ANTHROPIC_CUSTOM_HEADERS" in
-    *:*) export ANTHROPIC_CUSTOM_HEADERS ;;
-    *) die "ANTHROPIC_CUSTOM_HEADERS must be 'Name: value' (one header per line); the value given has no ':'." ;;
-  esac
-fi
 
 # Pin every model tier to the one review model (see the note above).
 export ANTHROPIC_MODEL="$REVIEW_MODEL"

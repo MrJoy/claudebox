@@ -61,7 +61,13 @@ cat >"$BIN/claude" <<'STUB'
            ANTHROPIC_MODEL ANTHROPIC_DEFAULT_FABLE_MODEL \
            ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL \
            ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_SMALL_FAST_MODEL; do
-    if [ -n "${!v+set}" ]; then echo "ENV $v=${!v}"; else echo "ENV $v=<unset>"; fi
+    # Escape newlines back to a literal \n: ANTHROPIC_CUSTOM_HEADERS is genuinely
+    # multi-line, and one dump line per variable keeps the assertions greppable.
+    # Backslashes are escaped FIRST, so a real newline (dumped as \n) can't be
+    # confused with a literal backslash-n that was never translated (dumped \\n).
+    if [ -n "${!v+set}" ]; then
+      val="${!v}"; val="${val//\\/\\\\}"; echo "ENV $v=${val//$'\n'/\\n}"
+    else echo "ENV $v=<unset>"; fi
   done
 } >"$HOME/dump"
 exit 42
@@ -177,7 +183,13 @@ refuses "custom: no credential" "needs an auth credential" -- PROVIDER=custom AN
 
 # --- cloudflare: shared requirements ---------------------------------------
 CF_HDR='cf-aig-authorization: Bearer cftok'
-refuses "cloudflare: no GATEWAY_UPSTREAM" "GATEWAY_UPSTREAM" -- PROVIDER=cloudflare
+# GATEWAY_UPSTREAM is optional and defaults to the upstream that needs no
+# switches; bedrock/vertex must be named because they change the wire protocol.
+wires "cloudflare: GATEWAY_UPSTREAM defaults to anthropic" \
+  PROVIDER=cloudflare REVIEW_MODEL=m ANTHROPIC_BASE_URL=https://gw.test/anthropic \
+  ANTHROPIC_API_KEY=k \
+  -- ANTHROPIC_BASE_URL=https://gw.test/anthropic CLAUDE_CODE_USE_BEDROCK='<unset>' \
+     CLAUDE_CODE_USE_VERTEX='<unset>' LOG:provider=cloudflare/anthropic
 refuses "cloudflare: unknown GATEWAY_UPSTREAM" "unknown GATEWAY_UPSTREAM" \
   -- PROVIDER=cloudflare GATEWAY_UPSTREAM=azure REVIEW_MODEL=m
 refuses "cloudflare: no REVIEW_MODEL (no default for any upstream)" "REVIEW_MODEL" \
@@ -267,6 +279,41 @@ wires "custom headers pass through on a non-gateway provider" \
   -- "ANTHROPIC_CUSTOM_HEADERS=$CF_HDR" ANTHROPIC_BASE_URL=https://ollama.com
 refuses "custom headers must look like a header" "ANTHROPIC_CUSTOM_HEADERS" \
   -- PROVIDER=ollama OLLAMA_API_KEY=k ANTHROPIC_CUSTOM_HEADERS=missing-the-colon
+
+# --- several custom headers -------------------------------------------------
+# An env file can't hold a multi-line value, so both one-line spellings have to
+# arrive at claude as the real multi-line value Claude Code expects. The dump
+# re-escapes newlines to \n, which is also how they're written on input.
+wires "several headers: literal \\n in one value becomes a newline" \
+  PROVIDER=ollama OLLAMA_API_KEY=k \
+  'ANTHROPIC_CUSTOM_HEADERS=cf-aig-gateway-id: gw\ncf-aig-authorization: Bearer t' \
+  -- 'ANTHROPIC_CUSTOM_HEADERS=cf-aig-gateway-id: gw\ncf-aig-authorization: Bearer t'
+wires "several headers: numbered vars are joined in index order" \
+  PROVIDER=ollama OLLAMA_API_KEY=k \
+  ANTHROPIC_CUSTOM_HEADERS_2='cf-aig-authorization: Bearer t' \
+  ANTHROPIC_CUSTOM_HEADERS_1='cf-aig-gateway-id: gw' \
+  -- 'ANTHROPIC_CUSTOM_HEADERS=cf-aig-gateway-id: gw\ncf-aig-authorization: Bearer t'
+wires "several headers: the two spellings mix, unnumbered first" \
+  PROVIDER=ollama OLLAMA_API_KEY=k \
+  'ANTHROPIC_CUSTOM_HEADERS=a: 1\nb: 2' ANTHROPIC_CUSTOM_HEADERS_1='c: 3' \
+  -- 'ANTHROPIC_CUSTOM_HEADERS=a: 1\nb: 2\nc: 3'
+wires "several headers: a skipped index warns but sends everything" \
+  PROVIDER=ollama OLLAMA_API_KEY=k \
+  ANTHROPIC_CUSTOM_HEADERS_1='a: 1' ANTHROPIC_CUSTOM_HEADERS_3='c: 3' \
+  -- 'ANTHROPIC_CUSTOM_HEADERS=a: 1\nc: 3' 'LOG:indices skip a number'
+wires "several headers: quotes are stripped from a numbered value too" \
+  PROVIDER=ollama OLLAMA_API_KEY=k ANTHROPIC_CUSTOM_HEADERS_1='"a: 1"' \
+  -- 'ANTHROPIC_CUSTOM_HEADERS=a: 1' 'LOG:ANTHROPIC_CUSTOM_HEADERS_1 was wrapped in quotes'
+refuses "several headers: one bad entry among several is rejected" "ANTHROPIC_CUSTOM_HEADERS" \
+  -- PROVIDER=ollama OLLAMA_API_KEY=k \
+     'ANTHROPIC_CUSTOM_HEADERS=a: 1\nmissing-the-colon'
+# On bedrock/vertex the header block IS the only credential, so a numbered-only
+# spelling has to satisfy the requirement the same as the unnumbered one.
+wires "several headers: numbered vars satisfy the bedrock credential check" \
+  PROVIDER=cloudflare GATEWAY_UPSTREAM=bedrock REVIEW_MODEL=m \
+  ANTHROPIC_BEDROCK_BASE_URL=https://gw.example/bedrock \
+  ANTHROPIC_CUSTOM_HEADERS_1='cf-aig-authorization: Bearer t' \
+  -- 'ANTHROPIC_CUSTOM_HEADERS=cf-aig-authorization: Bearer t' CLAUDE_CODE_USE_BEDROCK=1
 
 # --- unknown provider -------------------------------------------------------
 refuses "unknown PROVIDER" "unknown PROVIDER" -- PROVIDER=azure
