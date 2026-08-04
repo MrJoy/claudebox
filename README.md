@@ -2,11 +2,11 @@
 
 Using a different model to review code than the model that wrote it produces a better quality of result by avoiding group-think.  Copilot is nicely integrated into Github, allowing for automated back-and-forth between the model writing the code and the model reviewing it -- but Copilot is not the most effective reviewer model available.
 
-This is a Docker image that runs a hands-off pull-request reviewer, built on the claude CLI infrastructure. It can point Claude Code at whichever backend you like: **Ollama Cloud** (the default — no API costs beyond your Ollama plan, and a *different* model than the one that wrote the code), **Anthropic's own API**, or **any other Anthropic-compatible endpoint**. Out of the box it runs glm-5.2 on Ollama Cloud, which I've found to be impressively thorough compared to both Copilot and GPT 5.5.
+This is a Docker image that runs a hands-off pull-request reviewer, built on the claude CLI infrastructure. It can point Claude Code at whichever backend you like: **Ollama Cloud** (the default — no API costs beyond your Ollama plan, and a *different* model than the one that wrote the code), **Anthropic's own API**, a **Cloudflare AI Gateway** (fronting Anthropic, Bedrock, or Vertex), or **any other Anthropic-compatible endpoint**. Out of the box it runs glm-5.2 on Ollama Cloud, which I've found to be impressively thorough compared to both Copilot and GPT 5.5.
 
 The container bundles the **Claude Code CLI** and the **GitHub CLI**. Claude Code talks directly to the configured provider (via the Anthropic-compatible API — no proxy, and no local `ollama` binary needed) and runs in non-interactive "YOLO" mode on a loop, reviewing open PRs and posting findings as comments.
 
-> **Group-think caveat:** the value of an independent reviewer comes from it being a *different* model than the one that wrote the code. Pointing this at Anthropic to review Claude-authored PRs re-introduces the group-think this tool exists to avoid. Anthropic and custom providers are there for reviewing code written by other tools, or when you simply prefer a specific model.
+> **Group-think caveat:** the value of an independent reviewer comes from it being a *different* model than the one that wrote the code. Pointing this at Anthropic to review Claude-authored PRs re-introduces the group-think this tool exists to avoid — and that's just as true of a Claude model reached via Bedrock, Vertex, or a gateway. The non-Ollama providers are there for reviewing code written by other tools, or when you simply prefer a specific model.
 
 It is designed so the loop *cannot cause damage*:
 
@@ -23,10 +23,34 @@ Set `PROVIDER` (default `ollama`) to pick the backend. The entrypoint validates 
 | `ollama` *(default)* | `OLLAMA_API_KEY` | `https://ollama.com` | `glm-5.2:cloud` |
 | `anthropic` | `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, *or* mounted creds | Anthropic's default | `claude-opus-4-8` |
 | `custom` | `ANTHROPIC_AUTH_TOKEN` *or* `ANTHROPIC_API_KEY` | your `ANTHROPIC_BASE_URL` | *(none — you must set `REVIEW_MODEL`)* |
+| `cloudflare` | depends on `GATEWAY_UPSTREAM` — see [below](#cloudflare-ai-gateway) | your Cloudflare AI Gateway | *(none — you must set `REVIEW_MODEL`)* |
 
 - **`ollama`** — Ollama Cloud's native Anthropic-compatible API. Auth goes through `ANTHROPIC_AUTH_TOKEN` (a Bearer token), so `ANTHROPIC_API_KEY` is blanked.
 - **`anthropic`** — Anthropic's own API, at its default endpoint. You don't have to paste an API key: the entrypoint takes the first credential it finds, in this order — `ANTHROPIC_API_KEY` (console key), else `CLAUDE_CODE_OAUTH_TOKEN`, else a mounted credentials file — and only errors if none exists. See [Reusing your existing `claude` login](#reusing-your-existing-claude-login).
 - **`custom`** — any other Anthropic-compatible endpoint. Set `ANTHROPIC_BASE_URL`, a `REVIEW_MODEL` the endpoint serves, and whichever auth the endpoint expects: `ANTHROPIC_AUTH_TOKEN` for a Bearer header (most gateways/compatible services) or `ANTHROPIC_API_KEY` for `x-api-key`.
+- **`cloudflare`** — a [Cloudflare AI Gateway](https://developers.cloudflare.com/ai-gateway/integrations/coding-agents/claude-code/) fronting Anthropic, Amazon Bedrock, or Google Vertex AI. See [Cloudflare AI Gateway](#cloudflare-ai-gateway).
+
+Any provider also honors **`ANTHROPIC_CUSTOM_HEADERS`** (`Name: value`, one header per line), which Claude Code sends on every request to the provider. It's how a gateway token travels; required for two of the `cloudflare` upstreams, optional everywhere else.
+
+### Cloudflare AI Gateway
+
+`PROVIDER=cloudflare` points the reviewer at an AI Gateway, and `GATEWAY_UPSTREAM` says which upstream that gateway fronts — Claude Code speaks to each of the three differently. `REVIEW_MODEL` is always required, because each upstream names models its own way.
+
+| `GATEWAY_UPSTREAM` | Set these | Example `REVIEW_MODEL` |
+| --- | --- | --- |
+| `anthropic` | `ANTHROPIC_BASE_URL` (`…/<GATEWAY_ID>/anthropic`) + `ANTHROPIC_API_KEY` *or* `ANTHROPIC_AUTH_TOKEN` | `claude-opus-4-8` |
+| `bedrock` | `ANTHROPIC_BEDROCK_BASE_URL` (`…/aws-bedrock/bedrock-runtime/<AWS_REGION>/`) + `ANTHROPIC_CUSTOM_HEADERS` | `us.anthropic.claude-opus-4-5-v1:0` |
+| `vertex` | `ANTHROPIC_VERTEX_BASE_URL` (`…/google-vertex-ai/v1`) + `ANTHROPIC_VERTEX_PROJECT_ID` + `CLOUD_ML_REGION` + `ANTHROPIC_CUSTOM_HEADERS` | `claude-opus-4-5@20251101` |
+
+This is a **gateway-only** path, deliberately: the gateway holds the cloud credentials and Claude Code skips its own AWS/GCP auth, so the entrypoint sets `CLAUDE_CODE_USE_BEDROCK`/`CLAUDE_CODE_USE_VERTEX` and `CLAUDE_CODE_SKIP_BEDROCK_AUTH`/`CLAUDE_CODE_SKIP_VERTEX_AUTH` itself. Don't set those four yourself — a value that contradicts your `GATEWAY_UPSTREAM`, or one asking Claude Code to authenticate to AWS/GCP directly, is a startup error rather than something quietly overridden. There are no AWS or GCP credentials in this container and nothing mounts any, so on `bedrock` and `vertex` the `cf-aig-authorization` header **is** the only credential — hence `ANTHROPIC_CUSTOM_HEADERS` being required there. For the same reason, those two arms drop any `ANTHROPIC_BASE_URL`/`ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` left in the environment, so a stale key can't confuse which endpoint is really in use.
+
+```bash
+PROVIDER=cloudflare
+GATEWAY_UPSTREAM=bedrock
+REVIEW_MODEL=us.anthropic.claude-opus-4-5-v1:0
+ANTHROPIC_BEDROCK_BASE_URL=https://gateway.ai.cloudflare.com/v1/<ACCOUNT_ID>/<GATEWAY_ID>/aws-bedrock/bedrock-runtime/us-east-1/
+ANTHROPIC_CUSTOM_HEADERS=cf-aig-authorization: Bearer <CF_AIG_TOKEN>
+```
 
 ### Reusing your existing `claude` login
 
@@ -138,6 +162,18 @@ mount is skipped and only the path alignment is added.
 ./claudebox.sh build     # or: docker build -t claudebox .
 ```
 
+### Tests
+
+Provider wiring — which credential and endpoint variables each `PROVIDER` ends up handing Claude Code — is covered by a test suite that needs no Docker, network, or credentials:
+
+```bash
+./test-providers.sh              # all cases
+./test-providers.sh cloudflare   # only cases whose label matches
+bash -n entrypoint.sh && bash -n claudebox.sh   # syntax only
+```
+
+It stubs `gh`/`git`/`claude` and checks either the startup error the entrypoint refused with or the exact environment it built. That's a narrow claim on purpose: it proves the wiring matches intent, not that a provider accepts it. Before trusting a newly configured provider unattended, do one live `./claudebox.sh test --repo …` and watch it actually get a response.
+
 ## Run
 
 1. Create the GitHub token with **only** these permissions (fine-grained token, scoped to the target repo):
@@ -147,6 +183,7 @@ mount is skipped and only the path alignment is added.
 2. Get the credential for your provider:
    - **Ollama Cloud** (default): an API key from the [Ollama settings page](https://ollama.com/settings/keys) → `OLLAMA_API_KEY`.
    - **Anthropic**: set `PROVIDER=anthropic` and provide either an API key from the [Anthropic Console](https://console.anthropic.com/) → `ANTHROPIC_API_KEY`, or reuse your existing `claude` login → [Reusing your existing `claude` login](#reusing-your-existing-claude-login).
+   - **Cloudflare AI Gateway**: set `PROVIDER=cloudflare`, `GATEWAY_UPSTREAM` (`anthropic`/`bedrock`/`vertex`), a `REVIEW_MODEL`, and that upstream's base URL plus its credential. See [Cloudflare AI Gateway](#cloudflare-ai-gateway).
    - **Custom endpoint**: set `PROVIDER=custom`, `ANTHROPIC_BASE_URL`, a `REVIEW_MODEL`, and `ANTHROPIC_AUTH_TOKEN` (or `ANTHROPIC_API_KEY`). See [Choosing a provider](#choosing-a-provider).
 3. Fill in env vars (copy `.env.example` to `.env`):
 
@@ -244,12 +281,13 @@ All configuration is via environment variables — see `.env.example`. Always re
 
 Provider selection and its credential (see [Choosing a provider](#choosing-a-provider)):
 
-- `PROVIDER` — `ollama` (default), `anthropic`, or `custom`
-- The credential for that provider: `OLLAMA_API_KEY` (ollama); for anthropic one of `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` / a mounted `~/.claude` (see [Reusing your existing `claude` login](#reusing-your-existing-claude-login)); or `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_API_KEY` (custom)
+- `PROVIDER` — `ollama` (default), `anthropic`, `custom`, or `cloudflare`
+- The credential for that provider: `OLLAMA_API_KEY` (ollama); for anthropic one of `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` / a mounted `~/.claude` (see [Reusing your existing `claude` login](#reusing-your-existing-claude-login)); `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_API_KEY` (custom); or, for cloudflare, `GATEWAY_UPSTREAM` and that upstream's base URL and credential (see [Cloudflare AI Gateway](#cloudflare-ai-gateway))
 
 Optional:
 
-- `REVIEW_MODEL` (provider-specific default; **required** for `PROVIDER=custom`)
+- `REVIEW_MODEL` (provider-specific default; **required** for `PROVIDER=custom` and `PROVIDER=cloudflare`)
+- `ANTHROPIC_CUSTOM_HEADERS` (optional on any provider; **required** for `GATEWAY_UPSTREAM=bedrock`/`vertex`) — extra request headers, `Name: value` per line
 - `REVIEW_INTERVAL_SECONDS`
 - `REVIEW_PROMPT` (a PR's first review, new session; uses the `{{PR}}` token)
 - `FOLLOWUP_PROMPT` (a PR's resumed review; uses the `{{PR}}` token)

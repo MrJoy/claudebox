@@ -1,5 +1,12 @@
 # History
 
+## 0.0.5 - 2026-08-04
+
+* Add `PROVIDER=cloudflare` for a Cloudflare AI Gateway, covering every environment variable on Cloudflare's Claude Code integration page. `GATEWAY_UPSTREAM` (`anthropic` | `bedrock` | `vertex`) says which upstream the gateway fronts, since Claude Code speaks to each differently: `anthropic` takes `ANTHROPIC_BASE_URL` plus an API key or Bearer token, `bedrock` takes `ANTHROPIC_BEDROCK_BASE_URL`, and `vertex` takes `ANTHROPIC_VERTEX_BASE_URL` + `ANTHROPIC_VERTEX_PROJECT_ID` + `CLOUD_ML_REGION`. `REVIEW_MODEL` is required (all three name models differently).
+* This is a gateway-only path on purpose: the gateway holds the cloud credentials, so the entrypoint sets `CLAUDE_CODE_USE_BEDROCK`/`CLAUDE_CODE_USE_VERTEX` and `CLAUDE_CODE_SKIP_BEDROCK_AUTH`/`CLAUDE_CODE_SKIP_VERTEX_AUTH` itself. A switch that contradicts `GATEWAY_UPSTREAM`, or one asking Claude Code to authenticate to AWS/GCP directly, is a startup error rather than a silent override — and the bedrock/vertex arms drop any leftover `ANTHROPIC_BASE_URL`/`_API_KEY`/`_AUTH_TOKEN` so a stale key can't confuse which endpoint is in use.
+* Add `test-providers.sh`, the project's first test suite: 30 cases over the provider-selection block, asserting either the startup error each misconfiguration refuses with or the exact environment the entrypoint hands `claude`. No Docker, network, or credentials needed — `gh`/`git`/`claude`/`sleep` are stubbed. Run `./test-providers.sh`, or pass a substring to filter by case label.
+* Support `ANTHROPIC_CUSTOM_HEADERS` on **any** provider (a gateway can front a custom or Ollama endpoint too). It carries the `cf-aig-authorization` gateway token, and on the bedrock/vertex upstreams — where Claude Code's own cloud auth is skipped — it is the only credential there is, so it's required for those two.
+
 ## 0.0.4 - 2026-07-30
 
 * Review each PR in its own Claude Code session. The harness now enumerates candidate PRs and iterates, giving each PR an independent, resumable session so re-reviews avoid duplicate comments per PR. `MAX_PASSES_PER_SESSION` now applies per PR.

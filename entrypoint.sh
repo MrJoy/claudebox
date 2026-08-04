@@ -247,15 +247,20 @@ git config --global --add safe.directory "$WORK_REPO"
 
 # --- Backend selection (Claude Code -> model provider) ---------------------
 # Claude Code speaks the Anthropic API. PROVIDER picks where those requests go:
-#   ollama    - Ollama Cloud's native Anthropic-compatible API (default).
-#   anthropic - Anthropic's own API.
-#   custom    - any other Anthropic-compatible endpoint you point us at.
+#   ollama     - Ollama Cloud's native Anthropic-compatible API (default).
+#   anthropic  - Anthropic's own API.
+#   custom     - any other Anthropic-compatible endpoint you point us at.
+#   cloudflare - a Cloudflare AI Gateway fronting Anthropic, Bedrock, or Vertex
+#                (GATEWAY_UPSTREAM picks which).
 # Whichever backend is chosen, we pin EVERY model tier to the single
 # $REVIEW_MODEL. A non-Anthropic backend has no Opus/Sonnet/Haiku models, so if
 # a subagent or alias requests an un-overridden tier, Claude Code errors out on
 # an unknown model; mapping them all to $REVIEW_MODEL keeps any request valid.
 # (On Anthropic this also guarantees one model does every bit of the work.)
 PROVIDER="${PROVIDER:-ollama}"
+# What we report the backend as once it's wired. PROVIDER=cloudflare refines this
+# to name the upstream too, since that's the part that decides model ID shape.
+PROVIDER_LABEL="$PROVIDER"
 
 echo
 echo
@@ -322,10 +327,111 @@ case "$PROVIDER" in
       die "PROVIDER=custom needs an auth credential: set ANTHROPIC_AUTH_TOKEN (Bearer) or ANTHROPIC_API_KEY (x-api-key)."
     fi
     ;;
+  cloudflare)
+    # A Cloudflare AI Gateway (see the "Claude Code" page under AI Gateway ->
+    # Integrations -> Coding agents). The gateway fronts one of three upstreams,
+    # and Claude Code talks to each of them differently, so GATEWAY_UPSTREAM says
+    # which: the Anthropic API, Amazon Bedrock, or Google Vertex AI.
+    #
+    # GATEWAY-ONLY, deliberately: the gateway holds the cloud credentials and
+    # Claude Code skips its own AWS/GCP auth. This container has no AWS or GCP
+    # credentials and mounts none, so there is no direct-to-Bedrock/Vertex path
+    # to support. The CLAUDE_CODE_USE_* / CLAUDE_CODE_SKIP_*_AUTH switches are
+    # therefore ours to set, not the operator's; we only validate that nothing in
+    # the environment contradicts the upstream they picked.
+    : "${GATEWAY_UPSTREAM:?set GATEWAY_UPSTREAM to one of: anthropic, bedrock, vertex (which upstream your Cloudflare AI Gateway fronts)}"
+    # Each upstream names models its own way (Anthropic IDs vs. Bedrock's
+    # us.anthropic.*-v1:0 vs. Vertex's claude-*@date), so no default is right
+    # more than a third of the time.
+    : "${REVIEW_MODEL:?set REVIEW_MODEL to a model ID your GATEWAY_UPSTREAM serves for PROVIDER=cloudflare}"
+    # The gateway token travels as a cf-aig-authorization header. For bedrock and
+    # vertex it is the ONLY credential there is (Claude Code's own cloud auth is
+    # skipped), so those arms require it.
+    cf_headers_hint="ANTHROPIC_CUSTOM_HEADERS='cf-aig-authorization: Bearer <CF_AIG_TOKEN>'"
+
+    # Reject a CLAUDE_CODE_USE_* switch that selects an upstream other than the
+    # one GATEWAY_UPSTREAM names: inside Claude Code that switch, not our
+    # GATEWAY_UPSTREAM, decides the API — so a stale one in an env file would
+    # silently win. Fail instead of quietly picking a side.
+    reject_conflicting_switch() {
+      case "${2:-}" in
+        ''|0) return 0 ;;
+        *) die "$1=$2 selects the $3 upstream, which contradicts GATEWAY_UPSTREAM=$GATEWAY_UPSTREAM. Don't set $1 — GATEWAY_UPSTREAM picks the upstream and the entrypoint sets the switch." ;;
+      esac
+    }
+    # Likewise refuse a request for Claude Code to do its own cloud auth: nothing
+    # in here can satisfy it, and it would fail per-request instead of at startup.
+    reject_cloud_auth() {
+      case "${2:-1}" in
+        1) return 0 ;;
+        *) die "PROVIDER=cloudflare is gateway-only, but $1=$2 asks Claude Code to authenticate to $3 itself — this container holds no $3 credentials. Leave $1 unset (the entrypoint sets it to 1) and let the gateway hold the credentials." ;;
+      esac
+    }
+
+    case "$GATEWAY_UPSTREAM" in
+      anthropic)
+        # The gateway's Anthropic endpoint speaks the plain Anthropic API, so this
+        # is the ordinary base-URL-plus-credential shape. Cloudflare's docs reuse
+        # the gateway token as ANTHROPIC_API_KEY; a Bearer token works too.
+        : "${ANTHROPIC_BASE_URL:?set ANTHROPIC_BASE_URL to the anthropic endpoint of your gateway (https://gateway.ai.cloudflare.com/v1/<ACCOUNT_ID>/<GATEWAY_ID>/anthropic) for GATEWAY_UPSTREAM=anthropic}"
+        reject_conflicting_switch CLAUDE_CODE_USE_BEDROCK "${CLAUDE_CODE_USE_BEDROCK:-}" bedrock
+        reject_conflicting_switch CLAUDE_CODE_USE_VERTEX  "${CLAUDE_CODE_USE_VERTEX:-}"  vertex
+        export ANTHROPIC_BASE_URL
+        if [ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]; then
+          export ANTHROPIC_API_KEY=""
+        elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+          export ANTHROPIC_AUTH_TOKEN=""
+        else
+          die "GATEWAY_UPSTREAM=anthropic needs a credential: set ANTHROPIC_API_KEY (x-api-key — Cloudflare's docs reuse the gateway token here) or ANTHROPIC_AUTH_TOKEN (Bearer). If your gateway is authenticated, also set $cf_headers_hint."
+        fi
+        ;;
+      bedrock)
+        : "${ANTHROPIC_BEDROCK_BASE_URL:?set ANTHROPIC_BEDROCK_BASE_URL to the bedrock endpoint of your gateway (https://gateway.ai.cloudflare.com/v1/<ACCOUNT_ID>/<GATEWAY_ID>/aws-bedrock/bedrock-runtime/<AWS_REGION>/) for GATEWAY_UPSTREAM=bedrock}"
+        : "${ANTHROPIC_CUSTOM_HEADERS:?GATEWAY_UPSTREAM=bedrock authenticates to the gateway with a header and nothing else (Claude Code skips its own AWS auth): set $cf_headers_hint}"
+        reject_conflicting_switch CLAUDE_CODE_USE_VERTEX "${CLAUDE_CODE_USE_VERTEX:-}" vertex
+        reject_cloud_auth CLAUDE_CODE_SKIP_BEDROCK_AUTH "${CLAUDE_CODE_SKIP_BEDROCK_AUTH:-}" AWS
+        # In Bedrock mode the Anthropic-API vars are dead weight at best; drop them
+        # so a leftover key can't muddy which endpoint is really in use.
+        unset ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+        export ANTHROPIC_BEDROCK_BASE_URL
+        export CLAUDE_CODE_USE_BEDROCK=1
+        export CLAUDE_CODE_SKIP_BEDROCK_AUTH=1
+        ;;
+      vertex)
+        : "${ANTHROPIC_VERTEX_BASE_URL:?set ANTHROPIC_VERTEX_BASE_URL to the vertex endpoint of your gateway (https://gateway.ai.cloudflare.com/v1/<ACCOUNT_ID>/<GATEWAY_ID>/google-vertex-ai/v1) for GATEWAY_UPSTREAM=vertex}"
+        : "${ANTHROPIC_VERTEX_PROJECT_ID:?set ANTHROPIC_VERTEX_PROJECT_ID to your GCP project id for GATEWAY_UPSTREAM=vertex}"
+        : "${CLOUD_ML_REGION:?set CLOUD_ML_REGION to the Vertex region serving your model (e.g. us-east5) for GATEWAY_UPSTREAM=vertex}"
+        : "${ANTHROPIC_CUSTOM_HEADERS:?GATEWAY_UPSTREAM=vertex authenticates to the gateway with a header and nothing else (Claude Code skips its own Vertex auth): set $cf_headers_hint}"
+        reject_conflicting_switch CLAUDE_CODE_USE_BEDROCK "${CLAUDE_CODE_USE_BEDROCK:-}" bedrock
+        reject_cloud_auth CLAUDE_CODE_SKIP_VERTEX_AUTH "${CLAUDE_CODE_SKIP_VERTEX_AUTH:-}" GCP
+        unset ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+        export ANTHROPIC_VERTEX_BASE_URL ANTHROPIC_VERTEX_PROJECT_ID CLOUD_ML_REGION
+        export CLAUDE_CODE_USE_VERTEX=1
+        export CLAUDE_CODE_SKIP_VERTEX_AUTH=1
+        ;;
+      *)
+        die "unknown GATEWAY_UPSTREAM='$GATEWAY_UPSTREAM'; use one of: anthropic, bedrock, vertex."
+        ;;
+    esac
+    unset cf_headers_hint
+    PROVIDER_LABEL="cloudflare/$GATEWAY_UPSTREAM"
+    ;;
   *)
-    die "unknown PROVIDER='$PROVIDER'; use one of: ollama, anthropic, custom."
+    die "unknown PROVIDER='$PROVIDER'; use one of: ollama, anthropic, custom, cloudflare."
     ;;
 esac
+
+# Extra HTTP headers on every request to the provider, "Name: value" per line
+# (Claude Code's own ANTHROPIC_CUSTOM_HEADERS). Required by, and documented for,
+# the authenticated-gateway arms above, but honored on any provider — a gateway
+# can sit in front of a custom or Ollama endpoint just as well. Its value is a
+# credential, so it is validated but never logged.
+if [ -n "${ANTHROPIC_CUSTOM_HEADERS:-}" ]; then
+  case "$ANTHROPIC_CUSTOM_HEADERS" in
+    *:*) export ANTHROPIC_CUSTOM_HEADERS ;;
+    *) die "ANTHROPIC_CUSTOM_HEADERS must be 'Name: value' (one header per line); the value given has no ':'." ;;
+  esac
+fi
 
 # Pin every model tier to the one review model (see the note above).
 export ANTHROPIC_MODEL="$REVIEW_MODEL"
@@ -373,7 +479,7 @@ fi
 git -C "$WORK_REPO" remote set-url origin "https://github.com/${GITHUB_REPOSITORY}.git" \
   || git -C "$WORK_REPO" remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
 
-log "Reviewer ready. repo=$GITHUB_REPOSITORY provider=$PROVIDER model=$REVIEW_MODEL interval=${REVIEW_INTERVAL_SECONDS}s"
+log "Reviewer ready. repo=$GITHUB_REPOSITORY provider=$PROVIDER_LABEL model=$REVIEW_MODEL interval=${REVIEW_INTERVAL_SECONDS}s"
 
 # --- Review loop -----------------------------------------------------------
 # One Claude session PER PR. Each cycle the supervisor fetches refs, enumerates
