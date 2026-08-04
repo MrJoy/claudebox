@@ -46,6 +46,14 @@ printf '#!/bin/sh\nexit 0\n' >"$BIN/git"
 # signalling the supervisor from outside.
 printf '#!/bin/sh\nexit 1\n' >"$BIN/sleep"
 
+# PROVIDER=workersai starts the bundled LiteLLM translator and blocks until it
+# answers its liveness probe. Both halves are stubbed: `litellm` just has to stay
+# alive so the entrypoint's kill -0 check passes (`tail -f`, not `sleep`, since
+# sleep is the stub that ends the loop), and `curl` reports it ready at once so
+# the readiness wait never reaches that failing sleep.
+printf '#!/bin/sh\nprintf "%%s" "$*" >"$HOME/litellm-argv"\nexec tail -f /dev/null\n' >"$BIN/litellm"
+printf '#!/bin/sh\nexit 0\n' >"$BIN/curl"
+
 # The `claude` stub is the probe: it records the environment the entrypoint built
 # and the argv it was called with. The entrypoint sends claude's stderr to a temp
 # file it then discards, so the dump goes to a file of our own instead.
@@ -69,6 +77,11 @@ cat >"$BIN/claude" <<'STUB'
       val="${!v}"; val="${val//\\/\\\\}"; echo "ENV $v=${val//$'\n'/\\n}"
     else echo "ENV $v=<unset>"; fi
   done
+  # The generated translator config, so its YAML quoting can be asserted.
+  if [ -f "$HOME/litellm.yaml" ]; then sed 's/^/CFG /' "$HOME/litellm.yaml"; fi
+  # And the argv the translator was launched with — --host 127.0.0.1 is a
+  # security boundary, not a preference, so it gets asserted.
+  if [ -f "$HOME/litellm-argv" ]; then echo "PROXY $(cat "$HOME/litellm-argv")"; fi
 } >"$HOME/dump"
 exit 42
 STUB
@@ -85,11 +98,14 @@ run_entrypoint() {
   HOME_DIR="$WORK/home"; OUT="$WORK/out"; DUMP="$HOME_DIR/dump"
   rm -rf "$HOME_DIR"; mkdir -p "$HOME_DIR/work/repo/.git" "$HOME_DIR/seed"
   # env -i so nothing from the caller's shell leaks in and quietly satisfies a
-  # variable the case means to leave unset.
+  # variable the case means to leave unset. Case-supplied vars come last, so a
+  # case can override any default below (LITELLM_BIN, to test an image missing
+  # the translator).
   env -i PATH="$BIN:$PATH" HOME="$HOME_DIR" \
     ALLOW_UNHARDENED=1 \
     GITHUB_TOKEN=x GITHUB_REPOSITORY=owner/repo PR_IDS=1 \
     REPO_PATH="$HOME_DIR/seed" REVIEW_INTERVAL_SECONDS=1 \
+    LITELLM_BIN="$BIN/litellm" \
     "$@" "$BASH_BIN" "$ENTRYPOINT" >"$OUT" 2>&1
 }
 
@@ -139,6 +155,14 @@ wires() {
     # A LOG:<substring> expectation checks the run's log instead of the env dump.
     case "$expect" in
       LOG:*) grep -qF "${expect#LOG:}" "$OUT" || missing="$missing [log missing: ${expect#LOG:}]"; continue ;;
+      # A CFG:<line> expectation checks a line of the generated litellm.yaml.
+      CFG:*) grep -qxF "CFG ${expect#CFG:}" "$DUMP" || missing="$missing [config missing: ${expect#CFG:}]"; continue ;;
+      # A NOT:VAR=value expectation asserts claude did NOT get that exact value —
+      # for a credential that must stay behind the translator, where the value it
+      # legitimately holds instead is random and can't be matched positively.
+      NOT:*) grep -qxF "ENV ${expect#NOT:}" "$DUMP" && missing="$missing [should not have: ${expect#NOT:}]"; continue ;;
+      # A PROXY:<substring> expectation checks the translator's launch argv.
+      PROXY:*) grep -q -- "PROXY .*${expect#PROXY:}" "$DUMP" || missing="$missing [proxy argv missing: ${expect#PROXY:}]"; continue ;;
     esac
     grep -qxF "ENV $expect" "$DUMP" || missing="$missing $expect(was: $(grep "^ENV ${expect%%=*}=" "$DUMP" | sed 's/^ENV //'))"
   done
@@ -314,6 +338,44 @@ wires "several headers: numbered vars satisfy the bedrock credential check" \
   ANTHROPIC_BEDROCK_BASE_URL=https://gw.example/bedrock \
   ANTHROPIC_CUSTOM_HEADERS_1='cf-aig-authorization: Bearer t' \
   -- 'ANTHROPIC_CUSTOM_HEADERS=cf-aig-authorization: Bearer t' CLAUDE_CODE_USE_BEDROCK=1
+
+# --- workersai (Cloudflare Workers AI via the bundled translator) ------------
+# Only the wiring is tested; the stubbed litellm never translates anything.
+wires "workersai: defaults to glm-5.2 behind the local translator" \
+  PROVIDER=workersai CLOUDFLARE_ACCOUNT_ID=acct CLOUDFLARE_API_TOKEN=cftok \
+  -- ANTHROPIC_BASE_URL=http://127.0.0.1:4000 ANTHROPIC_API_KEY= \
+     ANTHROPIC_MODEL=@cf/zai-org/glm-5.2 ANTHROPIC_SMALL_FAST_MODEL=@cf/zai-org/glm-5.2 \
+     LOG:'Translator ready.'
+# The Cloudflare token must NOT reach Claude Code: it stays behind the translator,
+# so a prompt-injected review cannot read it out of the environment.
+wires "workersai: the Cloudflare token is not handed to claude" \
+  PROVIDER=workersai CLOUDFLARE_ACCOUNT_ID=acct CLOUDFLARE_API_TOKEN=cftok \
+  -- NOT:ANTHROPIC_AUTH_TOKEN=cftok NOT:ANTHROPIC_API_KEY=cftok \
+     CFG:'      api_key: os.environ/CLOUDFLARE_API_TOKEN'
+# The proxy is unauthenticated by default and holds a Cloudflare token, and its
+# own default host is 0.0.0.0. Loopback-only is a boundary, so assert it.
+wires "workersai: the translator is bound to loopback only" \
+  PROVIDER=workersai CLOUDFLARE_ACCOUNT_ID=acct CLOUDFLARE_API_TOKEN=cftok \
+  -- PROXY:'--host 127.0.0.1' PROXY:'--num_workers 1'
+wires "workersai: LITELLM_PORT moves the local endpoint" \
+  PROVIDER=workersai CLOUDFLARE_ACCOUNT_ID=acct CLOUDFLARE_API_TOKEN=cftok \
+  LITELLM_PORT=4123 \
+  -- ANTHROPIC_BASE_URL=http://127.0.0.1:4123
+# The config is generated through jq, so a model id full of '@' and '/' -- and an
+# account id with a YAML-hostile character in it -- come out as quoted scalars.
+wires "workersai: model and account id are emitted as quoted YAML scalars" \
+  PROVIDER=workersai CLOUDFLARE_ACCOUNT_ID='acct: "odd"' CLOUDFLARE_API_TOKEN=cftok \
+  REVIEW_MODEL=@cf/moonshotai/kimi-k2.7-code \
+  -- CFG:'  - model_name: "@cf/moonshotai/kimi-k2.7-code"' \
+     CFG:'      model: "openai/@cf/moonshotai/kimi-k2.7-code"' \
+     CFG:'      api_base: "https://api.cloudflare.com/client/v4/accounts/acct: \"odd\"/ai/v1"'
+refuses "workersai: no account id" "CLOUDFLARE_ACCOUNT_ID" \
+  -- PROVIDER=workersai CLOUDFLARE_API_TOKEN=cftok
+refuses "workersai: no API token" "CLOUDFLARE_API_TOKEN" \
+  -- PROVIDER=workersai CLOUDFLARE_ACCOUNT_ID=acct
+refuses "workersai: translator missing from the image" "LiteLLM translator" \
+  -- PROVIDER=workersai CLOUDFLARE_ACCOUNT_ID=acct CLOUDFLARE_API_TOKEN=cftok \
+     LITELLM_BIN=/nonexistent/litellm
 
 # --- unknown provider -------------------------------------------------------
 refuses "unknown PROVIDER" "unknown PROVIDER" -- PROVIDER=azure
