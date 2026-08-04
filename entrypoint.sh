@@ -38,9 +38,20 @@ strip_surrounding_quotes() {
 # request fail later with an opaque error from the HTTP client.
 check_url() {
   case "${2:-}" in
-    http://*|https://*) return 0 ;;
+    http://*|https://*) ;;
     *) die "$1 must be an http(s) URL; got '${2:-}'." ;;
   esac
+  # Claude Code appends the endpoint path (/v1/messages) to this URL itself, so a
+  # base URL that already ends in an endpoint path produces a doubled path and a
+  # 404 on every request. Very easy to do when copying a curl example, and the
+  # error the provider returns names the URI but not the reason. Note a bare
+  # trailing /v1 is fine and required for the Vertex base URL, so only the full
+  # endpoint paths are rejected.
+  case "${2%/}" in
+    */v1/messages|*/v1/chat/completions|*/v1/responses|*/v1/complete)
+      die "$1 ends with an endpoint path; it must be the base URL only. Claude Code appends /v1/messages itself, so this becomes a doubled path and every request 404s. Use ${2%/v1/*} instead." ;;
+  esac
+  return 0
 }
 
 # Do this before anything reads these values.

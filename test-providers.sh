@@ -345,6 +345,21 @@ refuses "custom: base URL with no scheme" "must be an http(s) URL" \
 refuses "cloudflare/bedrock: base URL with no scheme" "must be an http(s) URL" \
   -- PROVIDER=cloudflare GATEWAY_UPSTREAM=bedrock REVIEW_MODEL=m \
      ANTHROPIC_BEDROCK_BASE_URL=gw.test/aws-bedrock/ ANTHROPIC_CUSTOM_HEADERS="$CF_HDR"
+# Claude Code appends /v1/messages to the base URL, so one that already ends in
+# an endpoint path 404s every request -- an easy copy-from-a-curl-example mistake.
+refuses "custom: base URL ending in an endpoint path" "ends with an endpoint path" \
+  -- PROVIDER=custom REVIEW_MODEL=m ANTHROPIC_AUTH_TOKEN=t \
+     ANTHROPIC_BASE_URL=https://api.example/accounts/a/ai/v1/chat/completions
+refuses "custom: base URL ending in /v1/messages" "ends with an endpoint path" \
+  -- PROVIDER=custom REVIEW_MODEL=m ANTHROPIC_AUTH_TOKEN=t \
+     ANTHROPIC_BASE_URL=https://api.example/ai/v1/messages/
+# A bare trailing /v1 is legitimate -- the Vertex base URL requires one.
+wires "vertex: a bare trailing /v1 base URL is fine" \
+  PROVIDER=cloudflare GATEWAY_UPSTREAM=vertex REVIEW_MODEL=m \
+  ANTHROPIC_VERTEX_BASE_URL=https://gw.test/google-vertex-ai/v1 \
+  ANTHROPIC_VERTEX_PROJECT_ID=p CLOUD_ML_REGION=us-east5 \
+  ANTHROPIC_CUSTOM_HEADERS="$CF_HDR" \
+  -- ANTHROPIC_VERTEX_BASE_URL=https://gw.test/google-vertex-ai/v1 CLAUDE_CODE_USE_VERTEX=1
 refuses "ollama: overridden base URL must still be a URL" "must be an http(s) URL" \
   -- PROVIDER=ollama OLLAMA_API_KEY=k ANTHROPIC_BASE_URL=ollama.com
 
