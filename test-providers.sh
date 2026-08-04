@@ -163,6 +163,8 @@ wires() {
       NOT:*) grep -qxF "ENV ${expect#NOT:}" "$DUMP" && missing="$missing [should not have: ${expect#NOT:}]"; continue ;;
       # A PROXY:<substring> expectation checks the translator's launch argv.
       PROXY:*) grep -q -- "PROXY .*${expect#PROXY:}" "$DUMP" || missing="$missing [proxy argv missing: ${expect#PROXY:}]"; continue ;;
+      # NOPROXY:<substring> — the translator must NOT have been given that flag.
+      NOPROXY:*) grep -q -- "PROXY .*${expect#NOPROXY:}" "$DUMP" && missing="$missing [proxy argv should not have: ${expect#NOPROXY:}]"; continue ;;
     esac
     grep -qxF "ENV $expect" "$DUMP" || missing="$missing $expect(was: $(grep "^ENV ${expect%%=*}=" "$DUMP" | sed 's/^ENV //'))"
   done
@@ -352,6 +354,19 @@ wires "workersai: the Cloudflare token is not handed to claude" \
   PROVIDER=workersai CLOUDFLARE_ACCOUNT_ID=acct CLOUDFLARE_API_TOKEN=cftok \
   -- NOT:ANTHROPIC_AUTH_TOKEN=cftok NOT:ANTHROPIC_API_KEY=cftok \
      CFG:'      api_key: os.environ/CLOUDFLARE_API_TOKEN'
+# Load-bearing, not a tuning knob: without it LiteLLM translates /v1/messages into
+# the OpenAI *Responses* API, which Cloudflare does not serve for these models, and
+# every request fails its schema union.
+wires "workersai: the translator is forced onto chat/completions" \
+  PROVIDER=workersai CLOUDFLARE_ACCOUNT_ID=acct CLOUDFLARE_API_TOKEN=cftok \
+  -- CFG:'  use_chat_completions_url_for_anthropic_messages: true'
+wires "workersai: LITELLM_DEBUG adds detailed logging and warns about credentials" \
+  PROVIDER=workersai CLOUDFLARE_ACCOUNT_ID=acct CLOUDFLARE_API_TOKEN=cftok \
+  LITELLM_DEBUG=1 \
+  -- PROXY:'--detailed_debug' LOG:'INCLUDING CREDENTIALS'
+wires "workersai: no detailed logging by default" \
+  PROVIDER=workersai CLOUDFLARE_ACCOUNT_ID=acct CLOUDFLARE_API_TOKEN=cftok \
+  -- NOPROXY:'--detailed_debug'
 # The proxy is unauthenticated by default and holds a Cloudflare token, and its
 # own default host is 0.0.0.0. Loopback-only is a boundary, so assert it.
 wires "workersai: the translator is bound to loopback only" \

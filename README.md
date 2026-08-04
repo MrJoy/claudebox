@@ -69,6 +69,8 @@ Pick a model that lists **function calling** in the catalog. A reviewer that can
 >
 > Bundling it roughly doubles the image (~1.1GB to ~1.9GB) — it drags in Python and LiteLLM's dependency tree. That only affects `PROVIDER=workersai`; the other providers ignore it entirely, but they do carry the bytes.
 >
+> If a model rejects the translated requests, set `LITELLM_DEBUG=1` to log the actual request bodies to `litellm.log`. They include your token, so turn it back off for unattended runs.
+>
 > The translator is started before the first review pass and waited on, and re-checked every cycle — if it dies, the container fails loudly instead of grinding through passes that can't reach a model. `docker exec <container> cat litellm.log` has its output.
 
 ### Cloudflare AI Gateway

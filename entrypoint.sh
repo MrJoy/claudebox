@@ -410,6 +410,16 @@ write_litellm_config() {
     # Claude Code sends Anthropic-specific parameters that have no OpenAI
     # equivalent. Dropping them beats failing the request outright.
     printf '  drop_params: true\n'
+    # REQUIRED, not a tuning knob. For the "openai" provider LiteLLM translates an
+    # incoming /v1/messages request into the OpenAI *Responses* API by default
+    # (`input`/`instructions`/`max_output_tokens`, and flat `{type,name,parameters}`
+    # tools). Cloudflare's /ai/v1 surface serves Responses only for a couple of
+    # models -- not glm-5.2 -- so every request failed its schema union with a wall
+    # of "required properties at '/' are 'messages'" and, once per tool,
+    # "required properties at '/tools/N/function' are 'name'". This flag routes
+    # through /chat/completions instead, which emits `messages` and nested
+    # `{type: function, function: {name, ...}}` tools -- the shape Cloudflare wants.
+    printf '  use_chat_completions_url_for_anthropic_messages: true\n'
   } >>"$path"
 }
 
@@ -427,8 +437,18 @@ start_litellm() {
   # this container has any business reaching it.
   # --num_workers 1 because the loop reviews one PR at a time; the default is one
   # worker per CPU, which would waste memory and eat into --pids-limit.
+  # LITELLM_DEBUG=1 logs the translated request/response bodies, which is the only
+  # practical way to see what the translator actually put on the wire when a
+  # provider rejects a request. It is off by default because those bodies include
+  # the Authorization header, i.e. the Cloudflare token.
+  local debug_args=()
+  if pr_truthy "${LITELLM_DEBUG:-}"; then
+    debug_args=(--detailed_debug)
+    log "WARN: LITELLM_DEBUG is on; $HOME/litellm.log will contain full request bodies INCLUDING CREDENTIALS. Turn it off for unattended runs."
+  fi
   "$LITELLM_BIN" --config "$LITELLM_CONFIG" \
     --host 127.0.0.1 --port "$LITELLM_PORT" --num_workers 1 \
+    ${debug_args[@]+"${debug_args[@]}"} \
     >"$HOME/litellm.log" 2>&1 &
   LITELLM_PID=$!
   log "Starting the LiteLLM translator on 127.0.0.1:$LITELLM_PORT (pid $LITELLM_PID)..."
