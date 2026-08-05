@@ -263,16 +263,29 @@ case "$MAX_PASSES_PER_SESSION" in ''|*[!0-9]*) die "MAX_PASSES_PER_SESSION must 
 # {{PR}} token with that PR's number. REVIEW_PROMPT starts a PR's session;
 # FOLLOWUP_PROMPT is used when resuming it on a later cycle. Custom overrides use
 # the same {{PR}} token.
-DEFAULT_PROMPT="Perform a thorough review of pull request #{{PR}} in this repository. Inspect it with \`gh pr view {{PR}}\` and \`gh pr diff {{PR}}\`, and be sure you're looking at the most recent commit on its branch. Pay particular attention to test quality/robustness, security, correctness, and architectural coherence/consistency, and whether the approach the PR takes is prudent and robust in light of the issue it addresses. Post findings as comments on the PR, one comment per finding. Sign your comments with '-claudebox'."
+#
+# The gh constraints in these prompts are not style advice: they are what the
+# privilege-minimized token can actually do. A bare `gh pr view` asks for
+# statusCheckRollup, and a fine-grained PAT has no permission that grants it, so
+# the whole command fails on a permission error that reads like a token
+# misconfiguration. Naming the exact working invocation is cheaper than letting
+# each session rediscover it -- and a session that burns its first tool calls on
+# 403s tends to start guessing at the diff instead of reading it.
+_gh_stanza="Two constraints on the GitHub CLI here, because the token is deliberately privilege-minimized: always pass an explicit --json field list to \`gh pr view\` (a bare \`gh pr view\` also fetches statusCheckRollup, which this token cannot be granted permission for, so it fails outright), and do not use \`gh pr checks\` at all -- it needs that same permission and cannot work. CI status is therefore unavailable to you: review the code on its own merits, and never wait on or refer to check results."
+DEFAULT_PROMPT="Perform a thorough review of pull request #{{PR}} in this repository. Inspect it with \`gh pr diff {{PR}}\` and \`gh pr view {{PR}} --json number,title,body,author,url,state,isDraft,headRefName,headRefOid,baseRefName,labels,files,commits,comments,reviews\`, and be sure you're looking at the most recent commit on its branch. $_gh_stanza Pay particular attention to test quality/robustness, security, correctness, and architectural coherence/consistency, and whether the approach the PR takes is prudent and robust in light of the issue it addresses. Post findings as comments on the PR, one comment per finding. Sign your comments with '-claudebox'."
 # Prompt used when RESUMING a PR's session (it already holds context from prior
 # passes on that PR, so this nudges a re-check rather than re-introducing the task).
-DEFAULT_FOLLOWUP="I've fetched the latest refs. Re-check pull request #{{PR}} for new commits or changes since your last review of it. Apply the same review standard, and only post findings you haven't already raised on this PR. Be sure you're looking at the most recent commit on its branch. Sign your comments with '-claudebox'."
+# The gh stanza is repeated here rather than relied on from the session's own
+# history: a resumed session has been running for hours and its early turns are
+# the first thing a context summary drops, so the constraint has to arrive with
+# every pass or it silently stops being in effect.
+DEFAULT_FOLLOWUP="I've fetched the latest refs. Re-check pull request #{{PR}} for new commits or changes since your last review of it. Apply the same review standard, and only post findings you haven't already raised on this PR. Be sure you're looking at the most recent commit on its branch. $_gh_stanza Sign your comments with '-claudebox'."
 # Linear context is added to the DEFAULTS only: an operator who supplied their own
 # prompt gets exactly that prompt, unedited. No-op when LINEAR_API_KEY is unset.
 _linear_stanza="$(linear_stanza)"
 DEFAULT_PROMPT="${DEFAULT_PROMPT}${_linear_stanza}"
 DEFAULT_FOLLOWUP="${DEFAULT_FOLLOWUP}${_linear_stanza}"
-unset _linear_stanza
+unset _linear_stanza _gh_stanza
 REVIEW_PROMPT="${REVIEW_PROMPT:-$DEFAULT_PROMPT}"
 FOLLOWUP_PROMPT="${FOLLOWUP_PROMPT:-$DEFAULT_FOLLOWUP}"
 # Suffixes append to whichever prompt is now in effect (default or operator

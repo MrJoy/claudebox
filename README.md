@@ -339,6 +339,8 @@ Optional:
 - `REVIEW_INTERVAL_SECONDS`
 - `REVIEW_PROMPT` (a PR's first review, new session; uses the `{{PR}}` token)
 - `FOLLOWUP_PROMPT` (a PR's resumed review; uses the `{{PR}}` token)
+
+  > The default prompts tell the reviewer how to work within the minimized token: pass an explicit `--json` field list to `gh pr view`, and don't use `gh pr checks` at all. Both need a permission a fine-grained PAT can't be granted — a bare `gh pr view` implicitly fetches `statusCheckRollup` and fails outright, which reads like a broken token rather than a missing permission. **If you override `REVIEW_PROMPT`/`FOLLOWUP_PROMPT` you get your text verbatim, so carry those constraints over yourself** (or add them via the `_SUFFIX` variables, which apply to overrides too). CI status is simply unavailable to the reviewer; it judges the code, not the build.
 - `REVIEW_PROMPT_SUFFIX` / `FOLLOWUP_PROMPT_SUFFIX` (append extra instructions to the corresponding prompt — default or overridden; also supports the `{{PR}}` token)
 - `MAX_PASSES_PER_SESSION` (rotate a PR's session to a fresh one every N passes, per PR; `0` = never)
 - `LINEAR_API_KEY` (optional Linear ticket context; use a **read-only** key — see [Linear ticket context](#linear-ticket-context))

@@ -180,6 +180,11 @@ wires() {
       # SHIM:<substring> / NOSHIM:<substring> — how the normalizer was launched.
       SHIM:*) grep -q -- "SHIM .*${expect#SHIM:}" "$DUMP" || missing="$missing [shim launch missing: ${expect#SHIM:}]"; continue ;;
       NOSHIM:*) grep -q -- "SHIM .*${expect#NOSHIM:}" "$DUMP" && missing="$missing [shim launch should not have: ${expect#NOSHIM:}]"; continue ;;
+      # ARGV:<substring> / NOARGV:<substring> — claude's own argv, which is where
+      # the prompt lands. -F because prompt text is full of characters grep would
+      # otherwise read as pattern syntax.
+      ARGV:*) grep -qF -- "${expect#ARGV:}" <(grep '^ARGV ' "$DUMP") || missing="$missing [argv missing: ${expect#ARGV:}]"; continue ;;
+      NOARGV:*) grep -qF -- "${expect#NOARGV:}" <(grep '^ARGV ' "$DUMP") && missing="$missing [argv should not have: ${expect#NOARGV:}]"; continue ;;
     esac
     grep -qxF "ENV $expect" "$DUMP" || missing="$missing $expect(was: $(grep "^ENV ${expect%%=*}=" "$DUMP" | sed 's/^ENV //'))"
   done
@@ -491,6 +496,31 @@ wires "vertex: a bare trailing /v1 base URL is fine" \
   -- ANTHROPIC_VERTEX_BASE_URL=https://gw.test/google-vertex-ai/v1 CLAUDE_CODE_USE_VERTEX=1
 refuses "ollama: overridden base URL must still be a URL" "must be an http(s) URL" \
   -- PROVIDER=ollama OLLAMA_API_KEY=k ANTHROPIC_BASE_URL=ollama.com
+
+# --- Prompts ------------------------------------------------------------------
+# The default prompts tell the reviewer how to use gh under a privilege-minimized
+# token: `gh pr view` needs an explicit --json field list (the bare form also
+# fetches statusCheckRollup, which a fine-grained PAT cannot be granted), and
+# `gh pr checks` cannot work at all. Getting this wrong is invisible in the
+# wiring and only shows up as a session failing its first few tool calls.
+wires "prompt: the default names the working gh pr view invocation" \
+  PROVIDER=ollama OLLAMA_API_KEY=k \
+  -- ARGV:'gh pr view 1 --json number,title,body,author,url,state,isDraft,headRefName,headRefOid,baseRefName,labels,files,commits,comments,reviews' \
+     ARGV:'do not use `gh pr checks`'
+# {{PR}} must survive into the prompt as the real number, including inside the
+# --json invocation the reviewer is told to run.
+wires "prompt: {{PR}} is substituted throughout" \
+  PROVIDER=ollama OLLAMA_API_KEY=k PR_IDS=77 \
+  -- ARGV:'pull request #77' ARGV:'gh pr view 77 --json number,title'
+# An operator-supplied prompt reaches claude verbatim -- same convention as the
+# Linear stanza. If they need the gh constraints, REVIEW_PROMPT_SUFFIX adds them.
+wires "prompt: an override is verbatim, with no gh stanza appended" \
+  PROVIDER=ollama OLLAMA_API_KEY=k REVIEW_PROMPT='just review {{PR}} please' \
+  -- ARGV:'just review 1 please' NOARGV:'gh pr checks'
+wires "prompt: a suffix appends to an override" \
+  PROVIDER=ollama OLLAMA_API_KEY=k REVIEW_PROMPT='review {{PR}}' \
+  REVIEW_PROMPT_SUFFIX='and skip the tests' \
+  -- ARGV:'review 1 and skip the tests'
 
 # --- Result -----------------------------------------------------------------
 printf '\n%d passed, %d failed' "$PASS" "$FAIL"
