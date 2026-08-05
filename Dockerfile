@@ -98,7 +98,11 @@ ENV DISABLE_AUTOUPDATER=1 \
     REVIEW_INTERVAL_SECONDS=300
 
 COPY --chown=reviewer:reviewer entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+# The Workers AI normalizer, which entrypoint.sh runs between LiteLLM and
+# Cloudflare for PROVIDER=workersai. Stdlib-only, so it runs on the python3
+# installed above with no venv of its own. See the file header for why it exists.
+COPY --chown=reviewer:reviewer workersai-shim.py /usr/local/bin/workersai-shim.py
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/workersai-shim.py
 
 USER reviewer
 WORKDIR /home/reviewer

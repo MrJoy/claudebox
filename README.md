@@ -72,6 +72,8 @@ Pick a model that lists **function calling** in the catalog. A reviewer that can
 > If a model rejects the translated requests, set `LITELLM_DEBUG=1` to log the actual request bodies to `litellm.log`. They include your token, so turn it back off for unattended runs.
 >
 > The translator is started before the first review pass and waited on, and re-checked every cycle — if it dies, the container fails loudly instead of grinding through passes that can't reach a model. `docker exec <container> cat litellm.log` has its output.
+>
+> **And one more hop, for the Kimi models.** LiteLLM leaves the `content` field out entirely on an assistant message that carries only a tool call. That's legal OpenAI and glm-5.2 accepts it, but the Kimi models reject it outright — `Invalid value at messages[N].content` — and Claude Code produces such a message on *every* tool call, so those models would fail on essentially every review. So a small normalizer (`workersai-shim.py`, ~150 lines of Python standard library) runs between the translator and Cloudflare and fills in `content: ""`. It has to be a separate process because the omission happens in LiteLLM's output, after the translation its own plugin hooks can reach. Like the translator, it's loopback-only and this provider only; `SHIM_PORT` moves it off 4001 and `SHIM_NORMALIZE=0` removes it, though there's little reason to — an empty string is valid for every model, so it's one path that always gets exercised rather than a special case for one family. Its output is in `shim.log`.
 
 ### Cloudflare AI Gateway
 
@@ -212,10 +214,13 @@ Provider wiring — which credential and endpoint variables each `PROVIDER` ends
 ```bash
 ./test-providers.sh              # all cases
 ./test-providers.sh cloudflare   # only cases whose label matches
+./test-shim.sh                   # the workersai normalizer
 bash -n entrypoint.sh && bash -n claudebox.sh   # syntax only
 ```
 
 It stubs `gh`/`git`/`claude` and checks either the startup error the entrypoint refused with or the exact environment it built. That's a narrow claim on purpose: it proves the wiring matches intent, not that a provider accepts it. Before trusting a newly configured provider unattended, do one live `./claudebox.sh test --repo …` and watch it actually get a response.
+
+`test-shim.sh` covers the `workersai` normalizer, which the suite above only ever sees stubbed. It runs the real script against a local echo server — still no Docker, network, or credentials — and checks the content injection *and its restraint* (nothing else in the request is rewritten), that a streamed response is relayed as it arrives rather than buffered to the end, and that the listener stays on loopback.
 
 ## Run
 

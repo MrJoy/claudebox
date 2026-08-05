@@ -371,18 +371,31 @@ unset _custom_headers _h
 #
 # The proxy is a local implementation detail: it listens on loopback, holds the
 # Cloudflare token only via the environment, and exists only for this provider.
+#
+# The full chain is: Claude Code -> LiteLLM -> shim -> Cloudflare. The shim is
+# workersai-shim.py; see start_shim below for why the extra hop exists.
 LITELLM_PORT="${LITELLM_PORT:-4000}"
 LITELLM_CONFIG="$HOME/litellm.yaml"
 LITELLM_PID=""
+SHIM_PORT="${SHIM_PORT:-4001}"
+SHIM_BIN="${SHIM_BIN:-/usr/local/bin/workersai-shim.py}"
+SHIM_PID=""
 
-# Shut the translator down with us. Without this a `docker stop` (or any die
-# below) would leave it running until the container is reaped.
+# Shut the translators down with us. Without this a `docker stop` (or any die
+# below) would leave them running until the container is reaped.
 stop_litellm() {
   [ -n "$LITELLM_PID" ] || return 0
   kill "$LITELLM_PID" 2>/dev/null || true
   LITELLM_PID=""
 }
-trap stop_litellm EXIT
+stop_shim() {
+  [ -n "$SHIM_PID" ] || return 0
+  kill "$SHIM_PID" 2>/dev/null || true
+  SHIM_PID=""
+}
+# LiteLLM first: it is the one holding a client connection open, and shutting the
+# thing behind it down first would turn a clean stop into a burst of 502s.
+trap 'stop_litellm; stop_shim' EXIT
 
 # Write the proxy config. The Cloudflare token is referenced as os.environ/... so
 # it is never written to disk; the file still gets mode 600, since the account id
@@ -471,9 +484,67 @@ start_litellm() {
   die "the LiteLLM translator did not become ready within ${waited}s (log above)."
 }
 
-# Is the translator still up? Called each cycle so a dead one is a loud, fatal
+# Start the normalizer that sits between LiteLLM and Cloudflare.
+#
+# It exists for one thing LiteLLM cannot be configured out of: on an assistant
+# message that carries only tool_calls, LiteLLM omits the `content` key entirely.
+# That is legal OpenAI, and Cloudflare's glm-5.2 accepts it, but the Kimi models
+# reject it outright:
+#
+#   Model execution failed (User Input Error):
+#   Invalid value at messages[N].content: Invalid input
+#
+# Confirmed by sending Cloudflare two otherwise byte-identical bodies: without
+# the key, 400; with `content: ""`, 200. Claude Code emits a tool-only assistant
+# turn on every single tool call, so for those models it is not an edge case --
+# essentially every review pass dies on the second turn.
+#
+# It has to be a separate hop because the defect is in LiteLLM's *output*, after
+# the Anthropic->OpenAI translation, which its own proxy hooks run before and so
+# cannot reach. Two provider prefixes that do normalize content were ruled out
+# for doing much more than that: `deepseek/` drops the tool-role message from the
+# conversation, and `mistral/` rewrites tool_choice "required" to "any".
+#
+# Unconditional for this provider rather than per-model: `content: ""` is valid
+# OpenAI on its own terms, so there is one code path here, and it is the one that
+# gets exercised. SHIM_NORMALIZE=0 takes the hop out if it ever proves otherwise.
+start_shim() {
+  local upstream=$1 waited=0
+  [ -f "$SHIM_BIN" ] || die "PROVIDER=workersai needs the normalizer at $SHIM_BIN, which is missing. Rebuild the image (the Dockerfile installs it)."
+  [ "$SHIM_PORT" != "$LITELLM_PORT" ] || die "SHIM_PORT and LITELLM_PORT are both $SHIM_PORT; they are two separate local listeners and need two separate ports."
+  SHIM_UPSTREAM_URL="$upstream" SHIM_PORT="$SHIM_PORT" \
+    python3 "$SHIM_BIN" >"$HOME/shim.log" 2>&1 &
+  SHIM_PID=$!
+  log "Starting the Workers AI normalizer on 127.0.0.1:$SHIM_PORT (pid $SHIM_PID)..."
+  # Block until it answers: LiteLLM starts next and must not be handed requests
+  # for a port nothing is listening on. A GET is the normalizer's own probe --
+  # any HTTP answer at all proves the socket is up, hence no curl -f.
+  while [ "$waited" -lt 30 ]; do
+    if ! kill -0 "$SHIM_PID" 2>/dev/null; then
+      log "--- last 20 lines of the normalizer log ---"
+      tail -n 20 "$HOME/shim.log" || true
+      die "the Workers AI normalizer exited while starting up (log above)."
+    fi
+    if curl -sS -o /dev/null "http://127.0.0.1:$SHIM_PORT/" 2>/dev/null; then
+      log "Normalizer ready."
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  log "--- last 20 lines of the normalizer log ---"
+  tail -n 20 "$HOME/shim.log" || true
+  die "the Workers AI normalizer did not become ready within ${waited}s (log above)."
+}
+
+# Are the translators still up? Called each cycle so a dead one is a loud, fatal
 # error rather than every review pass failing for an unexplained reason.
 check_litellm() {
+  if [ -n "$SHIM_PID" ] && ! kill -0 "$SHIM_PID" 2>/dev/null; then
+    log "--- last 20 lines of the normalizer log ---"
+    tail -n 20 "$HOME/shim.log" || true
+    die "the Workers AI normalizer died (log above). Restarting the container will bring it back."
+  fi
   [ -n "$LITELLM_PID" ] || return 0
   kill -0 "$LITELLM_PID" 2>/dev/null && return 0
   log "--- last 40 lines of the translator log ---"
@@ -687,8 +758,19 @@ case "$PROVIDER" in
     # Cloudflare's OpenAI-compatible surface. LiteLLM appends /chat/completions.
     workersai_base="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/ai/v1"
     check_url CLOUDFLARE_WORKERS_AI_URL "$workersai_base"
-    start_litellm "$REVIEW_MODEL" "$workersai_base"
-    unset workersai_base
+    # Normalizer in front of Cloudflare (see start_shim), then LiteLLM in front of
+    # that. Started innermost-first so each one is already answering before the
+    # thing that talks to it comes up. SHIM_NORMALIZE=0 collapses the chain back to
+    # LiteLLM talking to Cloudflare directly.
+    if pr_truthy "${SHIM_NORMALIZE:-1}"; then
+      start_shim "$workersai_base"
+      workersai_upstream="http://127.0.0.1:$SHIM_PORT"
+    else
+      log "WARN: SHIM_NORMALIZE is off; models that require an explicit assistant content field (the Kimi models) will fail."
+      workersai_upstream="$workersai_base"
+    fi
+    start_litellm "$REVIEW_MODEL" "$workersai_upstream"
+    unset workersai_base workersai_upstream
     # Point Claude Code at the translator, not at Cloudflare. Auth is the
     # translator's own per-container key; the Cloudflare token stays behind it, so
     # a prompt-injected review can't read a credential out of Claude Code's env.

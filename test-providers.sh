@@ -54,6 +54,15 @@ printf '#!/bin/sh\nexit 1\n' >"$BIN/sleep"
 printf '#!/bin/sh\nprintf "%%s" "$*" >"$HOME/litellm-argv"\nexec tail -f /dev/null\n' >"$BIN/litellm"
 printf '#!/bin/sh\nexit 0\n' >"$BIN/curl"
 
+# The normalizer that runs between the translator and Cloudflare is launched as
+# `python3 <script>`, so python3 is stubbed the same way: record how it was
+# invoked, and stay alive so the entrypoint's kill -0 check passes. Stubbing it
+# rather than running the real thing keeps the suite from binding a real port
+# (and from caring whether one is already in use). The script's own behaviour is
+# not what these cases test — they test that the chain is wired and ordered
+# correctly, and that the credential-bearing hop stays on loopback.
+printf '#!/bin/sh\nprintf "%%s upstream=%%s port=%%s" "$*" "$SHIM_UPSTREAM_URL" "$SHIM_PORT" >"$HOME/shim-argv"\nexec tail -f /dev/null\n' >"$BIN/python3"
+
 # The `claude` stub is the probe: it records the environment the entrypoint built
 # and the argv it was called with. The entrypoint sends claude's stderr to a temp
 # file it then discards, so the dump goes to a file of our own instead.
@@ -82,6 +91,9 @@ cat >"$BIN/claude" <<'STUB'
   # And the argv the translator was launched with — --host 127.0.0.1 is a
   # security boundary, not a preference, so it gets asserted.
   if [ -f "$HOME/litellm-argv" ]; then echo "PROXY $(cat "$HOME/litellm-argv")"; fi
+  # Likewise for the normalizer behind it: which upstream it was pointed at, and
+  # on which port, is the whole wiring of the chain.
+  if [ -f "$HOME/shim-argv" ]; then echo "SHIM $(cat "$HOME/shim-argv")"; fi
 } >"$HOME/dump"
 exit 42
 STUB
@@ -105,7 +117,7 @@ run_entrypoint() {
     ALLOW_UNHARDENED=1 \
     GITHUB_TOKEN=x GITHUB_REPOSITORY=owner/repo PR_IDS=1 \
     REPO_PATH="$HOME_DIR/seed" REVIEW_INTERVAL_SECONDS=1 \
-    LITELLM_BIN="$BIN/litellm" \
+    LITELLM_BIN="$BIN/litellm" SHIM_BIN="$SCRIPT_DIR/workersai-shim.py" \
     "$@" "$BASH_BIN" "$ENTRYPOINT" >"$OUT" 2>&1
 }
 
@@ -165,6 +177,9 @@ wires() {
       PROXY:*) grep -q -- "PROXY .*${expect#PROXY:}" "$DUMP" || missing="$missing [proxy argv missing: ${expect#PROXY:}]"; continue ;;
       # NOPROXY:<substring> — the translator must NOT have been given that flag.
       NOPROXY:*) grep -q -- "PROXY .*${expect#NOPROXY:}" "$DUMP" && missing="$missing [proxy argv should not have: ${expect#NOPROXY:}]"; continue ;;
+      # SHIM:<substring> / NOSHIM:<substring> — how the normalizer was launched.
+      SHIM:*) grep -q -- "SHIM .*${expect#SHIM:}" "$DUMP" || missing="$missing [shim launch missing: ${expect#SHIM:}]"; continue ;;
+      NOSHIM:*) grep -q -- "SHIM .*${expect#NOSHIM:}" "$DUMP" && missing="$missing [shim launch should not have: ${expect#NOSHIM:}]"; continue ;;
     esac
     grep -qxF "ENV $expect" "$DUMP" || missing="$missing $expect(was: $(grep "^ENV ${expect%%=*}=" "$DUMP" | sed 's/^ENV //'))"
   done
@@ -376,14 +391,51 @@ wires "workersai: LITELLM_PORT moves the local endpoint" \
   PROVIDER=workersai CLOUDFLARE_ACCOUNT_ID=acct CLOUDFLARE_API_TOKEN=cftok \
   LITELLM_PORT=4123 \
   -- ANTHROPIC_BASE_URL=http://127.0.0.1:4123
-# The config is generated through jq, so a model id full of '@' and '/' -- and an
-# account id with a YAML-hostile character in it -- come out as quoted scalars.
-wires "workersai: model and account id are emitted as quoted YAML scalars" \
-  PROVIDER=workersai CLOUDFLARE_ACCOUNT_ID='acct: "odd"' CLOUDFLARE_API_TOKEN=cftok \
+# The config is generated through jq, so a model id full of '@' and '/' comes out
+# as a quoted scalar rather than breaking the YAML.
+wires "workersai: the model id is emitted as a quoted YAML scalar" \
+  PROVIDER=workersai CLOUDFLARE_ACCOUNT_ID=acct CLOUDFLARE_API_TOKEN=cftok \
   REVIEW_MODEL=@cf/moonshotai/kimi-k2.7-code \
   -- CFG:'  - model_name: "@cf/moonshotai/kimi-k2.7-code"' \
-     CFG:'      model: "openai/@cf/moonshotai/kimi-k2.7-code"' \
-     CFG:'      api_base: "https://api.cloudflare.com/client/v4/accounts/acct: \"odd\"/ai/v1"'
+     CFG:'      model: "openai/@cf/moonshotai/kimi-k2.7-code"'
+
+# --- workersai: the normalizer between the translator and Cloudflare ----------
+# The chain is Claude Code -> LiteLLM -> normalizer -> Cloudflare. LiteLLM omits
+# `content` entirely on a tool-call-only assistant message, which the Kimi models
+# reject outright ("Invalid value at messages[N].content"), and the defect is in
+# LiteLLM's output, past the reach of its own hooks. So: assert the hop exists and
+# that the translator is pointed at it rather than straight at Cloudflare.
+wires "workersai: the translator is pointed at the normalizer, not Cloudflare" \
+  PROVIDER=workersai CLOUDFLARE_ACCOUNT_ID=acct CLOUDFLARE_API_TOKEN=cftok \
+  -- CFG:'      api_base: "http://127.0.0.1:4001"' \
+     SHIM:'upstream=https://api.cloudflare.com/client/v4/accounts/acct/ai/v1' \
+     LOG:'Normalizer ready.'
+wires "workersai: SHIM_PORT moves the normalizer, and the translator follows it" \
+  PROVIDER=workersai CLOUDFLARE_ACCOUNT_ID=acct CLOUDFLARE_API_TOKEN=cftok \
+  SHIM_PORT=4222 \
+  -- CFG:'      api_base: "http://127.0.0.1:4222"' SHIM:'port=4222'
+# SHIM_NORMALIZE=0 collapses the chain back to LiteLLM talking to Cloudflare. This
+# is also the case that proves the account id is jq-quoted into the YAML, since
+# that is the only arm where the Cloudflare URL is the api_base.
+wires "workersai: SHIM_NORMALIZE=0 removes the hop and warns" \
+  PROVIDER=workersai CLOUDFLARE_ACCOUNT_ID='acct: "odd"' CLOUDFLARE_API_TOKEN=cftok \
+  SHIM_NORMALIZE=0 \
+  -- CFG:'      api_base: "https://api.cloudflare.com/client/v4/accounts/acct: \"odd\"/ai/v1"' \
+     NOSHIM:'upstream=' LOG:'SHIM_NORMALIZE is off'
+# One process is a plain relay for a credential-bearing request; the other is an
+# unauthenticated-by-default gateway holding the token. Neither may be reachable
+# from off the container, so loopback is asserted for both.
+wires "workersai: the normalizer is bound to loopback only" \
+  PROVIDER=workersai CLOUDFLARE_ACCOUNT_ID=acct CLOUDFLARE_API_TOKEN=cftok \
+  -- ANTHROPIC_BASE_URL=http://127.0.0.1:4000 CFG:'      api_base: "http://127.0.0.1:4001"'
+refuses "workersai: normalizer missing from the image" "normalizer at /nonexistent" \
+  -- PROVIDER=workersai CLOUDFLARE_ACCOUNT_ID=acct CLOUDFLARE_API_TOKEN=cftok \
+     SHIM_BIN=/nonexistent/shim.py
+# Two listeners, two ports. Sharing one would have the second bind fail at
+# startup, which is a confusing way to learn about a typo.
+refuses "workersai: normalizer and translator cannot share a port" "two separate ports" \
+  -- PROVIDER=workersai CLOUDFLARE_ACCOUNT_ID=acct CLOUDFLARE_API_TOKEN=cftok \
+     LITELLM_PORT=4400 SHIM_PORT=4400
 refuses "workersai: no account id" "CLOUDFLARE_ACCOUNT_ID" \
   -- PROVIDER=workersai CLOUDFLARE_API_TOKEN=cftok
 refuses "workersai: no API token" "CLOUDFLARE_API_TOKEN" \
