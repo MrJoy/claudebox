@@ -271,21 +271,35 @@ case "$MAX_PASSES_PER_SESSION" in ''|*[!0-9]*) die "MAX_PASSES_PER_SESSION must 
 # misconfiguration. Naming the exact working invocation is cheaper than letting
 # each session rediscover it -- and a session that burns its first tool calls on
 # 403s tends to start guessing at the diff instead of reading it.
+#
+# The test stanza exists because "review the tests" is not a strong enough
+# instruction on its own: a reviewer reads a new test, sees it assert something
+# true about the new code, and moves on. The failure that motivated this was a
+# PR whose tests passed identically with the production change reverted -- the
+# tests were real, readable, and worthless as regression protection, and the
+# review said nothing. The fix is to name the check as a procedure rather than a
+# quality ("mentally revert the change, does this test still pass?"), because a
+# procedure is something a model can actually run against a diff, whereas "is
+# this a good test?" resolves to "it looks like the other tests."
+_test_stanza="Treat the tests in this PR as code under review in their own right, not as evidence that the change works. For each test the PR adds or modifies, run this check explicitly: identify which specific lines of the non-test change it depends on, mentally revert just those lines, and decide whether the test would still pass. A test that passes against the pre-change code is not a regression test, and that it exercises the new code path is not the same thing -- exercising is not asserting. Raise every such test as a finding, and say in the comment which mutation of the production code survives it. Apply the same mutation thinking beyond a straight revert: would the test still pass if a boundary moved by one, a condition were negated, an error branch were deleted, a returned collection came back empty, or the function returned a fixed value? Also flag tests that lock in as-implemented behavior instead of intended behavior -- assertions that restate the implementation, recompute the expected value with the same logic the code under test uses, assert on a mock's own stubbed return, or freeze whatever the code currently emits (snapshots included) without any statement of what is actually required. A test should read as a claim about what the code must do that a reader could check against the ticket or the PR description. Call out tests that cannot fail (no assertion reached, assertions after an early return or inside a never-taken branch, a swallowed exception, a tautological comparison) and tests whose name or docstring promises a behavior the body never checks. Where a change adds a behavior with no test that would catch its removal, say so and name the missing case; where the tests are genuinely adequate, say nothing about them."
 _gh_stanza="Two constraints on the GitHub CLI here, because the token is deliberately privilege-minimized: always pass an explicit --json field list to \`gh pr view\` (a bare \`gh pr view\` also fetches statusCheckRollup, which this token cannot be granted permission for, so it fails outright), and do not use \`gh pr checks\` at all -- it needs that same permission and cannot work. CI status is therefore unavailable to you: review the code on its own merits, and never wait on or refer to check results."
-DEFAULT_PROMPT="Perform a thorough review of pull request #{{PR}} in this repository. Inspect it with \`gh pr diff {{PR}}\` and \`gh pr view {{PR}} --json number,title,body,author,url,state,isDraft,headRefName,headRefOid,baseRefName,labels,files,commits,comments,reviews\`, and be sure you're looking at the most recent commit on its branch. $_gh_stanza Pay particular attention to test quality/robustness, security, correctness, and architectural coherence/consistency, and whether the approach the PR takes is prudent and robust in light of the issue it addresses. Post findings as comments on the PR, one comment per finding. Sign your comments with '-claudebox'."
+DEFAULT_PROMPT="Perform a thorough review of pull request #{{PR}} in this repository. Inspect it with \`gh pr diff {{PR}}\` and \`gh pr view {{PR}} --json number,title,body,author,url,state,isDraft,headRefName,headRefOid,baseRefName,labels,files,commits,comments,reviews\`, and be sure you're looking at the most recent commit on its branch. $_gh_stanza Pay particular attention to test quality/robustness, security, correctness, and architectural coherence/consistency, and whether the approach the PR takes is prudent and robust in light of the issue it addresses. $_test_stanza Post findings as comments on the PR, one comment per finding. Sign your comments with '-claudebox'."
 # Prompt used when RESUMING a PR's session (it already holds context from prior
 # passes on that PR, so this nudges a re-check rather than re-introducing the task).
 # The gh stanza is repeated here rather than relied on from the session's own
 # history: a resumed session has been running for hours and its early turns are
 # the first thing a context summary drops, so the constraint has to arrive with
-# every pass or it silently stops being in effect.
-DEFAULT_FOLLOWUP="I've fetched the latest refs. Re-check pull request #{{PR}} for new commits or changes since your last review of it. Apply the same review standard, and only post findings you haven't already raised on this PR. Be sure you're looking at the most recent commit on its branch. $_gh_stanza Sign your comments with '-claudebox'."
+# every pass or it silently stops being in effect. The test stanza is repeated
+# for the same reason, and because later passes are exactly when tests get added
+# in response to earlier findings -- the pass most likely to see a hastily
+# written test is the one least likely to still remember how to judge one.
+DEFAULT_FOLLOWUP="I've fetched the latest refs. Re-check pull request #{{PR}} for new commits or changes since your last review of it. Apply the same review standard, and only post findings you haven't already raised on this PR. Be sure you're looking at the most recent commit on its branch. $_gh_stanza $_test_stanza Sign your comments with '-claudebox'."
 # Linear context is added to the DEFAULTS only: an operator who supplied their own
 # prompt gets exactly that prompt, unedited. No-op when LINEAR_API_KEY is unset.
 _linear_stanza="$(linear_stanza)"
 DEFAULT_PROMPT="${DEFAULT_PROMPT}${_linear_stanza}"
 DEFAULT_FOLLOWUP="${DEFAULT_FOLLOWUP}${_linear_stanza}"
-unset _linear_stanza _gh_stanza
+unset _linear_stanza _gh_stanza _test_stanza
 REVIEW_PROMPT="${REVIEW_PROMPT:-$DEFAULT_PROMPT}"
 FOLLOWUP_PROMPT="${FOLLOWUP_PROMPT:-$DEFAULT_FOLLOWUP}"
 # Suffixes append to whichever prompt is now in effect (default or operator
