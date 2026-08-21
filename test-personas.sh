@@ -167,8 +167,13 @@ cycle() {
         dump="$HOME_DIR/dump.$n"
         if [ ! -e "$dump" ]; then missing="$missing [no invocation $n]"; continue; fi
         case "$expect" in
-          ARGV:*)   grep -qF -- "$rest" <(grep '^ARGV ' "$dump") || missing="$missing [argv $n missing: $rest]" ;;
-          NOARGV:*) grep -qF -- "$rest" <(grep '^ARGV ' "$dump") && missing="$missing [argv $n should not have: $rest]" ;;
+          # The ARGV line can itself contain literal newlines (a persona's
+          # --append-system-prompt value is multi-paragraph), so isolating it
+          # is "everything before the first ENV line", not "lines starting
+          # with ARGV " — the latter would silently truncate at the value's
+          # first blank line.
+          ARGV:*)   grep -qF -- "$rest" <(awk '/^ENV /{exit} {print}' "$dump") || missing="$missing [argv $n missing: $rest]" ;;
+          NOARGV:*) grep -qF -- "$rest" <(awk '/^ENV /{exit} {print}' "$dump") && missing="$missing [argv $n should not have: $rest]" ;;
           ENV:*)    grep -qxF "ENV $rest" "$dump" || missing="$missing [env $n: $rest (was: $(grep "^ENV ${rest%%=*}=" "$dump" | sed 's/^ENV //'))]" ;;
         esac ;;
       LOG:*)   grep -qF "${expect#LOG:}" "$OUT" || missing="$missing [log missing: ${expect#LOG:}]" ;;
@@ -229,6 +234,53 @@ refuses "selection: a duplicate name refuses at startup" \
 refuses "selection: a missing persona directory refuses at startup" \
   "no persona definitions" \
   -- PERSONA_DIR=/nonexistent
+
+# --- per-persona passes -----------------------------------------------------
+cycle "passes: each persona gets its own pass, in the selected order" \
+  PERSONAS=red_team,sage \
+  -- CALLS:4 \
+     ARGV:1:"You are a Red Team security reviewer" \
+     ARGV:2:"You are a Sage" \
+     ARGV:3:"You are a Red Team security reviewer" \
+     ARGV:4:"You are a Sage"
+
+cycle "passes: the persona travels in the system prompt, not the task prompt" \
+  PERSONAS=red_team \
+  -- ARGV:1:"--append-system-prompt" \
+     ARGV:1:"Perform a thorough review of pull request #1"
+
+cycle "passes: the persona label is substituted into the shared contract" \
+  PERSONAS=sme \
+  -- ARGV:1:"-claudebox (Subject Matter Expert)" \
+     NOARGV:1:"{{PERSONA}}"
+
+cycle "resume: cycle one starts a session, cycle two resumes that persona's own" \
+  PERSONAS=red_team,sage \
+  -- CALLS:4 \
+     NOARGV:1:"--resume" \
+     NOARGV:2:"--resume" \
+     ARGV:3:"--resume S1" \
+     ARGV:4:"--resume S2"
+
+cycle "resume: the persona system prompt is re-passed on a resumed pass" \
+  PERSONAS=red_team \
+  -- CALLS:2 \
+     ARGV:2:"--resume S1" \
+     ARGV:2:"--append-system-prompt" \
+     ARGV:2:"You are a Red Team security reviewer"
+
+cycle "resume: MAX_PASSES_PER_SESSION rotates per (PR, persona) pair" \
+  PERSONAS=red_team,sage MAX_PASSES_PER_SESSION=1 \
+  -- CALLS:4 \
+     NOARGV:3:"--resume" \
+     NOARGV:4:"--resume" \
+     LOG:"PR #1 [red_team] reached MAX_PASSES_PER_SESSION=1"
+
+cycle "model: every tier still points at the one review model" \
+  PERSONAS=red_team \
+  -- ENV:1:ANTHROPIC_MODEL=glm-5.2:cloud \
+     ENV:1:ANTHROPIC_DEFAULT_OPUS_MODEL=glm-5.2:cloud \
+     ENV:1:ANTHROPIC_SMALL_FAST_MODEL=glm-5.2:cloud
 
 printf '\n%d passed, %d failed' "$PASS" "$FAIL"
 [ "$SKIP" -gt 0 ] && printf ', %d skipped' "$SKIP"

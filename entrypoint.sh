@@ -970,9 +970,10 @@ log "Reviewer ready. repo=$GITHUB_REPOSITORY provider=$PROVIDER_LABEL model=$REV
 # which headless `-p` mode isn't. Headless + all permissions skipped is safe:
 # unprivileged user, minimized token, read-only seed.
 cd "$WORK_REPO"
-# Per-PR state: session id and successful-pass count, keyed by PR number. These
-# are in-memory only, so a container restart re-reviews each PR once (may
-# re-comment once) — the same trade-off the old single-session design had.
+# Per-(PR, persona) state: session id and successful-pass count, keyed by
+# "$pr:$persona". These are in-memory only, so a container restart re-reviews
+# each PR once per persona (and may re-comment once) — the same trade-off the
+# single-session design had, multiplied by the size of the enabled set.
 declare -A PR_SESSION=()
 declare -A PR_PASSES=()
 
@@ -1001,12 +1002,20 @@ format_stream() {
   '
 }
 
-# Run one review pass for $1=prompt, resuming $2=session id when non-empty.
-# On success sets RUN_PASS_SESSION_ID to the recovered id (falling back to the
-# passed id) and returns 0; returns claude's exit code on failure.
+# Run one review pass for $1=prompt as persona $3, resuming $2=session id when
+# non-empty. Sets RUN_PASS_SESSION_ID to the recovered id (falling back to the
+# passed one) and returns claude's exit code.
+#
+# --append-system-prompt is passed on BOTH forms, and that is not redundant:
+# measured 2026-08-21, the flag does NOT survive --resume. Pass it only on the
+# first pass and cycle one is adversarial while every later cycle is the old
+# generalist reviewer wearing this persona's name in the log.
+#
+# It goes before the `--`, like every other flag: --mcp-config is variadic, so
+# the `--` is what stops the CLI reading the prompt as another config path.
 RUN_PASS_SESSION_ID=""
 run_pass() {
-  local prompt="$1" sid="$2" rc errfile rawfile got
+  local prompt="$1" sid="$2" persona="$3" rc errfile rawfile got
   RUN_PASS_SESSION_ID="$sid"
   errfile="$(mktemp)"; rawfile="$(mktemp)"
   # set +e around the pipeline so a formatter hiccup can't abort the script and
@@ -1015,23 +1024,28 @@ run_pass() {
   if [ -n "$sid" ]; then
     claude -p --resume "$sid" --output-format stream-json --verbose \
       --dangerously-skip-permissions --model "$REVIEW_MODEL" \
+      --append-system-prompt "${PERSONA_PROMPT[$persona]}" \
       "${CLAUDE_MCP_ARGS[@]}" -- "$prompt" \
       2>"$errfile" | stdbuf -oL tee "$rawfile" | format_stream
   else
     claude -p --output-format stream-json --verbose \
       --dangerously-skip-permissions --model "$REVIEW_MODEL" \
+      --append-system-prompt "${PERSONA_PROMPT[$persona]}" \
       "${CLAUDE_MCP_ARGS[@]}" -- "$prompt" \
       2>"$errfile" | stdbuf -oL tee "$rawfile" | format_stream
   fi
   rc=${PIPESTATUS[0]}
   set -e
+  # session_id appears in the init and result events; take the last one seen.
+  # Recovered before the exit-code check on purpose: a pass that started a
+  # session and then failed still has a resumable session, and Task 3's
+  # usage-limit path depends on knowing its id.
+  got="$(jq -r -R '(fromjson? // empty) | select(.session_id) | .session_id' "$rawfile" 2>/dev/null | tail -n 1 || true)"
+  [ -n "$got" ] && RUN_PASS_SESSION_ID="$got"
   if [ "$rc" -ne 0 ]; then
     log "WARN: claude exited $rc:"; tail -n 5 "$errfile" >&2
     rm -f "$errfile" "$rawfile"; return "$rc"
   fi
-  # session_id appears in the init and result events; take the last one seen.
-  got="$(jq -r -R '(fromjson? // empty) | select(.session_id) | .session_id' "$rawfile" 2>/dev/null | tail -n 1 || true)"
-  [ -n "$got" ] && RUN_PASS_SESSION_ID="$got"
   rm -f "$errfile" "$rawfile"
   return 0
 }
@@ -1054,32 +1068,39 @@ while true; do
     log "Candidate PRs ($PR_SELECTOR): ${prs[*]}"
   fi
 
-  # Review each PR in its own session, sequentially (they share the one clone).
+  # Review each PR with each enabled persona, sequentially: they share one
+  # working clone, and more importantly running them concurrently would multiply
+  # instantaneous usage-limit pressure. Personas are blind to each other by
+  # design (see personas/_shared.md), so nothing about the order is semantic —
+  # but it is stable, so a cycle cut short is interpretable.
   for pr in ${prs[@]+"${prs[@]}"}; do
-    sid="${PR_SESSION[$pr]:-}"
-    if [ -z "$sid" ]; then
-      log "Reviewing PR #$pr (new session)..."
-      prompt="$(render_prompt "$REVIEW_PROMPT" "$pr")"
-    else
-      log "Reviewing PR #$pr (resuming session $sid)..."
-      prompt="$(render_prompt "$FOLLOWUP_PROMPT" "$pr")"
-    fi
-
-    if run_pass "$prompt" "$sid"; then
-      PR_SESSION[$pr]="$RUN_PASS_SESSION_ID"
-      PR_PASSES[$pr]=$(( ${PR_PASSES[$pr]:-0} + 1 ))
-      log "PR #$pr review complete (session ${PR_SESSION[$pr]}, pass ${PR_PASSES[$pr]})."
-      # Rotate this PR's session once its cap is hit, to bound context growth.
-      if [ "$MAX_PASSES_PER_SESSION" -gt 0 ] && [ "${PR_PASSES[$pr]}" -ge "$MAX_PASSES_PER_SESSION" ]; then
-        log "PR #$pr reached MAX_PASSES_PER_SESSION=$MAX_PASSES_PER_SESSION; rotating its session next cycle."
-        unset 'PR_SESSION[$pr]'
-        PR_PASSES[$pr]=0
+    for persona in "${PERSONAS_LIST[@]}"; do
+      key="$pr:$persona"
+      sid="${PR_SESSION[$key]:-}"
+      if [ -z "$sid" ]; then
+        log "Reviewing PR #$pr as $persona (new session)..."
+        prompt="$(render_prompt "$REVIEW_PROMPT" "$pr")"
+      else
+        log "Reviewing PR #$pr as $persona (resuming session $sid)..."
+        prompt="$(render_prompt "$FOLLOWUP_PROMPT" "$pr")"
       fi
-    else
-      log "WARN: PR #$pr review failed; starting a fresh session for it next cycle."
-      unset 'PR_SESSION[$pr]'
-      PR_PASSES[$pr]=0
-    fi
+
+      if run_pass "$prompt" "$sid" "$persona"; then
+        PR_SESSION[$key]="$RUN_PASS_SESSION_ID"
+        PR_PASSES[$key]=$(( ${PR_PASSES[$key]:-0} + 1 ))
+        log "PR #$pr [$persona] review complete (session ${PR_SESSION[$key]}, pass ${PR_PASSES[$key]})."
+        # Rotate this pair's session once its cap is hit, to bound context growth.
+        if [ "$MAX_PASSES_PER_SESSION" -gt 0 ] && [ "${PR_PASSES[$key]}" -ge "$MAX_PASSES_PER_SESSION" ]; then
+          log "PR #$pr [$persona] reached MAX_PASSES_PER_SESSION=$MAX_PASSES_PER_SESSION; rotating its session next cycle."
+          unset 'PR_SESSION[$key]'
+          PR_PASSES[$key]=0
+        fi
+      else
+        log "WARN: PR #$pr [$persona] review failed; starting a fresh session for it next cycle."
+        unset 'PR_SESSION[$key]'
+        PR_PASSES[$key]=0
+      fi
+    done
   done
 
   log "Sleeping ${REVIEW_INTERVAL_SECONDS}s..."

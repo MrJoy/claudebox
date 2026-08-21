@@ -183,9 +183,12 @@ wires() {
       NOSHIM:*) grep -q -- "SHIM .*${expect#NOSHIM:}" "$DUMP" && missing="$missing [shim launch should not have: ${expect#NOSHIM:}]"; continue ;;
       # ARGV:<substring> / NOARGV:<substring> — claude's own argv, which is where
       # the prompt lands. -F because prompt text is full of characters grep would
-      # otherwise read as pattern syntax.
-      ARGV:*) grep -qF -- "${expect#ARGV:}" <(grep '^ARGV ' "$DUMP") || missing="$missing [argv missing: ${expect#ARGV:}]"; continue ;;
-      NOARGV:*) grep -qF -- "${expect#NOARGV:}" <(grep '^ARGV ' "$DUMP") && missing="$missing [argv should not have: ${expect#NOARGV:}]"; continue ;;
+      # otherwise read as pattern syntax. Isolating the ARGV line is "everything
+      # before the first ENV line", not "lines starting with ARGV " — a persona's
+      # --append-system-prompt value is itself multi-paragraph, and the latter
+      # would silently truncate at its first blank line.
+      ARGV:*) grep -qF -- "${expect#ARGV:}" <(awk '/^ENV /{exit} {print}' "$DUMP") || missing="$missing [argv missing: ${expect#ARGV:}]"; continue ;;
+      NOARGV:*) grep -qF -- "${expect#NOARGV:}" <(awk '/^ENV /{exit} {print}' "$DUMP") && missing="$missing [argv should not have: ${expect#NOARGV:}]"; continue ;;
     esac
     grep -qxF "ENV $expect" "$DUMP" || missing="$missing $expect(was: $(grep "^ENV ${expect%%=*}=" "$DUMP" | sed 's/^ENV //'))"
   done
