@@ -354,6 +354,11 @@ else
   WORK_REPO="$WORK_DIR/repo"
 fi
 REVIEW_INTERVAL_SECONDS="${REVIEW_INTERVAL_SECONDS:-300}"
+# How long to wait after a pass fails on a usage or rate limit, instead of the
+# normal interval. Long by default: the limit that stopped us is measured in
+# hours on most plans, and retrying into it costs the same allowance twice.
+LIMIT_BACKOFF_SECONDS="${LIMIT_BACKOFF_SECONDS:-1800}"
+case "$LIMIT_BACKOFF_SECONDS" in ''|*[!0-9]*) die "LIMIT_BACKOFF_SECONDS must be a non-negative integer";; esac
 # REVIEW_MODEL's default depends on the provider; it is resolved in the
 # "Backend selection" block below.
 # Rotate to a fresh session after this many successful passes, to cap the
@@ -1013,10 +1018,25 @@ format_stream() {
 #
 # It goes before the `--`, like every other flag: --mcp-config is variadic, so
 # the `--` is what stops the CLI reading the prompt as another config path.
+# True when the stderr in $1 reads as a usage, rate or capacity limit rather than
+# a real failure. Worth distinguishing because the two want opposite handling: a
+# broken session should be replaced, a throttled one should be resumed.
+#
+# This matches on provider error text, which is an upstream surface that can
+# change without notice, so the failure mode of a miss matters: a missed match
+# falls through to the ordinary path (drop the session, carry on), which is
+# exactly today's behaviour. A false positive keeps a session that will fail
+# again next cycle and be dropped then. Neither wedges the loop.
+is_usage_limit() {
+  grep -qiE 'rate.?limit|usage limit|too many requests|quota|overloaded|(^|[^0-9])(429|529)([^0-9]|$)' "$1"
+}
+
 RUN_PASS_SESSION_ID=""
+RUN_PASS_LIMITED=0
 run_pass() {
   local prompt="$1" sid="$2" persona="$3" rc errfile rawfile got
   RUN_PASS_SESSION_ID="$sid"
+  RUN_PASS_LIMITED=0
   errfile="$(mktemp)"; rawfile="$(mktemp)"
   # set +e around the pipeline so a formatter hiccup can't abort the script and
   # so we can read Claude's own exit code via PIPESTATUS[0] (not tee's/jq's).
@@ -1043,6 +1063,7 @@ run_pass() {
   got="$(jq -r -R '(fromjson? // empty) | select(.session_id) | .session_id' "$rawfile" 2>/dev/null | tail -n 1 || true)"
   [ -n "$got" ] && RUN_PASS_SESSION_ID="$got"
   if [ "$rc" -ne 0 ]; then
+    if is_usage_limit "$errfile"; then RUN_PASS_LIMITED=1; fi
     log "WARN: claude exited $rc:"; tail -n 5 "$errfile" >&2
     rm -f "$errfile" "$rawfile"; return "$rc"
   fi
@@ -1054,6 +1075,7 @@ while true; do
   # Only does anything for PROVIDER=workersai; a dead translator means every pass
   # this cycle would fail on connection refused, so fail loudly here instead.
   check_litellm
+  limited=0
   log "Fetching latest refs..."
   git fetch --all --prune --quiet || log "WARN: git fetch failed; continuing"
 
@@ -1095,6 +1117,13 @@ while true; do
           unset 'PR_SESSION[$key]'
           PR_PASSES[$key]=0
         fi
+      elif [ "$RUN_PASS_LIMITED" = 1 ]; then
+        # Keep the session. Abandon the rest of the cycle rather than walking the
+        # remaining personas into the same wall, and back off before the next one.
+        [ -n "$RUN_PASS_SESSION_ID" ] && PR_SESSION[$key]="$RUN_PASS_SESSION_ID"
+        log "WARN: PR #$pr [$persona] hit a usage or rate limit; keeping its session and ending this cycle early."
+        limited=1
+        break 2
       else
         log "WARN: PR #$pr [$persona] review failed; starting a fresh session for it next cycle."
         unset 'PR_SESSION[$key]'
@@ -1103,6 +1132,11 @@ while true; do
     done
   done
 
-  log "Sleeping ${REVIEW_INTERVAL_SECONDS}s..."
-  sleep "$REVIEW_INTERVAL_SECONDS"
+  if [ "$limited" = 1 ]; then
+    log "Backing off ${LIMIT_BACKOFF_SECONDS}s after a usage limit..."
+    sleep "$LIMIT_BACKOFF_SECONDS"
+  else
+    log "Sleeping ${REVIEW_INTERVAL_SECONDS}s..."
+    sleep "$REVIEW_INTERVAL_SECONDS"
+  fi
 done

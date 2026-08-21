@@ -282,6 +282,34 @@ cycle "model: every tier still points at the one review model" \
      ENV:1:ANTHROPIC_DEFAULT_OPUS_MODEL=glm-5.2:cloud \
      ENV:1:ANTHROPIC_SMALL_FAST_MODEL=glm-5.2:cloud
 
+# --- usage limits -----------------------------------------------------------
+# A limit is not a broken session. Dropping the session id would make the next
+# attempt re-read the whole PR and re-post findings already posted, spending more
+# of the resource that just ran out.
+cycle "limits: a rate-limited pass keeps its session and resumes next cycle" \
+  PERSONAS=red_team STUB_FAIL_ON=1 STUB_FAIL_MODE=limit \
+  -- CALLS:2 \
+     ARGV:2:"--resume S1" \
+     LOG:"hit a usage or rate limit" \
+     LOG:"Backing off"
+
+cycle "limits: an ordinary failure still drops the session" \
+  PERSONAS=red_team STUB_FAIL_ON=1 STUB_FAIL_MODE=other \
+  -- CALLS:2 \
+     NOARGV:2:"--resume" \
+     LOG:"starting a fresh session for it next cycle" \
+     NOLOG:"Backing off"
+
+cycle "limits: the rest of the cycle is abandoned, not pushed through" \
+  PERSONAS=red_team,sage,sme STUB_FAIL_ON=2 STUB_FAIL_MODE=limit STUB_MAX_CYCLES=1 \
+  -- CALLS:2 \
+     LOG:"ending this cycle early"
+
+cycle "limits: an unrecognised failure degrades to the ordinary path" \
+  PERSONAS=red_team STUB_FAIL_ON=1 STUB_FAIL_MODE=other STUB_MAX_CYCLES=1 \
+  -- CALLS:1 \
+     NOLOG:"Backing off"
+
 printf '\n%d passed, %d failed' "$PASS" "$FAIL"
 [ "$SKIP" -gt 0 ] && printf ', %d skipped' "$SKIP"
 printf '\n'
