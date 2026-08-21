@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+#
+# Persona tests for entrypoint.sh. Same technique as test-providers.sh (stubs on
+# PATH, `env -i`, ALLOW_UNHARDENED=1) with two deliberate differences:
+#
+#   * capture is INDEXED per `claude` invocation, because one cycle now runs one
+#     invocation per (PR, persona) instead of exactly one;
+#   * the `sleep` stub succeeds once before failing, so the loop runs TWO cycles.
+#     That second cycle is the point: a one-cycle harness produces no resumed
+#     invocation, which is why test-providers.sh cannot assert FOLLOWUP_PROMPT's
+#     stanzas, and the most important property of the persona design (the persona
+#     system prompt being re-passed on a resumed pass) lives exactly there.
+#
+#   ./test-personas.sh            # run everything
+#   ./test-personas.sh resume     # only cases whose label matches 'resume'
+#
+# Needs jq (the entrypoint pipes claude's stream-json through it), mktemp, tee,
+# and bash 4+ for the entrypoint itself. stdbuf is stubbed below rather than
+# required, since macOS does not ship it.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENTRYPOINT="$SCRIPT_DIR/entrypoint.sh"
+FILTER="${1:-}"
+
+command -v jq >/dev/null || { printf 'ERROR: jq is required.\n' >&2; exit 1; }
+
+BASH_BIN=""
+for candidate in "${BASH:-}" "$(command -v bash || true)" /opt/homebrew/bin/bash /usr/local/bin/bash /bin/bash; do
+  [ -n "$candidate" ] && [ -x "$candidate" ] || continue
+  if [ "$("$candidate" -c 'echo ${BASH_VERSINFO[0]}')" -ge 4 ] 2>/dev/null; then
+    BASH_BIN="$candidate"; break
+  fi
+done
+[ -n "$BASH_BIN" ] || { printf 'ERROR: no bash 4+ found (macOS /bin/bash is 3.2 — `brew install bash`).\n' >&2; exit 1; }
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+BIN="$WORK/bin"; mkdir -p "$BIN"
+
+printf '#!/bin/sh\nexit 0\n' >"$BIN/gh"
+printf '#!/bin/sh\nexit 0\n' >"$BIN/git"
+
+# The entrypoint pipes claude through `stdbuf -oL tee`, and stdbuf is GNU
+# coreutils, which a bare macOS does not ship. test-providers.sh survives its
+# absence because it only reads PIPESTATUS[0], but this suite needs the stream to
+# actually reach tee: that is where the session id comes from, and the session id
+# is what the resume assertions are about. Drop the flags, exec the rest.
+cat >"$BIN/stdbuf" <<'STUB'
+#!/bin/sh
+while [ $# -gt 0 ]; do case "$1" in -*) shift ;; *) break ;; esac; done
+exec "$@"
+STUB
+
+# Two cycles by default: succeed on the first sleep, fail on the next so the
+# entrypoint's own `set -e` ends the run. STUB_MAX_CYCLES overrides per case.
+cat >"$BIN/sleep" <<'STUB'
+#!/bin/sh
+n=$(( $(cat "$HOME/sleeps" 2>/dev/null || echo 0) + 1 ))
+echo "$n" >"$HOME/sleeps"
+[ "$n" -ge "${STUB_MAX_CYCLES:-2}" ] && exit 1
+exit 0
+STUB
+
+# The probe. One dump file per invocation ($HOME/dump.N, N counting from 1),
+# holding the argv and the model-tier env. Reports a successful pass by emitting
+# stream-json with a per-invocation session id, so the supervisor records it and
+# the next cycle resumes it. STUB_FAIL_ON=N makes invocation N fail, and
+# STUB_FAIL_MODE picks how: `limit` writes a rate-limit message to stderr,
+# anything else writes an ordinary error. A failing invocation still emits its
+# init event first, because that is what really happens: the session exists and
+# then a request fails, which is exactly the case where throwing the session id
+# away is the wrong move.
+cat >"$BIN/claude" <<'STUB'
+#!/usr/bin/env bash
+n=$(( $(cat "$HOME/calls" 2>/dev/null || echo 0) + 1 ))
+echo "$n" >"$HOME/calls"
+{
+  echo "ARGV $*"
+  for v in ANTHROPIC_MODEL ANTHROPIC_DEFAULT_FABLE_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL \
+           ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL \
+           ANTHROPIC_SMALL_FAST_MODEL; do
+    if [ -n "${!v+set}" ]; then echo "ENV $v=${!v}"; else echo "ENV $v=<unset>"; fi
+  done
+} >"$HOME/dump.$n"
+if [ "${STUB_FAIL_ON:-0}" = "$n" ]; then
+  printf '{"type":"system","subtype":"init","session_id":"S%s"}\n' "$n"
+  if [ "${STUB_FAIL_MODE:-limit}" = "limit" ]; then
+    echo "API Error: 429 rate limit exceeded" >&2
+  else
+    echo "API Error: 400 invalid request" >&2
+  fi
+  exit 1
+fi
+printf '{"type":"system","subtype":"init","session_id":"S%s"}\n' "$n"
+printf '{"type":"result","subtype":"success","session_id":"S%s","result":"ok"}\n' "$n"
+exit 0
+STUB
+chmod +x "$BIN"/*
+
+PASS=0; FAIL=0; SKIP=0
+FAILED_LABELS=""
+
+# Run the entrypoint once. $1 = label, rest = VAR=VALUE.
+run_entrypoint() {
+  local label="$1"; shift
+  HOME_DIR="$WORK/home"; OUT="$WORK/out"
+  rm -rf "$HOME_DIR"; mkdir -p "$HOME_DIR/work/repo/.git" "$HOME_DIR/seed"
+  env -i PATH="$BIN:$PATH" HOME="$HOME_DIR" \
+    ALLOW_UNHARDENED=1 \
+    GITHUB_TOKEN=x GITHUB_REPOSITORY=owner/repo PR_IDS=1 \
+    REPO_PATH="$HOME_DIR/seed" REVIEW_INTERVAL_SECONDS=1 \
+    PERSONA_DIR="$SCRIPT_DIR/personas" \
+    PROVIDER=ollama OLLAMA_API_KEY=k \
+    "$@" "$BASH_BIN" "$ENTRYPOINT" >"$OUT" 2>&1
+}
+
+ok()  { PASS=$((PASS + 1)); printf 'ok   %s\n' "$1"; }
+bad() { FAIL=$((FAIL + 1)); FAILED_LABELS="$FAILED_LABELS
+  - $1"; printf 'FAIL %s\n       %s\n' "$1" "$2"; [ -s "$OUT" ] && sed 's/^/       | /' "$OUT"; }
+
+selected() {
+  [ -z "$FILTER" ] && return 0
+  case "$1" in *"$FILTER"*) return 0 ;; *) SKIP=$((SKIP + 1)); return 1 ;; esac
+}
+
+# How many times the claude stub was called.
+calls() { cat "$HOME_DIR/calls" 2>/dev/null || echo 0; }
+
+# refuses LABEL EXPECTED-SUBSTRING -- VAR=VALUE...
+refuses() {
+  local label="$1" want="$2"; shift 2
+  [ "${1:-}" = "--" ] && shift
+  selected "$label" || return 0
+  run_entrypoint "$label" "$@"
+  if [ "$(calls)" != 0 ]; then
+    bad "$label" "expected a startup failure, but a review pass ran"
+  elif ! grep -qF "$want" "$OUT"; then
+    bad "$label" "expected the error to mention: $want"
+  else
+    ok "$label"
+  fi
+}
+
+# cycle LABEL 'VAR=VALUE...' -- EXPECTATION...
+# Runs the entrypoint, then checks expectations:
+#   CALLS:N              -- exactly N claude invocations happened
+#   ARGV:N:substring     -- invocation N's argv contains substring
+#   NOARGV:N:substring   -- invocation N's argv does NOT contain substring
+#   ENV:N:VAR=value      -- invocation N saw exactly that value
+#   LOG:substring        -- the run's log contains substring
+#   NOLOG:substring      -- the run's log does not contain substring
+cycle() {
+  local label="$1"; shift
+  local -a env_in=()
+  while [ $# -gt 0 ] && [ "$1" != "--" ]; do env_in+=("$1"); shift; done
+  [ "${1:-}" = "--" ] && shift
+  selected "$label" || return 0
+  run_entrypoint "$label" ${env_in[@]+"${env_in[@]}"}
+  local expect missing="" n rest dump
+  for expect in "$@"; do
+    case "$expect" in
+      CALLS:*)
+        [ "$(calls)" = "${expect#CALLS:}" ] || missing="$missing [expected ${expect#CALLS:} invocations, got $(calls)]" ;;
+      ARGV:*|NOARGV:*|ENV:*)
+        rest="${expect#*:}"; n="${rest%%:*}"; rest="${rest#*:}"
+        dump="$HOME_DIR/dump.$n"
+        if [ ! -e "$dump" ]; then missing="$missing [no invocation $n]"; continue; fi
+        case "$expect" in
+          ARGV:*)   grep -qF -- "$rest" <(grep '^ARGV ' "$dump") || missing="$missing [argv $n missing: $rest]" ;;
+          NOARGV:*) grep -qF -- "$rest" <(grep '^ARGV ' "$dump") && missing="$missing [argv $n should not have: $rest]" ;;
+          ENV:*)    grep -qxF "ENV $rest" "$dump" || missing="$missing [env $n: $rest (was: $(grep "^ENV ${rest%%=*}=" "$dump" | sed 's/^ENV //'))]" ;;
+        esac ;;
+      LOG:*)   grep -qF "${expect#LOG:}" "$OUT" || missing="$missing [log missing: ${expect#LOG:}]" ;;
+      NOLOG:*) grep -qF "${expect#NOLOG:}" "$OUT" && missing="$missing [log should not have: ${expect#NOLOG:}]" ;;
+      *) missing="$missing [unknown expectation: $expect]" ;;
+    esac
+  done
+  if [ -n "$missing" ]; then bad "$label" "$missing"; else ok "$label"; fi
+}
+
+printf 'Running persona tests with %s (bash %s)\n\n' "$BASH_BIN" "$("$BASH_BIN" -c 'echo $BASH_VERSION')"
+
+# --- definition files (static checks, no entrypoint run) --------------------
+if selected "definitions: every persona file is well formed"; then
+  problems=""
+  for f in "$SCRIPT_DIR"/personas/*.md; do
+    b="$(basename "$f" .md)"
+    case "$b" in _*) continue ;; esac
+    head -1 "$f" | grep -qx -- "---" || problems="$problems [$b: no frontmatter]"
+    grep -qE '^label: [A-Za-z0-9 ._-]+$' "$f" || problems="$problems [$b: no usable label]"
+    grep -q '^success: ' "$f" || problems="$problems [$b: no success criterion]"
+    grep -qF "JSON" "$f" && problems="$problems [$b: carries an output contract]"
+  done
+  [ -f "$SCRIPT_DIR/personas/_shared.md" ] || problems="$problems [_shared.md missing]"
+  grep -qF '{{PERSONA}}' "$SCRIPT_DIR/personas/_shared.md" || problems="$problems [_shared.md has no {{PERSONA}} token]"
+  if [ -n "$problems" ]; then bad "definitions: every persona file is well formed" "$problems"
+  else ok "definitions: every persona file is well formed"; fi
+fi
+
+# --- selection --------------------------------------------------------------
+cycle "selection: default set is the four code-facing personas in order" \
+  -- CALLS:8 LOG:"personas: red_team adversarial sme sage"
+
+cycle "selection: an explicit list is honoured, in the order given" \
+  PERSONAS=sage,red_team \
+  -- CALLS:4 LOG:"personas: sage red_team"
+
+cycle "selection: all expands to every shipped persona" \
+  PERSONAS=all \
+  -- CALLS:12 LOG:"personas: adversarial good_friend red_team sage sme user"
+
+refuses "selection: an unknown persona name refuses at startup" \
+  "unknown persona 'red-team'" \
+  -- PERSONAS=red-team
+
+refuses "selection: the reserved aggregate id cannot be selected" \
+  "reserved" \
+  -- PERSONAS=aggregate
+
+refuses "selection: an empty list refuses at startup" \
+  "PERSONAS is set but names no persona" \
+  -- PERSONAS=,
+
+refuses "selection: a duplicate name refuses at startup" \
+  "listed twice" \
+  -- PERSONAS=sage,sage
+
+refuses "selection: a missing persona directory refuses at startup" \
+  "no persona definitions" \
+  -- PERSONA_DIR=/nonexistent
+
+printf '\n%d passed, %d failed' "$PASS" "$FAIL"
+[ "$SKIP" -gt 0 ] && printf ', %d skipped' "$SKIP"
+printf '\n'
+[ "$FAIL" -eq 0 ] || { printf 'failed:%s\n' "$FAILED_LABELS"; exit 1; }

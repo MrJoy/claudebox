@@ -118,6 +118,7 @@ run_entrypoint() {
     GITHUB_TOKEN=x GITHUB_REPOSITORY=owner/repo PR_IDS=1 \
     REPO_PATH="$HOME_DIR/seed" REVIEW_INTERVAL_SECONDS=1 \
     LITELLM_BIN="$BIN/litellm" SHIM_BIN="$SCRIPT_DIR/workersai-shim.py" \
+    PERSONA_DIR="$SCRIPT_DIR/personas" PERSONAS=red_team \
     "$@" "$BASH_BIN" "$ENTRYPOINT" >"$OUT" 2>&1
 }
 

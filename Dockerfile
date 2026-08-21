@@ -98,6 +98,12 @@ ENV DISABLE_AUTOUPDATER=1 \
     REVIEW_INTERVAL_SECONDS=300
 
 COPY --chown=reviewer:reviewer entrypoint.sh /usr/local/bin/entrypoint.sh
+# Persona definitions for the adversarial review set: one file per persona
+# (frontmatter label/success, body = system prompt) plus _shared.md, which every
+# persona body gets appended to. Read at runtime from PERSONA_DIR, which an
+# operator can point at a read-only mount to supply their own set. Imported from
+# advocate by tools/import-advocate-personas.py; see CLAUDE.md.
+COPY --chown=reviewer:reviewer personas/ /opt/claudebox/personas/
 # The Workers AI normalizer, which entrypoint.sh runs between LiteLLM and
 # Cloudflare for PROVIDER=workersai. Stdlib-only, so it runs on the python3
 # installed above with no venv of its own. See the file header for why it exists.

@@ -171,6 +171,107 @@ render_prompt() {
   printf '%s' "${1//\{\{PR\}\}/$2}"
 }
 
+# --- Persona registry ------------------------------------------------------
+# Each review pass runs as one of advocate's adversarial personas rather than as
+# a generalist reviewer. A persona is a file in PERSONA_DIR: frontmatter (label,
+# success) plus a body that becomes the pass's system prompt. Files starting with
+# an underscore are not personas; _shared.md is the output contract appended to
+# every persona body.
+#
+# Definitions live in files rather than inline here for three reasons: it keeps
+# ~200 lines of prompt text out of this script, it gives an operator an override
+# by mounting their own directory at PERSONA_DIR, and it keeps the imported text
+# close to its provenance (tools/import-advocate-personas.py).
+PERSONA_DIR="${PERSONA_DIR:-/opt/claudebox/personas}"
+# The default set is code-facing. advocate's `user` and `good_friend` were written
+# against designs and whole projects; on a narrow diff they reach for material
+# that isn't in it, so they ship but are opt-in.
+DEFAULT_PERSONAS="red_team,adversarial,sme,sage"
+# Claimed now, used in phase 2: the pass that reconciles what the personas said
+# is the only one allowed to read their findings, which is why it is not itself
+# a persona and cannot be selected as one.
+RESERVED_PERSONAS="aggregate"
+
+declare -A PERSONA_PROMPT=()
+declare -A PERSONA_LABEL=()
+PERSONAS_LIST=()
+
+# Echo frontmatter key $2 from persona $1.
+persona_meta() {
+  awk -v k="$2" '
+    NR == 1 && $0 == "---" { fm = 1; next }
+    fm && $0 == "---" { exit }
+    fm && index($0, k ":") == 1 { sub(/^[^:]*:[[:space:]]*/, ""); print; exit }
+  ' "$PERSONA_DIR/$1.md"
+}
+
+# Echo persona $1's full system prompt: its body, then the shared contract, with
+# {{PERSONA}} replaced by its label. The label is validated in resolve_personas
+# to contain no slash, so it is safe as a sed replacement.
+persona_prompt() {
+  local id="$1" label="${PERSONA_LABEL[$1]}"
+  {
+    awk '
+      NR == 1 && $0 == "---" { fm = 1; next }
+      fm && $0 == "---" { fm = 0; body = 1; next }
+      body
+    ' "$PERSONA_DIR/$id.md"
+    printf '\n'
+    cat "$PERSONA_DIR/_shared.md"
+  } | sed "s|{{PERSONA}}|$label|g"
+}
+
+# Fill PERSONAS_LIST (order-preserving), PERSONA_LABEL and PERSONA_PROMPT from
+# PERSONAS, or from DEFAULT_PERSONAS when it is unset. Dies on anything it can't
+# resolve: a typo that silently narrowed the review to one persona, or to none,
+# would look exactly like a working run in the log.
+resolve_personas() {
+  local avail="" f b tok raw
+  [ -d "$PERSONA_DIR" ] || die "no persona definitions: PERSONA_DIR=$PERSONA_DIR is not a directory."
+  for f in "$PERSONA_DIR"/*.md; do
+    [ -e "$f" ] || continue
+    b="$(basename "$f" .md)"
+    case "$b" in _*) continue ;; esac
+    avail="$avail $b"
+  done
+  [ -n "$avail" ] || die "no persona definitions found in $PERSONA_DIR."
+
+  raw="${PERSONAS-$DEFAULT_PERSONAS}"
+  case "$(printf '%s' "$raw" | tr 'A-Z' 'a-z')" in
+    all) raw="$(printf '%s' "$avail")" ;;
+  esac
+
+  for tok in $(printf '%s' "$raw" | tr ',' ' '); do
+    case " $RESERVED_PERSONAS " in
+      *" $tok "*) die "persona '$tok' is reserved and cannot be selected." ;;
+    esac
+    case " $avail " in
+      *" $tok "*) ;;
+      *) die "unknown persona '$tok'; available:$avail" ;;
+    esac
+    case " ${PERSONAS_LIST[*]-} " in
+      *" $tok "*) die "persona '$tok' is listed twice in PERSONAS." ;;
+    esac
+    PERSONAS_LIST+=("$tok")
+  done
+  [ "${#PERSONAS_LIST[@]}" -gt 0 ] || die "PERSONAS is set but names no persona; unset it for the default set ($DEFAULT_PERSONAS), or name one of:$avail"
+
+  # Resolve labels and prompts once, so a pass is a string lookup rather than
+  # three file reads, and so a broken definition fails at startup.
+  local id label
+  for id in "${PERSONAS_LIST[@]}"; do
+    label="$(persona_meta "$id" label)"
+    case "$label" in
+      '') die "persona '$id' has no label: in its frontmatter." ;;
+      *[!A-Za-z0-9\ ._-]*) die "persona '$id' has a label with unexpected characters: '$label' (letters, digits, spaces, dot, underscore and hyphen only)." ;;
+    esac
+    PERSONA_LABEL[$id]="$label"
+    PERSONA_PROMPT[$id]="$(persona_prompt "$id")"
+    [ -n "${PERSONA_PROMPT[$id]}" ] || die "persona '$id' has an empty prompt body."
+  done
+  log "personas: ${PERSONAS_LIST[*]}"
+}
+
 # --- Optional Linear context ------------------------------------------------
 # LINEAR_API_KEY (optional) lets the reviewer read the Linear ticket a PR claims
 # to implement. Linear's MCP server accepts an API key passed straight through as
@@ -315,6 +416,7 @@ fi
 # Validate PR selection now (fail fast, before auth/clone), and warn if a prompt
 # template won't name the PR.
 resolve_pr_selection
+resolve_personas
 case "$REVIEW_PROMPT"   in *'{{PR}}'*) : ;; *) log "WARN: REVIEW_PROMPT has no {{PR}} token; reviews won't name the specific PR." ;; esac
 case "$FOLLOWUP_PROMPT" in *'{{PR}}'*) : ;; *) log "WARN: FOLLOWUP_PROMPT has no {{PR}} token; reviews won't name the specific PR." ;; esac
 
