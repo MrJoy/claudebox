@@ -113,6 +113,11 @@ run_entrypoint() {
   # variable the case means to leave unset. Case-supplied vars come last, so a
   # case can override any default below (LITELLM_BIN, to test an image missing
   # the translator).
+  # PERSONAS is pinned to a single persona so each case still produces exactly
+  # ONE `claude` invocation: the stub below overwrites its dump per call, and
+  # what this suite asserts (credentials, endpoints, model tiers) is identical
+  # for every persona. Multi-persona behaviour lives in test-personas.sh, which
+  # captures per invocation.
   env -i PATH="$BIN:$PATH" HOME="$HOME_DIR" \
     ALLOW_UNHARDENED=1 \
     GITHUB_TOKEN=x GITHUB_REPOSITORY=owner/repo PR_IDS=1 \

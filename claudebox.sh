@@ -38,6 +38,10 @@ PR_SEARCH=""
 PR_SEL_COUNT=0
 PR_SEL_NAMES=""
 
+# Persona selection (parsed and validated by the entrypoint, not here — this is
+# bash 3.2 on macOS, and the entrypoint is authoritative anyway).
+PERSONAS=""
+
 usage() {
   cat <<'EOF'
 claudebox — launcher for the unattended PR-reviewer container.
@@ -93,6 +97,10 @@ OPTIONS
                     "is:open label:needs-review"). You control state via the
                     query. Provide exactly ONE of --all/--assignee/--prs/--search
                     (here or via PR_* in the env file).
+  --persona LIST    Review with these adversarial personas only (comma list, or
+                    'all'). Default: red_team,adversarial,sme,sage. Also
+                    available: user, good_friend. One session per PR per persona,
+                    so a cycle is (PRs x personas) sequential reviews.
   --dry-run         Print the docker command instead of executing it.
   -h, --help        Show this help.
 
@@ -140,6 +148,7 @@ while [ $# -gt 0 ]; do
     --assignee)    PR_ASSIGNEE="${2:?--assignee requires a LOGIN}"; PR_SEL_COUNT=$((PR_SEL_COUNT + 1)); PR_SEL_NAMES="$PR_SEL_NAMES --assignee"; shift ;;
     --prs)         PR_IDS="${2:?--prs requires a comma/space list of PR numbers}"; PR_SEL_COUNT=$((PR_SEL_COUNT + 1)); PR_SEL_NAMES="$PR_SEL_NAMES --prs"; shift ;;
     --search)      PR_SEARCH="${2:?--search requires a gh search query}"; PR_SEL_COUNT=$((PR_SEL_COUNT + 1)); PR_SEL_NAMES="$PR_SEL_NAMES --search"; shift ;;
+    --persona)     PERSONAS="${2:?--persona requires a comma-separated list of persona names}"; shift ;;
     --dry-run)     DRY_RUN=1 ;;
     -h|--help)     usage; exit 0 ;;
     --)            shift; EXTRA=("$@"); break ;;
@@ -281,6 +290,7 @@ build_run_flags() {
   [ -n "$PR_ASSIGNEE" ] && RUN_FLAGS+=(-e "PR_ASSIGNEE=$PR_ASSIGNEE")
   [ -n "$PR_IDS" ]      && RUN_FLAGS+=(-e "PR_IDS=$PR_IDS")
   [ -n "$PR_SEARCH" ]   && RUN_FLAGS+=(-e "PR_SEARCH=$PR_SEARCH")
+  [ -n "$PERSONAS" ]    && RUN_FLAGS+=(-e "PERSONAS=$PERSONAS")
   true  # keep the function's exit status 0: the last `[ ... ] && ...` above
         # would otherwise make build_run_flags itself fail under `set -e`
         # whenever PR_SEARCH is unset (the test-then-&& idiom is only safe
