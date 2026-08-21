@@ -1,0 +1,239 @@
+version: "1.0"
+generated_by: constrain-methodology-by-hand
+session_id: claudebox-personas
+
+components:
+  - name: "launcher"
+    description: "Host-side claudebox.sh. Parses --persona and any operator persona-to-model override, injects hardening flags, and passes both through to the container as opaque environment strings."
+    type: ingress
+    port: null
+    protocol: null
+    data_access:
+      reads: [PUBLIC, AUTH]
+      writes: [PUBLIC]
+      rationale: "Reads the operator env file, which holds credentials, and forwards them to docker run. Parses none of the persona configuration itself, because it must run under macOS bash 3.2."
+    authority:
+      domains: ["operator-cli-surface"]
+      rationale: "Sole owner of the host-facing flag vocabulary."
+    dependencies: []
+    constraints: ["C002", "C003", "C019"]
+
+  - name: "persona-registry"
+    description: "Persona definition files shipped in the image, one markdown file per persona with frontmatter and a prompt body. Loads them, validates the selected set, and yields the system-prompt text for each."
+    type: library
+    port: null
+    protocol: null
+    data_access:
+      reads: [PUBLIC]
+      writes: []
+      rationale: "Reads only prompt text baked into the image or supplied at an override path. Handles no credentials."
+    authority:
+      domains: ["persona-definitions"]
+      rationale: "Single source of what a persona is and what its prompt says."
+    dependencies: []
+    constraints: ["C002", "C003", "C010", "C011", "C014", "C021"]
+
+  - name: "persona-model-resolver"
+    description: "Resolves the model for each enabled persona. Merges the operator map over the reviewed repo's map, validates every resulting model id, and refuses to start on a bad one."
+    type: library
+    port: null
+    protocol: null
+    data_access:
+      reads: [PUBLIC]
+      writes: []
+      rationale: "Reads untrusted text from the working clone and trusted text from the operator environment. Emits model identifiers only."
+    authority:
+      domains: ["persona-model-assignment"]
+      rationale: "The only place the two maps are combined, so precedence lives in exactly one place."
+    dependencies: ["persona-registry"]
+    constraints: ["C005", "C006", "C007", "C009", "C017"]
+
+  - name: "supervisor"
+    description: "The review loop in entrypoint.sh. Fetches refs, enumerates candidate PRs, and for each PR runs each enabled persona in a stable order, tracking a session and pass count per (PR, persona)."
+    type: worker
+    port: null
+    protocol: null
+    data_access:
+      reads: [PUBLIC, AUTH]
+      writes: [PUBLIC]
+      rationale: "Holds the provider credential in its environment and passes it to child sessions. Writes nothing outside the work dir."
+    authority:
+      domains: ["cycle-scheduling", "session-lifecycle"]
+      rationale: "Owns cadence, PR selection, persona ordering and rotation."
+    dependencies: ["persona-registry", "persona-model-resolver", "review-session-runner", "session-store", "status-comment-writer", "github-egress", "aggregator"]
+    constraints: ["C004", "C005", "C014", "C015", "C018", "C022", "C023"]
+
+  - name: "review-session-runner"
+    description: "run_pass. One headless claude invocation for one (PR, persona) pair: re-passes the persona system prompt, applies that persona's model to --model and to the model-tier env vars for this invocation only, and recovers the session id."
+    type: worker
+    port: null
+    protocol: http
+    data_access:
+      reads: [PUBLIC, AUTH]
+      writes: [PUBLIC]
+      rationale: "Receives the provider credential from the supervisor's environment. Emits the model provider request and the stream-json transcript."
+    authority:
+      domains: ["single-pass-invocation"]
+      rationale: "The only place a claude process is spawned."
+    dependencies: ["provider-wiring"]
+    constraints: ["C001", "C008", "C011", "C016"]
+
+  - name: "aggregator"
+    description: "One pass per PR after every enabled persona has swept it. The only pass allowed to read other personas' findings. Maintains a single marker-identified digest comment naming where personas agree and where they disagree."
+    type: worker
+    port: null
+    protocol: http
+    data_access:
+      reads: [PUBLIC, AUTH]
+      writes: [PUBLIC]
+      rationale: "Reads the PR's -claudebox comments through the minimized token and writes one digest comment. Sees no credential beyond what any pass sees."
+    authority:
+      domains: ["cross-persona-reconciliation"]
+      rationale: "Reconciliation is centralized here precisely so that no persona does it, which is what keeps the personas independent."
+    dependencies: ["github-egress", "review-session-runner"]
+    constraints: ["C014", "C024", "C004"]
+
+  - name: "session-store"
+    description: "Persists the (PR, persona) to session-id map under the writable work dir and reloads it at startup, so a restart resumes rather than re-reviewing."
+    type: library
+    port: null
+    protocol: null
+    data_access:
+      reads: [PUBLIC]
+      writes: [PUBLIC]
+      rationale: "Stores PR numbers, persona names and session identifiers. No credential and no diff content."
+    authority:
+      domains: ["session-id-persistence"]
+      rationale: "Owns the on-disk form of the session map."
+    dependencies: []
+    constraints: ["C015", "C016", "C021"]
+
+  - name: "status-comment-writer"
+    description: "Harness-owned coverage comment. Locates a single marker-tagged comment per PR through gh, creates it once, and edits it in place each cycle with which personas swept which head SHA."
+    type: egress
+    port: null
+    protocol: http
+    data_access:
+      reads: [PUBLIC]
+      writes: [PUBLIC]
+      rationale: "Writes persona names, pass counts and commit SHAs to a public PR comment. Must never write credential material."
+    authority:
+      domains: ["coverage-reporting"]
+      rationale: "Coverage reporting must be deterministic, so no model may author it."
+    dependencies: ["github-egress"]
+    constraints: ["C012", "C013", "C021"]
+
+  - name: "github-egress"
+    description: "The gh CLI authenticated with the privilege-minimized token. Used by the harness for PR enumeration and the status comment, and by each persona session for diffs and findings."
+    type: egress
+    port: null
+    protocol: http
+    data_access:
+      reads: [PUBLIC, AUTH]
+      writes: [PUBLIC]
+      rationale: "Holds GITHUB_TOKEN. Its scope is the real safety boundary and cannot be introspected from inside the container."
+    authority:
+      domains: ["github-api-access"]
+      rationale: "Sole path to GitHub."
+    dependencies: []
+    constraints: ["C018", "C021"]
+
+  - name: "provider-wiring"
+    description: "The existing backend-selection block. Unchanged by this work except that the model-tier fan-out becomes reproducible per pass rather than only once at startup."
+    type: library
+    port: null
+    protocol: http
+    data_access:
+      reads: [AUTH]
+      writes: []
+      rationale: "Resolves and validates the provider credential."
+    authority:
+      domains: ["provider-selection"]
+      rationale: "Existing sole owner of base URL and credential wiring."
+    dependencies: []
+    constraints: ["C008", "C009", "C018"]
+
+  - name: "test-suites"
+    description: "test-providers.sh and test-shim.sh. The provider suite must grow from asserting one claude invocation per cycle to asserting the per-persona argv and env of several."
+    type: library
+    port: null
+    protocol: null
+    data_access:
+      reads: [PUBLIC]
+      writes: [PUBLIC]
+      rationale: "Runs the entrypoint under env -i with stubs; handles no real credential."
+    authority:
+      domains: ["wiring-verification"]
+      rationale: "Owns the assertion that what we intended is what gets wired."
+    dependencies: ["supervisor", "persona-registry", "persona-model-resolver", "review-session-runner"]
+    constraints: ["C020"]
+
+edges:
+  - from: "supervisor"
+    to: "aggregator"
+    protocol: null
+    description: "After the last persona pass for a PR in a cycle, run the aggregation pass."
+  - from: "aggregator"
+    to: "github-egress"
+    protocol: http
+    description: "Read the PR's -claudebox comments; create or edit the digest comment."
+  - from: "aggregator"
+    to: "review-session-runner"
+    protocol: null
+    description: "The aggregation pass is an ordinary headless invocation with its own per-PR session."
+  - from: "launcher"
+    to: "supervisor"
+    protocol: tcp
+    description: "docker run environment: persona selection, operator persona-to-model overrides, provider credentials, hardening flags."
+  - from: "supervisor"
+    to: "persona-registry"
+    protocol: null
+    description: "Resolve the enabled persona set and each persona's system-prompt text."
+  - from: "supervisor"
+    to: "persona-model-resolver"
+    protocol: null
+    description: "Resolve and validate a model per enabled persona, from the repo map and the operator map."
+  - from: "supervisor"
+    to: "review-session-runner"
+    protocol: null
+    description: "One invocation per (PR, persona), with prompt, persona system prompt, model and any session id to resume."
+  - from: "supervisor"
+    to: "session-store"
+    protocol: null
+    description: "Load at startup, write after each successful pass."
+  - from: "supervisor"
+    to: "status-comment-writer"
+    protocol: null
+    description: "Per PR per cycle, the personas swept and the head SHA they saw."
+  - from: "supervisor"
+    to: "github-egress"
+    protocol: http
+    description: "Candidate PR enumeration and head SHA lookup."
+  - from: "persona-model-resolver"
+    to: "persona-registry"
+    protocol: null
+    description: "Valid persona names, so an unknown key in either map is an error rather than a silent no-op."
+  - from: "review-session-runner"
+    to: "provider-wiring"
+    protocol: http
+    description: "Per-pass model-tier environment layered over the startup provider wiring."
+  - from: "status-comment-writer"
+    to: "github-egress"
+    protocol: http
+    description: "Find, create and edit the marker-tagged coverage comment."
+  - from: "test-suites"
+    to: "supervisor"
+    protocol: null
+    description: "Runs the entrypoint under stubs and asserts the argv and env of each per-persona invocation in one cycle."
+  - from: "test-suites"
+    to: "persona-registry"
+    protocol: null
+    description: "Asserts the default set, selector validation, and that no persona prompt carries a JSON output contract."
+  - from: "test-suites"
+    to: "persona-model-resolver"
+    protocol: null
+    description: "Asserts precedence, validation refusals, and that a PR head is never the source of the map."
+  - from: "test-suites"
+    to: "review-session-runner"
+    protocol: null
+    description: "Asserts the persona system prompt is re-passed on resumed invocations."

@@ -1,0 +1,308 @@
+version: "1.0"
+generated_by: constrain-methodology-by-hand
+session_id: claudebox-personas
+system: "claudebox multi-persona PR reviewer"
+
+constraints:
+  - id: C001
+    boundary: "persona identity injection"
+    condition: "The persona system prompt is re-passed on EVERY pass, including resumed ones, via --append-system-prompt."
+    violation: "A resumed pass reviews with no persona identity, so cycle 1 is adversarial and cycles 2..N are the generic reviewer, silently."
+    severity: must
+    rationale: "Verified empirically 2026-08-21: a session started with --append-system-prompt and resumed without it dropped the injected identity; re-passing the flag restored it. Same class as the _gh_stanza/_test_stanza repetition."
+    classification_tier: null
+    affected_components: ["review-session-runner"]
+
+  - id: C002
+    boundary: "default persona set"
+    condition: "With no selector, the enabled set is red_team, adversarial, sme, sage. user and good_friend are reachable only by explicit selection."
+    violation: "Design-oriented personas reach for material not present in a narrow diff, raising the noise floor for every operator who did not ask for them."
+    severity: should
+    rationale: "advocate's user and good_friend personas were written against designs and whole projects, not diffs."
+    classification_tier: null
+    affected_components: ["persona-registry", "launcher"]
+
+  - id: C003
+    boundary: "persona selection input"
+    condition: "An unrecognized persona name in --persona / PERSONAS is a startup failure naming the valid set."
+    violation: "A typo silently narrows the review to a subset, or to nothing, and the operator reads clean logs."
+    severity: must
+    rationale: "Same failure shape as the mis-wired credential var that motivated test-providers.sh: the symptom appears far from the cause."
+    classification_tier: null
+    affected_components: ["persona-registry", "launcher"]
+
+  - id: C004
+    boundary: "intra-cycle persona ordering"
+    condition: "Within a cycle, a PR's personas run sequentially in a stable, documented order."
+    violation: >-
+      Runs are not reproducible, and the aggregation pass can run before a persona
+      it is supposed to be aggregating.
+    severity: must
+    rationale: >-
+      Ordering no longer carries de-duplication (see C014), but the aggregation
+      pass must be last for a PR in a cycle, and a stable order is what makes a
+      partially-completed cycle after a rate-limit backoff interpretable.
+    classification_tier: null
+    affected_components: ["supervisor"]
+
+  - id: C005
+    boundary: "provenance of the per-project persona-to-model map"
+    condition: "The repo map is read only from the default-branch working clone. It is never read from a PR head, and no code path checks out a PR head."
+    violation: "A PR author gains control of which model reviews their own PR, including choosing the weakest available one or a name that fails outright."
+    severity: must
+    rationale: "/repo is untrusted; this is the same threat model that makes --strict-mcp-config mandatory. Today the property holds by accident because the reviewer reads diffs via `gh pr diff`. It must become an explicit, commented rule."
+    classification_tier: null
+    affected_components: ["persona-model-resolver", "supervisor"]
+
+  - id: C006
+    boundary: "map authority"
+    condition: "For any persona named in operator config, operator config wins. The repo map supplies values for personas the operator did not name."
+    violation: "A reviewed repo overrides the operator's spend and model-reachability decisions."
+    severity: must
+    rationale: "The operator holds the credential and pays for the tokens; the repo expresses a preference."
+    classification_tier: null
+    affected_components: ["persona-model-resolver"]
+
+  - id: C007
+    boundary: "model identifier validation"
+    condition: "Every resolved model id is validated at startup against a strict character allow-list and refused if it fails. Refusal is a startup error, not a per-request one."
+    violation: "An untrusted string reaches a command line and an env var; or a malformed id fails once per request, which reads as a provider outage."
+    severity: must
+    rationale: "The map is untrusted input that lands in --model and in every ANTHROPIC_*_MODEL var. Startup is where an operator is watching."
+    classification_tier: null
+    affected_components: ["persona-model-resolver"]
+
+  - id: C008
+    boundary: "per-pass model wiring"
+    condition: "A per-persona model is applied to --model AND to every model-tier env var (ANTHROPIC_MODEL, ..._DEFAULT_FABLE/OPUS/SONNET/HAIKU_MODEL, ANTHROPIC_SMALL_FAST_MODEL) for that invocation only."
+    violation: "A subagent or model alias inside the persona's session requests a tier still pointing at the global REVIEW_MODEL, so part of the review silently runs on a different model than the map specifies."
+    severity: must
+    rationale: "Non-Anthropic providers have no Opus/Sonnet/Haiku, which is why the all-tiers-to-one-model block exists at startup. A per-pass override has to reproduce it per pass."
+    classification_tier: null
+    affected_components: ["review-session-runner", "persona-model-resolver"]
+
+  - id: C009
+    boundary: "model substitution"
+    condition: "No resolved model is ever silently replaced by another. A model that cannot be used is an error."
+    violation: "A review appears to run under the mapped model while actually running under a fallback, invalidating the whole premise of assigning models to personas."
+    severity: must
+    rationale: "Pre-existing project invariant; the persona map multiplies the number of places it could be violated."
+    classification_tier: null
+    affected_components: ["persona-model-resolver", "provider-wiring"]
+
+  - id: C010
+    boundary: "borrowed persona prompt content"
+    condition: "Persona definitions carry advocate's identity, dimensions, success criterion and its do-not-manufacture-findings rule, and carry none of advocate's JSON output contract."
+    violation: "The persona emits a JSON findings array into a headless session that nothing parses, and posts no comments."
+    severity: must
+    rationale: "Every entry in advocate's SYSTEM_PROMPTS ends with _COMMON_OUTPUT_FORMAT, which demands a JSON array. claudebox's output channel is `gh pr comment`."
+    classification_tier: null
+    affected_components: ["persona-registry"]
+
+  - id: C011
+    boundary: "operator prompt overrides"
+    condition: "REVIEW_PROMPT / FOLLOWUP_PROMPT overrides still reach Claude verbatim. Persona identity travels in the system prompt, not by concatenation onto the task prompt."
+    violation: "An operator-supplied prompt arrives modified, breaking a documented guarantee."
+    severity: must
+    rationale: "Pre-existing invariant, stated for linear_stanza, _gh_stanza and _test_stanza. Keeping persona identity in --append-system-prompt makes the two concerns orthogonal instead of competing."
+    classification_tier: null
+    affected_components: ["review-session-runner", "persona-registry"]
+
+  - id: C012
+    boundary: "status reporting authorship"
+    condition: "The coverage status comment is written and edited by the harness through gh, never by a persona session."
+    violation: "Coverage reporting becomes a thing a model may or may not decide to do, so the one signal that distinguishes a silent persona from a broken one is itself unreliable."
+    severity: must
+    rationale: "The purpose of the status comment is to be verifiable. A model-authored status comment cannot serve that purpose."
+    classification_tier: null
+    affected_components: ["status-comment-writer"]
+
+  - id: C013
+    boundary: "status comment identity and count"
+    condition: "Exactly one status comment per PR, located by an HTML-comment marker and edited in place; it records, per persona, the head SHA last swept and the pass count."
+    violation: "A new status comment per cycle buries the PR under bot noise."
+    severity: should
+    rationale: "Editing in place needs only the PR-comment write permission the minimized token already has."
+    classification_tier: null
+    affected_components: ["status-comment-writer"]
+
+  - id: C014
+    boundary: "persona independence"
+    condition: >-
+      Personas are not instructed to defer to, or refrain from restating, another
+      persona's findings. Each reviews the diff on its own terms and signs with
+      its own label. Reconciliation happens in a separate aggregation pass, never
+      inside a persona.
+    violation: >-
+      Later personas are anchored by earlier ones, which is group-think with extra
+      steps and is the exact failure the project exists to avoid.
+    severity: must
+    rationale: >-
+      advocate runs its personas in parallel and blind to each other, then
+      aggregates centrally. Blindness is the mechanism that makes six
+      perspectives worth more than one; de-duplication inside a persona buys a
+      cleaner PR by spending the thing being imported.
+    classification_tier: null
+    affected_components: ["persona-registry", "supervisor", "aggregator"]
+
+  - id: C024
+    boundary: "aggregation pass"
+    condition: >-
+      After every enabled persona has swept a PR in a cycle, one aggregation pass
+      per PR reads the -claudebox comments and maintains a single
+      marker-identified digest comment naming agreements and disagreements. The
+      reserved id `aggregate` cannot be selected as a persona.
+    violation: >-
+      Disagreement between personas, which advocate treats as the most valuable
+      output, is left as an exercise for whoever reads the PR.
+    severity: should
+    rationale: >-
+      This is advocate's aggregation step ported rather than dropped. It is the
+      only pass permitted to read other personas' findings, which is why it is
+      not a persona.
+    classification_tier: null
+    affected_components: ["aggregator", "supervisor", "status-comment-writer"]
+
+  - id: C025
+    boundary: "usage and rate-limit failures"
+    condition: >-
+      A pass that fails because of a usage or rate limit is distinguished from a
+      pass that fails for any other reason. Its session id is KEPT, the rest of
+      the cycle is abandoned, and the loop backs off.
+    violation: >-
+      The existing failure path drops the session, so the next cycle re-reads the
+      whole PR and re-posts findings already posted. A transient limit becomes
+      repeated full re-reviews, duplicate comments, and more usage: a positive
+      feedback loop into the constraint that caused it.
+    severity: must
+    rationale: >-
+      On a fixed-price plan the binding resource is usage allowance. Multiplying
+      sessions per cycle by the persona count moves hitting the cap from
+      theoretical to routine, so this path has to exist before the multiplier
+      does. Detection depends on matching Claude Code's error output, which can
+      change upstream, so a miss must degrade to today's behavior rather than to
+      a crash.
+    classification_tier: null
+    affected_components: ["review-session-runner", "supervisor"]
+
+  - id: C026
+    boundary: "intra-cycle concurrency"
+    condition: "Passes within a cycle run sequentially."
+    violation: >-
+      Concurrent passes multiply instantaneous usage-limit pressure and make the
+      backoff in C025 race against itself.
+    severity: should
+    rationale: >-
+      Blind personas are not ordered by anything, so concurrency is available and
+      would keep cycle time flat. It is declined for the rate-limit reason, not
+      because the personas share a working clone: they only read it, and the one
+      writer (git fetch) runs once per cycle before any pass.
+    classification_tier: null
+    affected_components: ["supervisor"]
+
+  - id: C027
+    boundary: "resumed-pass test coverage"
+    condition: >-
+      The persona suite drives at least two cycles, so a resumed invocation exists
+      to assert against, and asserts the persona system prompt on it.
+    violation: >-
+      The single most important property of the design (C001) has no automated
+      test, because a one-cycle harness never produces a resumed invocation.
+    severity: must
+    rationale: >-
+      test-providers.sh deliberately ends the loop after one cycle via a sleep
+      stub that exits non-zero, which is why FOLLOWUP_PROMPT's stanzas are
+      hand-checked today. The persona suite needs a sleep stub that succeeds once
+      and then fails.
+    classification_tier: null
+    affected_components: ["test-suites"]
+
+  - id: C015
+    boundary: "session persistence"
+    condition: "The (pr, persona) -> session_id map is persisted under the writable work dir at mode 600 and reloaded at startup."
+    violation: "A restart re-reviews every PR with every persona, so the existing single duplicate-comment burst becomes one burst per persona."
+    severity: should
+    rationale: "The in-memory-only trade-off was acceptable at one session per PR. Personas multiply its cost by the size of the enabled set."
+    classification_tier: null
+    affected_components: ["session-store", "supervisor"]
+
+  - id: C016
+    boundary: "stale persisted session ids"
+    condition: "A persisted session id that no longer resumes is handled by the existing failure path: drop it and start a fresh session for that pair next cycle."
+    violation: "A stale id from a previous container generation makes every pass for that pair fail forever."
+    severity: must
+    rationale: "Session transcripts may be gone while the map file survives. The existing run_pass failure path already does the right thing."
+    classification_tier: null
+    affected_components: ["session-store", "review-session-runner"]
+
+  - id: C017
+    boundary: "repo map grammar"
+    condition: "The repo map accepts a strictly-defined flat mapping subset (comments, blank lines, `persona: model`) and refuses anything else with a named error."
+    violation: "An ad hoc parser silently accepts something that means one thing to a human and another to the parser, on untrusted input."
+    severity: must
+    rationale: "A tiny auditable grammar in shell beats importing a YAML parser to read a file the reviewed repo controls. The accepted subset must be documented as such rather than presented as YAML support."
+    classification_tier: null
+    affected_components: ["persona-model-resolver"]
+
+  - id: C018
+    boundary: "existing safety boundaries"
+    condition: "All three hardening boundaries (unprivileged user, read-only seed repo, minimized token) and --strict-mcp-config are unchanged. Personas add no MCP surface and no new writable mount."
+    violation: "A feature about review breadth erodes the constraint that makes unattended YOLO mode acceptable."
+    severity: must
+    rationale: "The whole design of the project follows from the unattended-YOLO constraint."
+    classification_tier: AUTH
+    affected_components: ["supervisor", "provider-wiring", "github-egress"]
+
+  - id: C019
+    boundary: "host launcher portability"
+    condition: "claudebox.sh parses no map and holds no associative array; it passes persona selection and any operator map through as opaque strings."
+    violation: "The launcher breaks on macOS, where /bin/bash is 3.2."
+    severity: must
+    rationale: "Pre-existing project constraint; a persona-to-model map is exactly the shape that invites `declare -A` on the host side."
+    classification_tier: null
+    affected_components: ["launcher"]
+
+  - id: C020
+    boundary: "test coverage of the wiring"
+    condition: >-
+      test-providers.sh keeps asserting exactly one claude invocation per cycle by
+      pinning a single persona in its baseline environment. Multi-persona argv and
+      env assertions live in a separate suite with indexed capture.
+    violation: >-
+      Either the provider suite's one-invocation assumption silently starts
+      reading the first of several captures, or every case in it is rewritten for
+      no reason related to what it tests.
+    severity: must
+    rationale: >-
+      The provider suite exists to prove credential and model wiring, and it does
+      that with one invocation. Pinning one persona keeps that suite's diff to a
+      single baseline line and puts persona behaviour where it belongs.
+    classification_tier: null
+    affected_components: ["test-suites"]
+
+  - id: C021
+    boundary: "credential exposure"
+    condition: "No credential value appears in a persona prompt, a status comment, or a persisted session-map file."
+    violation: "A credential leaves the container in a PR comment, or lands on a host bind mount."
+    severity: must
+    rationale: "Pre-existing rule for ANTHROPIC_CUSTOM_HEADERS and the LiteLLM master key. Two new output channels are being added."
+    classification_tier: AUTH
+    affected_components: ["status-comment-writer", "session-store", "persona-registry"]
+
+  - id: C022
+    boundary: "session rotation"
+    condition: "MAX_PASSES_PER_SESSION counts passes per (pr, persona) pair."
+    violation: "Rotation fires after N passes across all personas, so a set of four personas rotates four times as often as configured."
+    severity: should
+    rationale: "The existing counter is per PR because a PR had one session."
+    classification_tier: null
+    affected_components: ["supervisor"]
+
+  - id: C023
+    boundary: "cadence expectations"
+    condition: "Documentation states that REVIEW_INTERVAL_SECONDS is the gap between cycles and that one cycle is (candidate PRs x enabled personas) sequential sessions."
+    violation: "An operator sets a 5-minute interval, observes 40-minute cycles, and concludes the loop is hung."
+    severity: should
+    rationale: "The interval already meant gap-after-work; personas make the work large enough that the distinction stops being academic."
+    classification_tier: null
+    affected_components: ["supervisor"]
