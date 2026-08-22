@@ -62,7 +62,8 @@ strip_surrounding_quotes \
   ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN OLLAMA_API_KEY \
   CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN \
   GITHUB_TOKEN GITHUB_REPOSITORY LINEAR_API_KEY \
-  PR_ASSIGNEE PR_IDS PR_SEARCH
+  PR_ASSIGNEE PR_IDS PR_SEARCH \
+  PERSONAS PERSONA_DIR LIMIT_BACKOFF_SECONDS
 
 # --- Required configuration ------------------------------------------------
 # Provider-specific credentials are validated in "Backend selection" below.
@@ -205,17 +206,26 @@ persona_meta() {
   ' "$PERSONA_DIR/$1.md"
 }
 
+# Echo persona $1's own body: everything after its frontmatter. Separate from
+# persona_prompt because resolve_personas has to judge the body on its own -- a
+# body-plus-shared-contract string is never empty, so a persona file that is
+# nothing but frontmatter would resolve and then review a PR with no identity at
+# all, signing findings with a label it has no angle of attack behind.
+persona_body() {
+  awk '
+    NR == 1 && $0 == "---" { fm = 1; next }
+    fm && $0 == "---" { fm = 0; body = 1; next }
+    body
+  ' "$PERSONA_DIR/$1.md"
+}
+
 # Echo persona $1's full system prompt: its body, then the shared contract, with
 # {{PERSONA}} replaced by its label. The label is validated in resolve_personas
 # to contain no slash, so it is safe as a sed replacement.
 persona_prompt() {
   local id="$1" label="${PERSONA_LABEL[$1]}"
   {
-    awk '
-      NR == 1 && $0 == "---" { fm = 1; next }
-      fm && $0 == "---" { fm = 0; body = 1; next }
-      body
-    ' "$PERSONA_DIR/$id.md"
+    persona_body "$id"
     printf '\n'
     cat "$PERSONA_DIR/_shared.md"
   } | sed "s|{{PERSONA}}|$label|g"
@@ -228,6 +238,11 @@ persona_prompt() {
 resolve_personas() {
   local avail="" f b tok raw
   [ -d "$PERSONA_DIR" ] || die "no persona definitions: PERSONA_DIR=$PERSONA_DIR is not a directory."
+  # Every persona body is appended to _shared.md, so without it persona_prompt's
+  # `cat` fails, pipefail fails the command substitution and set -e exits with
+  # nothing but cat's own message -- under --restart unless-stopped, a silent
+  # crash loop reachable by the documented "mount your own personas" workflow.
+  [ -f "$PERSONA_DIR/_shared.md" ] || die "no output contract: $PERSONA_DIR/_shared.md is missing; every persona body is appended to it."
   for f in "$PERSONA_DIR"/*.md; do
     [ -e "$f" ] || continue
     b="$(basename "$f" .md)"
@@ -258,16 +273,17 @@ resolve_personas() {
 
   # Resolve labels and prompts once, so a pass is a string lookup rather than
   # three file reads, and so a broken definition fails at startup.
-  local id label
+  local id label body
   for id in "${PERSONAS_LIST[@]}"; do
     label="$(persona_meta "$id" label)"
     case "$label" in
       '') die "persona '$id' has no label: in its frontmatter." ;;
       *[!A-Za-z0-9\ ._-]*) die "persona '$id' has a label with unexpected characters: '$label' (letters, digits, spaces, dot, underscore and hyphen only)." ;;
     esac
+    body="$(persona_body "$id")"
+    [ -n "${body//[[:space:]]/}" ] || die "persona '$id' has an empty prompt body."
     PERSONA_LABEL[$id]="$label"
     PERSONA_PROMPT[$id]="$(persona_prompt "$id")"
-    [ -n "${PERSONA_PROMPT[$id]}" ] || die "persona '$id' has an empty prompt body."
   done
   log "personas: ${PERSONAS_LIST[*]}"
 }

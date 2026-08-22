@@ -65,12 +65,13 @@ STUB
 # The probe. One dump file per invocation ($HOME/dump.N, N counting from 1),
 # holding the argv and the model-tier env. Reports a successful pass by emitting
 # stream-json with a per-invocation session id, so the supervisor records it and
-# the next cycle resumes it. STUB_FAIL_ON=N makes invocation N fail, and
-# STUB_FAIL_MODE picks how: `limit` writes a rate-limit message to stderr,
-# anything else writes an ordinary error. A failing invocation still emits its
-# init event first, because that is what really happens: the session exists and
-# then a request fails, which is exactly the case where throwing the session id
-# away is the wrong move.
+# the next cycle resumes it. STUB_FAIL_ON is a comma-separated list of invocation
+# numbers that fail (a single number is the common case), which is what lets a
+# case describe a RUN of failures, and a run with a success in the middle of it.
+# STUB_FAIL_MODE picks the wording written to stderr; see the case below. A
+# failing invocation still emits its init event first, because that is what
+# really happens: the session exists and then a request fails, which is exactly
+# the case where throwing the session id away is the wrong move.
 cat >"$BIN/claude" <<'STUB'
 #!/usr/bin/env bash
 n=$(( $(cat "$HOME/calls" 2>/dev/null || echo 0) + 1 ))
@@ -83,20 +84,50 @@ echo "$n" >"$HOME/calls"
     if [ -n "${!v+set}" ]; then echo "ENV $v=${!v}"; else echo "ENV $v=<unset>"; fi
   done
 } >"$HOME/dump.$n"
-if [ "${STUB_FAIL_ON:-0}" = "$n" ]; then
-  printf '{"type":"system","subtype":"init","session_id":"S%s"}\n' "$n"
-  if [ "${STUB_FAIL_MODE:-limit}" = "limit" ]; then
-    echo "API Error: 429 rate limit exceeded" >&2
-  else
-    echo "API Error: 400 invalid request" >&2
-  fi
-  exit 1
-fi
+case ",${STUB_FAIL_ON:-},"  in
+  *",$n,"*)
+    # STUB_NO_SESSION suppresses the init event, which is the one case where the
+    # supervisor really has no session id to keep: the request died before the
+    # session existed.
+    [ -n "${STUB_NO_SESSION:-}" ] || printf '{"type":"system","subtype":"init","session_id":"S%s"}\n' "$n"
+    case "${STUB_FAIL_MODE:-limit}" in
+      # Hand-written, and deliberately so: it is the shape the classifier was
+      # first written against, not evidence about any upstream.
+      limit)    echo "API Error: 429 rate limit exceeded" >&2 ;;
+      # CAPTURED, NOT COMPOSED. This is Claude Code's own message when the
+      # account allowance is exhausted, epoch and all -- the same string the
+      # design review quoted when it asked for a real fixture here. Do not
+      # paraphrase it, do not tidy the pipe: an upstream rewording is precisely
+      # what this fixture exists to turn red.
+      captured) echo "Claude AI usage limit reached|1755772800" >&2 ;;
+      # The near-miss wording that motivated the `limit reached` alternative in
+      # USAGE_LIMIT_RE: no `rate limit`, no `usage limit`, no 429.
+      window)   echo "5-hour limit reached, resets at 3pm" >&2 ;;
+      # Limit-SHAPED but outside the pattern on purpose: a spend cap, not a rate
+      # cap. This is the classifier's negative direction, and it must stay a
+      # miss if the pattern grows further.
+      nearmiss) echo "API Error: 403 Your credit balance is too low to continue" >&2 ;;
+      *)        echo "API Error: 400 invalid request" >&2 ;;
+    esac
+    exit 1 ;;
+esac
 printf '{"type":"system","subtype":"init","session_id":"S%s"}\n' "$n"
 printf '{"type":"result","subtype":"success","session_id":"S%s","result":"ok"}\n' "$n"
 exit 0
 STUB
 chmod +x "$BIN"/*
+
+# Persona directories built to be broken, for the startup checks that only a
+# mounted PERSONA_DIR can reach. The shipped personas/ cannot express either of
+# these, and both used to be silent: the first crash-looped the container with
+# nothing but cat's own message, the second resolved and reviewed a PR with no
+# identity behind the label it signed.
+NO_SHARED="$WORK/personas-no-shared"; mkdir -p "$NO_SHARED"
+cp "$SCRIPT_DIR/personas/red_team.md" "$NO_SHARED/red_team.md"
+
+HOLLOW="$WORK/personas-hollow"; mkdir -p "$HOLLOW"
+cp "$SCRIPT_DIR/personas/_shared.md" "$HOLLOW/_shared.md"
+printf -- '---\nlabel: Hollow\nsuccess: Nothing at all.\n---\n' >"$HOLLOW/hollow.md"
 
 PASS=0; FAIL=0; SKIP=0
 FAILED_LABELS=""
@@ -234,6 +265,14 @@ refuses "selection: a duplicate name refuses at startup" \
 refuses "selection: a missing persona directory refuses at startup" \
   "no persona definitions" \
   -- PERSONA_DIR=/nonexistent
+
+refuses "selection: a persona directory with no output contract refuses at startup" \
+  "no output contract" \
+  -- PERSONA_DIR="$NO_SHARED" PERSONAS=red_team
+
+refuses "selection: a persona that is only frontmatter refuses at startup" \
+  "empty prompt body" \
+  -- PERSONA_DIR="$HOLLOW" PERSONAS=hollow
 
 # --- per-persona passes -----------------------------------------------------
 cycle "passes: each persona gets its own pass, in the selected order" \
