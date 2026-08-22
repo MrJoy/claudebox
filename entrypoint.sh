@@ -983,12 +983,13 @@ git -C "$WORK_REPO" remote set-url origin "https://github.com/${GITHUB_REPOSITOR
 log "Reviewer ready. repo=$GITHUB_REPOSITORY provider=$PROVIDER_LABEL model=$REVIEW_MODEL interval=${REVIEW_INTERVAL_SECONDS}s"
 
 # --- Review loop -----------------------------------------------------------
-# One Claude session PER PR. Each cycle the supervisor fetches refs, enumerates
-# the candidate PRs (per the active selector), and reviews each in its own
-# session: a new session for a PR not seen yet, or --resume of that PR's session
-# (tracked in the in-memory PR_SESSION map) so Claude won't re-raise findings on
-# it. /loop can't be used here because it needs a live interactive session,
-# which headless `-p` mode isn't. Headless + all permissions skipped is safe:
+# One Claude session PER (PR, PERSONA) PAIR. Each cycle the supervisor fetches
+# refs, enumerates the candidate PRs (per the active selector), and reviews each
+# with each enabled persona in its own session: a new session for a pair not seen
+# yet, or --resume of that pair's session (tracked in the in-memory PR_SESSION
+# map) so Claude won't re-raise findings it already raised on that pair. /loop
+# can't be used here because it needs a live interactive session, which headless
+# `-p` mode isn't. Headless + all permissions skipped is safe:
 # unprivileged user, minimized token, read-only seed.
 cd "$WORK_REPO"
 # Per-(PR, persona) state: session id and successful-pass count, keyed by
@@ -997,6 +998,14 @@ cd "$WORK_REPO"
 # single-session design had, multiplied by the size of the enabled set.
 declare -A PR_SESSION=()
 declare -A PR_PASSES=()
+# The (PR, persona) pair the next cycle starts at, so a cycle cut short by a
+# limit or by a run of failures does not leave the trailing pairs unreviewed
+# forever. Empty means "start at the first pair". In memory, like the maps above.
+RESUME_AT=""
+# How many failed passes in a row -- limits excepted, they end the cycle on the
+# first one -- end a cycle. Not operator-configurable: it is a guard against a
+# dead provider, not a tuning knob.
+MAX_CONSECUTIVE_FAILURES=3
 
 # Pretty-print Claude's stream-json (one JSON event per line) into readable,
 # live log lines: assistant text, tool calls, tool results, and the final
@@ -1051,12 +1060,22 @@ is_usage_limit() {
   grep -qiE "$USAGE_LIMIT_RE" "$1"
 }
 
+# Echo the first line of $1 that read as a limit. The classifier scans the whole
+# stderr while the log tails only its last few lines, so a limit reported early
+# in a long stderr is classified right and invisible to whoever reads the log --
+# which is the difference between a legible stall and an apparent hang.
+usage_limit_line() {
+  grep -im1 -E "$USAGE_LIMIT_RE" "$1"
+}
+
 RUN_PASS_SESSION_ID=""
 RUN_PASS_LIMITED=0
+RUN_PASS_LIMIT_LINE=""
 run_pass() {
   local prompt="$1" sid="$2" persona="$3" rc errfile rawfile got
   RUN_PASS_SESSION_ID="$sid"
   RUN_PASS_LIMITED=0
+  RUN_PASS_LIMIT_LINE=""
   errfile="$(mktemp)"; rawfile="$(mktemp)"
   # set +e around the pipeline so a formatter hiccup can't abort the script and
   # so we can read Claude's own exit code via PIPESTATUS[0] (not tee's/jq's).
@@ -1083,7 +1102,14 @@ run_pass() {
   got="$(jq -r -R '(fromjson? // empty) | select(.session_id) | .session_id' "$rawfile" 2>/dev/null | tail -n 1 || true)"
   [ -n "$got" ] && RUN_PASS_SESSION_ID="$got"
   if [ "$rc" -ne 0 ]; then
-    if is_usage_limit "$errfile"; then RUN_PASS_LIMITED=1; fi
+    if is_usage_limit "$errfile"; then
+      RUN_PASS_LIMITED=1
+      # One line, and only the line that matched: claude's stderr is not a
+      # trusted-to-be-credential-free stream, so the log gets the smallest slice
+      # that explains the stall. Truncated for the same reason.
+      RUN_PASS_LIMIT_LINE="$(usage_limit_line "$errfile" || true)"
+      RUN_PASS_LIMIT_LINE="${RUN_PASS_LIMIT_LINE:0:400}"
+    fi
     log "WARN: claude exited $rc:"; tail -n 5 "$errfile" >&2
     rm -f "$errfile" "$rawfile"; return "$rc"
   fi
@@ -1115,42 +1141,109 @@ while true; do
   # instantaneous usage-limit pressure. Personas are blind to each other by
   # design (see personas/_shared.md), so nothing about the order is semantic —
   # but it is stable, so a cycle cut short is interpretable.
+  #
+  # The pairs are flattened into one list so that a cycle cut short can resume
+  # where it stopped. A cycle that always restarted at the first pair would,
+  # under a limit that only allows a few passes per backoff window, review the
+  # leading pairs forever and the trailing ones never — not later, never. The
+  # persona multiplier is what turns that from unlucky into routine. RESUME_AT
+  # holds the pair to start at and is in memory only: surviving a container
+  # restart is deferred with the rest of the persisted state.
+  pairs=()
   for pr in ${prs[@]+"${prs[@]}"}; do
-    for persona in "${PERSONAS_LIST[@]}"; do
-      key="$pr:$persona"
-      sid="${PR_SESSION[$key]:-}"
-      if [ -z "$sid" ]; then
-        log "Reviewing PR #$pr as $persona (new session)..."
-        prompt="$(render_prompt "$REVIEW_PROMPT" "$pr")"
-      else
-        log "Reviewing PR #$pr as $persona (resuming session $sid)..."
-        prompt="$(render_prompt "$FOLLOWUP_PROMPT" "$pr")"
-      fi
+    for persona in "${PERSONAS_LIST[@]}"; do pairs+=("$pr:$persona"); done
+  done
+  npairs=${#pairs[@]}
 
-      if run_pass "$prompt" "$sid" "$persona"; then
-        PR_SESSION[$key]="$RUN_PASS_SESSION_ID"
-        PR_PASSES[$key]=$(( ${PR_PASSES[$key]:-0} + 1 ))
-        log "PR #$pr [$persona] review complete (session ${PR_SESSION[$key]}, pass ${PR_PASSES[$key]})."
-        # Rotate this pair's session once its cap is hit, to bound context growth.
-        if [ "$MAX_PASSES_PER_SESSION" -gt 0 ] && [ "${PR_PASSES[$key]}" -ge "$MAX_PASSES_PER_SESSION" ]; then
-          log "PR #$pr [$persona] reached MAX_PASSES_PER_SESSION=$MAX_PASSES_PER_SESSION; rotating its session next cycle."
-          unset 'PR_SESSION[$key]'
-          PR_PASSES[$key]=0
-        fi
-      elif [ "$RUN_PASS_LIMITED" = 1 ]; then
-        # Keep the session. Abandon the rest of the cycle rather than walking the
-        # remaining personas into the same wall, and back off before the next one.
-        [ -n "$RUN_PASS_SESSION_ID" ] && PR_SESSION[$key]="$RUN_PASS_SESSION_ID"
-        log "WARN: PR #$pr [$persona] hit a usage or rate limit; keeping its session and ending this cycle early."
-        limited=1
-        break 2
-      else
-        log "WARN: PR #$pr [$persona] review failed; starting a fresh session for it next cycle."
+  start=0
+  if [ -n "$RESUME_AT" ] && [ "$npairs" -gt 0 ]; then
+    # A RESUME_AT that no longer exists (its PR closed, the persona set changed)
+    # falls back to the head of the list rather than skipping a cycle.
+    for ((i = 0; i < npairs; i++)); do
+      if [ "${pairs[$i]}" = "$RESUME_AT" ]; then start=$i; break; fi
+    done
+    [ "$start" -eq 0 ] || log "Starting this cycle at ${pairs[$start]}, where the last one was cut."
+  fi
+
+  # Consecutive failures that were NOT limits: connection refused, a dead
+  # translator, a gateway 502. Each one drops its pair's session, so the next
+  # cycle re-reads that PR from scratch and re-posts findings it already posted.
+  # Walking the whole list into a dead endpoint therefore costs a duplicate-
+  # comment burst per pair; abandoning after a few is strictly cheaper. Reset by
+  # any successful pass, and counted within a cycle only.
+  consec_fail=0
+  cut=-1 cut_i=-1
+  for ((i = 0; i < npairs; i++)); do
+    idx=$(( (start + i) % npairs ))
+    key="${pairs[$idx]}"
+    pr="${key%%:*}"; persona="${key#*:}"
+    sid="${PR_SESSION[$key]:-}"
+    if [ -z "$sid" ]; then
+      log "Reviewing PR #$pr as $persona (new session)..."
+      prompt="$(render_prompt "$REVIEW_PROMPT" "$pr")"
+    else
+      log "Reviewing PR #$pr as $persona (resuming session $sid)..."
+      prompt="$(render_prompt "$FOLLOWUP_PROMPT" "$pr")"
+    fi
+
+    if run_pass "$prompt" "$sid" "$persona"; then
+      consec_fail=0
+      PR_SESSION[$key]="$RUN_PASS_SESSION_ID"
+      PR_PASSES[$key]=$(( ${PR_PASSES[$key]:-0} + 1 ))
+      log "PR #$pr [$persona] review complete (session ${PR_SESSION[$key]}, pass ${PR_PASSES[$key]})."
+      # Rotate this pair's session once its cap is hit, to bound context growth.
+      if [ "$MAX_PASSES_PER_SESSION" -gt 0 ] && [ "${PR_PASSES[$key]}" -ge "$MAX_PASSES_PER_SESSION" ]; then
+        log "PR #$pr [$persona] reached MAX_PASSES_PER_SESSION=$MAX_PASSES_PER_SESSION; rotating its session next cycle."
         unset 'PR_SESSION[$key]'
         PR_PASSES[$key]=0
       fi
-    done
+    elif [ "$RUN_PASS_LIMITED" = 1 ]; then
+      # Keep the session. Abandon the rest of the cycle rather than walking the
+      # remaining pairs into the same wall, and back off before the next one.
+      if [ -n "$RUN_PASS_SESSION_ID" ]; then
+        PR_SESSION[$key]="$RUN_PASS_SESSION_ID"
+        log "WARN: PR #$pr [$persona] hit a usage or rate limit; keeping its session and ending this cycle early."
+      else
+        log "WARN: PR #$pr [$persona] hit a usage or rate limit before it had a session; ending this cycle early."
+      fi
+      [ -n "$RUN_PASS_LIMIT_LINE" ] && log "  limit reported by claude: $RUN_PASS_LIMIT_LINE"
+      limited=1
+      cut=$idx cut_i=$i
+      break
+    else
+      log "WARN: PR #$pr [$persona] review failed; starting a fresh session for it next cycle."
+      unset 'PR_SESSION[$key]'
+      PR_PASSES[$key]=0
+      consec_fail=$(( consec_fail + 1 ))
+      if [ "$consec_fail" -ge "$MAX_CONSECUTIVE_FAILURES" ]; then
+        # Not a limit, so no backoff: the next cycle comes at the ordinary
+        # interval, and starts where this one stopped.
+        log "WARN: $consec_fail passes in a row failed for reasons other than a limit; the provider looks unhealthy. Abandoning this cycle."
+        cut=$idx cut_i=$i
+        break
+      fi
+    fi
   done
+
+  # Whatever cut the cycle short, the next one starts at the pair after it and
+  # the pairs this one never reached are named, so an operator reads a stall in
+  # the log instead of inferring one from missing comments.
+  if [ "$cut" -ge 0 ]; then
+    RESUME_AT="${pairs[$(( (cut + 1) % npairs ))]}"
+    skipped=()
+    for ((i = cut_i + 1; i < npairs; i++)); do skipped+=("${pairs[$(( (start + i) % npairs ))]}"); done
+    if [ "${#skipped[@]}" -gt 0 ]; then
+      log "Not reviewed this cycle: ${skipped[*]}. The next cycle starts at $RESUME_AT."
+    else
+      log "The next cycle starts at $RESUME_AT."
+    fi
+  elif [ "$npairs" -gt 0 ]; then
+    # A cycle that walked the whole list has nothing left to resume. A cycle with
+    # no pairs at all keeps the resume point instead of clearing it: enumeration
+    # failures are swallowed above, so "no candidate PRs" can mean gh had a bad
+    # minute, and that must not silently send the next cycle back to the head.
+    RESUME_AT=""
+  fi
 
   if [ "$limited" = 1 ]; then
     log "Backing off ${LIMIT_BACKOFF_SECONDS}s after a usage limit..."

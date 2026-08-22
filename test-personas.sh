@@ -385,6 +385,53 @@ cycle "limits: an unrecognised failure degrades to the ordinary path" \
      LOG:"starting a fresh session for it next cycle" \
      NOLOG:"Backing off"
 
+# The matched line itself reaches the log. is_usage_limit scans the whole stderr
+# while the WARN line tails only its last few, so without this a limit reported
+# early in a long stderr is classified right and invisible.
+cycle "limits: the line that read as a limit is logged" \
+  PERSONAS=red_team STUB_FAIL_ON=1 STUB_FAIL_MODE=captured STUB_MAX_CYCLES=1 \
+  -- LOG:"limit reported by claude: Claude AI usage limit reached|1755772800"
+
+# On a genuinely first pass there is no session to keep, and the log used to say
+# there was.
+cycle "limits: a limit before any session does not claim to keep one" \
+  PERSONAS=red_team STUB_FAIL_ON=1 STUB_FAIL_MODE=limit STUB_NO_SESSION=1 STUB_MAX_CYCLES=1 \
+  -- LOG:"before it had a session" \
+     NOLOG:"keeping its session"
+
+# --- cycles cut short --------------------------------------------------------
+# A cycle that always restarted at the first pair would, under a limit that only
+# allows a few passes per backoff window, review the leading pairs forever and
+# the trailing ones never.
+cycle "resume: the next cycle starts at the pair after the one a limit cut" \
+  PERSONAS=red_team,sage,sme STUB_FAIL_ON=2 STUB_FAIL_MODE=limit \
+  -- CALLS:5 \
+     LOG:"Not reviewed this cycle: 1:sme" \
+     LOG:"Starting this cycle at 1:sme, where the last one was cut." \
+     ARGV:3:"You are a Subject Matter Expert" \
+     NOARGV:3:"--resume" \
+     ARGV:4:"--resume S1" \
+     ARGV:5:"--resume S2"
+
+# Three in a row that are not limits means the provider is unhealthy, not that
+# these particular pairs are cursed. Walking the rest of the list into it costs
+# one duplicate-comment burst per pair, since each failure drops its session.
+cycle "failures: a run of non-limit failures abandons the cycle at the ordinary interval" \
+  PR_IDS=1,2 PERSONAS=red_team,sage,sme STUB_FAIL_ON=2,3,4 STUB_FAIL_MODE=other STUB_MAX_CYCLES=1 \
+  -- CALLS:4 \
+     LOG:"3 passes in a row failed for reasons other than a limit" \
+     LOG:"Not reviewed this cycle: 2:sage 2:sme" \
+     LOG:"The next cycle starts at 2:sage" \
+     NOLOG:"Backing off"
+
+# ... and the counter is consecutive, not cumulative: two failures, a success,
+# another failure is an ordinary bad day, not a dead endpoint.
+cycle "failures: a success resets the run, so scattered failures do not abandon" \
+  PERSONAS=red_team,sage,sme,adversarial STUB_FAIL_ON=1,2,4 STUB_FAIL_MODE=other STUB_MAX_CYCLES=1 \
+  -- CALLS:4 \
+     NOLOG:"Abandoning this cycle" \
+     NOLOG:"Not reviewed this cycle"
+
 printf '\n%d passed, %d failed' "$PASS" "$FAIL"
 [ "$SKIP" -gt 0 ] && printf ', %d skipped' "$SKIP"
 printf '\n'
