@@ -1043,8 +1043,12 @@ format_stream() {
 # falls through to the ordinary path (drop the session, carry on), which is
 # exactly today's behaviour. A false positive keeps a session that will fail
 # again next cycle and be dropped then. Neither wedges the loop.
+# `limit reached` and `reached your limit` are here because `limit` on its own is
+# only reachable via `rate.?limit` and `usage limit`, so the near-miss wordings
+# (`5-hour limit reached`, `you have reached your limit`) matched nothing.
+USAGE_LIMIT_RE='rate.?limit|usage limit|limit reached|reached your limit|too many requests|quota|overloaded|(^|[^0-9])(429|529)([^0-9]|$)'
 is_usage_limit() {
-  grep -qiE 'rate.?limit|usage limit|too many requests|quota|overloaded|(^|[^0-9])(429|529)([^0-9]|$)' "$1"
+  grep -qiE "$USAGE_LIMIT_RE" "$1"
 }
 
 RUN_PASS_SESSION_ID=""

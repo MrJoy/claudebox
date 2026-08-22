@@ -362,9 +362,27 @@ cycle "limits: the rest of the cycle is abandoned, not pushed through" \
   -- CALLS:2 \
      LOG:"ending this cycle early"
 
+cycle "limits: a real captured limit message is classified as a limit" \
+  PERSONAS=red_team STUB_FAIL_ON=1 STUB_FAIL_MODE=captured \
+  -- CALLS:2 \
+     ARGV:2:"--resume S1" \
+     LOG:"hit a usage or rate limit" \
+     LOG:"Backing off"
+
+cycle "limits: the near-miss window wording is classified as a limit" \
+  PERSONAS=red_team STUB_FAIL_ON=1 STUB_FAIL_MODE=window \
+  -- CALLS:2 \
+     ARGV:2:"--resume S1" \
+     LOG:"Backing off"
+
+# The classifier's negative direction: limit-shaped, deliberately outside the
+# pattern. If the pattern ever grows wide enough to swallow a spend-cap error,
+# this goes red rather than the loop quietly backing off for hours on a failure
+# that no amount of waiting fixes.
 cycle "limits: an unrecognised failure degrades to the ordinary path" \
-  PERSONAS=red_team STUB_FAIL_ON=1 STUB_FAIL_MODE=other STUB_MAX_CYCLES=1 \
+  PERSONAS=red_team STUB_FAIL_ON=1 STUB_FAIL_MODE=nearmiss STUB_MAX_CYCLES=1 \
   -- CALLS:1 \
+     LOG:"starting a fresh session for it next cycle" \
      NOLOG:"Backing off"
 
 printf '\n%d passed, %d failed' "$PASS" "$FAIL"
