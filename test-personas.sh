@@ -283,10 +283,28 @@ cycle "passes: each persona gets its own pass, in the selected order" \
      ARGV:3:"You are a Red Team security reviewer" \
      ARGV:4:"You are a Sage"
 
+# Both assertions are adjacency assertions, the same technique the --resume ones
+# use. Asserting the two strings separately would pass just as happily with the
+# persona concatenated onto the task prompt, which is the arrangement this case
+# exists to rule out: the flag has to be followed by the persona, and the `--`
+# that ends the flags has to be followed by the task prompt with nothing wedged
+# in between.
 cycle "passes: the persona travels in the system prompt, not the task prompt" \
   PERSONAS=red_team \
-  -- ARGV:1:"--append-system-prompt" \
-     ARGV:1:"Perform a thorough review of pull request #1"
+  -- ARGV:1:"--append-system-prompt You are a Red Team security reviewer" \
+     ARGV:1:"-- Perform a thorough review of pull request #1"
+
+# The persona-specific signature lives in the system prompt (see the case above),
+# so a default prompt carrying its own signature sentence would contradict it and
+# the winner would be model-dependent. Asserted on both a new and a resumed pass,
+# because DEFAULT_PROMPT and DEFAULT_FOLLOWUP each had the sentence.
+cycle "prompts: the defaults carry no signature instruction of their own" \
+  PERSONAS=red_team \
+  -- CALLS:2 \
+     NOARGV:1:"Sign your comments with '-claudebox'." \
+     NOARGV:2:"Sign your comments with '-claudebox'." \
+     ARGV:1:"-claudebox (Red Team)" \
+     ARGV:2:"-claudebox (Red Team)"
 
 cycle "passes: the persona label is substituted into the shared contract" \
   PERSONAS=sme \

@@ -17,7 +17,6 @@ coverage of anything. Do not suppress a finding because another persona reached 
 similar conclusion from a different direction: a thing that two angles of attack
 both hit is more important than a thing only one of them hit, not less. Reaching
 your own verdict from your own angle is the entire reason you are a separate
-reviewer, and a separate pass exists to reconcile what the personas collectively
-said.
+reviewer, so report what your angle finds and let the overlap stand.
 
 Human replies to your own findings are worth reading and worth answering.
