@@ -139,13 +139,17 @@ claude -p --resume "${PR_SESSION[$pr:$persona]}" --output-format stream-json --v
   "${CLAUDE_MCP_ARGS[@]}" -- "${FOLLOWUP_PROMPT//\{\{PR\}\}/$pr}"
 ```
 
-Each pass streams as `stream-json`; the entrypoint pretty-prints the events live to its log (so `docker logs -f` shows the play-by-play) and recovers the session id from the stream to resume that PR next cycle.
+Each pass streams as `stream-json`; the entrypoint pretty-prints the events live to its log (so `docker logs -f` shows the play-by-play) and recovers the session id from the stream to resume that pair next cycle.
 
-The entrypoint shell is the supervisor: it controls cadence (`git fetch`, enumerate PRs, review each sequentially, then sleep), keeps an in-memory PR→session map, and starts a fresh session for a PR if its pass fails (so it may re-comment once on that PR). Claude itself uses `gh`/`git` to inspect the PR, check out the latest commit, and post one comment per finding. `MAX_PASSES_PER_SESSION` rotates a PR's session after N passes to bound its context growth (per PR).
+The entrypoint shell is the supervisor: it controls cadence (`git fetch`, enumerate PRs, review each sequentially, then sleep), keeps an in-memory (PR, persona)→session map, and starts a fresh session for a pair if its pass fails (so that persona may re-comment once on that PR). Claude itself uses `gh`/`git` to inspect the PR, check out the latest commit, and post one comment per finding. `MAX_PASSES_PER_SESSION` rotates a pair's session after N passes to bound its context growth (per pair).
 
 `--append-system-prompt` is passed on *both* forms, which is not redundant: the flag does not survive `--resume`. Passed only on the first pass, cycle one would be adversarial and every later cycle would be a generic reviewer wearing the persona's name in the log.
 
-A pass that fails on a usage or rate limit is treated differently from one that fails for any other reason: it keeps its session, ends the cycle early instead of walking the remaining personas into the same limit, and waits `LIMIT_BACKOFF_SECONDS` (default 1800). Dropping the session there would make the next attempt re-read the whole PR and re-post findings already posted, spending more of the allowance that just ran out.
+A pass that fails on a usage or rate limit is treated differently from one that fails for any other reason: it keeps its session, ends the cycle early instead of walking the remaining pairs into the same limit, and waits `LIMIT_BACKOFF_SECONDS` (default 1800). Dropping the session there would make the next attempt re-read the whole PR and re-post findings already posted, spending more of the allowance that just ran out.
+
+A cycle cut short does not simply start over. The reviewer remembers the pair it was cut at and the next cycle begins at the pair *after* it, wrapping around, so an allowance that only covers a few passes per backoff window still works its way through the whole set instead of reviewing the first few pairs forever. The pairs a cut skipped are named in the log. That memory is in-process, so a container restart loses it and the next cycle starts at the first pair.
+
+Three failures in a row that are **not** limits — connection refused, a dead translator, a gateway 502 — also end the cycle, with a log line saying so, on the ordinary `REVIEW_INTERVAL_SECONDS` rather than the backoff. Each such failure drops its pair's session, so walking the rest of the list into a dead endpoint would cost a duplicate-comment burst per pair. Any successful pass resets the count.
 
 > Why not `/loop`? Claude Code's `/loop` needs a live *interactive* session — scheduled wake-ups only fire while a session is running and idle, and headless `-p` mode exits after each response. The shell loop + `--resume` gives the same continuous, context-retaining behavior while staying headless and crash-safe.
 
@@ -353,14 +357,14 @@ Optional:
 - `REVIEW_MODEL` (provider-specific default; **required** for `PROVIDER=custom` and `PROVIDER=cloudflare`)
 - `ANTHROPIC_CUSTOM_HEADERS` (optional on any provider; **required** for `GATEWAY_UPSTREAM=bedrock`/`vertex`) — extra request headers, `Name: value` per line
 - `REVIEW_INTERVAL_SECONDS`
-- `REVIEW_PROMPT` (a PR's first review, new session; uses the `{{PR}}` token)
-- `FOLLOWUP_PROMPT` (a PR's resumed review; uses the `{{PR}}` token)
+- `REVIEW_PROMPT` (a (PR, persona) pair's first review, new session; uses the `{{PR}}` token)
+- `FOLLOWUP_PROMPT` (a pair's resumed review; uses the `{{PR}}` token)
 
   > The default prompts tell the reviewer how to work within the minimized token: pass an explicit `--json` field list to `gh pr view`, and don't use `gh pr checks` at all. Both need a permission a fine-grained PAT can't be granted — a bare `gh pr view` implicitly fetches `statusCheckRollup` and fails outright, which reads like a broken token rather than a missing permission. **If you override `REVIEW_PROMPT`/`FOLLOWUP_PROMPT` you get your text verbatim, so carry those constraints over yourself** (or add them via the `_SUFFIX` variables, which apply to overrides too). CI status is simply unavailable to the reviewer; it judges the code, not the build.
   >
   > They also carry a test-quality stanza, for a failure mode plain "review the tests" doesn't catch: a PR whose new tests pass unchanged with the production change reverted. The stanza turns that into a procedure the reviewer runs per added test — work out which lines of the non-test change the test depends on, mentally revert them, and ask whether it would still pass — plus the related mutations (a moved boundary, a negated condition, a deleted error branch, a constant return), and the as-implemented smells: assertions that restate the implementation, recompute the expected value the same way the code does, assert a mock's own stubbed return, or freeze current output as a snapshot. Overriding the prompt drops this too.
 - `REVIEW_PROMPT_SUFFIX` / `FOLLOWUP_PROMPT_SUFFIX` (append extra instructions to the corresponding prompt — default or overridden; also supports the `{{PR}}` token)
-- `MAX_PASSES_PER_SESSION` (rotate a PR's session to a fresh one every N passes, per PR; `0` = never)
+- `MAX_PASSES_PER_SESSION` (rotate a session to a fresh one every N passes, per (PR, persona) pair; `0` = never)
 - `LINEAR_API_KEY` (optional Linear ticket context; use a **read-only** key — see [Linear ticket context](#linear-ticket-context))
 - `--export-sessions` (launcher flag, not an env var) — export review transcripts to the host and align the session folder; see [Exporting review sessions to your host](#exporting-review-sessions-to-your-host)
 
@@ -375,7 +379,7 @@ Set **exactly one** of these (or pass the matching launcher flag). Zero or more 
 | `PR_IDS=12,15,20` | `--prs 12,15,20` | exactly those PR numbers |
 | `PR_SEARCH=is:open label:x` | `--search "…"` | PRs matching a gh search query (you control state) |
 
-`REVIEW_PROMPT`/`FOLLOWUP_PROMPT` use a `{{PR}}` token (substituted with the PR number), and `MAX_PASSES_PER_SESSION` applies per PR.
+`REVIEW_PROMPT`/`FOLLOWUP_PROMPT` use a `{{PR}}` token (substituted with the PR number), and `MAX_PASSES_PER_SESSION` applies per (PR, persona) pair.
 
 ### Personas
 
@@ -405,5 +409,5 @@ The entrypoint writes the key into a generated MCP config at `$HOME/mcp.json` (m
 
 - **Model names move fast, and there is no fallback.** `REVIEW_MODEL` must name a model your chosen provider actually serves; a wrong name is a hard error, not a silent fall-through to some other model. For Ollama the `:cloud` suffix is stable but exact versions change — browse [Ollama's model registry](https://ollama.com/search?c=cloud). For Anthropic, see the current model IDs in the [Anthropic docs](https://docs.anthropic.com/en/docs/about-claude/models).
 - The token is the real safety boundary. Verify it has no write access beyond PR comments before running unattended.
-- Because each PR is reviewed in its own resumed session, the reviewer remembers what it already flagged on that PR and won't re-raise the same findings. If a PR's pass fails it starts a fresh session for that PR next cycle (losing that in-session memory), so it may occasionally re-comment on it after a failure — harmless, just noise. The PR→session map is in-memory, so a container restart can likewise re-review each PR once.
-- Each PR's session context grows over time. Set `MAX_PASSES_PER_SESSION` to rotate a PR's session to a fresh one every N passes and bound that growth (the trade-off: the new session forgets that PR's earlier passes, so it may re-raise findings once after a rotation). Left at `0`, each PR's session runs unbounded until the container restarts.
+- Because each (PR, persona) pair is reviewed in its own resumed session, each persona remembers what it already flagged on that PR and won't re-raise the same findings. If a pair's pass fails it starts a fresh session for that pair next cycle (losing that in-session memory), so that persona may occasionally re-comment after a failure — harmless, just noise. The session map is in-memory, so a container restart can likewise re-review each PR once **per persona**, which is the same multiplier the interval note above warns about.
+- Each session's context grows over time. Set `MAX_PASSES_PER_SESSION` to rotate a (PR, persona) pair's session to a fresh one every N passes and bound that growth (the trade-off: the new session forgets that pair's earlier passes, so that persona may re-raise findings once after a rotation). Left at `0`, every pair's session runs unbounded until the container restarts.
