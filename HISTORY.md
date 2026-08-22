@@ -1,6 +1,6 @@
 # History
 
-## 0.0.6 - 2026-08-21
+## 0.1.0 - 2026-08-21
 
 * Reviews now run as **adversarial personas** rather than as one generalist reviewer, borrowed from [advocate](https://github.com/jmcentire/advocate) — Red Team (survive assault), Adversarial (hold under challenge), Sage (simplify), Subject Matter Expert (peer sign-off), and opt-in User (navigate it cold) and Good Friend (the 3am test). advocate itself cannot be used here: it calls provider APIs directly, so it cannot run against a fixed-price plan, which is the whole reason claudebox drives the CLI. Definitions ship as files (`personas/*.md`, `PERSONA_DIR`) imported by a committed script, with advocate's JSON output contract stripped (claudebox posts `gh` comments) and its "silence from you is a strong signal" rule kept. `--persona` / `PERSONAS` selects the set; an unknown name is a startup error, because a typo that silently narrowed the review to one persona would read as a working run.
 * One session per PR **per persona** (`PR_SESSION` keyed `pr:persona`, so `MAX_PASSES_PER_SESSION` rotates per pair). The persona travels in `--append-system-prompt`, which keeps an operator-supplied `REVIEW_PROMPT` verbatim, and is re-passed on every single pass: measured, the flag does **not** survive `--resume`, so passing it once would make cycle one adversarial and every cycle after it the old generalist wearing a persona's name in the log.

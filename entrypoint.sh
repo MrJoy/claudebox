@@ -129,12 +129,18 @@ pr_truthy() {
 # unquoted expansion does the comma->space splitting.
 parse_pr_ids() {
   local raw="$1" tok
+  # set -f for the split: the expansion has to stay unquoted to split on the
+  # separators, and unquoted means pathname expansion too, so a value of `*`
+  # would silently become whatever happens to be in the current directory
+  # rather than failing as the malformed input it is. Restored right after.
+  set -f
   for tok in $(printf '%s' "$raw" | tr ',' ' '); do
     case "$tok" in
       ''|*[!0-9]*) die "PR_IDS contains a non-numeric value: '$tok' (expected e.g. 12,15,20)" ;;
       *) printf '%s\n' "$tok" ;;
     esac
   done
+  set +f
 }
 
 # Determine the active selector; die unless EXACTLY ONE is provided. Sets the
@@ -256,6 +262,10 @@ resolve_personas() {
     all) raw="$(printf '%s' "$avail")" ;;
   esac
 
+  # set -f for the split, for the same reason as parse_pr_ids: unquoted is what
+  # splits on the separators, and unquoted also globs, so PERSONAS=* would be
+  # resolved against the current directory instead of dying as an unknown name.
+  set -f
   for tok in $(printf '%s' "$raw" | tr ',' ' '); do
     case " $RESERVED_PERSONAS " in
       *" $tok "*) die "persona '$tok' is reserved and cannot be selected." ;;
@@ -269,6 +279,7 @@ resolve_personas() {
     esac
     PERSONAS_LIST+=("$tok")
   done
+  set +f
   [ "${#PERSONAS_LIST[@]}" -gt 0 ] || die "PERSONAS is set but names no persona; unset it for the default set ($DEFAULT_PERSONAS), or name one of:$avail"
 
   # Resolve labels and prompts once, so a pass is a string lookup rather than

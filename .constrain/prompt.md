@@ -15,7 +15,8 @@ stanzas, one about the privilege-minimized token's actual capabilities and one
 that turns "review the tests" into a mutation-testing procedure.
 
 The work being briefed replaces the generalist with a set of named adversarial
-personas borrowed from advocate, a six-persona review engine by the same author.
+personas borrowed from advocate (https://github.com/jmcentire/advocate), a
+six-persona review engine by Jeremy McEntire.
 Each persona has an angle of attack and a success criterion: Red Team wants the
 thing to survive assault, Adversarial wants the argument to hold under direct
 challenge, Sage wants a smart person to be able to explain it simply, Subject

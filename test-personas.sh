@@ -274,6 +274,14 @@ refuses "selection: a persona that is only frontmatter refuses at startup" \
   "empty prompt body" \
   -- PERSONA_DIR="$HOLLOW" PERSONAS=hollow
 
+# The token split has to be unquoted to split on the separators, which also
+# makes it glob. Without `set -f` the name reaching the error is whatever the
+# startup directory happens to contain, and a directory holding a file named
+# after a persona would select it silently.
+refuses "selection: a glob is a name, not a pattern" \
+  "unknown persona '*'" \
+  -- PERSONAS='*'
+
 # --- per-persona passes -----------------------------------------------------
 cycle "passes: each persona gets its own pass, in the selected order" \
   PERSONAS=red_team,sage \
