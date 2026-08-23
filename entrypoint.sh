@@ -62,7 +62,8 @@ strip_surrounding_quotes \
   ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN OLLAMA_API_KEY \
   CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN \
   GITHUB_TOKEN GITHUB_REPOSITORY LINEAR_API_KEY \
-  PR_ASSIGNEE PR_IDS PR_SEARCH
+  PR_ASSIGNEE PR_IDS PR_SEARCH \
+  PERSONAS PERSONA_DIR LIMIT_BACKOFF_SECONDS
 
 # --- Required configuration ------------------------------------------------
 # Provider-specific credentials are validated in "Backend selection" below.
@@ -128,12 +129,18 @@ pr_truthy() {
 # unquoted expansion does the comma->space splitting.
 parse_pr_ids() {
   local raw="$1" tok
+  # set -f for the split: the expansion has to stay unquoted to split on the
+  # separators, and unquoted means pathname expansion too, so a value of `*`
+  # would silently become whatever happens to be in the current directory
+  # rather than failing as the malformed input it is. Restored right after.
+  set -f
   for tok in $(printf '%s' "$raw" | tr ',' ' '); do
     case "$tok" in
       ''|*[!0-9]*) die "PR_IDS contains a non-numeric value: '$tok' (expected e.g. 12,15,20)" ;;
       *) printf '%s\n' "$tok" ;;
     esac
   done
+  set +f
 }
 
 # Determine the active selector; die unless EXACTLY ONE is provided. Sets the
@@ -169,6 +176,127 @@ enumerate_candidate_prs() {
 # Substitute the {{PR}} token in a prompt template with a PR number.
 render_prompt() {
   printf '%s' "${1//\{\{PR\}\}/$2}"
+}
+
+# --- Persona registry ------------------------------------------------------
+# Each review pass runs as one of advocate's adversarial personas rather than as
+# a generalist reviewer. A persona is a file in PERSONA_DIR: frontmatter (label,
+# success) plus a body that becomes the pass's system prompt. Files starting with
+# an underscore are not personas; _shared.md is the output contract appended to
+# every persona body.
+#
+# Definitions live in files rather than inline here for three reasons: it keeps
+# ~200 lines of prompt text out of this script, it gives an operator an override
+# by mounting their own directory at PERSONA_DIR, and it keeps the imported text
+# close to its provenance (tools/import-advocate-personas.py).
+PERSONA_DIR="${PERSONA_DIR:-/opt/claudebox/personas}"
+# The default set is code-facing. advocate's `user` and `good_friend` were written
+# against designs and whole projects; on a narrow diff they reach for material
+# that isn't in it, so they ship but are opt-in.
+DEFAULT_PERSONAS="red_team,adversarial,sme,sage"
+# Claimed now, used in phase 2: the pass that reconciles what the personas said
+# is the only one allowed to read their findings, which is why it is not itself
+# a persona and cannot be selected as one.
+RESERVED_PERSONAS="aggregate"
+
+declare -A PERSONA_PROMPT=()
+declare -A PERSONA_LABEL=()
+PERSONAS_LIST=()
+
+# Echo frontmatter key $2 from persona $1.
+persona_meta() {
+  awk -v k="$2" '
+    NR == 1 && $0 == "---" { fm = 1; next }
+    fm && $0 == "---" { exit }
+    fm && index($0, k ":") == 1 { sub(/^[^:]*:[[:space:]]*/, ""); print; exit }
+  ' "$PERSONA_DIR/$1.md"
+}
+
+# Echo persona $1's own body: everything after its frontmatter. Separate from
+# persona_prompt because resolve_personas has to judge the body on its own -- a
+# body-plus-shared-contract string is never empty, so a persona file that is
+# nothing but frontmatter would resolve and then review a PR with no identity at
+# all, signing findings with a label it has no angle of attack behind.
+persona_body() {
+  awk '
+    NR == 1 && $0 == "---" { fm = 1; next }
+    fm && $0 == "---" { fm = 0; body = 1; next }
+    body
+  ' "$PERSONA_DIR/$1.md"
+}
+
+# Echo persona $1's full system prompt: its body, then the shared contract, with
+# {{PERSONA}} replaced by its label. The label is validated in resolve_personas
+# to contain no slash, so it is safe as a sed replacement.
+persona_prompt() {
+  local id="$1" label="${PERSONA_LABEL[$1]}"
+  {
+    persona_body "$id"
+    printf '\n'
+    cat "$PERSONA_DIR/_shared.md"
+  } | sed "s|{{PERSONA}}|$label|g"
+}
+
+# Fill PERSONAS_LIST (order-preserving), PERSONA_LABEL and PERSONA_PROMPT from
+# PERSONAS, or from DEFAULT_PERSONAS when it is unset. Dies on anything it can't
+# resolve: a typo that silently narrowed the review to one persona, or to none,
+# would look exactly like a working run in the log.
+resolve_personas() {
+  local avail="" f b tok raw
+  [ -d "$PERSONA_DIR" ] || die "no persona definitions: PERSONA_DIR=$PERSONA_DIR is not a directory."
+  # Every persona body is appended to _shared.md, so without it persona_prompt's
+  # `cat` fails, pipefail fails the command substitution and set -e exits with
+  # nothing but cat's own message -- under --restart unless-stopped, a silent
+  # crash loop reachable by the documented "mount your own personas" workflow.
+  [ -f "$PERSONA_DIR/_shared.md" ] || die "no output contract: $PERSONA_DIR/_shared.md is missing; every persona body is appended to it."
+  for f in "$PERSONA_DIR"/*.md; do
+    [ -e "$f" ] || continue
+    b="$(basename "$f" .md)"
+    case "$b" in _*) continue ;; esac
+    avail="$avail $b"
+  done
+  [ -n "$avail" ] || die "no persona definitions found in $PERSONA_DIR."
+
+  raw="${PERSONAS-$DEFAULT_PERSONAS}"
+  case "$(printf '%s' "$raw" | tr 'A-Z' 'a-z')" in
+    all) raw="$(printf '%s' "$avail")" ;;
+  esac
+
+  # set -f for the split, for the same reason as parse_pr_ids: unquoted is what
+  # splits on the separators, and unquoted also globs, so PERSONAS=* would be
+  # resolved against the current directory instead of dying as an unknown name.
+  set -f
+  for tok in $(printf '%s' "$raw" | tr ',' ' '); do
+    case " $RESERVED_PERSONAS " in
+      *" $tok "*) die "persona '$tok' is reserved and cannot be selected." ;;
+    esac
+    case " $avail " in
+      *" $tok "*) ;;
+      *) die "unknown persona '$tok'; available:$avail" ;;
+    esac
+    case " ${PERSONAS_LIST[*]-} " in
+      *" $tok "*) die "persona '$tok' is listed twice in PERSONAS." ;;
+    esac
+    PERSONAS_LIST+=("$tok")
+  done
+  set +f
+  [ "${#PERSONAS_LIST[@]}" -gt 0 ] || die "PERSONAS is set but names no persona; unset it for the default set ($DEFAULT_PERSONAS), or name one of:$avail"
+
+  # Resolve labels and prompts once, so a pass is a string lookup rather than
+  # three file reads, and so a broken definition fails at startup.
+  local id label body
+  for id in "${PERSONAS_LIST[@]}"; do
+    label="$(persona_meta "$id" label)"
+    case "$label" in
+      '') die "persona '$id' has no label: in its frontmatter." ;;
+      *[!A-Za-z0-9\ ._-]*) die "persona '$id' has a label with unexpected characters: '$label' (letters, digits, spaces, dot, underscore and hyphen only)." ;;
+    esac
+    body="$(persona_body "$id")"
+    [ -n "${body//[[:space:]]/}" ] || die "persona '$id' has an empty prompt body."
+    PERSONA_LABEL[$id]="$label"
+    PERSONA_PROMPT[$id]="$(persona_prompt "$id")"
+  done
+  log "personas: ${PERSONAS_LIST[*]}"
 }
 
 # --- Optional Linear context ------------------------------------------------
@@ -253,6 +381,11 @@ else
   WORK_REPO="$WORK_DIR/repo"
 fi
 REVIEW_INTERVAL_SECONDS="${REVIEW_INTERVAL_SECONDS:-300}"
+# How long to wait after a pass fails on a usage or rate limit, instead of the
+# normal interval. Long by default: the limit that stopped us is measured in
+# hours on most plans, and retrying into it costs the same allowance twice.
+LIMIT_BACKOFF_SECONDS="${LIMIT_BACKOFF_SECONDS:-1800}"
+case "$LIMIT_BACKOFF_SECONDS" in ''|*[!0-9]*) die "LIMIT_BACKOFF_SECONDS must be a non-negative integer";; esac
 # REVIEW_MODEL's default depends on the provider; it is resolved in the
 # "Backend selection" block below.
 # Rotate to a fresh session after this many successful passes, to cap the
@@ -283,7 +416,7 @@ case "$MAX_PASSES_PER_SESSION" in ''|*[!0-9]*) die "MAX_PASSES_PER_SESSION must 
 # this a good test?" resolves to "it looks like the other tests."
 _test_stanza="Treat the tests in this PR as code under review in their own right, not as evidence that the change works. For each test the PR adds or modifies, run this check explicitly: identify which specific lines of the non-test change it depends on, mentally revert just those lines, and decide whether the test would still pass. A test that passes against the pre-change code is not a regression test, and that it exercises the new code path is not the same thing -- exercising is not asserting. Raise every such test as a finding, and say in the comment which mutation of the production code survives it. Apply the same mutation thinking beyond a straight revert: would the test still pass if a boundary moved by one, a condition were negated, an error branch were deleted, a returned collection came back empty, or the function returned a fixed value? Also flag tests that lock in as-implemented behavior instead of intended behavior -- assertions that restate the implementation, recompute the expected value with the same logic the code under test uses, assert on a mock's own stubbed return, or freeze whatever the code currently emits (snapshots included) without any statement of what is actually required. A test should read as a claim about what the code must do that a reader could check against the ticket or the PR description. Call out tests that cannot fail (no assertion reached, assertions after an early return or inside a never-taken branch, a swallowed exception, a tautological comparison) and tests whose name or docstring promises a behavior the body never checks. Where a change adds a behavior with no test that would catch its removal, say so and name the missing case; where the tests are genuinely adequate, say nothing about them."
 _gh_stanza="Two constraints on the GitHub CLI here, because the token is deliberately privilege-minimized: always pass an explicit --json field list to \`gh pr view\` (a bare \`gh pr view\` also fetches statusCheckRollup, which this token cannot be granted permission for, so it fails outright), and do not use \`gh pr checks\` at all -- it needs that same permission and cannot work. CI status is therefore unavailable to you: review the code on its own merits, and never wait on or refer to check results."
-DEFAULT_PROMPT="Perform a thorough review of pull request #{{PR}} in this repository. Inspect it with \`gh pr diff {{PR}}\` and \`gh pr view {{PR}} --json number,title,body,author,url,state,isDraft,headRefName,headRefOid,baseRefName,labels,files,commits,comments,reviews\`, and be sure you're looking at the most recent commit on its branch. $_gh_stanza Pay particular attention to test quality/robustness, security, correctness, and architectural coherence/consistency, and whether the approach the PR takes is prudent and robust in light of the issue it addresses. $_test_stanza Post findings as comments on the PR, one comment per finding. Sign your comments with '-claudebox'."
+DEFAULT_PROMPT="Perform a thorough review of pull request #{{PR}} in this repository. Inspect it with \`gh pr diff {{PR}}\` and \`gh pr view {{PR}} --json number,title,body,author,url,state,isDraft,headRefName,headRefOid,baseRefName,labels,files,commits,comments,reviews\`, and be sure you're looking at the most recent commit on its branch. $_gh_stanza Pay particular attention to test quality/robustness, security, correctness, and architectural coherence/consistency, and whether the approach the PR takes is prudent and robust in light of the issue it addresses. $_test_stanza Post findings as comments on the PR, one comment per finding."
 # Prompt used when RESUMING a PR's session (it already holds context from prior
 # passes on that PR, so this nudges a re-check rather than re-introducing the task).
 # The gh stanza is repeated here rather than relied on from the session's own
@@ -293,7 +426,7 @@ DEFAULT_PROMPT="Perform a thorough review of pull request #{{PR}} in this reposi
 # for the same reason, and because later passes are exactly when tests get added
 # in response to earlier findings -- the pass most likely to see a hastily
 # written test is the one least likely to still remember how to judge one.
-DEFAULT_FOLLOWUP="I've fetched the latest refs. Re-check pull request #{{PR}} for new commits or changes since your last review of it. Apply the same review standard, and only post findings you haven't already raised on this PR. Be sure you're looking at the most recent commit on its branch. $_gh_stanza $_test_stanza Sign your comments with '-claudebox'."
+DEFAULT_FOLLOWUP="I've fetched the latest refs. Re-check pull request #{{PR}} for new commits or changes since your last review of it. Apply the same review standard, and only post findings you haven't already raised on this PR. Be sure you're looking at the most recent commit on its branch. $_gh_stanza $_test_stanza"
 # Linear context is added to the DEFAULTS only: an operator who supplied their own
 # prompt gets exactly that prompt, unedited. No-op when LINEAR_API_KEY is unset.
 _linear_stanza="$(linear_stanza)"
@@ -315,6 +448,7 @@ fi
 # Validate PR selection now (fail fast, before auth/clone), and warn if a prompt
 # template won't name the PR.
 resolve_pr_selection
+resolve_personas
 case "$REVIEW_PROMPT"   in *'{{PR}}'*) : ;; *) log "WARN: REVIEW_PROMPT has no {{PR}} token; reviews won't name the specific PR." ;; esac
 case "$FOLLOWUP_PROMPT" in *'{{PR}}'*) : ;; *) log "WARN: FOLLOWUP_PROMPT has no {{PR}} token; reviews won't name the specific PR." ;; esac
 
@@ -860,19 +994,29 @@ git -C "$WORK_REPO" remote set-url origin "https://github.com/${GITHUB_REPOSITOR
 log "Reviewer ready. repo=$GITHUB_REPOSITORY provider=$PROVIDER_LABEL model=$REVIEW_MODEL interval=${REVIEW_INTERVAL_SECONDS}s"
 
 # --- Review loop -----------------------------------------------------------
-# One Claude session PER PR. Each cycle the supervisor fetches refs, enumerates
-# the candidate PRs (per the active selector), and reviews each in its own
-# session: a new session for a PR not seen yet, or --resume of that PR's session
-# (tracked in the in-memory PR_SESSION map) so Claude won't re-raise findings on
-# it. /loop can't be used here because it needs a live interactive session,
-# which headless `-p` mode isn't. Headless + all permissions skipped is safe:
+# One Claude session PER (PR, PERSONA) PAIR. Each cycle the supervisor fetches
+# refs, enumerates the candidate PRs (per the active selector), and reviews each
+# with each enabled persona in its own session: a new session for a pair not seen
+# yet, or --resume of that pair's session (tracked in the in-memory PR_SESSION
+# map) so Claude won't re-raise findings it already raised on that pair. /loop
+# can't be used here because it needs a live interactive session, which headless
+# `-p` mode isn't. Headless + all permissions skipped is safe:
 # unprivileged user, minimized token, read-only seed.
 cd "$WORK_REPO"
-# Per-PR state: session id and successful-pass count, keyed by PR number. These
-# are in-memory only, so a container restart re-reviews each PR once (may
-# re-comment once) — the same trade-off the old single-session design had.
+# Per-(PR, persona) state: session id and successful-pass count, keyed by
+# "$pr:$persona". These are in-memory only, so a container restart re-reviews
+# each PR once per persona (and may re-comment once) — the same trade-off the
+# single-session design had, multiplied by the size of the enabled set.
 declare -A PR_SESSION=()
 declare -A PR_PASSES=()
+# The (PR, persona) pair the next cycle starts at, so a cycle cut short by a
+# limit or by a run of failures does not leave the trailing pairs unreviewed
+# forever. Empty means "start at the first pair". In memory, like the maps above.
+RESUME_AT=""
+# How many failed passes in a row -- limits excepted, they end the cycle on the
+# first one -- end a cycle. Not operator-configurable: it is a guard against a
+# dead provider, not a tuning knob.
+MAX_CONSECUTIVE_FAILURES=3
 
 # Pretty-print Claude's stream-json (one JSON event per line) into readable,
 # live log lines: assistant text, tool calls, tool results, and the final
@@ -899,13 +1043,50 @@ format_stream() {
   '
 }
 
-# Run one review pass for $1=prompt, resuming $2=session id when non-empty.
-# On success sets RUN_PASS_SESSION_ID to the recovered id (falling back to the
-# passed id) and returns 0; returns claude's exit code on failure.
+# Run one review pass for $1=prompt as persona $3, resuming $2=session id when
+# non-empty. Sets RUN_PASS_SESSION_ID to the recovered id (falling back to the
+# passed one) and returns claude's exit code.
+#
+# --append-system-prompt is passed on BOTH forms, and that is not redundant:
+# measured 2026-08-21, the flag does NOT survive --resume. Pass it only on the
+# first pass and cycle one is adversarial while every later cycle is the old
+# generalist reviewer wearing this persona's name in the log.
+#
+# It goes before the `--`, like every other flag: --mcp-config is variadic, so
+# the `--` is what stops the CLI reading the prompt as another config path.
+# True when the stderr in $1 reads as a usage, rate or capacity limit rather than
+# a real failure. Worth distinguishing because the two want opposite handling: a
+# broken session should be replaced, a throttled one should be resumed.
+#
+# This matches on provider error text, which is an upstream surface that can
+# change without notice, so the failure mode of a miss matters: a missed match
+# falls through to the ordinary path (drop the session, carry on), which is
+# exactly today's behaviour. A false positive keeps a session that will fail
+# again next cycle and be dropped then. Neither wedges the loop.
+# `limit reached` and `reached your limit` are here because `limit` on its own is
+# only reachable via `rate.?limit` and `usage limit`, so the near-miss wordings
+# (`5-hour limit reached`, `you have reached your limit`) matched nothing.
+USAGE_LIMIT_RE='rate.?limit|usage limit|limit reached|reached your limit|too many requests|quota|overloaded|(^|[^0-9])(429|529)([^0-9]|$)'
+is_usage_limit() {
+  grep -qiE "$USAGE_LIMIT_RE" "$1"
+}
+
+# Echo the first line of $1 that read as a limit. The classifier scans the whole
+# stderr while the log tails only its last few lines, so a limit reported early
+# in a long stderr is classified right and invisible to whoever reads the log --
+# which is the difference between a legible stall and an apparent hang.
+usage_limit_line() {
+  grep -im1 -E "$USAGE_LIMIT_RE" "$1"
+}
+
 RUN_PASS_SESSION_ID=""
+RUN_PASS_LIMITED=0
+RUN_PASS_LIMIT_LINE=""
 run_pass() {
-  local prompt="$1" sid="$2" rc errfile rawfile got
+  local prompt="$1" sid="$2" persona="$3" rc errfile rawfile got
   RUN_PASS_SESSION_ID="$sid"
+  RUN_PASS_LIMITED=0
+  RUN_PASS_LIMIT_LINE=""
   errfile="$(mktemp)"; rawfile="$(mktemp)"
   # set +e around the pipeline so a formatter hiccup can't abort the script and
   # so we can read Claude's own exit code via PIPESTATUS[0] (not tee's/jq's).
@@ -913,23 +1094,36 @@ run_pass() {
   if [ -n "$sid" ]; then
     claude -p --resume "$sid" --output-format stream-json --verbose \
       --dangerously-skip-permissions --model "$REVIEW_MODEL" \
+      --append-system-prompt "${PERSONA_PROMPT[$persona]}" \
       "${CLAUDE_MCP_ARGS[@]}" -- "$prompt" \
       2>"$errfile" | stdbuf -oL tee "$rawfile" | format_stream
   else
     claude -p --output-format stream-json --verbose \
       --dangerously-skip-permissions --model "$REVIEW_MODEL" \
+      --append-system-prompt "${PERSONA_PROMPT[$persona]}" \
       "${CLAUDE_MCP_ARGS[@]}" -- "$prompt" \
       2>"$errfile" | stdbuf -oL tee "$rawfile" | format_stream
   fi
   rc=${PIPESTATUS[0]}
   set -e
+  # session_id appears in the init and result events; take the last one seen.
+  # Recovered before the exit-code check on purpose: a pass that started a
+  # session and then failed still has a resumable session, and Task 3's
+  # usage-limit path depends on knowing its id.
+  got="$(jq -r -R '(fromjson? // empty) | select(.session_id) | .session_id' "$rawfile" 2>/dev/null | tail -n 1 || true)"
+  [ -n "$got" ] && RUN_PASS_SESSION_ID="$got"
   if [ "$rc" -ne 0 ]; then
+    if is_usage_limit "$errfile"; then
+      RUN_PASS_LIMITED=1
+      # One line, and only the line that matched: claude's stderr is not a
+      # trusted-to-be-credential-free stream, so the log gets the smallest slice
+      # that explains the stall. Truncated for the same reason.
+      RUN_PASS_LIMIT_LINE="$(usage_limit_line "$errfile" || true)"
+      RUN_PASS_LIMIT_LINE="${RUN_PASS_LIMIT_LINE:0:400}"
+    fi
     log "WARN: claude exited $rc:"; tail -n 5 "$errfile" >&2
     rm -f "$errfile" "$rawfile"; return "$rc"
   fi
-  # session_id appears in the init and result events; take the last one seen.
-  got="$(jq -r -R '(fromjson? // empty) | select(.session_id) | .session_id' "$rawfile" 2>/dev/null | tail -n 1 || true)"
-  [ -n "$got" ] && RUN_PASS_SESSION_ID="$got"
   rm -f "$errfile" "$rawfile"
   return 0
 }
@@ -938,6 +1132,7 @@ while true; do
   # Only does anything for PROVIDER=workersai; a dead translator means every pass
   # this cycle would fail on connection refused, so fail loudly here instead.
   check_litellm
+  limited=0
   log "Fetching latest refs..."
   git fetch --all --prune --quiet || log "WARN: git fetch failed; continuing"
 
@@ -952,34 +1147,120 @@ while true; do
     log "Candidate PRs ($PR_SELECTOR): ${prs[*]}"
   fi
 
-  # Review each PR in its own session, sequentially (they share the one clone).
+  # Review each PR with each enabled persona, sequentially: they share one
+  # working clone, and more importantly running them concurrently would multiply
+  # instantaneous usage-limit pressure. Personas are blind to each other by
+  # design (see personas/_shared.md), so nothing about the order is semantic —
+  # but it is stable, so a cycle cut short is interpretable.
+  #
+  # The pairs are flattened into one list so that a cycle cut short can resume
+  # where it stopped. A cycle that always restarted at the first pair would,
+  # under a limit that only allows a few passes per backoff window, review the
+  # leading pairs forever and the trailing ones never — not later, never. The
+  # persona multiplier is what turns that from unlucky into routine. RESUME_AT
+  # holds the pair to start at and is in memory only: surviving a container
+  # restart is deferred with the rest of the persisted state.
+  pairs=()
   for pr in ${prs[@]+"${prs[@]}"}; do
-    sid="${PR_SESSION[$pr]:-}"
+    for persona in "${PERSONAS_LIST[@]}"; do pairs+=("$pr:$persona"); done
+  done
+  npairs=${#pairs[@]}
+
+  start=0
+  if [ -n "$RESUME_AT" ] && [ "$npairs" -gt 0 ]; then
+    # A RESUME_AT that no longer exists (its PR closed, the persona set changed)
+    # falls back to the head of the list rather than skipping a cycle.
+    for ((i = 0; i < npairs; i++)); do
+      if [ "${pairs[$i]}" = "$RESUME_AT" ]; then start=$i; break; fi
+    done
+    [ "$start" -eq 0 ] || log "Starting this cycle at ${pairs[$start]}, where the last one was cut."
+  fi
+
+  # Consecutive failures that were NOT limits: connection refused, a dead
+  # translator, a gateway 502. Each one drops its pair's session, so the next
+  # cycle re-reads that PR from scratch and re-posts findings it already posted.
+  # Walking the whole list into a dead endpoint therefore costs a duplicate-
+  # comment burst per pair; abandoning after a few is strictly cheaper. Reset by
+  # any successful pass, and counted within a cycle only.
+  consec_fail=0
+  cut=-1 cut_i=-1
+  for ((i = 0; i < npairs; i++)); do
+    idx=$(( (start + i) % npairs ))
+    key="${pairs[$idx]}"
+    pr="${key%%:*}"; persona="${key#*:}"
+    sid="${PR_SESSION[$key]:-}"
     if [ -z "$sid" ]; then
-      log "Reviewing PR #$pr (new session)..."
+      log "Reviewing PR #$pr as $persona (new session)..."
       prompt="$(render_prompt "$REVIEW_PROMPT" "$pr")"
     else
-      log "Reviewing PR #$pr (resuming session $sid)..."
+      log "Reviewing PR #$pr as $persona (resuming session $sid)..."
       prompt="$(render_prompt "$FOLLOWUP_PROMPT" "$pr")"
     fi
 
-    if run_pass "$prompt" "$sid"; then
-      PR_SESSION[$pr]="$RUN_PASS_SESSION_ID"
-      PR_PASSES[$pr]=$(( ${PR_PASSES[$pr]:-0} + 1 ))
-      log "PR #$pr review complete (session ${PR_SESSION[$pr]}, pass ${PR_PASSES[$pr]})."
-      # Rotate this PR's session once its cap is hit, to bound context growth.
-      if [ "$MAX_PASSES_PER_SESSION" -gt 0 ] && [ "${PR_PASSES[$pr]}" -ge "$MAX_PASSES_PER_SESSION" ]; then
-        log "PR #$pr reached MAX_PASSES_PER_SESSION=$MAX_PASSES_PER_SESSION; rotating its session next cycle."
-        unset 'PR_SESSION[$pr]'
-        PR_PASSES[$pr]=0
+    if run_pass "$prompt" "$sid" "$persona"; then
+      consec_fail=0
+      PR_SESSION[$key]="$RUN_PASS_SESSION_ID"
+      PR_PASSES[$key]=$(( ${PR_PASSES[$key]:-0} + 1 ))
+      log "PR #$pr [$persona] review complete (session ${PR_SESSION[$key]}, pass ${PR_PASSES[$key]})."
+      # Rotate this pair's session once its cap is hit, to bound context growth.
+      if [ "$MAX_PASSES_PER_SESSION" -gt 0 ] && [ "${PR_PASSES[$key]}" -ge "$MAX_PASSES_PER_SESSION" ]; then
+        log "PR #$pr [$persona] reached MAX_PASSES_PER_SESSION=$MAX_PASSES_PER_SESSION; rotating its session next cycle."
+        unset 'PR_SESSION[$key]'
+        PR_PASSES[$key]=0
       fi
+    elif [ "$RUN_PASS_LIMITED" = 1 ]; then
+      # Keep the session. Abandon the rest of the cycle rather than walking the
+      # remaining pairs into the same wall, and back off before the next one.
+      if [ -n "$RUN_PASS_SESSION_ID" ]; then
+        PR_SESSION[$key]="$RUN_PASS_SESSION_ID"
+        log "WARN: PR #$pr [$persona] hit a usage or rate limit; keeping its session and ending this cycle early."
+      else
+        log "WARN: PR #$pr [$persona] hit a usage or rate limit before it had a session; ending this cycle early."
+      fi
+      [ -n "$RUN_PASS_LIMIT_LINE" ] && log "  limit reported by claude: $RUN_PASS_LIMIT_LINE"
+      limited=1
+      cut=$idx cut_i=$i
+      break
     else
-      log "WARN: PR #$pr review failed; starting a fresh session for it next cycle."
-      unset 'PR_SESSION[$pr]'
-      PR_PASSES[$pr]=0
+      log "WARN: PR #$pr [$persona] review failed; starting a fresh session for it next cycle."
+      unset 'PR_SESSION[$key]'
+      PR_PASSES[$key]=0
+      consec_fail=$(( consec_fail + 1 ))
+      if [ "$consec_fail" -ge "$MAX_CONSECUTIVE_FAILURES" ]; then
+        # Not a limit, so no backoff: the next cycle comes at the ordinary
+        # interval, and starts where this one stopped.
+        log "WARN: $consec_fail passes in a row failed for reasons other than a limit; the provider looks unhealthy. Abandoning this cycle."
+        cut=$idx cut_i=$i
+        break
+      fi
     fi
   done
 
-  log "Sleeping ${REVIEW_INTERVAL_SECONDS}s..."
-  sleep "$REVIEW_INTERVAL_SECONDS"
+  # Whatever cut the cycle short, the next one starts at the pair after it and
+  # the pairs this one never reached are named, so an operator reads a stall in
+  # the log instead of inferring one from missing comments.
+  if [ "$cut" -ge 0 ]; then
+    RESUME_AT="${pairs[$(( (cut + 1) % npairs ))]}"
+    skipped=()
+    for ((i = cut_i + 1; i < npairs; i++)); do skipped+=("${pairs[$(( (start + i) % npairs ))]}"); done
+    if [ "${#skipped[@]}" -gt 0 ]; then
+      log "Not reviewed this cycle: ${skipped[*]}. The next cycle starts at $RESUME_AT."
+    else
+      log "The next cycle starts at $RESUME_AT."
+    fi
+  elif [ "$npairs" -gt 0 ]; then
+    # A cycle that walked the whole list has nothing left to resume. A cycle with
+    # no pairs at all keeps the resume point instead of clearing it: enumeration
+    # failures are swallowed above, so "no candidate PRs" can mean gh had a bad
+    # minute, and that must not silently send the next cycle back to the head.
+    RESUME_AT=""
+  fi
+
+  if [ "$limited" = 1 ]; then
+    log "Backing off ${LIMIT_BACKOFF_SECONDS}s after a usage limit..."
+    sleep "$LIMIT_BACKOFF_SECONDS"
+  else
+    log "Sleeping ${REVIEW_INTERVAL_SECONDS}s..."
+    sleep "$REVIEW_INTERVAL_SECONDS"
+  fi
 done

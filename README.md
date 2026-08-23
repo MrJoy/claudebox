@@ -115,24 +115,41 @@ Whichever provider you pick, the entrypoint pins **every** model tier (`ANTHROPI
 
 ## How it works
 
-The reviewer runs **one Claude session per PR**. Each cycle the entrypoint enumerates the candidate PRs (see [PR selection](#pr-selection)), then reviews each one in its own session: a PR's first review starts a new session with `REVIEW_PROMPT`; later cycles `--resume` that PR's session with `FOLLOWUP_PROMPT`, so Claude remembers what it already flagged on that PR and avoids duplicate comments. The PR number is substituted into the prompt's `{{PR}}` token.
+The reviewer runs **one Claude session per PR per persona**. Each cycle the entrypoint enumerates the candidate PRs (see [PR selection](#pr-selection)), then reviews each one with each enabled persona in its own session: a pair's first review starts a new session with `REVIEW_PROMPT`; later cycles `--resume` that pair's session with `FOLLOWUP_PROMPT`, so a persona remembers what it already flagged and avoids duplicate comments. The PR number is substituted into the prompt's `{{PR}}` token.
+
+A persona is an angle of attack, borrowed from [advocate](https://github.com/jmcentire/advocate): Red Team wants the change to survive assault, Adversarial wants its logic to hold under challenge, Sage wants it simplified, Subject Matter Expert wants a peer to sign off, User wants a stranger to navigate it, Good Friend applies the 3am test. The first four run by default; `user` and `good_friend` were written against designs rather than diffs, so they ship but are opt-in via `--persona`.
+
+Personas are deliberately **blind to each other**. Nothing tells a persona to defer to another's comments, because that would anchor it to a review it did not do, and avoiding that kind of group-think is the reason this tool exists. Overlapping findings between two angles of attack are a signal that something is worth two comments, not noise to suppress. Each comment is signed with the persona that raised it, e.g. `-claudebox (Red Team)`.
+
+**A cycle is now (candidate PRs x enabled personas) sequential sessions.** `REVIEW_INTERVAL_SECONDS` is the gap *after* a cycle, so four PRs and four personas is sixteen reviews before the interval starts. Set `--persona` to one name for the cheapest run.
 
 ```bash
 # CLAUDE_MCP_ARGS is always (--strict-mcp-config), plus (--mcp-config "$MCP_CONFIG_FILE")
 # when LINEAR_API_KEY is set. The "--" is load-bearing: --mcp-config is variadic, so
 # without it the prompt would be parsed as another MCP config path.
 
-# a PR's first review — new session
+# a (PR, persona) pair's first review — new session
 claude -p --output-format stream-json --verbose --dangerously-skip-permissions \
-  --model "$REVIEW_MODEL" "${CLAUDE_MCP_ARGS[@]}" -- "${REVIEW_PROMPT//\{\{PR\}\}/$pr}"
-# later cycles — resume that PR's session
-claude -p --resume "${PR_SESSION[$pr]}" --output-format stream-json --verbose \
-  --dangerously-skip-permissions --model "$REVIEW_MODEL" "${CLAUDE_MCP_ARGS[@]}" -- "${FOLLOWUP_PROMPT//\{\{PR\}\}/$pr}"
+  --model "$REVIEW_MODEL" --append-system-prompt "${PERSONA_PROMPT[$persona]}" \
+  "${CLAUDE_MCP_ARGS[@]}" -- "${REVIEW_PROMPT//\{\{PR\}\}/$pr}"
+# later cycles — resume that pair's session
+claude -p --resume "${PR_SESSION[$pr:$persona]}" --output-format stream-json --verbose \
+  --dangerously-skip-permissions --model "$REVIEW_MODEL" \
+  --append-system-prompt "${PERSONA_PROMPT[$persona]}" \
+  "${CLAUDE_MCP_ARGS[@]}" -- "${FOLLOWUP_PROMPT//\{\{PR\}\}/$pr}"
 ```
 
-Each pass streams as `stream-json`; the entrypoint pretty-prints the events live to its log (so `docker logs -f` shows the play-by-play) and recovers the session id from the stream to resume that PR next cycle.
+Each pass streams as `stream-json`; the entrypoint pretty-prints the events live to its log (so `docker logs -f` shows the play-by-play) and recovers the session id from the stream to resume that pair next cycle.
 
-The entrypoint shell is the supervisor: it controls cadence (`git fetch`, enumerate PRs, review each sequentially, then sleep), keeps an in-memory PR→session map, and starts a fresh session for a PR if its pass fails (so it may re-comment once on that PR). Claude itself uses `gh`/`git` to inspect the PR, check out the latest commit, and post one comment per finding. `MAX_PASSES_PER_SESSION` rotates a PR's session after N passes to bound its context growth (per PR).
+The entrypoint shell is the supervisor: it controls cadence (`git fetch`, enumerate PRs, review each sequentially, then sleep), keeps an in-memory (PR, persona)→session map, and starts a fresh session for a pair if its pass fails (so that persona may re-comment once on that PR). Claude itself uses `gh`/`git` to inspect the PR, check out the latest commit, and post one comment per finding. `MAX_PASSES_PER_SESSION` rotates a pair's session after N passes to bound its context growth (per pair).
+
+`--append-system-prompt` is passed on *both* forms, which is not redundant: the flag does not survive `--resume`. Passed only on the first pass, cycle one would be adversarial and every later cycle would be a generic reviewer wearing the persona's name in the log.
+
+A pass that fails on a usage or rate limit is treated differently from one that fails for any other reason: it keeps its session, ends the cycle early instead of walking the remaining pairs into the same limit, and waits `LIMIT_BACKOFF_SECONDS` (default 1800). Dropping the session there would make the next attempt re-read the whole PR and re-post findings already posted, spending more of the allowance that just ran out.
+
+A cycle cut short does not simply start over. The reviewer remembers the pair it was cut at and the next cycle begins at the pair *after* it, wrapping around, so an allowance that only covers a few passes per backoff window still works its way through the whole set instead of reviewing the first few pairs forever. The pairs a cut skipped are named in the log. That memory is in-process, so a container restart loses it and the next cycle starts at the first pair.
+
+Three failures in a row that are **not** limits — connection refused, a dead translator, a gateway 502 — also end the cycle, with a log line saying so, on the ordinary `REVIEW_INTERVAL_SECONDS` rather than the backoff. Each such failure drops its pair's session, so walking the rest of the list into a dead endpoint would cost a duplicate-comment burst per pair. Any successful pass resets the count.
 
 > Why not `/loop`? Claude Code's `/loop` needs a live *interactive* session — scheduled wake-ups only fire while a session is running and idle, and headless `-p` mode exits after each response. The shell loop + `--resume` gives the same continuous, context-retaining behavior while staying headless and crash-safe.
 
@@ -214,11 +231,14 @@ Provider wiring — which credential and endpoint variables each `PROVIDER` ends
 ```bash
 ./test-providers.sh              # all cases
 ./test-providers.sh cloudflare   # only cases whose label matches
+./test-personas.sh               # persona selection and the per-persona loop
 ./test-shim.sh                   # the workersai normalizer
 bash -n entrypoint.sh && bash -n claudebox.sh   # syntax only
 ```
 
 It stubs `gh`/`git`/`claude` and checks either the startup error the entrypoint refused with or the exact environment it built. That's a narrow claim on purpose: it proves the wiring matches intent, not that a provider accepts it. Before trusting a newly configured provider unattended, do one live `./claudebox.sh test --repo …` and watch it actually get a response.
+
+`test-personas.sh` covers persona selection and the per-persona review loop. It runs **two** cycles rather than one, because the property that matters most cannot be observed in a single cycle: `--append-system-prompt` does not survive `--resume`, so the assertion that has to exist is that a *resumed* pass still carries its persona. It captures one dump per `claude` invocation and asserts the invocation count, each invocation's argv, the resume targets, and the usage-limit path.
 
 `test-shim.sh` covers the `workersai` normalizer, which the suite above only ever sees stubbed. It runs the real script against a local echo server — still no Docker, network, or credentials — and checks the content injection *and its restraint* (nothing else in the request is rewritten), that a streamed response is relayed as it arrives rather than buffered to the end, and that the listener stays on loopback.
 
@@ -337,14 +357,14 @@ Optional:
 - `REVIEW_MODEL` (provider-specific default; **required** for `PROVIDER=custom` and `PROVIDER=cloudflare`)
 - `ANTHROPIC_CUSTOM_HEADERS` (optional on any provider; **required** for `GATEWAY_UPSTREAM=bedrock`/`vertex`) — extra request headers, `Name: value` per line
 - `REVIEW_INTERVAL_SECONDS`
-- `REVIEW_PROMPT` (a PR's first review, new session; uses the `{{PR}}` token)
-- `FOLLOWUP_PROMPT` (a PR's resumed review; uses the `{{PR}}` token)
+- `REVIEW_PROMPT` (a (PR, persona) pair's first review, new session; uses the `{{PR}}` token)
+- `FOLLOWUP_PROMPT` (a pair's resumed review; uses the `{{PR}}` token)
 
   > The default prompts tell the reviewer how to work within the minimized token: pass an explicit `--json` field list to `gh pr view`, and don't use `gh pr checks` at all. Both need a permission a fine-grained PAT can't be granted — a bare `gh pr view` implicitly fetches `statusCheckRollup` and fails outright, which reads like a broken token rather than a missing permission. **If you override `REVIEW_PROMPT`/`FOLLOWUP_PROMPT` you get your text verbatim, so carry those constraints over yourself** (or add them via the `_SUFFIX` variables, which apply to overrides too). CI status is simply unavailable to the reviewer; it judges the code, not the build.
   >
   > They also carry a test-quality stanza, for a failure mode plain "review the tests" doesn't catch: a PR whose new tests pass unchanged with the production change reverted. The stanza turns that into a procedure the reviewer runs per added test — work out which lines of the non-test change the test depends on, mentally revert them, and ask whether it would still pass — plus the related mutations (a moved boundary, a negated condition, a deleted error branch, a constant return), and the as-implemented smells: assertions that restate the implementation, recompute the expected value the same way the code does, assert a mock's own stubbed return, or freeze current output as a snapshot. Overriding the prompt drops this too.
 - `REVIEW_PROMPT_SUFFIX` / `FOLLOWUP_PROMPT_SUFFIX` (append extra instructions to the corresponding prompt — default or overridden; also supports the `{{PR}}` token)
-- `MAX_PASSES_PER_SESSION` (rotate a PR's session to a fresh one every N passes, per PR; `0` = never)
+- `MAX_PASSES_PER_SESSION` (rotate a session to a fresh one every N passes, per (PR, persona) pair; `0` = never)
 - `LINEAR_API_KEY` (optional Linear ticket context; use a **read-only** key — see [Linear ticket context](#linear-ticket-context))
 - `--export-sessions` (launcher flag, not an env var) — export review transcripts to the host and align the session folder; see [Exporting review sessions to your host](#exporting-review-sessions-to-your-host)
 
@@ -359,7 +379,19 @@ Set **exactly one** of these (or pass the matching launcher flag). Zero or more 
 | `PR_IDS=12,15,20` | `--prs 12,15,20` | exactly those PR numbers |
 | `PR_SEARCH=is:open label:x` | `--search "…"` | PRs matching a gh search query (you control state) |
 
-`REVIEW_PROMPT`/`FOLLOWUP_PROMPT` use a `{{PR}}` token (substituted with the PR number), and `MAX_PASSES_PER_SESSION` applies per PR.
+`REVIEW_PROMPT`/`FOLLOWUP_PROMPT` use a `{{PR}}` token (substituted with the PR number), and `MAX_PASSES_PER_SESSION` applies per (PR, persona) pair.
+
+### Personas
+
+| Variable | Flag | Default | Meaning |
+|---|---|---|---|
+| `PERSONAS` | `--persona` | `red_team,adversarial,sme,sage` | Comma list of persona ids, or `all`. Order is honoured. An unknown name is a startup error. |
+| `PERSONA_DIR` | — | `/opt/claudebox/personas` | Where definitions are read from. Point it at a read-only mount to supply your own set. |
+| `LIMIT_BACKOFF_SECONDS` | — | `1800` | How long to wait after a pass fails on a usage or rate limit, instead of `REVIEW_INTERVAL_SECONDS`. |
+
+Available ids: `red_team`, `adversarial`, `sage`, `sme`, `user`, `good_friend`. A definition file is frontmatter (`label`, `success`) plus a body that becomes the pass's system prompt; `personas/_shared.md` is appended to every body and carries the output contract and the independence rule. `aggregate` is reserved.
+
+Each persona multiplies the sessions per cycle. On a fixed-price plan the binding resource is usage allowance, so start with one or two personas and widen once you have seen what a cycle costs you.
 
 ### Linear ticket context
 
@@ -377,5 +409,5 @@ The entrypoint writes the key into a generated MCP config at `$HOME/mcp.json` (m
 
 - **Model names move fast, and there is no fallback.** `REVIEW_MODEL` must name a model your chosen provider actually serves; a wrong name is a hard error, not a silent fall-through to some other model. For Ollama the `:cloud` suffix is stable but exact versions change — browse [Ollama's model registry](https://ollama.com/search?c=cloud). For Anthropic, see the current model IDs in the [Anthropic docs](https://docs.anthropic.com/en/docs/about-claude/models).
 - The token is the real safety boundary. Verify it has no write access beyond PR comments before running unattended.
-- Because each PR is reviewed in its own resumed session, the reviewer remembers what it already flagged on that PR and won't re-raise the same findings. If a PR's pass fails it starts a fresh session for that PR next cycle (losing that in-session memory), so it may occasionally re-comment on it after a failure — harmless, just noise. The PR→session map is in-memory, so a container restart can likewise re-review each PR once.
-- Each PR's session context grows over time. Set `MAX_PASSES_PER_SESSION` to rotate a PR's session to a fresh one every N passes and bound that growth (the trade-off: the new session forgets that PR's earlier passes, so it may re-raise findings once after a rotation). Left at `0`, each PR's session runs unbounded until the container restarts.
+- Because each (PR, persona) pair is reviewed in its own resumed session, each persona remembers what it already flagged on that PR and won't re-raise the same findings. If a pair's pass fails it starts a fresh session for that pair next cycle (losing that in-session memory), so that persona may occasionally re-comment after a failure — harmless, just noise. The session map is in-memory, so a container restart can likewise re-review each PR once **per persona**, which is the same multiplier the interval note above warns about.
+- Each session's context grows over time. Set `MAX_PASSES_PER_SESSION` to rotate a (PR, persona) pair's session to a fresh one every N passes and bound that growth (the trade-off: the new session forgets that pair's earlier passes, so that persona may re-raise findings once after a rotation). Left at `0`, every pair's session runs unbounded until the container restarts.

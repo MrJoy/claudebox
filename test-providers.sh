@@ -113,11 +113,17 @@ run_entrypoint() {
   # variable the case means to leave unset. Case-supplied vars come last, so a
   # case can override any default below (LITELLM_BIN, to test an image missing
   # the translator).
+  # PERSONAS is pinned to a single persona so each case still produces exactly
+  # ONE `claude` invocation: the stub below overwrites its dump per call, and
+  # what this suite asserts (credentials, endpoints, model tiers) is identical
+  # for every persona. Multi-persona behaviour lives in test-personas.sh, which
+  # captures per invocation.
   env -i PATH="$BIN:$PATH" HOME="$HOME_DIR" \
     ALLOW_UNHARDENED=1 \
     GITHUB_TOKEN=x GITHUB_REPOSITORY=owner/repo PR_IDS=1 \
     REPO_PATH="$HOME_DIR/seed" REVIEW_INTERVAL_SECONDS=1 \
     LITELLM_BIN="$BIN/litellm" SHIM_BIN="$SCRIPT_DIR/workersai-shim.py" \
+    PERSONA_DIR="$SCRIPT_DIR/personas" PERSONAS=red_team \
     "$@" "$BASH_BIN" "$ENTRYPOINT" >"$OUT" 2>&1
 }
 
@@ -182,9 +188,12 @@ wires() {
       NOSHIM:*) grep -q -- "SHIM .*${expect#NOSHIM:}" "$DUMP" && missing="$missing [shim launch should not have: ${expect#NOSHIM:}]"; continue ;;
       # ARGV:<substring> / NOARGV:<substring> — claude's own argv, which is where
       # the prompt lands. -F because prompt text is full of characters grep would
-      # otherwise read as pattern syntax.
-      ARGV:*) grep -qF -- "${expect#ARGV:}" <(grep '^ARGV ' "$DUMP") || missing="$missing [argv missing: ${expect#ARGV:}]"; continue ;;
-      NOARGV:*) grep -qF -- "${expect#NOARGV:}" <(grep '^ARGV ' "$DUMP") && missing="$missing [argv should not have: ${expect#NOARGV:}]"; continue ;;
+      # otherwise read as pattern syntax. Isolating the ARGV line is "everything
+      # before the first ENV line", not "lines starting with ARGV " — a persona's
+      # --append-system-prompt value is itself multi-paragraph, and the latter
+      # would silently truncate at its first blank line.
+      ARGV:*) grep -qF -- "${expect#ARGV:}" <(awk '/^ENV /{exit} {print}' "$DUMP") || missing="$missing [argv missing: ${expect#ARGV:}]"; continue ;;
+      NOARGV:*) grep -qF -- "${expect#NOARGV:}" <(awk '/^ENV /{exit} {print}' "$DUMP") && missing="$missing [argv should not have: ${expect#NOARGV:}]"; continue ;;
     esac
     grep -qxF "ENV $expect" "$DUMP" || missing="$missing $expect(was: $(grep "^ENV ${expect%%=*}=" "$DUMP" | sed 's/^ENV //'))"
   done

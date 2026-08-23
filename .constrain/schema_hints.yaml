@@ -1,0 +1,26 @@
+version: "1.0"
+generated_by: constrain-methodology-by-hand
+session_id: claudebox-personas
+
+_note: >-
+  claudebox owns no database. This artifact is near-empty by fact, not by
+  omission. Two on-disk artifacts are introduced by the persona work and are
+  recorded below so that their contents are a deliberate choice rather than an
+  accident; neither is a schema in Ledger's sense.
+
+storage_backends:
+  - owner_component: "session-store"
+    type: unknown
+    description: "A flat file under the writable work dir mapping (PR number, persona) to a Claude Code session id, plus a pass count. Mode 600. Reloaded at startup."
+
+field_hints:
+  - backend_owner: "session-store"
+    field_description: "Claude Code session identifier per (PR, persona)"
+    likely_classification: PUBLIC
+    likely_annotations: []
+    rationale: "An opaque local identifier. Not a credential and not a capability outside this container. Explicitly must not be accompanied by any credential material in the same file."
+  - backend_owner: "status-comment-writer"
+    field_description: "Coverage comment body: persona names, pass counts, head SHAs"
+    likely_classification: PUBLIC
+    likely_annotations: []
+    rationale: "Written to a public-facing PR comment, so it is treated as published output. The constraint that matters is exclusion: no credential, no path, no environment dump."

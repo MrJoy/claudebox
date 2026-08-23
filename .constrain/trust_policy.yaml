@@ -1,0 +1,96 @@
+version: "1.0"
+generated_by: constrain-methodology-by-hand
+session_id: claudebox-personas
+system: "claudebox multi-persona PR reviewer"
+
+_note: >-
+  Most of this artifact's vocabulary does not apply to claudebox and has been
+  left null rather than fabricated. There is no user data, no database, no
+  classification registry to speak of, and no canary or soak machinery: the
+  system reviews public-or-private source diffs and writes PR comments. What the
+  trust model does contain is three credentials and one untrusted input, so those
+  are recorded here and the numeric trust/decay/soak apparatus is left unset.
+
+trust:
+  floor: null
+  authority_override_floor: null
+  decay_lambda: null
+  taint_lock_tiers: [AUTH]
+  conflict_trust_delta_threshold: null
+  _note: "No trust-scoring subsystem exists. Arbiter is not in this stack."
+
+classifications:
+  - field_pattern: "GITHUB_TOKEN"
+    tier: AUTH
+    authoritative_component: "github-egress"
+    canary_eligible: false
+    canary_pattern: null
+    rationale: "The real safety boundary. Its scope cannot be introspected from inside the container, so it is trusted by construction and verified by the operator before an unattended run."
+  - field_pattern: "provider credential (OLLAMA_API_KEY, ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, CLOUDFLARE_API_TOKEN, ANTHROPIC_CUSTOM_HEADERS)"
+    tier: AUTH
+    authoritative_component: "provider-wiring"
+    canary_eligible: false
+    canary_pattern: null
+    rationale: "Never logged. For workersai the real Cloudflare token is withheld from the review session and replaced by a per-container LiteLLM master key, precisely so a prompt-injected review cannot read it."
+  - field_pattern: "LINEAR_API_KEY"
+    tier: AUTH
+    authoritative_component: "supervisor"
+    canary_eligible: false
+    canary_pattern: null
+    rationale: "Documented as read-only because a write-capable key would let an unattended YOLO session mutate tickets. Scope is unverifiable from inside."
+  - field_pattern: "/repo/.claudebox/personas.yml"
+    tier: PUBLIC
+    authoritative_component: "persona-model-resolver"
+    canary_eligible: false
+    canary_pattern: null
+    rationale: "Untrusted input written by whoever can merge to the reviewed repo's default branch. Constrained to naming models, validated against a character allow-list, and overridable per persona by the operator."
+
+soak:
+  base_durations: null
+  target_requests: null
+  _note: "No progressive-rollout mechanism. A change ships by rebuilding the image."
+
+authority_map:
+  - component: "launcher"
+    domains: ["operator-cli-surface"]
+    rationale: "Owns the host flag vocabulary; parses no configuration because it must stay bash 3.2 safe."
+  - component: "persona-registry"
+    domains: ["persona-definitions"]
+    rationale: "Sole owner of persona identity text."
+  - component: "persona-model-resolver"
+    domains: ["persona-model-assignment"]
+    rationale: "Sole place the repo map and operator map are combined, so precedence exists in one location."
+  - component: "supervisor"
+    domains: ["cycle-scheduling", "session-lifecycle"]
+    rationale: "Owns cadence, ordering and rotation."
+  - component: "review-session-runner"
+    domains: ["single-pass-invocation"]
+    rationale: "Only spawner of claude processes."
+  - component: "session-store"
+    domains: ["session-id-persistence"]
+    rationale: "Owns the on-disk session map."
+  - component: "aggregator"
+    domains: ["cross-persona-reconciliation"]
+    rationale: "The only pass permitted to read other personas' findings, so that no persona does."
+  - component: "status-comment-writer"
+    domains: ["coverage-reporting"]
+    rationale: "Coverage must be deterministic, so no model authors it."
+  - component: "github-egress"
+    domains: ["github-api-access"]
+    rationale: "Sole path to GitHub."
+  - component: "provider-wiring"
+    domains: ["provider-selection"]
+    rationale: "Existing owner of base URL and credential wiring."
+  - component: "test-suites"
+    domains: ["wiring-verification"]
+    rationale: "Owns the claim that intended wiring is actual wiring."
+
+human_gates:
+  always: []
+  on_low_trust_authoritative: null
+  on_unresolvable_conflict: null
+  _note: >-
+    The operator gate is the token scope and the hardening flags, checked before
+    an unattended run rather than per event. One new gate is worth naming: any
+    later change that checks out a PR head invalidates C005 and needs a human
+    decision, because it hands the PR author authority over the persona map.
