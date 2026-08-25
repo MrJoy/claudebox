@@ -38,7 +38,25 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 BIN="$WORK/bin"; mkdir -p "$BIN"
 
-printf '#!/bin/sh\nexit 0\n' >"$BIN/gh"
+# `gh` now gets asked for a PR's labels, because mode routing decides code-vs-plan
+# from them. Everything else it is asked still just has to succeed.
+#   STUB_PLAN_PRS   -- comma-separated PR numbers that carry the plan label
+#   STUB_LABEL_FAIL -- comma-separated PR numbers whose label lookup fails
+cat >"$BIN/gh" <<'STUB'
+#!/bin/sh
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  n="$3"
+  case ",${STUB_LABEL_FAIL:-}," in
+    *",$n,"*) echo "gh: could not resolve to a PullRequest" >&2; exit 1 ;;
+  esac
+  case ",${STUB_PLAN_PRS:-}," in
+    *",$n,"*) printf '{"number":%s,"labels":[{"name":"%s"}]}\n' "$n" "${STUB_PLAN_LABEL:-plan}" ;;
+    *)        printf '{"number":%s,"labels":[]}\n' "$n" ;;
+  esac
+  exit 0
+fi
+exit 0
+STUB
 printf '#!/bin/sh\nexit 0\n' >"$BIN/git"
 
 # The entrypoint pipes claude through `stdbuf -oL tee`, and stdbuf is GNU
@@ -339,7 +357,7 @@ cycle "resume: MAX_PASSES_PER_SESSION rotates per (PR, persona) pair" \
   -- CALLS:4 \
      NOARGV:3:"--resume" \
      NOARGV:4:"--resume" \
-     LOG:"PR #1 [red_team] reached MAX_PASSES_PER_SESSION=1"
+     LOG:"PR #1 [code/red_team] reached MAX_PASSES_PER_SESSION=1"
 
 cycle "model: every tier still points at the one review model" \
   PERSONAS=red_team \
@@ -414,12 +432,49 @@ cycle "limits: a limit before any session does not claim to keep one" \
 cycle "resume: the next cycle starts at the pair after the one a limit cut" \
   PERSONAS=red_team,sage,sme STUB_FAIL_ON=2 STUB_FAIL_MODE=limit \
   -- CALLS:5 \
-     LOG:"Not reviewed this cycle: 1:sme" \
-     LOG:"Starting this cycle at 1:sme, where the last one was cut." \
+     LOG:"Not reviewed this cycle: 1:code:sme" \
+     LOG:"Starting this cycle at 1:code:sme, where the last one was cut." \
      ARGV:3:"You are a Subject Matter Expert" \
      NOARGV:3:"--resume" \
      ARGV:4:"--resume S1" \
      ARGV:5:"--resume S2"
+
+# --- mode routing ------------------------------------------------------------
+# Mode is decided once per PR, inside enumerate_candidate_prs, from its labels.
+cycle "mode: an unlabeled PR is reviewed in code mode" \
+  PERSONAS=red_team STUB_MAX_CYCLES=1 \
+  -- CALLS:1 \
+     LOG:"Candidate PRs (ids): 1:code" \
+     LOG:"Reviewing PR #1 [code/red_team]"
+
+cycle "mode: a PR carrying the plan label is reviewed in plan mode" \
+  PERSONAS=red_team STUB_PLAN_PRS=1 STUB_MAX_CYCLES=1 \
+  -- CALLS:1 \
+     LOG:"Candidate PRs (ids): 1:plan" \
+     LOG:"Reviewing PR #1 [plan/red_team]"
+
+cycle "mode: PLAN_LABEL names the label that means plan" \
+  PERSONAS=red_team PLAN_LABEL=proposal STUB_PLAN_PRS=1 STUB_PLAN_LABEL=proposal STUB_MAX_CYCLES=1 \
+  -- CALLS:1 LOG:"1:plan"
+
+cycle "mode: a label that is not PLAN_LABEL leaves the PR in code mode" \
+  PERSONAS=red_team PLAN_LABEL=proposal STUB_PLAN_PRS=1 STUB_PLAN_LABEL=plan STUB_MAX_CYCLES=1 \
+  -- CALLS:1 LOG:"1:code"
+
+cycle "mode: both modes can appear in one cycle" \
+  PR_IDS=1,2 PERSONAS=red_team STUB_PLAN_PRS=2 STUB_MAX_CYCLES=1 \
+  -- CALLS:2 \
+     LOG:"Candidate PRs (ids): 1:code 2:plan"
+
+# A failed label lookup must NOT fall back to code mode. Guessing posts real
+# comments in the wrong register on a real PR, and there is no undoing that; a
+# skip is one log line and a retry next cycle.
+cycle "mode: a failed label lookup skips the PR rather than guessing" \
+  PR_IDS=1,2 PERSONAS=red_team STUB_LABEL_FAIL=1 STUB_MAX_CYCLES=1 \
+  -- CALLS:1 \
+     LOG:"could not read labels for PR #1" \
+     LOG:"Candidate PRs (ids): 2:code" \
+     NOLOG:"Reviewing PR #1"
 
 # Three in a row that are not limits means the provider is unhealthy, not that
 # these particular pairs are cursed. Walking the rest of the list into it costs
@@ -428,8 +483,8 @@ cycle "failures: a run of non-limit failures abandons the cycle at the ordinary 
   PR_IDS=1,2 PERSONAS=red_team,sage,sme STUB_FAIL_ON=2,3,4 STUB_FAIL_MODE=other STUB_MAX_CYCLES=1 \
   -- CALLS:4 \
      LOG:"3 passes in a row failed for reasons other than a limit" \
-     LOG:"Not reviewed this cycle: 2:sage 2:sme" \
-     LOG:"The next cycle starts at 2:sage" \
+     LOG:"Not reviewed this cycle: 2:code:sage 2:code:sme" \
+     LOG:"The next cycle starts at 2:code:sage" \
      NOLOG:"Backing off"
 
 # ... and the counter is consecutive, not cumulative: two failures, a success,

@@ -63,7 +63,7 @@ strip_surrounding_quotes \
   CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN \
   GITHUB_TOKEN GITHUB_REPOSITORY LINEAR_API_KEY \
   PR_ASSIGNEE PR_IDS PR_SEARCH \
-  PERSONAS PERSONA_DIR LIMIT_BACKOFF_SECONDS
+  PERSONAS PERSONA_DIR PLAN_LABEL LIMIT_BACKOFF_SECONDS
 
 # --- Required configuration ------------------------------------------------
 # Provider-specific credentials are validated in "Backend selection" below.
@@ -163,13 +163,48 @@ resolve_pr_selection() {
   return 0
 }
 
-# Echo candidate PR numbers (one per line) for the active selector.
+# --- Review mode -------------------------------------------------------------
+# A plan arrives as a pull request whose diff is the plan document, so plan
+# review reuses the whole loop and differs only in which personas and which
+# prompt a PR gets. Routing is by label rather than by a path heuristic or a
+# classifier pass: a label is explicit, per-PR, author-controlled, and puts no
+# nondeterministic decision inside the harness's control flow.
+PLAN_LABEL="${PLAN_LABEL:-plan}"
+
+# Read `gh --json number,labels` output on stdin -- an array from `gh pr list`,
+# or a single object from `gh pr view` -- and echo `number<TAB>mode` per PR.
+# Unparseable input exits non-zero, which the ids arm below turns into a skip.
+pr_modes() {
+  jq -r --arg L "$PLAN_LABEL" '
+    (if type == "array" then . else [.] end)[]
+    | "\(.number)\t\(if any(.labels[]?; .name == $L) then "plan" else "code" end)"
+  '
+}
+
+# Echo one `number<TAB>mode` line per candidate PR. Mode is decided here, at the
+# one seam that already decides what gets reviewed at all, so nothing downstream
+# asks GitHub a second time. For the three list selectors the labels ride along
+# in the call that was already being made; `ids` has no list call behind it, so
+# it costs one `gh pr view` per PR per cycle.
 enumerate_candidate_prs() {
+  local n raw
   case "$PR_SELECTOR" in
-    all)      gh pr list -R "$GITHUB_REPOSITORY" --state open --limit 100 --json number --jq '.[].number' ;;
-    assignee) gh pr list -R "$GITHUB_REPOSITORY" --state open --assignee "$PR_ASSIGNEE" --limit 100 --json number --jq '.[].number' ;;
-    search)   gh pr list -R "$GITHUB_REPOSITORY" --search "$PR_SEARCH" --limit 100 --json number --jq '.[].number' ;;
-    ids)      parse_pr_ids "$PR_IDS" ;;
+    all)      gh pr list -R "$GITHUB_REPOSITORY" --state open --limit 100 --json number,labels | pr_modes ;;
+    assignee) gh pr list -R "$GITHUB_REPOSITORY" --state open --assignee "$PR_ASSIGNEE" --limit 100 --json number,labels | pr_modes ;;
+    search)   gh pr list -R "$GITHUB_REPOSITORY" --search "$PR_SEARCH" --limit 100 --json number,labels | pr_modes ;;
+    ids)
+      for n in $(parse_pr_ids "$PR_IDS"); do
+        # A failed lookup skips this PR for the cycle. It does NOT fall back to
+        # code mode: a wrong-mode review posts real comments on a real PR and
+        # cannot be taken back, where a skip is one log line and a retry next
+        # cycle. The log goes to stderr because this function's stdout is the
+        # candidate list.
+        if raw="$(gh pr view "$n" -R "$GITHUB_REPOSITORY" --json number,labels 2>/dev/null)"; then
+          printf '%s\n' "$raw" | pr_modes || log "WARN: could not read labels for PR #$n; skipping it this cycle." >&2
+        else
+          log "WARN: could not read labels for PR #$n; skipping it this cycle." >&2
+        fi
+      done ;;
   esac
 }
 
@@ -1139,7 +1174,9 @@ while true; do
   # Re-enumerate every cycle so newly-matching PRs get picked up (PR_IDS is a
   # fixed set). Read the numbers into an array.
   prs=()
-  while IFS= read -r _n; do [ -n "$_n" ] && prs+=("$_n"); done < <(enumerate_candidate_prs || true)
+  while IFS=$'\t' read -r _n _mode; do
+    [ -n "$_n" ] && [ -n "$_mode" ] && prs+=("$_n:$_mode")
+  done < <(enumerate_candidate_prs || true)
 
   if [ "${#prs[@]}" -eq 0 ]; then
     log "No candidate PRs for selector '$PR_SELECTOR'."
@@ -1161,8 +1198,9 @@ while true; do
   # holds the pair to start at and is in memory only: surviving a container
   # restart is deferred with the rest of the persisted state.
   pairs=()
-  for pr in ${prs[@]+"${prs[@]}"}; do
-    for persona in "${PERSONAS_LIST[@]}"; do pairs+=("$pr:$persona"); done
+  for pr_mode in ${prs[@]+"${prs[@]}"}; do
+    pr="${pr_mode%%:*}"; mode="${pr_mode#*:}"
+    for persona in "${PERSONAS_LIST[@]}"; do pairs+=("$pr:$mode:$persona"); done
   done
   npairs=${#pairs[@]}
 
@@ -1187,13 +1225,13 @@ while true; do
   for ((i = 0; i < npairs; i++)); do
     idx=$(( (start + i) % npairs ))
     key="${pairs[$idx]}"
-    pr="${key%%:*}"; persona="${key#*:}"
+    pr="${key%%:*}"; _rest="${key#*:}"; mode="${_rest%%:*}"; persona="${_rest#*:}"
     sid="${PR_SESSION[$key]:-}"
     if [ -z "$sid" ]; then
-      log "Reviewing PR #$pr as $persona (new session)..."
+      log "Reviewing PR #$pr [$mode/$persona] (new session)..."
       prompt="$(render_prompt "$REVIEW_PROMPT" "$pr")"
     else
-      log "Reviewing PR #$pr as $persona (resuming session $sid)..."
+      log "Reviewing PR #$pr [$mode/$persona] (resuming session $sid)..."
       prompt="$(render_prompt "$FOLLOWUP_PROMPT" "$pr")"
     fi
 
@@ -1201,10 +1239,10 @@ while true; do
       consec_fail=0
       PR_SESSION[$key]="$RUN_PASS_SESSION_ID"
       PR_PASSES[$key]=$(( ${PR_PASSES[$key]:-0} + 1 ))
-      log "PR #$pr [$persona] review complete (session ${PR_SESSION[$key]}, pass ${PR_PASSES[$key]})."
+      log "PR #$pr [$mode/$persona] review complete (session ${PR_SESSION[$key]}, pass ${PR_PASSES[$key]})."
       # Rotate this pair's session once its cap is hit, to bound context growth.
       if [ "$MAX_PASSES_PER_SESSION" -gt 0 ] && [ "${PR_PASSES[$key]}" -ge "$MAX_PASSES_PER_SESSION" ]; then
-        log "PR #$pr [$persona] reached MAX_PASSES_PER_SESSION=$MAX_PASSES_PER_SESSION; rotating its session next cycle."
+        log "PR #$pr [$mode/$persona] reached MAX_PASSES_PER_SESSION=$MAX_PASSES_PER_SESSION; rotating its session next cycle."
         unset 'PR_SESSION[$key]'
         PR_PASSES[$key]=0
       fi
@@ -1213,16 +1251,16 @@ while true; do
       # remaining pairs into the same wall, and back off before the next one.
       if [ -n "$RUN_PASS_SESSION_ID" ]; then
         PR_SESSION[$key]="$RUN_PASS_SESSION_ID"
-        log "WARN: PR #$pr [$persona] hit a usage or rate limit; keeping its session and ending this cycle early."
+        log "WARN: PR #$pr [$mode/$persona] hit a usage or rate limit; keeping its session and ending this cycle early."
       else
-        log "WARN: PR #$pr [$persona] hit a usage or rate limit before it had a session; ending this cycle early."
+        log "WARN: PR #$pr [$mode/$persona] hit a usage or rate limit before it had a session; ending this cycle early."
       fi
       [ -n "$RUN_PASS_LIMIT_LINE" ] && log "  limit reported by claude: $RUN_PASS_LIMIT_LINE"
       limited=1
       cut=$idx cut_i=$i
       break
     else
-      log "WARN: PR #$pr [$persona] review failed; starting a fresh session for it next cycle."
+      log "WARN: PR #$pr [$mode/$persona] review failed; starting a fresh session for it next cycle."
       unset 'PR_SESSION[$key]'
       PR_PASSES[$key]=0
       consec_fail=$(( consec_fail + 1 ))
