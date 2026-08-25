@@ -284,7 +284,7 @@ taken back."
   - `PERSONA_PROMPT["$mode:$id"]`, `PERSONA_LABEL["$mode:$id"]` — mode-qualified keys.
   - `MODE_PERSONAS[$mode]` — space-joined persona ids for that mode, in selection order.
   - `resolve_personas MODE` — takes the mode as its one argument.
-  - `persona_meta ID MODE`, `persona_body ID MODE`, `persona_prompt ID MODE` — all take the mode as a trailing argument.
+  - `persona_meta ID KEY MODE`, `persona_body ID MODE`, `persona_prompt ID MODE` — all take the mode as a trailing argument.
 
 - [ ] **Step 1: Restructure the persona files**
 
@@ -515,10 +515,10 @@ persona_prompt() {
 # one no PR currently uses, so a broken definition fails at boot rather than the
 # first time somebody adds a label to a PR.
 resolve_personas() {
-  local mode="$1" dir="$PERSONA_DIR/$mode" avail="" f b tok raw def sel list=""
+  local mode="$1" dir="$PERSONA_DIR/$mode" avail="" f b tok raw def list=""
   case "$mode" in
-    code) def="$DEFAULT_PERSONAS_CODE"; sel="${PERSONAS-}"; [ -n "${PERSONAS+set}" ] || sel="" ;;
-    plan) def="$DEFAULT_PERSONAS_PLAN"; sel="${PLAN_PERSONAS-}" ;;
+    code) def="$DEFAULT_PERSONAS_CODE" ;;
+    plan) def="$DEFAULT_PERSONAS_PLAN" ;;
   esac
   [ -d "$PERSONA_DIR" ] || die "no persona definitions: PERSONA_DIR=$PERSONA_DIR is not a directory."
   # The flat layout phase 1 shipped is reachable by exactly the mount-your-own-
@@ -590,16 +590,6 @@ resolve_personas() {
 }
 ```
 
-Note the two local variables `def` and `sel` in the `case` at the top are redundant with the `raw` assignment below; drop the first `case` block entirely and keep only the `raw` one, plus a `def` assignment for the error message:
-
-```bash
-  local mode="$1" dir="$PERSONA_DIR/$mode" avail="" f b tok raw def list=""
-  case "$mode" in
-    code) def="$DEFAULT_PERSONAS_CODE" ;;
-    plan) def="$DEFAULT_PERSONAS_PLAN" ;;
-  esac
-```
-
 - [ ] **Step 5: Update the call site and the pair loop**
 
 At `entrypoint.sh:451`, replace `resolve_personas` with:
@@ -619,7 +609,23 @@ In the cycle loop, replace the pair-flattening block from Task 1 with:
   done
 ```
 
-At the two `--append-system-prompt` sites (`entrypoint.sh:1097` and `:1103`), change `"${PERSONA_PROMPT[$persona]}"` to `"${PERSONA_PROMPT[$mode:$persona]}"`. `run_pass` takes the persona as `$3`; give it the mode as `$4` and set `local mode="$4"` alongside the existing locals, then pass `"$mode"` at the call site in the cycle loop.
+`run_pass` needs the mode, because the persona prompt is now keyed by it. Change its signature line from
+
+```bash
+  local prompt="$1" sid="$2" persona="$3" rc errfile rawfile got
+```
+
+to
+
+```bash
+  local prompt="$1" sid="$2" persona="$3" mode="$4" rc errfile rawfile got
+```
+
+and at both `--append-system-prompt` sites inside it (`entrypoint.sh:1097` and `:1103`), change `"${PERSONA_PROMPT[$persona]}"` to `"${PERSONA_PROMPT[$mode:$persona]}"`. At its one call site in the cycle loop, `if run_pass "$prompt" "$sid" "$persona"; then` becomes:
+
+```bash
+    if run_pass "$prompt" "$sid" "$persona" "$mode"; then
+```
 
 - [ ] **Step 6: Add `PLAN_PERSONAS` to the quote-stripping list**
 
@@ -820,7 +826,7 @@ done
 unset _mode
 ```
 
-This loop reads `MODE_REVIEW_PROMPT`, so it must sit after the block above and after the `resolve_personas` loop that defines nothing it needs. Keep it where the old two-line version was, immediately following `resolve_pr_selection` and the persona resolution.
+Keep it exactly where the old two-line version was, immediately after the `resolve_pr_selection` and persona-resolution calls. It reads `MODE_REVIEW_PROMPT` and `REVIEW_MODES`, both of which are set further up the file, so that position is already valid.
 
 - [ ] **Step 5: Use the per-mode prompt in the cycle loop**
 
