@@ -175,8 +175,17 @@ Bare names keep meaning code mode. Plan mode gets `PLAN_`-prefixed counterparts:
 - `PLAN_REVIEW_PROMPT`, `PLAN_FOLLOWUP_PROMPT`
 - `PLAN_REVIEW_PROMPT_SUFFIX`, `PLAN_FOLLOWUP_PROMPT_SUFFIX`
 
-All six go on the `strip_surrounding_quotes` list, since every one of them is
-operator-supplied and `docker run --env-file` does no quote processing.
+**Corrected during implementation.** This spec originally said all six go on the
+`strip_surrounding_quotes` list, since every one of them is operator-supplied and
+`docker run --env-file` does no quote processing. What shipped is narrower.
+`PLAN_LABEL` and `PLAN_PERSONAS` go on the list. The four prompt vars
+deliberately do not, because their code counterparts `REVIEW_PROMPT`,
+`FOLLOWUP_PROMPT`, `REVIEW_PROMPT_SUFFIX` and `FOLLOWUP_PROMPT_SUFFIX` are not on
+it either, and leaving the plan four on it would have made two identically
+spelled vars behave differently. A prompt value is the one class here where a
+leading or trailing quote can be legitimate content, so all eight are exempt.
+Adding the code four to the list instead was not available: code-mode behavior
+has to stay identical to what it was before this change.
 
 ## 5. Tests
 
