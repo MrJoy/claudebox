@@ -63,7 +63,15 @@ strip_surrounding_quotes \
   CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN \
   GITHUB_TOKEN GITHUB_REPOSITORY LINEAR_API_KEY \
   PR_ASSIGNEE PR_IDS PR_SEARCH \
-  PERSONAS PERSONA_DIR LIMIT_BACKOFF_SECONDS
+  PERSONAS PLAN_PERSONAS PERSONA_DIR PLAN_LABEL LIMIT_BACKOFF_SECONDS
+# The prompt vars (REVIEW_PROMPT, FOLLOWUP_PROMPT, their _SUFFIX forms, and the
+# PLAN_-prefixed counterparts of all four) are deliberately absent from that
+# list. Everything else on it is a URL, an id, a credential, or a name or number
+# drawn from a fixed vocabulary, where a leading or trailing quote is always
+# operator error. A prompt is free text, so a quote at either end can be exactly
+# what the operator meant to send, and stripping it would edit the prompt behind
+# their back -- against the guarantee that an operator-supplied prompt reaches
+# Claude verbatim.
 
 # --- Required configuration ------------------------------------------------
 # Provider-specific credentials are validated in "Backend selection" below.
@@ -163,13 +171,59 @@ resolve_pr_selection() {
   return 0
 }
 
-# Echo candidate PR numbers (one per line) for the active selector.
+# --- Review mode -------------------------------------------------------------
+# A plan arrives as a pull request whose diff is the plan document, so plan
+# review reuses the whole loop and differs only in which personas and which
+# prompt a PR gets. Routing is by label rather than by a path heuristic or a
+# classifier pass: a label is explicit, per-PR, set by someone with triage
+# rights, and puts no nondeterministic decision inside the harness's control
+# flow.
+PLAN_LABEL="${PLAN_LABEL:-plan}"
+
+# Read `gh --json number,labels` output on stdin -- an array from `gh pr list`,
+# or a single object from `gh pr view` -- and echo `number<TAB>mode` per PR.
+# Unparseable input exits non-zero, which the ids arm below turns into a skip.
+pr_modes() {
+  jq -r --arg L "$PLAN_LABEL" '
+    (if type == "array" then . else [.] end)[]
+    | select(.number != null)
+    | "\(.number)\t\(if any(.labels[]?; .name == $L) then "plan" else "code" end)"
+  '
+}
+
+# Echo one `number<TAB>mode` line per candidate PR. Mode is decided here, at the
+# one seam that already decides what gets reviewed at all, so nothing downstream
+# asks GitHub a second time. For the three list selectors the labels ride along
+# in the call that was already being made; `ids` has no list call behind it, so
+# it costs one `gh pr view` per PR per cycle.
 enumerate_candidate_prs() {
+  local n raw out
   case "$PR_SELECTOR" in
-    all)      gh pr list -R "$GITHUB_REPOSITORY" --state open --limit 100 --json number --jq '.[].number' ;;
-    assignee) gh pr list -R "$GITHUB_REPOSITORY" --state open --assignee "$PR_ASSIGNEE" --limit 100 --json number --jq '.[].number' ;;
-    search)   gh pr list -R "$GITHUB_REPOSITORY" --search "$PR_SEARCH" --limit 100 --json number --jq '.[].number' ;;
-    ids)      parse_pr_ids "$PR_IDS" ;;
+    all)      gh pr list -R "$GITHUB_REPOSITORY" --state open --limit 100 --json number,labels | pr_modes ;;
+    assignee) gh pr list -R "$GITHUB_REPOSITORY" --state open --assignee "$PR_ASSIGNEE" --limit 100 --json number,labels | pr_modes ;;
+    search)   gh pr list -R "$GITHUB_REPOSITORY" --search "$PR_SEARCH" --limit 100 --json number,labels | pr_modes ;;
+    ids)
+      for n in $(parse_pr_ids "$PR_IDS"); do
+        # A failed lookup skips this PR for the cycle. It does NOT fall back to
+        # code mode: a wrong-mode review posts real comments on a real PR and
+        # cannot be taken back, where a skip is one log line and a retry next
+        # cycle. The log goes to stderr because this function's stdout is the
+        # candidate list. `out` is checked non-empty, not just pr_modes' exit
+        # code: a `gh` that exits 0 with empty/whitespace stdout, or with a
+        # well-formed object missing `number`, makes pr_modes itself exit 0
+        # with nothing on stdout -- silently dropping the PR with no WARN at
+        # all, which is worse than the ordinary failed-lookup case it exists
+        # to guard against.
+        out=""
+        if raw="$(gh pr view "$n" -R "$GITHUB_REPOSITORY" --json number,labels 2>/dev/null)"; then
+          out="$(printf '%s\n' "$raw" | pr_modes)"
+        fi
+        if [ -n "$out" ]; then
+          printf '%s\n' "$out"
+        else
+          log "WARN: could not read labels for PR #$n; skipping it this cycle." >&2
+        fi
+      done ;;
   esac
 }
 
@@ -180,84 +234,112 @@ render_prompt() {
 
 # --- Persona registry ------------------------------------------------------
 # Each review pass runs as one of advocate's adversarial personas rather than as
-# a generalist reviewer. A persona is a file in PERSONA_DIR: frontmatter (label,
-# success) plus a body that becomes the pass's system prompt. Files starting with
-# an underscore are not personas; _shared.md is the output contract appended to
-# every persona body.
+# a generalist reviewer. advocate's personas are PLAN-review personas: they were
+# written to interrogate a proposal before the work happens. Code mode runs the
+# subset of them that survives contact with a diff; plan mode runs all six.
+#
+# PERSONA_DIR is a parent holding one tree per mode. A persona is a file in
+# PERSONA_DIR/<mode>: frontmatter (label, success) plus a body that becomes the
+# pass's system prompt. Files starting with an underscore are not personas;
+# _shared.md is the output contract appended to every persona body in that tree.
 #
 # Definitions live in files rather than inline here for three reasons: it keeps
 # ~200 lines of prompt text out of this script, it gives an operator an override
 # by mounting their own directory at PERSONA_DIR, and it keeps the imported text
 # close to its provenance (tools/import-advocate-personas.py).
 PERSONA_DIR="${PERSONA_DIR:-/opt/claudebox/personas}"
-# The default set is code-facing. advocate's `user` and `good_friend` were written
-# against designs and whole projects; on a narrow diff they reach for material
-# that isn't in it, so they ship but are opt-in.
-DEFAULT_PERSONAS="red_team,adversarial,sme,sage"
+REVIEW_MODES="code plan"
+# The code default is the subset: advocate's `user` and `good_friend` were
+# written against designs and whole projects, so on a narrow diff they reach for
+# material that isn't in it. Plan mode is where they finally have something to
+# bite on, which is why the plan default is everything.
+DEFAULT_PERSONAS_CODE="red_team,adversarial,sme,sage"
+DEFAULT_PERSONAS_PLAN="adversarial,good_friend,red_team,sage,sme,user"
 # Claimed now, used in phase 2: the pass that reconciles what the personas said
 # is the only one allowed to read their findings, which is why it is not itself
 # a persona and cannot be selected as one.
 RESERVED_PERSONAS="aggregate"
 
+# Keyed "$mode:$id", so the same persona name in two trees is two entries.
 declare -A PERSONA_PROMPT=()
 declare -A PERSONA_LABEL=()
-PERSONAS_LIST=()
+# Keyed "$mode", holding that mode's selected persona ids space-joined, in order.
+declare -A MODE_PERSONAS=()
 
-# Echo frontmatter key $2 from persona $1.
+# Echo frontmatter key $2 from persona $1 in mode $3.
 persona_meta() {
   awk -v k="$2" '
     NR == 1 && $0 == "---" { fm = 1; next }
     fm && $0 == "---" { exit }
     fm && index($0, k ":") == 1 { sub(/^[^:]*:[[:space:]]*/, ""); print; exit }
-  ' "$PERSONA_DIR/$1.md"
+  ' "$PERSONA_DIR/$3/$1.md"
 }
 
-# Echo persona $1's own body: everything after its frontmatter. Separate from
-# persona_prompt because resolve_personas has to judge the body on its own -- a
-# body-plus-shared-contract string is never empty, so a persona file that is
-# nothing but frontmatter would resolve and then review a PR with no identity at
-# all, signing findings with a label it has no angle of attack behind.
+# Echo persona $1's own body in mode $2: everything after its frontmatter.
+# Separate from persona_prompt because resolve_personas has to judge the body on
+# its own -- a body-plus-shared-contract string is never empty, so a persona file
+# that is nothing but frontmatter would resolve and then review a PR with no
+# identity at all, signing findings with a label it has no angle of attack behind.
 persona_body() {
   awk '
     NR == 1 && $0 == "---" { fm = 1; next }
     fm && $0 == "---" { fm = 0; body = 1; next }
     body
-  ' "$PERSONA_DIR/$1.md"
+  ' "$PERSONA_DIR/$2/$1.md"
 }
 
-# Echo persona $1's full system prompt: its body, then the shared contract, with
-# {{PERSONA}} replaced by its label. The label is validated in resolve_personas
-# to contain no slash, so it is safe as a sed replacement.
+# Echo persona $1's full system prompt in mode $2: its body, then that tree's
+# shared contract, with {{PERSONA}} replaced by its label. The label is validated
+# in resolve_personas to contain no slash, so it is safe as a sed replacement.
 persona_prompt() {
-  local id="$1" label="${PERSONA_LABEL[$1]}"
+  local id="$1" mode="$2" label="${PERSONA_LABEL[$2:$1]}"
   {
-    persona_body "$id"
+    persona_body "$id" "$mode"
     printf '\n'
-    cat "$PERSONA_DIR/_shared.md"
+    cat "$PERSONA_DIR/$mode/_shared.md"
   } | sed "s|{{PERSONA}}|$label|g"
 }
 
-# Fill PERSONAS_LIST (order-preserving), PERSONA_LABEL and PERSONA_PROMPT from
-# PERSONAS, or from DEFAULT_PERSONAS when it is unset. Dies on anything it can't
-# resolve: a typo that silently narrowed the review to one persona, or to none,
-# would look exactly like a working run in the log.
+# Fill MODE_PERSONAS[$1], PERSONA_LABEL and PERSONA_PROMPT for mode $1, from that
+# mode's selector var or its default set. Dies on anything it can't resolve: a
+# typo that silently narrowed the review to one persona, or to none, would look
+# exactly like a working run in the log. Called for EVERY mode at startup, even
+# one no PR currently uses, so a broken definition fails at boot rather than the
+# first time somebody adds a label to a PR.
 resolve_personas() {
-  local avail="" f b tok raw
+  local mode="$1" dir avail="" f b tok raw def list=""
+  dir="$PERSONA_DIR/$mode"
+  case "$mode" in
+    code) def="$DEFAULT_PERSONAS_CODE" ;;
+    plan) def="$DEFAULT_PERSONAS_PLAN" ;;
+  esac
   [ -d "$PERSONA_DIR" ] || die "no persona definitions: PERSONA_DIR=$PERSONA_DIR is not a directory."
+  # The flat layout phase 1 shipped is reachable by exactly the mount-your-own-
+  # personas workflow the docs advertise, so it has to say what changed rather
+  # than dying on a missing file three checks later.
+  if [ ! -d "$dir" ]; then
+    for f in "$PERSONA_DIR"/*.md; do
+      [ -e "$f" ] && die "PERSONA_DIR now holds one tree per review mode: $PERSONA_DIR needs code/ and plan/ subdirectories, but its persona files sit directly in it."
+    done
+    die "no persona definitions for $mode review: $dir is not a directory."
+  fi
   # Every persona body is appended to _shared.md, so without it persona_prompt's
   # `cat` fails, pipefail fails the command substitution and set -e exits with
   # nothing but cat's own message -- under --restart unless-stopped, a silent
   # crash loop reachable by the documented "mount your own personas" workflow.
-  [ -f "$PERSONA_DIR/_shared.md" ] || die "no output contract: $PERSONA_DIR/_shared.md is missing; every persona body is appended to it."
-  for f in "$PERSONA_DIR"/*.md; do
+  [ -f "$dir/_shared.md" ] || die "no output contract: $dir/_shared.md is missing; every persona body is appended to it."
+  for f in "$dir"/*.md; do
     [ -e "$f" ] || continue
     b="$(basename "$f" .md)"
     case "$b" in _*) continue ;; esac
     avail="$avail $b"
   done
-  [ -n "$avail" ] || die "no persona definitions found in $PERSONA_DIR."
+  [ -n "$avail" ] || die "no persona definitions found in $dir."
 
-  raw="${PERSONAS-$DEFAULT_PERSONAS}"
+  case "$mode" in
+    code) raw="${PERSONAS-$def}" ;;
+    plan) raw="${PLAN_PERSONAS-$def}" ;;
+  esac
   case "$(printf '%s' "$raw" | tr 'A-Z' 'a-z')" in
     all) raw="$(printf '%s' "$avail")" ;;
   esac
@@ -272,31 +354,33 @@ resolve_personas() {
     esac
     case " $avail " in
       *" $tok "*) ;;
-      *) die "unknown persona '$tok'; available:$avail" ;;
+      *) die "unknown persona '$tok' for $mode review; available:$avail" ;;
     esac
-    case " ${PERSONAS_LIST[*]-} " in
-      *" $tok "*) die "persona '$tok' is listed twice in PERSONAS." ;;
+    case " $list " in
+      *" $tok "*) die "persona '$tok' is listed twice for $mode review." ;;
     esac
-    PERSONAS_LIST+=("$tok")
+    list="${list:+$list }$tok"
   done
   set +f
-  [ "${#PERSONAS_LIST[@]}" -gt 0 ] || die "PERSONAS is set but names no persona; unset it for the default set ($DEFAULT_PERSONAS), or name one of:$avail"
+  local var; case "$mode" in code) var=PERSONAS ;; plan) var=PLAN_PERSONAS ;; esac
+  [ -n "$list" ] || die "$var is set but names no persona; unset it for the default set ($def), or name one of:$avail"
 
   # Resolve labels and prompts once, so a pass is a string lookup rather than
   # three file reads, and so a broken definition fails at startup.
   local id label body
-  for id in "${PERSONAS_LIST[@]}"; do
-    label="$(persona_meta "$id" label)"
+  for id in $list; do
+    label="$(persona_meta "$id" label "$mode")"
     case "$label" in
-      '') die "persona '$id' has no label: in its frontmatter." ;;
-      *[!A-Za-z0-9\ ._-]*) die "persona '$id' has a label with unexpected characters: '$label' (letters, digits, spaces, dot, underscore and hyphen only)." ;;
+      '') die "persona '$mode/$id' has no label: in its frontmatter." ;;
+      *[!A-Za-z0-9\ ._-]*) die "persona '$mode/$id' has a label with unexpected characters: '$label' (letters, digits, spaces, dot, underscore and hyphen only)." ;;
     esac
-    body="$(persona_body "$id")"
-    [ -n "${body//[[:space:]]/}" ] || die "persona '$id' has an empty prompt body."
-    PERSONA_LABEL[$id]="$label"
-    PERSONA_PROMPT[$id]="$(persona_prompt "$id")"
+    body="$(persona_body "$id" "$mode")"
+    [ -n "${body//[[:space:]]/}" ] || die "persona '$mode/$id' has an empty prompt body."
+    PERSONA_LABEL[$mode:$id]="$label"
+    PERSONA_PROMPT[$mode:$id]="$(persona_prompt "$id" "$mode")"
   done
-  log "personas: ${PERSONAS_LIST[*]}"
+  MODE_PERSONAS[$mode]="$list"
+  log "$mode personas: $list"
 }
 
 # --- Optional Linear context ------------------------------------------------
@@ -392,10 +476,15 @@ case "$LIMIT_BACKOFF_SECONDS" in ''|*[!0-9]*) die "LIMIT_BACKOFF_SECONDS must be
 # growth of a long-lived resumed session's context. 0 = never rotate.
 MAX_PASSES_PER_SESSION="${MAX_PASSES_PER_SESSION:-0}"
 case "$MAX_PASSES_PER_SESSION" in ''|*[!0-9]*) die "MAX_PASSES_PER_SESSION must be a non-negative integer";; esac
-# Prompts are PR-scoped: the harness runs one session per PR and substitutes the
-# {{PR}} token with that PR's number. REVIEW_PROMPT starts a PR's session;
-# FOLLOWUP_PROMPT is used when resuming it on a later cycle. Custom overrides use
-# the same {{PR}} token.
+# Prompts are PR-scoped and mode-scoped. Every one of them substitutes the
+# {{PR}} token with the number of the PR the pass is reviewing, overrides
+# included. There are four, one per (mode, new-or-resumed) combination: code mode
+# uses REVIEW_PROMPT to start a pair's session and FOLLOWUP_PROMPT to resume it
+# on a later cycle, and plan mode uses PLAN_REVIEW_PROMPT and
+# PLAN_FOLLOWUP_PROMPT for the same two jobs. The bare names stay code mode, so
+# an operator who tunes the code prompt cannot silently change what a plan PR
+# gets asked. The four defaults are built below and land in MODE_REVIEW_PROMPT /
+# MODE_FOLLOWUP_PROMPT, keyed by mode.
 #
 # The gh constraints in these prompts are not style advice: they are what the
 # privilege-minimized token can actually do. A bare `gh pr view` asks for
@@ -416,6 +505,11 @@ case "$MAX_PASSES_PER_SESSION" in ''|*[!0-9]*) die "MAX_PASSES_PER_SESSION must 
 # this a good test?" resolves to "it looks like the other tests."
 _test_stanza="Treat the tests in this PR as code under review in their own right, not as evidence that the change works. For each test the PR adds or modifies, run this check explicitly: identify which specific lines of the non-test change it depends on, mentally revert just those lines, and decide whether the test would still pass. A test that passes against the pre-change code is not a regression test, and that it exercises the new code path is not the same thing -- exercising is not asserting. Raise every such test as a finding, and say in the comment which mutation of the production code survives it. Apply the same mutation thinking beyond a straight revert: would the test still pass if a boundary moved by one, a condition were negated, an error branch were deleted, a returned collection came back empty, or the function returned a fixed value? Also flag tests that lock in as-implemented behavior instead of intended behavior -- assertions that restate the implementation, recompute the expected value with the same logic the code under test uses, assert on a mock's own stubbed return, or freeze whatever the code currently emits (snapshots included) without any statement of what is actually required. A test should read as a claim about what the code must do that a reader could check against the ticket or the PR description. Call out tests that cannot fail (no assertion reached, assertions after an early return or inside a never-taken branch, a swallowed exception, a tautological comparison) and tests whose name or docstring promises a behavior the body never checks. Where a change adds a behavior with no test that would catch its removal, say so and name the missing case; where the tests are genuinely adequate, say nothing about them."
 _gh_stanza="Two constraints on the GitHub CLI here, because the token is deliberately privilege-minimized: always pass an explicit --json field list to \`gh pr view\` (a bare \`gh pr view\` also fetches statusCheckRollup, which this token cannot be granted permission for, so it fails outright), and do not use \`gh pr checks\` at all -- it needs that same permission and cannot work. CI status is therefore unavailable to you: review the code on its own merits, and never wait on or refer to check results."
+# The plan stanza does two jobs. It says what to review, and it says what NOT to
+# flag: a code-shaped reviewer handed a design document will reliably report
+# missing error handling in code nobody has written, and a review full of that is
+# a review nobody reads. Like the others it is appended to the DEFAULTS only.
+_plan_stanza="This pull request proposes an approach rather than implementing one. Review the proposal itself: whether the problem is stated correctly, whether this is the simplest thing that solves it, what it fails to account for, what it forecloses, and what would have to be true for it to work. Where you object, say what you would do instead. There is no implementation to inspect, so do not ask for tests, error handling, or input validation in code that does not exist yet; a gap in the plan's own reasoning is a finding, a gap in code it has not written is not."
 DEFAULT_PROMPT="Perform a thorough review of pull request #{{PR}} in this repository. Inspect it with \`gh pr diff {{PR}}\` and \`gh pr view {{PR}} --json number,title,body,author,url,state,isDraft,headRefName,headRefOid,baseRefName,labels,files,commits,comments,reviews\`, and be sure you're looking at the most recent commit on its branch. $_gh_stanza Pay particular attention to test quality/robustness, security, correctness, and architectural coherence/consistency, and whether the approach the PR takes is prudent and robust in light of the issue it addresses. $_test_stanza Post findings as comments on the PR, one comment per finding."
 # Prompt used when RESUMING a PR's session (it already holds context from prior
 # passes on that PR, so this nudges a re-check rather than re-introducing the task).
@@ -427,30 +521,52 @@ DEFAULT_PROMPT="Perform a thorough review of pull request #{{PR}} in this reposi
 # in response to earlier findings -- the pass most likely to see a hastily
 # written test is the one least likely to still remember how to judge one.
 DEFAULT_FOLLOWUP="I've fetched the latest refs. Re-check pull request #{{PR}} for new commits or changes since your last review of it. Apply the same review standard, and only post findings you haven't already raised on this PR. Be sure you're looking at the most recent commit on its branch. $_gh_stanza $_test_stanza"
+# Prompt pair for plan mode. No test stanza -- there is no implementation to
+# mutate. The plan stanza is repeated on the followup for the same
+# context-summary reason the gh stanza is.
+DEFAULT_PLAN_PROMPT="Review the plan or design proposed in pull request #{{PR}} in this repository. Read it with \`gh pr diff {{PR}}\` and \`gh pr view {{PR}} --json number,title,body,author,url,state,isDraft,headRefName,headRefOid,baseRefName,labels,files,commits,comments,reviews\`, and be sure you're looking at the most recent commit on its branch. $_gh_stanza $_plan_stanza Post findings as comments on the PR, one comment per finding."
+DEFAULT_PLAN_FOLLOWUP="I've fetched the latest refs. Re-read the plan in pull request #{{PR}} for revisions since your last review of it. Apply the same review standard, and only post findings you haven't already raised on this PR. A point you raised that the revision addresses is settled; say nothing further about it. Be sure you're looking at the most recent commit on its branch. $_gh_stanza $_plan_stanza"
 # Linear context is added to the DEFAULTS only: an operator who supplied their own
 # prompt gets exactly that prompt, unedited. No-op when LINEAR_API_KEY is unset.
 _linear_stanza="$(linear_stanza)"
 DEFAULT_PROMPT="${DEFAULT_PROMPT}${_linear_stanza}"
 DEFAULT_FOLLOWUP="${DEFAULT_FOLLOWUP}${_linear_stanza}"
-unset _linear_stanza _gh_stanza _test_stanza
-REVIEW_PROMPT="${REVIEW_PROMPT:-$DEFAULT_PROMPT}"
-FOLLOWUP_PROMPT="${FOLLOWUP_PROMPT:-$DEFAULT_FOLLOWUP}"
+DEFAULT_PLAN_PROMPT="${DEFAULT_PLAN_PROMPT}${_linear_stanza}"
+DEFAULT_PLAN_FOLLOWUP="${DEFAULT_PLAN_FOLLOWUP}${_linear_stanza}"
+unset _linear_stanza _gh_stanza _test_stanza _plan_stanza
+# Keyed "$mode". An operator override replaces that mode's default only, so
+# tuning the code prompt cannot silently change what a plan PR is asked.
+declare -A MODE_REVIEW_PROMPT=()
+declare -A MODE_FOLLOWUP_PROMPT=()
+MODE_REVIEW_PROMPT[code]="${REVIEW_PROMPT:-$DEFAULT_PROMPT}"
+MODE_FOLLOWUP_PROMPT[code]="${FOLLOWUP_PROMPT:-$DEFAULT_FOLLOWUP}"
+MODE_REVIEW_PROMPT[plan]="${PLAN_REVIEW_PROMPT:-$DEFAULT_PLAN_PROMPT}"
+MODE_FOLLOWUP_PROMPT[plan]="${PLAN_FOLLOWUP_PROMPT:-$DEFAULT_PLAN_FOLLOWUP}"
 # Suffixes append to whichever prompt is now in effect (default or operator
-# override) — unlike the Linear stanza above, they apply either way. A single
+# override) -- unlike the Linear stanza above, they apply either way. A single
 # space joins them since the prompts above end in '.'.
 if [ -n "${REVIEW_PROMPT_SUFFIX:-}" ]; then
-  REVIEW_PROMPT="${REVIEW_PROMPT} ${REVIEW_PROMPT_SUFFIX}"
+  MODE_REVIEW_PROMPT[code]="${MODE_REVIEW_PROMPT[code]} ${REVIEW_PROMPT_SUFFIX}"
 fi
 if [ -n "${FOLLOWUP_PROMPT_SUFFIX:-}" ]; then
-  FOLLOWUP_PROMPT="${FOLLOWUP_PROMPT} ${FOLLOWUP_PROMPT_SUFFIX}"
+  MODE_FOLLOWUP_PROMPT[code]="${MODE_FOLLOWUP_PROMPT[code]} ${FOLLOWUP_PROMPT_SUFFIX}"
+fi
+if [ -n "${PLAN_REVIEW_PROMPT_SUFFIX:-}" ]; then
+  MODE_REVIEW_PROMPT[plan]="${MODE_REVIEW_PROMPT[plan]} ${PLAN_REVIEW_PROMPT_SUFFIX}"
+fi
+if [ -n "${PLAN_FOLLOWUP_PROMPT_SUFFIX:-}" ]; then
+  MODE_FOLLOWUP_PROMPT[plan]="${MODE_FOLLOWUP_PROMPT[plan]} ${PLAN_FOLLOWUP_PROMPT_SUFFIX}"
 fi
 
 # Validate PR selection now (fail fast, before auth/clone), and warn if a prompt
 # template won't name the PR.
 resolve_pr_selection
-resolve_personas
-case "$REVIEW_PROMPT"   in *'{{PR}}'*) : ;; *) log "WARN: REVIEW_PROMPT has no {{PR}} token; reviews won't name the specific PR." ;; esac
-case "$FOLLOWUP_PROMPT" in *'{{PR}}'*) : ;; *) log "WARN: FOLLOWUP_PROMPT has no {{PR}} token; reviews won't name the specific PR." ;; esac
+for _mode in $REVIEW_MODES; do resolve_personas "$_mode"; done
+for _mode in $REVIEW_MODES; do
+  case "${MODE_REVIEW_PROMPT[$_mode]}"   in *'{{PR}}'*) : ;; *) log "WARN: the $_mode review prompt has no {{PR}} token; reviews won't name the specific PR." ;; esac
+  case "${MODE_FOLLOWUP_PROMPT[$_mode]}" in *'{{PR}}'*) : ;; *) log "WARN: the $_mode followup prompt has no {{PR}} token; reviews won't name the specific PR." ;; esac
+done
+unset _mode
 
 # --- GitHub auth (gh + git) ------------------------------------------------
 # gh reads GH_TOKEN from the environment; setup-git makes git reuse it for
@@ -1083,7 +1199,7 @@ RUN_PASS_SESSION_ID=""
 RUN_PASS_LIMITED=0
 RUN_PASS_LIMIT_LINE=""
 run_pass() {
-  local prompt="$1" sid="$2" persona="$3" rc errfile rawfile got
+  local prompt="$1" sid="$2" persona="$3" mode="$4" rc errfile rawfile got
   RUN_PASS_SESSION_ID="$sid"
   RUN_PASS_LIMITED=0
   RUN_PASS_LIMIT_LINE=""
@@ -1094,13 +1210,13 @@ run_pass() {
   if [ -n "$sid" ]; then
     claude -p --resume "$sid" --output-format stream-json --verbose \
       --dangerously-skip-permissions --model "$REVIEW_MODEL" \
-      --append-system-prompt "${PERSONA_PROMPT[$persona]}" \
+      --append-system-prompt "${PERSONA_PROMPT[$mode:$persona]}" \
       "${CLAUDE_MCP_ARGS[@]}" -- "$prompt" \
       2>"$errfile" | stdbuf -oL tee "$rawfile" | format_stream
   else
     claude -p --output-format stream-json --verbose \
       --dangerously-skip-permissions --model "$REVIEW_MODEL" \
-      --append-system-prompt "${PERSONA_PROMPT[$persona]}" \
+      --append-system-prompt "${PERSONA_PROMPT[$mode:$persona]}" \
       "${CLAUDE_MCP_ARGS[@]}" -- "$prompt" \
       2>"$errfile" | stdbuf -oL tee "$rawfile" | format_stream
   fi
@@ -1139,7 +1255,9 @@ while true; do
   # Re-enumerate every cycle so newly-matching PRs get picked up (PR_IDS is a
   # fixed set). Read the numbers into an array.
   prs=()
-  while IFS= read -r _n; do [ -n "$_n" ] && prs+=("$_n"); done < <(enumerate_candidate_prs || true)
+  while IFS=$'\t' read -r _n _mode; do
+    [ -n "$_n" ] && [ -n "$_mode" ] && prs+=("$_n:$_mode")
+  done < <(enumerate_candidate_prs || true)
 
   if [ "${#prs[@]}" -eq 0 ]; then
     log "No candidate PRs for selector '$PR_SELECTOR'."
@@ -1161,8 +1279,9 @@ while true; do
   # holds the pair to start at and is in memory only: surviving a container
   # restart is deferred with the rest of the persisted state.
   pairs=()
-  for pr in ${prs[@]+"${prs[@]}"}; do
-    for persona in "${PERSONAS_LIST[@]}"; do pairs+=("$pr:$persona"); done
+  for pr_mode in ${prs[@]+"${prs[@]}"}; do
+    pr="${pr_mode%%:*}"; mode="${pr_mode#*:}"
+    for persona in ${MODE_PERSONAS[$mode]}; do pairs+=("$pr:$mode:$persona"); done
   done
   npairs=${#pairs[@]}
 
@@ -1187,24 +1306,24 @@ while true; do
   for ((i = 0; i < npairs; i++)); do
     idx=$(( (start + i) % npairs ))
     key="${pairs[$idx]}"
-    pr="${key%%:*}"; persona="${key#*:}"
+    pr="${key%%:*}"; _rest="${key#*:}"; mode="${_rest%%:*}"; persona="${_rest#*:}"
     sid="${PR_SESSION[$key]:-}"
     if [ -z "$sid" ]; then
-      log "Reviewing PR #$pr as $persona (new session)..."
-      prompt="$(render_prompt "$REVIEW_PROMPT" "$pr")"
+      log "Reviewing PR #$pr [$mode/$persona] (new session)..."
+      prompt="$(render_prompt "${MODE_REVIEW_PROMPT[$mode]}" "$pr")"
     else
-      log "Reviewing PR #$pr as $persona (resuming session $sid)..."
-      prompt="$(render_prompt "$FOLLOWUP_PROMPT" "$pr")"
+      log "Reviewing PR #$pr [$mode/$persona] (resuming session $sid)..."
+      prompt="$(render_prompt "${MODE_FOLLOWUP_PROMPT[$mode]}" "$pr")"
     fi
 
-    if run_pass "$prompt" "$sid" "$persona"; then
+    if run_pass "$prompt" "$sid" "$persona" "$mode"; then
       consec_fail=0
       PR_SESSION[$key]="$RUN_PASS_SESSION_ID"
       PR_PASSES[$key]=$(( ${PR_PASSES[$key]:-0} + 1 ))
-      log "PR #$pr [$persona] review complete (session ${PR_SESSION[$key]}, pass ${PR_PASSES[$key]})."
+      log "PR #$pr [$mode/$persona] review complete (session ${PR_SESSION[$key]}, pass ${PR_PASSES[$key]})."
       # Rotate this pair's session once its cap is hit, to bound context growth.
       if [ "$MAX_PASSES_PER_SESSION" -gt 0 ] && [ "${PR_PASSES[$key]}" -ge "$MAX_PASSES_PER_SESSION" ]; then
-        log "PR #$pr [$persona] reached MAX_PASSES_PER_SESSION=$MAX_PASSES_PER_SESSION; rotating its session next cycle."
+        log "PR #$pr [$mode/$persona] reached MAX_PASSES_PER_SESSION=$MAX_PASSES_PER_SESSION; rotating its session next cycle."
         unset 'PR_SESSION[$key]'
         PR_PASSES[$key]=0
       fi
@@ -1213,16 +1332,16 @@ while true; do
       # remaining pairs into the same wall, and back off before the next one.
       if [ -n "$RUN_PASS_SESSION_ID" ]; then
         PR_SESSION[$key]="$RUN_PASS_SESSION_ID"
-        log "WARN: PR #$pr [$persona] hit a usage or rate limit; keeping its session and ending this cycle early."
+        log "WARN: PR #$pr [$mode/$persona] hit a usage or rate limit; keeping its session and ending this cycle early."
       else
-        log "WARN: PR #$pr [$persona] hit a usage or rate limit before it had a session; ending this cycle early."
+        log "WARN: PR #$pr [$mode/$persona] hit a usage or rate limit before it had a session; ending this cycle early."
       fi
       [ -n "$RUN_PASS_LIMIT_LINE" ] && log "  limit reported by claude: $RUN_PASS_LIMIT_LINE"
       limited=1
       cut=$idx cut_i=$i
       break
     else
-      log "WARN: PR #$pr [$persona] review failed; starting a fresh session for it next cycle."
+      log "WARN: PR #$pr [$mode/$persona] review failed; starting a fresh session for it next cycle."
       unset 'PR_SESSION[$key]'
       PR_PASSES[$key]=0
       consec_fail=$(( consec_fail + 1 ))

@@ -38,7 +38,47 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 BIN="$WORK/bin"; mkdir -p "$BIN"
 
-printf '#!/bin/sh\nexit 0\n' >"$BIN/gh"
+# `gh` now gets asked for a PR's labels, because mode routing decides code-vs-plan
+# from them. Everything else it is asked still just has to succeed.
+#   STUB_PLAN_PRS      -- comma-separated PR numbers that carry the plan label
+#   STUB_LABEL_FAIL    -- comma-separated PR numbers whose label lookup fails
+#   STUB_LABEL_GARBAGE -- comma-separated PR numbers whose lookup exits 0 but
+#                         prints nothing (a successful, empty response)
+#   STUB_LABEL_NULL    -- comma-separated PR numbers whose lookup exits 0 and
+#                         prints the literal JSON `null` (a well-formed but
+#                         useless response)
+#   STUB_PLAN_AFTER    -- the PR is unlabeled until cycle N has finished, then
+#                         labeled (see below)
+cat >"$BIN/gh" <<'STUB'
+#!/bin/sh
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  n="$3"
+  case ",${STUB_LABEL_FAIL:-}," in
+    *",$n,"*) echo "gh: could not resolve to a PullRequest" >&2; exit 1 ;;
+  esac
+  case ",${STUB_LABEL_GARBAGE:-}," in
+    *",$n,"*) exit 0 ;;
+  esac
+  case ",${STUB_LABEL_NULL:-}," in
+    *",$n,"*) echo "null"; exit 0 ;;
+  esac
+  # STUB_PLAN_AFTER=N: the PR is unlabeled until cycle N has finished, then
+  # labeled. Cycles are counted by the sleep stub, which writes $HOME/sleeps.
+  if [ -n "${STUB_PLAN_AFTER:-}" ]; then
+    c=$(cat "$HOME/sleeps" 2>/dev/null || echo 0)
+    if [ "$c" -ge "$STUB_PLAN_AFTER" ]; then
+      printf '{"number":%s,"labels":[{"name":"%s"}]}\n' "$n" "${STUB_PLAN_LABEL:-plan}"
+      exit 0
+    fi
+  fi
+  case ",${STUB_PLAN_PRS:-}," in
+    *",$n,"*) printf '{"number":%s,"labels":[{"name":"%s"}]}\n' "$n" "${STUB_PLAN_LABEL:-plan}" ;;
+    *)        printf '{"number":%s,"labels":[]}\n' "$n" ;;
+  esac
+  exit 0
+fi
+exit 0
+STUB
 printf '#!/bin/sh\nexit 0\n' >"$BIN/git"
 
 # The entrypoint pipes claude through `stdbuf -oL tee`, and stdbuf is GNU
@@ -118,16 +158,27 @@ STUB
 chmod +x "$BIN"/*
 
 # Persona directories built to be broken, for the startup checks that only a
-# mounted PERSONA_DIR can reach. The shipped personas/ cannot express either of
-# these, and both used to be silent: the first crash-looped the container with
-# nothing but cat's own message, the second resolved and reviewed a PR with no
-# identity behind the label it signed.
-NO_SHARED="$WORK/personas-no-shared"; mkdir -p "$NO_SHARED"
-cp "$SCRIPT_DIR/personas/red_team.md" "$NO_SHARED/red_team.md"
+# mounted PERSONA_DIR can reach. The shipped personas/ cannot express any of
+# these, and all three used to be silent: the first crash-looped the container
+# with nothing but cat's own message, the second resolved and reviewed a PR with
+# no identity behind the label it signed, the third is what the flat pre-modes
+# layout now looks like from the inside.
+NO_SHARED="$WORK/personas-no-shared"; mkdir -p "$NO_SHARED/code" "$NO_SHARED/plan"
+cp "$SCRIPT_DIR/personas/code/red_team.md" "$NO_SHARED/code/red_team.md"
+cp "$SCRIPT_DIR/personas/plan/_shared.md" "$NO_SHARED/plan/_shared.md"
+cp "$SCRIPT_DIR/personas/plan/red_team.md" "$NO_SHARED/plan/red_team.md"
 
-HOLLOW="$WORK/personas-hollow"; mkdir -p "$HOLLOW"
-cp "$SCRIPT_DIR/personas/_shared.md" "$HOLLOW/_shared.md"
-printf -- '---\nlabel: Hollow\nsuccess: Nothing at all.\n---\n' >"$HOLLOW/hollow.md"
+HOLLOW="$WORK/personas-hollow"; mkdir -p "$HOLLOW/code" "$HOLLOW/plan"
+cp "$SCRIPT_DIR/personas/code/_shared.md" "$HOLLOW/code/_shared.md"
+cp "$SCRIPT_DIR/personas/plan/_shared.md" "$HOLLOW/plan/_shared.md"
+printf -- '---\nlabel: Hollow\nsuccess: Nothing at all.\n---\n' >"$HOLLOW/code/hollow.md"
+cp "$HOLLOW/code/hollow.md" "$HOLLOW/plan/hollow.md"
+
+# The layout phase 1 shipped: persona files directly in PERSONA_DIR, no
+# subdirectories. Reachable by exactly the mount-your-own-personas workflow the
+# docs advertise, so it has to say what changed rather than dying on a missing file.
+FLAT="$WORK/personas-flat"; mkdir -p "$FLAT"
+cp "$SCRIPT_DIR/personas/code/_shared.md" "$SCRIPT_DIR/personas/code/red_team.md" "$FLAT/"
 
 PASS=0; FAIL=0; SKIP=0
 FAILED_LABELS=""
@@ -220,31 +271,33 @@ printf 'Running persona tests with %s (bash %s)\n\n' "$BASH_BIN" "$("$BASH_BIN" 
 # --- definition files (static checks, no entrypoint run) --------------------
 if selected "definitions: every persona file is well formed"; then
   problems=""
-  for f in "$SCRIPT_DIR"/personas/*.md; do
-    b="$(basename "$f" .md)"
-    case "$b" in _*) continue ;; esac
-    head -1 "$f" | grep -qx -- "---" || problems="$problems [$b: no frontmatter]"
-    grep -qE '^label: [A-Za-z0-9 ._-]+$' "$f" || problems="$problems [$b: no usable label]"
-    grep -q '^success: ' "$f" || problems="$problems [$b: no success criterion]"
-    grep -qF "JSON" "$f" && problems="$problems [$b: carries an output contract]"
+  for tree in code plan; do
+    for f in "$SCRIPT_DIR/personas/$tree"/*.md; do
+      b="$(basename "$f" .md)"
+      case "$b" in _*) continue ;; esac
+      head -1 "$f" | grep -qx -- "---" || problems="$problems [$tree/$b: no frontmatter]"
+      grep -qE '^label: [A-Za-z0-9 ._-]+$' "$f" || problems="$problems [$tree/$b: no usable label]"
+      grep -q '^success: ' "$f" || problems="$problems [$tree/$b: no success criterion]"
+      grep -qF "JSON" "$f" && problems="$problems [$tree/$b: carries an output contract]"
+    done
+    [ -f "$SCRIPT_DIR/personas/$tree/_shared.md" ] || problems="$problems [$tree/_shared.md missing]"
+    grep -qF '{{PERSONA}}' "$SCRIPT_DIR/personas/$tree/_shared.md" || problems="$problems [$tree/_shared.md has no {{PERSONA}} token]"
   done
-  [ -f "$SCRIPT_DIR/personas/_shared.md" ] || problems="$problems [_shared.md missing]"
-  grep -qF '{{PERSONA}}' "$SCRIPT_DIR/personas/_shared.md" || problems="$problems [_shared.md has no {{PERSONA}} token]"
   if [ -n "$problems" ]; then bad "definitions: every persona file is well formed" "$problems"
   else ok "definitions: every persona file is well formed"; fi
 fi
 
 # --- selection --------------------------------------------------------------
 cycle "selection: default set is the four code-facing personas in order" \
-  -- CALLS:8 LOG:"personas: red_team adversarial sme sage"
+  -- CALLS:8 LOG:"code personas: red_team adversarial sme sage"
 
 cycle "selection: an explicit list is honoured, in the order given" \
   PERSONAS=sage,red_team \
-  -- CALLS:4 LOG:"personas: sage red_team"
+  -- CALLS:4 LOG:"code personas: sage red_team"
 
 cycle "selection: all expands to every shipped persona" \
   PERSONAS=all \
-  -- CALLS:12 LOG:"personas: adversarial good_friend red_team sage sme user"
+  -- CALLS:12 LOG:"code personas: adversarial good_friend red_team sage sme user"
 
 refuses "selection: an unknown persona name refuses at startup" \
   "unknown persona 'red-team'" \
@@ -272,7 +325,7 @@ refuses "selection: a persona directory with no output contract refuses at start
 
 refuses "selection: a persona that is only frontmatter refuses at startup" \
   "empty prompt body" \
-  -- PERSONA_DIR="$HOLLOW" PERSONAS=hollow
+  -- PERSONA_DIR="$HOLLOW" PERSONAS=hollow PLAN_PERSONAS=hollow
 
 # The token split has to be unquoted to split on the separators, which also
 # makes it glob. Without `set -f` the name reaching the error is whatever the
@@ -339,7 +392,7 @@ cycle "resume: MAX_PASSES_PER_SESSION rotates per (PR, persona) pair" \
   -- CALLS:4 \
      NOARGV:3:"--resume" \
      NOARGV:4:"--resume" \
-     LOG:"PR #1 [red_team] reached MAX_PASSES_PER_SESSION=1"
+     LOG:"PR #1 [code/red_team] reached MAX_PASSES_PER_SESSION=1"
 
 cycle "model: every tier still points at the one review model" \
   PERSONAS=red_team \
@@ -414,12 +467,120 @@ cycle "limits: a limit before any session does not claim to keep one" \
 cycle "resume: the next cycle starts at the pair after the one a limit cut" \
   PERSONAS=red_team,sage,sme STUB_FAIL_ON=2 STUB_FAIL_MODE=limit \
   -- CALLS:5 \
-     LOG:"Not reviewed this cycle: 1:sme" \
-     LOG:"Starting this cycle at 1:sme, where the last one was cut." \
+     LOG:"Not reviewed this cycle: 1:code:sme" \
+     LOG:"Starting this cycle at 1:code:sme, where the last one was cut." \
      ARGV:3:"You are a Subject Matter Expert" \
      NOARGV:3:"--resume" \
      ARGV:4:"--resume S1" \
      ARGV:5:"--resume S2"
+
+# --- mode routing ------------------------------------------------------------
+# Mode is decided once per PR, inside enumerate_candidate_prs, from its labels.
+cycle "mode: an unlabeled PR is reviewed in code mode" \
+  PERSONAS=red_team STUB_MAX_CYCLES=1 \
+  -- CALLS:1 \
+     LOG:"Candidate PRs (ids): 1:code" \
+     LOG:"Reviewing PR #1 [code/red_team]"
+
+cycle "mode: a PR carrying the plan label is reviewed in plan mode" \
+  PERSONAS=red_team PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 STUB_MAX_CYCLES=1 \
+  -- CALLS:1 \
+     LOG:"Candidate PRs (ids): 1:plan" \
+     LOG:"Reviewing PR #1 [plan/red_team]"
+
+cycle "mode: PLAN_LABEL names the label that means plan" \
+  PERSONAS=red_team PLAN_PERSONAS=red_team PLAN_LABEL=proposal STUB_PLAN_PRS=1 STUB_PLAN_LABEL=proposal STUB_MAX_CYCLES=1 \
+  -- CALLS:1 LOG:"1:plan"
+
+cycle "mode: a label that is not PLAN_LABEL leaves the PR in code mode" \
+  PERSONAS=red_team PLAN_LABEL=proposal STUB_PLAN_PRS=1 STUB_PLAN_LABEL=plan STUB_MAX_CYCLES=1 \
+  -- CALLS:1 LOG:"1:code"
+
+cycle "mode: both modes can appear in one cycle" \
+  PR_IDS=1,2 PERSONAS=red_team PLAN_PERSONAS=red_team STUB_PLAN_PRS=2 STUB_MAX_CYCLES=1 \
+  -- CALLS:2 \
+     LOG:"Candidate PRs (ids): 1:code 2:plan"
+
+# A failed label lookup must NOT fall back to code mode. Guessing posts real
+# comments in the wrong register on a real PR, and there is no undoing that; a
+# skip is one log line and a retry next cycle.
+cycle "mode: a failed label lookup skips the PR rather than guessing" \
+  PR_IDS=1,2 PERSONAS=red_team STUB_LABEL_FAIL=1 STUB_MAX_CYCLES=1 \
+  -- CALLS:1 \
+     LOG:"could not read labels for PR #1" \
+     LOG:"Candidate PRs (ids): 2:code" \
+     NOLOG:"Reviewing PR #1"
+
+# A `gh` that exits 0 but prints nothing is not a failed lookup by the ordinary
+# check (it succeeded), so it must be caught separately or the PR vanishes from
+# the cycle with no WARN at all -- indistinguishable from having been reviewed
+# clean.
+cycle "mode: a successful but empty label lookup skips the PR, not silently" \
+  PR_IDS=1,2 PERSONAS=red_team STUB_LABEL_GARBAGE=1 STUB_MAX_CYCLES=1 \
+  -- CALLS:1 \
+     LOG:"could not read labels for PR #1" \
+     LOG:"Candidate PRs (ids): 2:code" \
+     NOLOG:"Reviewing PR #1"
+
+# A `gh` that exits 0 with a well-formed but useless body (bare `null`) must not
+# turn into a candidate PR literally numbered "null".
+cycle "mode: a null label response skips the PR rather than reviewing PR #null" \
+  PR_IDS=1,2 PERSONAS=red_team STUB_LABEL_NULL=1 STUB_MAX_CYCLES=1 \
+  -- CALLS:1 \
+     LOG:"could not read labels for PR #1" \
+     LOG:"Candidate PRs (ids): 2:code" \
+     NOLOG:"Reviewing PR #1" \
+     NOLOG:"PR #null"
+
+# --- per-mode persona sets ---------------------------------------------------
+cycle "modes: plan mode runs all six personas by default" \
+  STUB_PLAN_PRS=1 STUB_MAX_CYCLES=1 \
+  -- CALLS:6 LOG:"plan personas: adversarial good_friend red_team sage sme user"
+
+cycle "modes: code mode still runs the four code-facing personas by default" \
+  STUB_MAX_CYCLES=1 \
+  -- CALLS:4 LOG:"code personas: red_team adversarial sme sage"
+
+cycle "modes: PLAN_PERSONAS selects the plan set, PERSONAS the code set" \
+  PR_IDS=1,2 PERSONAS=red_team PLAN_PERSONAS=user,sage STUB_PLAN_PRS=2 STUB_MAX_CYCLES=1 \
+  -- CALLS:3 \
+     LOG:"code personas: red_team" \
+     LOG:"plan personas: user sage" \
+     ARGV:1:"You are a Red Team security reviewer" \
+     ARGV:2:"You are a User advocate" \
+     ARGV:3:"You are a Sage"
+
+# Both modes resolve at startup, so a broken plan persona kills the container at
+# boot rather than the first time somebody labels a PR.
+refuses "modes: a broken plan persona refuses at startup even with no plan PR" \
+  "unknown persona 'saeg'" \
+  -- PLAN_PERSONAS=saeg
+
+refuses "modes: a flat PERSONA_DIR says what the layout changed to" \
+  "code/ and plan/" \
+  -- PERSONA_DIR="$FLAT" PERSONAS=red_team
+
+refuses "modes: a mode tree with no output contract refuses at startup" \
+  "no output contract" \
+  -- PERSONA_DIR="$NO_SHARED" PERSONAS=red_team
+
+# The property the whole persona design rests on, now asserted per mode: the flag
+# does not survive --resume, so a resumed plan pass must re-carry its plan persona.
+cycle "modes: a resumed plan pass still carries its plan persona" \
+  PLAN_PERSONAS=user STUB_PLAN_PRS=1 \
+  -- CALLS:2 \
+     ARGV:2:"--resume S1" \
+     ARGV:2:"--append-system-prompt You are a User advocate"
+
+# A label added between cycles changes the pair key, so the old session is
+# orphaned and the new mode starts fresh rather than resuming a code session
+# under a plan persona.
+cycle "modes: a PR that gains the label starts a fresh session, not a resumed one" \
+  PERSONAS=red_team PLAN_PERSONAS=red_team STUB_PLAN_AFTER=1 \
+  -- CALLS:2 \
+     LOG:"Reviewing PR #1 [code/red_team]" \
+     LOG:"Reviewing PR #1 [plan/red_team]" \
+     NOARGV:2:"--resume"
 
 # Three in a row that are not limits means the provider is unhealthy, not that
 # these particular pairs are cursed. Walking the rest of the list into it costs
@@ -428,8 +589,8 @@ cycle "failures: a run of non-limit failures abandons the cycle at the ordinary 
   PR_IDS=1,2 PERSONAS=red_team,sage,sme STUB_FAIL_ON=2,3,4 STUB_FAIL_MODE=other STUB_MAX_CYCLES=1 \
   -- CALLS:4 \
      LOG:"3 passes in a row failed for reasons other than a limit" \
-     LOG:"Not reviewed this cycle: 2:sage 2:sme" \
-     LOG:"The next cycle starts at 2:sage" \
+     LOG:"Not reviewed this cycle: 2:code:sage 2:code:sme" \
+     LOG:"The next cycle starts at 2:code:sage" \
      NOLOG:"Backing off"
 
 # ... and the counter is consecutive, not cumulative: two failures, a success,
@@ -439,6 +600,112 @@ cycle "failures: a success resets the run, so scattered failures do not abandon"
   -- CALLS:4 \
      NOLOG:"Abandoning this cycle" \
      NOLOG:"Not reviewed this cycle"
+
+# --- per-mode prompts --------------------------------------------------------
+# The test stanza asks the reviewer to mentally revert production lines a test
+# depends on. There are none in a plan, and a reviewer handed a design document
+# will otherwise report missing tests in code nobody has written.
+cycle "prompts: plan mode drops the test stanza and code mode keeps it" \
+  PR_IDS=1,2 PERSONAS=red_team PLAN_PERSONAS=red_team STUB_PLAN_PRS=2 STUB_MAX_CYCLES=1 \
+  -- CALLS:2 \
+     ARGV:1:"Treat the tests in this PR as code under review" \
+     NOARGV:2:"Treat the tests in this PR as code under review"
+
+cycle "prompts: the plan default says what a plan review is and is not" \
+  PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 STUB_MAX_CYCLES=1 \
+  -- ARGV:1:"proposes an approach rather than implementing one" \
+     ARGV:1:"do not ask for tests, error handling, or input validation in code that does not exist yet"
+
+# The gh constraints are what the privilege-minimized token can actually do, and
+# they are identical in both modes.
+cycle "prompts: the plan default keeps the gh stanza" \
+  PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 STUB_MAX_CYCLES=1 \
+  -- ARGV:1:'do not use `gh pr checks`'
+
+# The code followup's own coverage: it lived as a bare scalar before this branch
+# moved both prompts into MODE_FOLLOWUP_PROMPT[code], the refactor that could
+# silently drop a stanza, and the gh/test text is now hand-maintained in four
+# copies rather than two.
+cycle "prompts: the code followup repeats the gh and test stanzas" \
+  PERSONAS=red_team \
+  -- CALLS:2 \
+     ARGV:2:"Re-check pull request #1" \
+     ARGV:2:'do not use `gh pr checks`' \
+     ARGV:2:"Treat the tests in this PR as code under review"
+
+# Repeated on resumed passes for the same reason the gh stanza is: a long-resumed
+# session's earliest turns are the first thing a context summary drops.
+# The "Re-read the plan" assertion is what tells the followup apart from the
+# review prompt: both carry the plan stanza, so a resumed pass handed the review
+# prompt by mistake would satisfy the stanza assertion and re-introduce the whole
+# task from scratch on every cycle.
+cycle "prompts: a resumed plan pass repeats the plan stanza" \
+  PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 \
+  -- CALLS:2 \
+     ARGV:2:"--resume S1" \
+     ARGV:2:"Re-read the plan in pull request" \
+     ARGV:2:"do not ask for tests, error handling, or input validation in code that does not exist yet"
+
+cycle "prompts: PLAN_REVIEW_PROMPT reaches Claude verbatim, with no stanzas" \
+  PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 PLAN_REVIEW_PROMPT='just read the plan in 1' STUB_MAX_CYCLES=1 \
+  -- ARGV:1:"just read the plan in 1" \
+     NOARGV:1:'do not use `gh pr checks`' \
+     NOARGV:1:"proposes an approach rather than implementing one"
+
+cycle "prompts: PLAN_REVIEW_PROMPT_SUFFIX appends to the plan default" \
+  PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 PLAN_REVIEW_PROMPT_SUFFIX='And mention the ticket.' STUB_MAX_CYCLES=1 \
+  -- ARGV:1:"proposes an approach rather than implementing one" \
+     ARGV:1:"And mention the ticket."
+
+cycle "prompts: FOLLOWUP_PROMPT reaches Claude verbatim, with no stanzas" \
+  PERSONAS=red_team FOLLOWUP_PROMPT='just re-check 1' \
+  -- CALLS:2 \
+     ARGV:2:"just re-check 1" \
+     NOARGV:1:"just re-check 1" \
+     NOARGV:2:'do not use `gh pr checks`' \
+     NOARGV:2:"Treat the tests in this PR as code under review"
+
+cycle "prompts: PLAN_FOLLOWUP_PROMPT reaches Claude verbatim, with no stanzas" \
+  PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 PLAN_FOLLOWUP_PROMPT='just re-read the plan in 1' \
+  -- CALLS:2 \
+     ARGV:2:"--resume S1" \
+     ARGV:2:"just re-read the plan in 1" \
+     NOARGV:1:"just re-read the plan in 1" \
+     NOARGV:2:'do not use `gh pr checks`' \
+     NOARGV:2:"proposes an approach rather than implementing one"
+
+cycle "prompts: FOLLOWUP_PROMPT_SUFFIX appends to the code followup default" \
+  PERSONAS=red_team FOLLOWUP_PROMPT_SUFFIX='And mention the ticket.' \
+  -- CALLS:2 \
+     ARGV:2:"Re-check pull request #1" \
+     ARGV:2:"And mention the ticket." \
+     NOARGV:1:"And mention the ticket."
+
+cycle "prompts: PLAN_FOLLOWUP_PROMPT_SUFFIX appends to the plan followup default" \
+  PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 PLAN_FOLLOWUP_PROMPT_SUFFIX='And mention the ticket.' \
+  -- CALLS:2 \
+     ARGV:2:"Re-read the plan in pull request" \
+     ARGV:2:"And mention the ticket." \
+     NOARGV:1:"And mention the ticket."
+
+# The code-mode overrides must not leak into plan mode, or an operator who tuned
+# their code prompt would silently get it on plan PRs too.
+cycle "prompts: a code override does not reach plan mode" \
+  PR_IDS=1,2 PERSONAS=red_team PLAN_PERSONAS=red_team STUB_PLAN_PRS=2 \
+  REVIEW_PROMPT='code only 1' STUB_MAX_CYCLES=1 \
+  -- CALLS:2 \
+     ARGV:1:"code only 1" \
+     NOARGV:2:"code only 1" \
+     ARGV:2:"proposes an approach rather than implementing one"
+
+# The opposite direction: a plan override must not leak into code mode either.
+# The asymmetry is the kind of thing that hides a one-directional bug.
+cycle "prompts: a plan override does not reach code mode" \
+  PR_IDS=1,2 PERSONAS=red_team PLAN_PERSONAS=red_team STUB_PLAN_PRS=2 \
+  PLAN_REVIEW_PROMPT='plan only 2' STUB_MAX_CYCLES=1 \
+  -- CALLS:2 \
+     NOARGV:1:"plan only 2" \
+     ARGV:2:"plan only 2"
 
 printf '\n%d passed, %d failed' "$PASS" "$FAIL"
 [ "$SKIP" -gt 0 ] && printf ', %d skipped' "$SKIP"

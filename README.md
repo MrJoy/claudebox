@@ -115,33 +115,48 @@ Whichever provider you pick, the entrypoint pins **every** model tier (`ANTHROPI
 
 ## How it works
 
-The reviewer runs **one Claude session per PR per persona**. Each cycle the entrypoint enumerates the candidate PRs (see [PR selection](#pr-selection)), then reviews each one with each enabled persona in its own session: a pair's first review starts a new session with `REVIEW_PROMPT`; later cycles `--resume` that pair's session with `FOLLOWUP_PROMPT`, so a persona remembers what it already flagged and avoids duplicate comments. The PR number is substituted into the prompt's `{{PR}}` token.
+The reviewer runs **one Claude session per PR per mode per persona**. Each cycle the entrypoint enumerates the candidate PRs (see [PR selection](#pr-selection)), works out each one's review mode, then reviews it with each persona enabled for that mode in its own session: a pair's first review starts a new session with that mode's review prompt; later cycles `--resume` that pair's session with the mode's followup prompt, so a persona remembers what it already flagged and avoids duplicate comments. The PR number is substituted into the prompt's `{{PR}}` token.
 
-A persona is an angle of attack, borrowed from [advocate](https://github.com/jmcentire/advocate): Red Team wants the change to survive assault, Adversarial wants its logic to hold under challenge, Sage wants it simplified, Subject Matter Expert wants a peer to sign off, User wants a stranger to navigate it, Good Friend applies the 3am test. The first four run by default; `user` and `good_friend` were written against designs rather than diffs, so they ship but are opt-in via `--persona`.
+### Two review modes
+
+There are two kinds of review, and a GitHub label picks which one a PR gets.
+
+- Label a PR **`plan`** and it is reviewed as a proposal: all six personas, a prompt that asks whether the problem is stated correctly and what the approach fails to account for, and an explicit instruction not to ask for tests or error handling in code nobody has written yet.
+- Leave it unlabeled and it gets the code review: four personas and a prompt built around the diff, including the test-quality stanza below.
+
+Change the label with `PLAN_LABEL`. Nothing else has to change to keep today's behavior: an operator who never labels anything sees exactly the code review, since every unlabeled PR is code mode. The match is exact and case-sensitive: `PLAN_LABEL=Plan` will not match a label named `plan`, and every PR silently reviews as code mode with no warning to tell that apart from nobody having labeled anything.
+
+Labeling a PR is a review-weakening control, not just a routing switch: plan mode drops the test-quality stanza entirely and tells every persona not to ask about tests or error handling. That's the right tradeoff when labeling requires triage permission, but it means a repo where every contributor has write access is a repo where any contributor can turn off that scrutiny on their own PR.
+
+Put a plan in a PR the same way you put code in one. Write the design document on a branch, open the PR, add the label, and the reviewer reads the diff as the proposal. When you revise the plan in response to a comment, push the revision to the same branch: each persona resumes its own session, reads the new revision knowing what it already said about the old one, and drops the points your revision settles.
+
+With `PR_IDS`, where each PR's labels are looked up one at a time, a lookup that fails skips that PR for the cycle with a warning in the log and retries it next cycle. It is never guessed into the wrong mode, because a wrong-mode review posts real comments you would have to go and delete. The other three selectors read their labels from the `gh pr list` call that finds the PRs in the first place, so there is no per-PR lookup to fail: a failed listing simply yields no candidates that cycle, and the log says so.
+
+A persona is an angle of attack, borrowed from [advocate](https://github.com/jmcentire/advocate): Red Team wants the change to survive assault, Adversarial wants its logic to hold under challenge, Sage wants it simplified, Subject Matter Expert wants a peer to sign off, User wants a stranger to navigate it, Good Friend applies the 3am test. These are **plan-review** personas on loan. advocate wrote them to interrogate a proposal before the work happens, which is why plan mode runs all six and code mode runs the four that survive contact with a diff: `user` and `good_friend` were written against designs and whole projects, so on a narrow diff they reach for material that is not in it. Both sets ship in both modes, so you can opt either one into code review with `PERSONAS` if you want it.
 
 Personas are deliberately **blind to each other**. Nothing tells a persona to defer to another's comments, because that would anchor it to a review it did not do, and avoiding that kind of group-think is the reason this tool exists. Overlapping findings between two angles of attack are a signal that something is worth two comments, not noise to suppress. Each comment is signed with the persona that raised it, e.g. `-claudebox (Red Team)`.
 
-**A cycle is now (candidate PRs x enabled personas) sequential sessions.** `REVIEW_INTERVAL_SECONDS` is the gap *after* a cycle, so four PRs and four personas is sixteen reviews before the interval starts. Set `--persona` to one name for the cheapest run.
+**A cycle is now (candidate PRs x that PR's personas) sequential sessions.** `REVIEW_INTERVAL_SECONDS` is the gap *after* a cycle, so four PRs and four personas is sixteen reviews before the interval starts, and a plan-labeled PR contributes six sessions rather than four. Set `--persona` to one name for the cheapest code-mode run; it does not touch `PLAN_PERSONAS`, so a labeled PR still costs six sessions until you set that too.
 
 ```bash
 # CLAUDE_MCP_ARGS is always (--strict-mcp-config), plus (--mcp-config "$MCP_CONFIG_FILE")
 # when LINEAR_API_KEY is set. The "--" is load-bearing: --mcp-config is variadic, so
 # without it the prompt would be parsed as another MCP config path.
 
-# a (PR, persona) pair's first review — new session
+# a (PR, mode, persona) pair's first review — new session
 claude -p --output-format stream-json --verbose --dangerously-skip-permissions \
-  --model "$REVIEW_MODEL" --append-system-prompt "${PERSONA_PROMPT[$persona]}" \
-  "${CLAUDE_MCP_ARGS[@]}" -- "${REVIEW_PROMPT//\{\{PR\}\}/$pr}"
+  --model "$REVIEW_MODEL" --append-system-prompt "${PERSONA_PROMPT[$mode:$persona]}" \
+  "${CLAUDE_MCP_ARGS[@]}" -- "${MODE_REVIEW_PROMPT[$mode]//\{\{PR\}\}/$pr}"
 # later cycles — resume that pair's session
-claude -p --resume "${PR_SESSION[$pr:$persona]}" --output-format stream-json --verbose \
+claude -p --resume "${PR_SESSION[$pr:$mode:$persona]}" --output-format stream-json --verbose \
   --dangerously-skip-permissions --model "$REVIEW_MODEL" \
-  --append-system-prompt "${PERSONA_PROMPT[$persona]}" \
-  "${CLAUDE_MCP_ARGS[@]}" -- "${FOLLOWUP_PROMPT//\{\{PR\}\}/$pr}"
+  --append-system-prompt "${PERSONA_PROMPT[$mode:$persona]}" \
+  "${CLAUDE_MCP_ARGS[@]}" -- "${MODE_FOLLOWUP_PROMPT[$mode]//\{\{PR\}\}/$pr}"
 ```
 
 Each pass streams as `stream-json`; the entrypoint pretty-prints the events live to its log (so `docker logs -f` shows the play-by-play) and recovers the session id from the stream to resume that pair next cycle.
 
-The entrypoint shell is the supervisor: it controls cadence (`git fetch`, enumerate PRs, review each sequentially, then sleep), keeps an in-memory (PR, persona)→session map, and starts a fresh session for a pair if its pass fails (so that persona may re-comment once on that PR). Claude itself uses `gh`/`git` to inspect the PR, check out the latest commit, and post one comment per finding. `MAX_PASSES_PER_SESSION` rotates a pair's session after N passes to bound its context growth (per pair).
+The entrypoint shell is the supervisor: it controls cadence (`git fetch`, enumerate PRs, review each sequentially, then sleep), keeps an in-memory (PR, mode, persona)→session map, so a PR whose label changes starts fresh in its new mode instead of resuming a session that was reviewing it as something else, and starts a fresh session for a pair if its pass fails (so that persona may re-comment once on that PR). Claude itself uses `gh`/`git` to inspect the PR, check out the latest commit, and post one comment per finding. `MAX_PASSES_PER_SESSION` rotates a pair's session after N passes to bound its context growth (per pair).
 
 `--append-system-prompt` is passed on *both* forms, which is not redundant: the flag does not survive `--resume`. Passed only on the first pass, cycle one would be adversarial and every later cycle would be a generic reviewer wearing the persona's name in the log.
 
@@ -238,7 +253,7 @@ bash -n entrypoint.sh && bash -n claudebox.sh   # syntax only
 
 It stubs `gh`/`git`/`claude` and checks either the startup error the entrypoint refused with or the exact environment it built. That's a narrow claim on purpose: it proves the wiring matches intent, not that a provider accepts it. Before trusting a newly configured provider unattended, do one live `./claudebox.sh test --repo …` and watch it actually get a response.
 
-`test-personas.sh` covers persona selection and the per-persona review loop. It runs **two** cycles rather than one, because the property that matters most cannot be observed in a single cycle: `--append-system-prompt` does not survive `--resume`, so the assertion that has to exist is that a *resumed* pass still carries its persona. It captures one dump per `claude` invocation and asserts the invocation count, each invocation's argv, the resume targets, and the usage-limit path.
+`test-personas.sh` covers persona selection and the per-persona review loop. It runs **two** cycles rather than one, because the property that matters most cannot be observed in a single cycle: `--append-system-prompt` does not survive `--resume`, so the assertion that has to exist is that a *resumed* pass still carries its persona. It captures one dump per `claude` invocation and asserts the invocation count, each invocation's argv, the resume targets, and the usage-limit path. It also covers review-mode routing: that a labeled PR resolves the plan persona set and the plan prompts, that an unlabeled PR in the same cycle resolves the code set, that a PR gaining the label starts a fresh session rather than resuming a code-mode one, and that an override written for one mode never reaches the other.
 
 `test-shim.sh` covers the `workersai` normalizer, which the suite above only ever sees stubbed. It runs the real script against a local echo server — still no Docker, network, or credentials — and checks the content injection *and its restraint* (nothing else in the request is rewritten), that a streamed response is relayed as it arrives rather than buffered to the end, and that the listener stays on loopback.
 
@@ -364,7 +379,11 @@ Optional:
   >
   > They also carry a test-quality stanza, for a failure mode plain "review the tests" doesn't catch: a PR whose new tests pass unchanged with the production change reverted. The stanza turns that into a procedure the reviewer runs per added test — work out which lines of the non-test change the test depends on, mentally revert them, and ask whether it would still pass — plus the related mutations (a moved boundary, a negated condition, a deleted error branch, a constant return), and the as-implemented smells: assertions that restate the implementation, recompute the expected value the same way the code does, assert a mock's own stubbed return, or freeze current output as a snapshot. Overriding the prompt drops this too.
 - `REVIEW_PROMPT_SUFFIX` / `FOLLOWUP_PROMPT_SUFFIX` (append extra instructions to the corresponding prompt — default or overridden; also supports the `{{PR}}` token)
-- `MAX_PASSES_PER_SESSION` (rotate a session to a fresh one every N passes, per (PR, persona) pair; `0` = never)
+- `PLAN_REVIEW_PROMPT` / `PLAN_FOLLOWUP_PROMPT` and `PLAN_REVIEW_PROMPT_SUFFIX` / `PLAN_FOLLOWUP_PROMPT_SUFFIX` (the plan-mode counterparts of the four above, used for a PR carrying `PLAN_LABEL`; same `{{PR}}` token, same verbatim-override rule)
+
+  > The bare names are code mode, so tuning your code-review prompt never changes what a plan PR is asked. The URLs, ids, credentials and selector values above each have one matched pair of surrounding quotes stripped at startup; the eight prompt variables deliberately do not, because a quote at either end of free text can be exactly what you meant to send. That is an exemption, not a safety net: quote nothing in your env file, since `docker run --env-file` keeps quotes literally and several values here are stripped by nothing at all.
+- `PLAN_LABEL` (default `plan`), the GitHub label that routes a PR to plan mode; see [Two review modes](#two-review-modes)
+- `MAX_PASSES_PER_SESSION` (rotate a session to a fresh one every N passes, per (PR, mode, persona) pair; `0` = never)
 - `LINEAR_API_KEY` (optional Linear ticket context; use a **read-only** key — see [Linear ticket context](#linear-ticket-context))
 - `--export-sessions` (launcher flag, not an env var) — export review transcripts to the host and align the session folder; see [Exporting review sessions to your host](#exporting-review-sessions-to-your-host)
 
@@ -379,23 +398,27 @@ Set **exactly one** of these (or pass the matching launcher flag). Zero or more 
 | `PR_IDS=12,15,20` | `--prs 12,15,20` | exactly those PR numbers |
 | `PR_SEARCH=is:open label:x` | `--search "…"` | PRs matching a gh search query (you control state) |
 
-`REVIEW_PROMPT`/`FOLLOWUP_PROMPT` use a `{{PR}}` token (substituted with the PR number), and `MAX_PASSES_PER_SESSION` applies per (PR, persona) pair.
+All eight prompt variables use a `{{PR}}` token (substituted with the PR number), and `MAX_PASSES_PER_SESSION` applies per (PR, mode, persona) pair.
 
 ### Personas
 
 | Variable | Flag | Default | Meaning |
 |---|---|---|---|
-| `PERSONAS` | `--persona` | `red_team,adversarial,sme,sage` | Comma list of persona ids, or `all`. Order is honoured. An unknown name is a startup error. |
+| `PERSONAS` | `--persona` | `red_team,adversarial,sme,sage` | Code-mode personas. Comma list of ids, or `all`. Order is honoured. An unknown name is a startup error. |
+| `PLAN_PERSONAS` | — | all six | Plan-mode personas. Same spelling and the same rules as `PERSONAS`. |
+| `PLAN_LABEL` | — | `plan` | The GitHub label that puts a PR in plan mode. |
 | `PERSONA_DIR` | — | `/opt/claudebox/personas` | Where definitions are read from. Point it at a read-only mount to supply your own set. |
 | `LIMIT_BACKOFF_SECONDS` | — | `1800` | How long to wait after a pass fails on a usage or rate limit, instead of `REVIEW_INTERVAL_SECONDS`. |
 
-Available ids: `red_team`, `adversarial`, `sage`, `sme`, `user`, `good_friend`. A definition file is frontmatter (`label`, `success`) plus a body that becomes the pass's system prompt; `personas/_shared.md` is appended to every body and carries the output contract and the independence rule. `aggregate` is reserved.
+Available ids in both modes: `red_team`, `adversarial`, `sage`, `sme`, `user`, `good_friend`. `aggregate` is reserved.
 
-Each persona multiplies the sessions per cycle. On a fixed-price plan the binding resource is usage allowance, so start with one or two personas and widen once you have seen what a cycle costs you.
+`PERSONA_DIR` holds one tree per mode: `code/` and `plan/`, each with its own six definitions and its own `_shared.md`. A definition file is frontmatter (`label`, `success`) plus a body that becomes the pass's system prompt; the tree's `_shared.md` is appended to every body in it and carries the output contract and the independence rule. If you mount your own directory, it needs both subdirectories, and a flat directory of `.md` files is a startup error that says so. Both trees are read and validated at boot whether or not any PR is currently labeled, so a broken plan persona stops the container instead of surfacing the first time somebody adds a label.
+
+Each persona multiplies the sessions per cycle, and a plan-labeled PR runs six of them by default rather than four. On a fixed-price plan the binding resource is usage allowance, so start with one or two personas and widen once you have seen what a cycle costs you.
 
 ### Linear ticket context
 
-Set `LINEAR_API_KEY` and the reviewer also reads the Linear ticket a PR references — its description *and* its comments, where later feedback and revised requirements usually live — and raises divergence from what the ticket asked for as a finding, alongside the usual code findings. Unset, nothing about the review changes. This only happens with the default `REVIEW_PROMPT`/`FOLLOWUP_PROMPT`, though: the Linear instructions are appended to those defaults, not injected independently, so if you override either prompt, your prompt runs verbatim with the Linear MCP server available but no instruction to use it — tell the reviewer yourself to consult the ticket if you want that behavior with a custom prompt. If you just want to add your own instructions on top of the defaults (Linear stanza included), `REVIEW_PROMPT_SUFFIX`/`FOLLOWUP_PROMPT_SUFFIX` are the cleaner route — they append to whichever prompt is in effect instead of replacing it.
+Set `LINEAR_API_KEY` and the reviewer also reads the Linear ticket a PR references — its description *and* its comments, where later feedback and revised requirements usually live — and raises divergence from what the ticket asked for as a finding, alongside the usual code findings. Unset, nothing about the review changes. This only happens with the default prompts, though (the plan-mode defaults carry the same Linear stanza): the Linear instructions are appended to those defaults, not injected independently, so if you override either prompt, your prompt runs verbatim with the Linear MCP server available but no instruction to use it — tell the reviewer yourself to consult the ticket if you want that behavior with a custom prompt. If you just want to add your own instructions on top of the defaults (Linear stanza included), `REVIEW_PROMPT_SUFFIX`/`FOLLOWUP_PROMPT_SUFFIX` are the cleaner route — they append to whichever prompt is in effect instead of replacing it.
 
 Get a key from **Settings → Security & access → Personal API keys**. Linear's MCP server accepts an API key straight through as an `Authorization: Bearer` header ([Linear docs](https://linear.app/docs/mcp)), so there is no interactive OAuth step and the loop stays headless.
 

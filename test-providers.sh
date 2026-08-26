@@ -36,9 +36,17 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 BIN="$WORK/bin"; mkdir -p "$BIN"
 
-# gh and git only need to succeed; nothing here exercises them. (PR enumeration
-# is bypassed by handing every case PR_IDS=1, which needs no gh call.)
-printf '#!/bin/sh\nexit 0\n' >"$BIN/gh"
+# gh answers PR label queries (mode routing reads them) and otherwise only needs
+# to succeed. Every case here leaves its PR unlabeled, so every case is code mode.
+cat >"$BIN/gh" <<'STUB'
+#!/bin/sh
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  n="$3"
+  printf '{"number":%s,"labels":[]}\n' "$n"
+  exit 0
+fi
+exit 0
+STUB
 printf '#!/bin/sh\nexit 0\n' >"$BIN/git"
 # One cycle per case: the review loop ends with `sleep $REVIEW_INTERVAL_SECONDS`
 # as its last unprotected command, so a failing sleep makes the entrypoint's own
