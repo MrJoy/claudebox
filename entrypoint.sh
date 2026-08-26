@@ -63,7 +63,7 @@ strip_surrounding_quotes \
   CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN \
   GITHUB_TOKEN GITHUB_REPOSITORY LINEAR_API_KEY \
   PR_ASSIGNEE PR_IDS PR_SEARCH \
-  PERSONAS PERSONA_DIR PLAN_LABEL LIMIT_BACKOFF_SECONDS
+  PERSONAS PLAN_PERSONAS PERSONA_DIR PLAN_LABEL LIMIT_BACKOFF_SECONDS
 
 # --- Required configuration ------------------------------------------------
 # Provider-specific credentials are validated in "Backend selection" below.
@@ -225,84 +225,112 @@ render_prompt() {
 
 # --- Persona registry ------------------------------------------------------
 # Each review pass runs as one of advocate's adversarial personas rather than as
-# a generalist reviewer. A persona is a file in PERSONA_DIR: frontmatter (label,
-# success) plus a body that becomes the pass's system prompt. Files starting with
-# an underscore are not personas; _shared.md is the output contract appended to
-# every persona body.
+# a generalist reviewer. advocate's personas are PLAN-review personas: they were
+# written to interrogate a proposal before the work happens. Code mode runs the
+# subset of them that survives contact with a diff; plan mode runs all six.
+#
+# PERSONA_DIR is a parent holding one tree per mode. A persona is a file in
+# PERSONA_DIR/<mode>: frontmatter (label, success) plus a body that becomes the
+# pass's system prompt. Files starting with an underscore are not personas;
+# _shared.md is the output contract appended to every persona body in that tree.
 #
 # Definitions live in files rather than inline here for three reasons: it keeps
 # ~200 lines of prompt text out of this script, it gives an operator an override
 # by mounting their own directory at PERSONA_DIR, and it keeps the imported text
 # close to its provenance (tools/import-advocate-personas.py).
 PERSONA_DIR="${PERSONA_DIR:-/opt/claudebox/personas}"
-# The default set is code-facing. advocate's `user` and `good_friend` were written
-# against designs and whole projects; on a narrow diff they reach for material
-# that isn't in it, so they ship but are opt-in.
-DEFAULT_PERSONAS="red_team,adversarial,sme,sage"
+REVIEW_MODES="code plan"
+# The code default is the subset: advocate's `user` and `good_friend` were
+# written against designs and whole projects, so on a narrow diff they reach for
+# material that isn't in it. Plan mode is where they finally have something to
+# bite on, which is why the plan default is everything.
+DEFAULT_PERSONAS_CODE="red_team,adversarial,sme,sage"
+DEFAULT_PERSONAS_PLAN="adversarial,good_friend,red_team,sage,sme,user"
 # Claimed now, used in phase 2: the pass that reconciles what the personas said
 # is the only one allowed to read their findings, which is why it is not itself
 # a persona and cannot be selected as one.
 RESERVED_PERSONAS="aggregate"
 
+# Keyed "$mode:$id", so the same persona name in two trees is two entries.
 declare -A PERSONA_PROMPT=()
 declare -A PERSONA_LABEL=()
-PERSONAS_LIST=()
+# Keyed "$mode", holding that mode's selected persona ids space-joined, in order.
+declare -A MODE_PERSONAS=()
 
-# Echo frontmatter key $2 from persona $1.
+# Echo frontmatter key $2 from persona $1 in mode $3.
 persona_meta() {
   awk -v k="$2" '
     NR == 1 && $0 == "---" { fm = 1; next }
     fm && $0 == "---" { exit }
     fm && index($0, k ":") == 1 { sub(/^[^:]*:[[:space:]]*/, ""); print; exit }
-  ' "$PERSONA_DIR/$1.md"
+  ' "$PERSONA_DIR/$3/$1.md"
 }
 
-# Echo persona $1's own body: everything after its frontmatter. Separate from
-# persona_prompt because resolve_personas has to judge the body on its own -- a
-# body-plus-shared-contract string is never empty, so a persona file that is
-# nothing but frontmatter would resolve and then review a PR with no identity at
-# all, signing findings with a label it has no angle of attack behind.
+# Echo persona $1's own body in mode $2: everything after its frontmatter.
+# Separate from persona_prompt because resolve_personas has to judge the body on
+# its own -- a body-plus-shared-contract string is never empty, so a persona file
+# that is nothing but frontmatter would resolve and then review a PR with no
+# identity at all, signing findings with a label it has no angle of attack behind.
 persona_body() {
   awk '
     NR == 1 && $0 == "---" { fm = 1; next }
     fm && $0 == "---" { fm = 0; body = 1; next }
     body
-  ' "$PERSONA_DIR/$1.md"
+  ' "$PERSONA_DIR/$2/$1.md"
 }
 
-# Echo persona $1's full system prompt: its body, then the shared contract, with
-# {{PERSONA}} replaced by its label. The label is validated in resolve_personas
-# to contain no slash, so it is safe as a sed replacement.
+# Echo persona $1's full system prompt in mode $2: its body, then that tree's
+# shared contract, with {{PERSONA}} replaced by its label. The label is validated
+# in resolve_personas to contain no slash, so it is safe as a sed replacement.
 persona_prompt() {
-  local id="$1" label="${PERSONA_LABEL[$1]}"
+  local id="$1" mode="$2" label="${PERSONA_LABEL[$2:$1]}"
   {
-    persona_body "$id"
+    persona_body "$id" "$mode"
     printf '\n'
-    cat "$PERSONA_DIR/_shared.md"
+    cat "$PERSONA_DIR/$mode/_shared.md"
   } | sed "s|{{PERSONA}}|$label|g"
 }
 
-# Fill PERSONAS_LIST (order-preserving), PERSONA_LABEL and PERSONA_PROMPT from
-# PERSONAS, or from DEFAULT_PERSONAS when it is unset. Dies on anything it can't
-# resolve: a typo that silently narrowed the review to one persona, or to none,
-# would look exactly like a working run in the log.
+# Fill MODE_PERSONAS[$1], PERSONA_LABEL and PERSONA_PROMPT for mode $1, from that
+# mode's selector var or its default set. Dies on anything it can't resolve: a
+# typo that silently narrowed the review to one persona, or to none, would look
+# exactly like a working run in the log. Called for EVERY mode at startup, even
+# one no PR currently uses, so a broken definition fails at boot rather than the
+# first time somebody adds a label to a PR.
 resolve_personas() {
-  local avail="" f b tok raw
+  local mode="$1" dir avail="" f b tok raw def list=""
+  dir="$PERSONA_DIR/$mode"
+  case "$mode" in
+    code) def="$DEFAULT_PERSONAS_CODE" ;;
+    plan) def="$DEFAULT_PERSONAS_PLAN" ;;
+  esac
   [ -d "$PERSONA_DIR" ] || die "no persona definitions: PERSONA_DIR=$PERSONA_DIR is not a directory."
+  # The flat layout phase 1 shipped is reachable by exactly the mount-your-own-
+  # personas workflow the docs advertise, so it has to say what changed rather
+  # than dying on a missing file three checks later.
+  if [ ! -d "$dir" ]; then
+    for f in "$PERSONA_DIR"/*.md; do
+      [ -e "$f" ] && die "PERSONA_DIR now holds one tree per review mode: $PERSONA_DIR needs code/ and plan/ subdirectories, but its persona files sit directly in it."
+    done
+    die "no persona definitions for $mode review: $dir is not a directory."
+  fi
   # Every persona body is appended to _shared.md, so without it persona_prompt's
   # `cat` fails, pipefail fails the command substitution and set -e exits with
   # nothing but cat's own message -- under --restart unless-stopped, a silent
   # crash loop reachable by the documented "mount your own personas" workflow.
-  [ -f "$PERSONA_DIR/_shared.md" ] || die "no output contract: $PERSONA_DIR/_shared.md is missing; every persona body is appended to it."
-  for f in "$PERSONA_DIR"/*.md; do
+  [ -f "$dir/_shared.md" ] || die "no output contract: $dir/_shared.md is missing; every persona body is appended to it."
+  for f in "$dir"/*.md; do
     [ -e "$f" ] || continue
     b="$(basename "$f" .md)"
     case "$b" in _*) continue ;; esac
     avail="$avail $b"
   done
-  [ -n "$avail" ] || die "no persona definitions found in $PERSONA_DIR."
+  [ -n "$avail" ] || die "no persona definitions found in $dir."
 
-  raw="${PERSONAS-$DEFAULT_PERSONAS}"
+  case "$mode" in
+    code) raw="${PERSONAS-$def}" ;;
+    plan) raw="${PLAN_PERSONAS-$def}" ;;
+  esac
   case "$(printf '%s' "$raw" | tr 'A-Z' 'a-z')" in
     all) raw="$(printf '%s' "$avail")" ;;
   esac
@@ -317,31 +345,33 @@ resolve_personas() {
     esac
     case " $avail " in
       *" $tok "*) ;;
-      *) die "unknown persona '$tok'; available:$avail" ;;
+      *) die "unknown persona '$tok' for $mode review; available:$avail" ;;
     esac
-    case " ${PERSONAS_LIST[*]-} " in
-      *" $tok "*) die "persona '$tok' is listed twice in PERSONAS." ;;
+    case " $list " in
+      *" $tok "*) die "persona '$tok' is listed twice for $mode review." ;;
     esac
-    PERSONAS_LIST+=("$tok")
+    list="${list:+$list }$tok"
   done
   set +f
-  [ "${#PERSONAS_LIST[@]}" -gt 0 ] || die "PERSONAS is set but names no persona; unset it for the default set ($DEFAULT_PERSONAS), or name one of:$avail"
+  local var; case "$mode" in code) var=PERSONAS ;; plan) var=PLAN_PERSONAS ;; esac
+  [ -n "$list" ] || die "$var is set but names no persona; unset it for the default set ($def), or name one of:$avail"
 
   # Resolve labels and prompts once, so a pass is a string lookup rather than
   # three file reads, and so a broken definition fails at startup.
   local id label body
-  for id in "${PERSONAS_LIST[@]}"; do
-    label="$(persona_meta "$id" label)"
+  for id in $list; do
+    label="$(persona_meta "$id" label "$mode")"
     case "$label" in
-      '') die "persona '$id' has no label: in its frontmatter." ;;
-      *[!A-Za-z0-9\ ._-]*) die "persona '$id' has a label with unexpected characters: '$label' (letters, digits, spaces, dot, underscore and hyphen only)." ;;
+      '') die "persona '$mode/$id' has no label: in its frontmatter." ;;
+      *[!A-Za-z0-9\ ._-]*) die "persona '$mode/$id' has a label with unexpected characters: '$label' (letters, digits, spaces, dot, underscore and hyphen only)." ;;
     esac
-    body="$(persona_body "$id")"
-    [ -n "${body//[[:space:]]/}" ] || die "persona '$id' has an empty prompt body."
-    PERSONA_LABEL[$id]="$label"
-    PERSONA_PROMPT[$id]="$(persona_prompt "$id")"
+    body="$(persona_body "$id" "$mode")"
+    [ -n "${body//[[:space:]]/}" ] || die "persona '$mode/$id' has an empty prompt body."
+    PERSONA_LABEL[$mode:$id]="$label"
+    PERSONA_PROMPT[$mode:$id]="$(persona_prompt "$id" "$mode")"
   done
-  log "personas: ${PERSONAS_LIST[*]}"
+  MODE_PERSONAS[$mode]="$list"
+  log "$mode personas: $list"
 }
 
 # --- Optional Linear context ------------------------------------------------
@@ -493,7 +523,8 @@ fi
 # Validate PR selection now (fail fast, before auth/clone), and warn if a prompt
 # template won't name the PR.
 resolve_pr_selection
-resolve_personas
+for _mode in $REVIEW_MODES; do resolve_personas "$_mode"; done
+unset _mode
 case "$REVIEW_PROMPT"   in *'{{PR}}'*) : ;; *) log "WARN: REVIEW_PROMPT has no {{PR}} token; reviews won't name the specific PR." ;; esac
 case "$FOLLOWUP_PROMPT" in *'{{PR}}'*) : ;; *) log "WARN: FOLLOWUP_PROMPT has no {{PR}} token; reviews won't name the specific PR." ;; esac
 
@@ -1128,7 +1159,7 @@ RUN_PASS_SESSION_ID=""
 RUN_PASS_LIMITED=0
 RUN_PASS_LIMIT_LINE=""
 run_pass() {
-  local prompt="$1" sid="$2" persona="$3" rc errfile rawfile got
+  local prompt="$1" sid="$2" persona="$3" mode="$4" rc errfile rawfile got
   RUN_PASS_SESSION_ID="$sid"
   RUN_PASS_LIMITED=0
   RUN_PASS_LIMIT_LINE=""
@@ -1139,13 +1170,13 @@ run_pass() {
   if [ -n "$sid" ]; then
     claude -p --resume "$sid" --output-format stream-json --verbose \
       --dangerously-skip-permissions --model "$REVIEW_MODEL" \
-      --append-system-prompt "${PERSONA_PROMPT[$persona]}" \
+      --append-system-prompt "${PERSONA_PROMPT[$mode:$persona]}" \
       "${CLAUDE_MCP_ARGS[@]}" -- "$prompt" \
       2>"$errfile" | stdbuf -oL tee "$rawfile" | format_stream
   else
     claude -p --output-format stream-json --verbose \
       --dangerously-skip-permissions --model "$REVIEW_MODEL" \
-      --append-system-prompt "${PERSONA_PROMPT[$persona]}" \
+      --append-system-prompt "${PERSONA_PROMPT[$mode:$persona]}" \
       "${CLAUDE_MCP_ARGS[@]}" -- "$prompt" \
       2>"$errfile" | stdbuf -oL tee "$rawfile" | format_stream
   fi
@@ -1210,7 +1241,7 @@ while true; do
   pairs=()
   for pr_mode in ${prs[@]+"${prs[@]}"}; do
     pr="${pr_mode%%:*}"; mode="${pr_mode#*:}"
-    for persona in "${PERSONAS_LIST[@]}"; do pairs+=("$pr:$mode:$persona"); done
+    for persona in ${MODE_PERSONAS[$mode]}; do pairs+=("$pr:$mode:$persona"); done
   done
   npairs=${#pairs[@]}
 
@@ -1245,7 +1276,7 @@ while true; do
       prompt="$(render_prompt "$FOLLOWUP_PROMPT" "$pr")"
     fi
 
-    if run_pass "$prompt" "$sid" "$persona"; then
+    if run_pass "$prompt" "$sid" "$persona" "$mode"; then
       consec_fail=0
       PR_SESSION[$key]="$RUN_PASS_SESSION_ID"
       PR_PASSES[$key]=$(( ${PR_PASSES[$key]:-0} + 1 ))

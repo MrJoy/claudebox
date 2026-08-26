@@ -47,6 +47,8 @@ BIN="$WORK/bin"; mkdir -p "$BIN"
 #   STUB_LABEL_NULL    -- comma-separated PR numbers whose lookup exits 0 and
 #                         prints the literal JSON `null` (a well-formed but
 #                         useless response)
+#   STUB_PLAN_AFTER    -- the PR is unlabeled until cycle N has finished, then
+#                         labeled (see below)
 cat >"$BIN/gh" <<'STUB'
 #!/bin/sh
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
@@ -60,6 +62,15 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   case ",${STUB_LABEL_NULL:-}," in
     *",$n,"*) echo "null"; exit 0 ;;
   esac
+  # STUB_PLAN_AFTER=N: the PR is unlabeled until cycle N has finished, then
+  # labeled. Cycles are counted by the sleep stub, which writes $HOME/sleeps.
+  if [ -n "${STUB_PLAN_AFTER:-}" ]; then
+    c=$(cat "$HOME/sleeps" 2>/dev/null || echo 0)
+    if [ "$c" -ge "$STUB_PLAN_AFTER" ]; then
+      printf '{"number":%s,"labels":[{"name":"%s"}]}\n' "$n" "${STUB_PLAN_LABEL:-plan}"
+      exit 0
+    fi
+  fi
   case ",${STUB_PLAN_PRS:-}," in
     *",$n,"*) printf '{"number":%s,"labels":[{"name":"%s"}]}\n' "$n" "${STUB_PLAN_LABEL:-plan}" ;;
     *)        printf '{"number":%s,"labels":[]}\n' "$n" ;;
@@ -147,16 +158,27 @@ STUB
 chmod +x "$BIN"/*
 
 # Persona directories built to be broken, for the startup checks that only a
-# mounted PERSONA_DIR can reach. The shipped personas/ cannot express either of
-# these, and both used to be silent: the first crash-looped the container with
-# nothing but cat's own message, the second resolved and reviewed a PR with no
-# identity behind the label it signed.
-NO_SHARED="$WORK/personas-no-shared"; mkdir -p "$NO_SHARED"
-cp "$SCRIPT_DIR/personas/red_team.md" "$NO_SHARED/red_team.md"
+# mounted PERSONA_DIR can reach. The shipped personas/ cannot express any of
+# these, and all three used to be silent: the first crash-looped the container
+# with nothing but cat's own message, the second resolved and reviewed a PR with
+# no identity behind the label it signed, the third is what the flat pre-modes
+# layout now looks like from the inside.
+NO_SHARED="$WORK/personas-no-shared"; mkdir -p "$NO_SHARED/code" "$NO_SHARED/plan"
+cp "$SCRIPT_DIR/personas/code/red_team.md" "$NO_SHARED/code/red_team.md"
+cp "$SCRIPT_DIR/personas/plan/_shared.md" "$NO_SHARED/plan/_shared.md"
+cp "$SCRIPT_DIR/personas/plan/red_team.md" "$NO_SHARED/plan/red_team.md"
 
-HOLLOW="$WORK/personas-hollow"; mkdir -p "$HOLLOW"
-cp "$SCRIPT_DIR/personas/_shared.md" "$HOLLOW/_shared.md"
-printf -- '---\nlabel: Hollow\nsuccess: Nothing at all.\n---\n' >"$HOLLOW/hollow.md"
+HOLLOW="$WORK/personas-hollow"; mkdir -p "$HOLLOW/code" "$HOLLOW/plan"
+cp "$SCRIPT_DIR/personas/code/_shared.md" "$HOLLOW/code/_shared.md"
+cp "$SCRIPT_DIR/personas/plan/_shared.md" "$HOLLOW/plan/_shared.md"
+printf -- '---\nlabel: Hollow\nsuccess: Nothing at all.\n---\n' >"$HOLLOW/code/hollow.md"
+cp "$HOLLOW/code/hollow.md" "$HOLLOW/plan/hollow.md"
+
+# The layout phase 1 shipped: persona files directly in PERSONA_DIR, no
+# subdirectories. Reachable by exactly the mount-your-own-personas workflow the
+# docs advertise, so it has to say what changed rather than dying on a missing file.
+FLAT="$WORK/personas-flat"; mkdir -p "$FLAT"
+cp "$SCRIPT_DIR/personas/code/_shared.md" "$SCRIPT_DIR/personas/code/red_team.md" "$FLAT/"
 
 PASS=0; FAIL=0; SKIP=0
 FAILED_LABELS=""
@@ -249,31 +271,33 @@ printf 'Running persona tests with %s (bash %s)\n\n' "$BASH_BIN" "$("$BASH_BIN" 
 # --- definition files (static checks, no entrypoint run) --------------------
 if selected "definitions: every persona file is well formed"; then
   problems=""
-  for f in "$SCRIPT_DIR"/personas/*.md; do
-    b="$(basename "$f" .md)"
-    case "$b" in _*) continue ;; esac
-    head -1 "$f" | grep -qx -- "---" || problems="$problems [$b: no frontmatter]"
-    grep -qE '^label: [A-Za-z0-9 ._-]+$' "$f" || problems="$problems [$b: no usable label]"
-    grep -q '^success: ' "$f" || problems="$problems [$b: no success criterion]"
-    grep -qF "JSON" "$f" && problems="$problems [$b: carries an output contract]"
+  for tree in code plan; do
+    for f in "$SCRIPT_DIR/personas/$tree"/*.md; do
+      b="$(basename "$f" .md)"
+      case "$b" in _*) continue ;; esac
+      head -1 "$f" | grep -qx -- "---" || problems="$problems [$tree/$b: no frontmatter]"
+      grep -qE '^label: [A-Za-z0-9 ._-]+$' "$f" || problems="$problems [$tree/$b: no usable label]"
+      grep -q '^success: ' "$f" || problems="$problems [$tree/$b: no success criterion]"
+      grep -qF "JSON" "$f" && problems="$problems [$tree/$b: carries an output contract]"
+    done
+    [ -f "$SCRIPT_DIR/personas/$tree/_shared.md" ] || problems="$problems [$tree/_shared.md missing]"
+    grep -qF '{{PERSONA}}' "$SCRIPT_DIR/personas/$tree/_shared.md" || problems="$problems [$tree/_shared.md has no {{PERSONA}} token]"
   done
-  [ -f "$SCRIPT_DIR/personas/_shared.md" ] || problems="$problems [_shared.md missing]"
-  grep -qF '{{PERSONA}}' "$SCRIPT_DIR/personas/_shared.md" || problems="$problems [_shared.md has no {{PERSONA}} token]"
   if [ -n "$problems" ]; then bad "definitions: every persona file is well formed" "$problems"
   else ok "definitions: every persona file is well formed"; fi
 fi
 
 # --- selection --------------------------------------------------------------
 cycle "selection: default set is the four code-facing personas in order" \
-  -- CALLS:8 LOG:"personas: red_team adversarial sme sage"
+  -- CALLS:8 LOG:"code personas: red_team adversarial sme sage"
 
 cycle "selection: an explicit list is honoured, in the order given" \
   PERSONAS=sage,red_team \
-  -- CALLS:4 LOG:"personas: sage red_team"
+  -- CALLS:4 LOG:"code personas: sage red_team"
 
 cycle "selection: all expands to every shipped persona" \
   PERSONAS=all \
-  -- CALLS:12 LOG:"personas: adversarial good_friend red_team sage sme user"
+  -- CALLS:12 LOG:"code personas: adversarial good_friend red_team sage sme user"
 
 refuses "selection: an unknown persona name refuses at startup" \
   "unknown persona 'red-team'" \
@@ -301,7 +325,7 @@ refuses "selection: a persona directory with no output contract refuses at start
 
 refuses "selection: a persona that is only frontmatter refuses at startup" \
   "empty prompt body" \
-  -- PERSONA_DIR="$HOLLOW" PERSONAS=hollow
+  -- PERSONA_DIR="$HOLLOW" PERSONAS=hollow PLAN_PERSONAS=hollow
 
 # The token split has to be unquoted to split on the separators, which also
 # makes it glob. Without `set -f` the name reaching the error is whatever the
@@ -459,13 +483,13 @@ cycle "mode: an unlabeled PR is reviewed in code mode" \
      LOG:"Reviewing PR #1 [code/red_team]"
 
 cycle "mode: a PR carrying the plan label is reviewed in plan mode" \
-  PERSONAS=red_team STUB_PLAN_PRS=1 STUB_MAX_CYCLES=1 \
+  PERSONAS=red_team PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 STUB_MAX_CYCLES=1 \
   -- CALLS:1 \
      LOG:"Candidate PRs (ids): 1:plan" \
      LOG:"Reviewing PR #1 [plan/red_team]"
 
 cycle "mode: PLAN_LABEL names the label that means plan" \
-  PERSONAS=red_team PLAN_LABEL=proposal STUB_PLAN_PRS=1 STUB_PLAN_LABEL=proposal STUB_MAX_CYCLES=1 \
+  PERSONAS=red_team PLAN_PERSONAS=red_team PLAN_LABEL=proposal STUB_PLAN_PRS=1 STUB_PLAN_LABEL=proposal STUB_MAX_CYCLES=1 \
   -- CALLS:1 LOG:"1:plan"
 
 cycle "mode: a label that is not PLAN_LABEL leaves the PR in code mode" \
@@ -473,7 +497,7 @@ cycle "mode: a label that is not PLAN_LABEL leaves the PR in code mode" \
   -- CALLS:1 LOG:"1:code"
 
 cycle "mode: both modes can appear in one cycle" \
-  PR_IDS=1,2 PERSONAS=red_team STUB_PLAN_PRS=2 STUB_MAX_CYCLES=1 \
+  PR_IDS=1,2 PERSONAS=red_team PLAN_PERSONAS=red_team STUB_PLAN_PRS=2 STUB_MAX_CYCLES=1 \
   -- CALLS:2 \
      LOG:"Candidate PRs (ids): 1:code 2:plan"
 
@@ -507,6 +531,56 @@ cycle "mode: a null label response skips the PR rather than reviewing PR #null" 
      LOG:"Candidate PRs (ids): 2:code" \
      NOLOG:"Reviewing PR #1" \
      NOLOG:"PR #null"
+
+# --- per-mode persona sets ---------------------------------------------------
+cycle "modes: plan mode runs all six personas by default" \
+  STUB_PLAN_PRS=1 STUB_MAX_CYCLES=1 \
+  -- CALLS:6 LOG:"plan personas: adversarial good_friend red_team sage sme user"
+
+cycle "modes: code mode still runs the four code-facing personas by default" \
+  STUB_MAX_CYCLES=1 \
+  -- CALLS:4 LOG:"code personas: red_team adversarial sme sage"
+
+cycle "modes: PLAN_PERSONAS selects the plan set, PERSONAS the code set" \
+  PR_IDS=1,2 PERSONAS=red_team PLAN_PERSONAS=user,sage STUB_PLAN_PRS=2 STUB_MAX_CYCLES=1 \
+  -- CALLS:3 \
+     LOG:"code personas: red_team" \
+     LOG:"plan personas: user sage" \
+     ARGV:1:"You are a Red Team security reviewer" \
+     ARGV:2:"You are a User advocate" \
+     ARGV:3:"You are a Sage"
+
+# Both modes resolve at startup, so a broken plan persona kills the container at
+# boot rather than the first time somebody labels a PR.
+refuses "modes: a broken plan persona refuses at startup even with no plan PR" \
+  "unknown persona 'saeg'" \
+  -- PLAN_PERSONAS=saeg
+
+refuses "modes: a flat PERSONA_DIR says what the layout changed to" \
+  "code/ and plan/" \
+  -- PERSONA_DIR="$FLAT" PERSONAS=red_team
+
+refuses "modes: a mode tree with no output contract refuses at startup" \
+  "no output contract" \
+  -- PERSONA_DIR="$NO_SHARED" PERSONAS=red_team
+
+# The property the whole persona design rests on, now asserted per mode: the flag
+# does not survive --resume, so a resumed plan pass must re-carry its plan persona.
+cycle "modes: a resumed plan pass still carries its plan persona" \
+  PLAN_PERSONAS=user STUB_PLAN_PRS=1 \
+  -- CALLS:2 \
+     ARGV:2:"--resume S1" \
+     ARGV:2:"--append-system-prompt You are a User advocate"
+
+# A label added between cycles changes the pair key, so the old session is
+# orphaned and the new mode starts fresh rather than resuming a code session
+# under a plan persona.
+cycle "modes: a PR that gains the label starts a fresh session, not a resumed one" \
+  PERSONAS=red_team PLAN_PERSONAS=red_team STUB_PLAN_AFTER=1 \
+  -- CALLS:2 \
+     LOG:"Reviewing PR #1 [code/red_team]" \
+     LOG:"Reviewing PR #1 [plan/red_team]" \
+     NOARGV:2:"--resume"
 
 # Three in a row that are not limits means the provider is unhealthy, not that
 # these particular pairs are cursed. Walking the rest of the list into it costs

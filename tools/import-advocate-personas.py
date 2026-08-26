@@ -13,6 +13,11 @@ only interpolation is _COMMON_OUTPUT_FORMAT, so dropping every interpolation is
 exactly the transformation we want: it removes advocate's JSON output contract
 (claudebox posts gh comments, not JSON) and keeps the persona identity. The
 assertion below fails loudly if that stops being true upstream.
+
+Both review-mode trees get the same imported body. advocate has one body per
+persona, so this importer cannot invent two, and hand-tuning one tree is
+protected by the fact that a re-run produces a diff reviewed before it is
+committed -- a hand edit shows up there as a reverted line to keep.
 """
 import ast
 import pathlib
@@ -81,15 +86,18 @@ for stmt in tree.body:
             prompts[enum_id(k)] = literal_text(v).strip()
 
 assert set(meta) == set(prompts), (sorted(meta), sorted(prompts))
-out.mkdir(parents=True, exist_ok=True)
 for pid in sorted(meta):
     body = prompts[pid]
     assert "JSON" not in body, f"{pid}: advocate's output contract survived extraction"
-    (out / f"{pid}.md").write_text(
+    text = (
         "---\n"
         f"label: {meta[pid]['label']}\n"
         f"success: {meta[pid]['success']}\n"
         "---\n"
         f"{body}\n"
     )
-    print(f"wrote {pid}.md  label={meta[pid]['label']!r}  {len(body)} chars")
+    for tree_name in ("code", "plan"):
+        d = out / tree_name
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{pid}.md").write_text(text, encoding="utf-8")
+    print(f"wrote code/{pid}.md and plan/{pid}.md  label={meta[pid]['label']!r}  {len(body)} chars")
