@@ -622,6 +622,17 @@ cycle "prompts: the plan default keeps the gh stanza" \
   PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 STUB_MAX_CYCLES=1 \
   -- ARGV:1:'do not use `gh pr checks`'
 
+# The code followup's own coverage: it lived as a bare scalar before this branch
+# moved both prompts into MODE_FOLLOWUP_PROMPT[code], the refactor that could
+# silently drop a stanza, and the gh/test text is now hand-maintained in four
+# copies rather than two.
+cycle "prompts: the code followup repeats the gh and test stanzas" \
+  PERSONAS=red_team \
+  -- CALLS:2 \
+     ARGV:2:"Re-check pull request #1" \
+     ARGV:2:'do not use `gh pr checks`' \
+     ARGV:2:"Treat the tests in this PR as code under review"
+
 # Repeated on resumed passes for the same reason the gh stanza is: a long-resumed
 # session's earliest turns are the first thing a context summary drops.
 # The "Re-read the plan" assertion is what tells the followup apart from the
@@ -646,6 +657,14 @@ cycle "prompts: PLAN_REVIEW_PROMPT_SUFFIX appends to the plan default" \
   -- ARGV:1:"proposes an approach rather than implementing one" \
      ARGV:1:"And mention the ticket."
 
+cycle "prompts: FOLLOWUP_PROMPT reaches Claude verbatim, with no stanzas" \
+  PERSONAS=red_team FOLLOWUP_PROMPT='just re-check 1' \
+  -- CALLS:2 \
+     ARGV:2:"just re-check 1" \
+     NOARGV:1:"just re-check 1" \
+     NOARGV:2:'do not use `gh pr checks`' \
+     NOARGV:2:"Treat the tests in this PR as code under review"
+
 cycle "prompts: PLAN_FOLLOWUP_PROMPT reaches Claude verbatim, with no stanzas" \
   PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 PLAN_FOLLOWUP_PROMPT='just re-read the plan in 1' \
   -- CALLS:2 \
@@ -654,6 +673,13 @@ cycle "prompts: PLAN_FOLLOWUP_PROMPT reaches Claude verbatim, with no stanzas" \
      NOARGV:1:"just re-read the plan in 1" \
      NOARGV:2:'do not use `gh pr checks`' \
      NOARGV:2:"proposes an approach rather than implementing one"
+
+cycle "prompts: FOLLOWUP_PROMPT_SUFFIX appends to the code followup default" \
+  PERSONAS=red_team FOLLOWUP_PROMPT_SUFFIX='And mention the ticket.' \
+  -- CALLS:2 \
+     ARGV:2:"Re-check pull request #1" \
+     ARGV:2:"And mention the ticket." \
+     NOARGV:1:"And mention the ticket."
 
 cycle "prompts: PLAN_FOLLOWUP_PROMPT_SUFFIX appends to the plan followup default" \
   PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 PLAN_FOLLOWUP_PROMPT_SUFFIX='And mention the ticket.' \
