@@ -63,9 +63,14 @@ strip_surrounding_quotes \
   CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN \
   GITHUB_TOKEN GITHUB_REPOSITORY LINEAR_API_KEY \
   PR_ASSIGNEE PR_IDS PR_SEARCH \
-  PERSONAS PLAN_PERSONAS PERSONA_DIR PLAN_LABEL LIMIT_BACKOFF_SECONDS \
-  PLAN_REVIEW_PROMPT PLAN_FOLLOWUP_PROMPT \
-  PLAN_REVIEW_PROMPT_SUFFIX PLAN_FOLLOWUP_PROMPT_SUFFIX
+  PERSONAS PLAN_PERSONAS PERSONA_DIR PLAN_LABEL LIMIT_BACKOFF_SECONDS
+# The prompt vars (REVIEW_PROMPT, FOLLOWUP_PROMPT, their _SUFFIX forms, and the
+# PLAN_-prefixed counterparts of all four) are deliberately absent from that
+# list. Everything else on it is a URL, an id, or a credential, where a leading
+# or trailing quote is always operator error. A prompt is free text, so a quote
+# at either end can be exactly what the operator meant to send, and stripping it
+# would edit the prompt behind their back -- against the guarantee that an
+# operator-supplied prompt reaches Claude verbatim.
 
 # --- Required configuration ------------------------------------------------
 # Provider-specific credentials are validated in "Backend selection" below.
@@ -469,10 +474,15 @@ case "$LIMIT_BACKOFF_SECONDS" in ''|*[!0-9]*) die "LIMIT_BACKOFF_SECONDS must be
 # growth of a long-lived resumed session's context. 0 = never rotate.
 MAX_PASSES_PER_SESSION="${MAX_PASSES_PER_SESSION:-0}"
 case "$MAX_PASSES_PER_SESSION" in ''|*[!0-9]*) die "MAX_PASSES_PER_SESSION must be a non-negative integer";; esac
-# Prompts are PR-scoped: the harness runs one session per PR and substitutes the
-# {{PR}} token with that PR's number. REVIEW_PROMPT starts a PR's session;
-# FOLLOWUP_PROMPT is used when resuming it on a later cycle. Custom overrides use
-# the same {{PR}} token.
+# Prompts are PR-scoped and mode-scoped. Every one of them substitutes the
+# {{PR}} token with the number of the PR the pass is reviewing, overrides
+# included. There are four, one per (mode, new-or-resumed) combination: code mode
+# uses REVIEW_PROMPT to start a pair's session and FOLLOWUP_PROMPT to resume it
+# on a later cycle, and plan mode uses PLAN_REVIEW_PROMPT and
+# PLAN_FOLLOWUP_PROMPT for the same two jobs. The bare names stay code mode, so
+# an operator who tunes the code prompt cannot silently change what a plan PR
+# gets asked. The four defaults are built below and land in MODE_REVIEW_PROMPT /
+# MODE_FOLLOWUP_PROMPT, keyed by mode.
 #
 # The gh constraints in these prompts are not style advice: they are what the
 # privilege-minimized token can actually do. A bare `gh pr view` asks for

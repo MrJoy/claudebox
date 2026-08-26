@@ -624,10 +624,15 @@ cycle "prompts: the plan default keeps the gh stanza" \
 
 # Repeated on resumed passes for the same reason the gh stanza is: a long-resumed
 # session's earliest turns are the first thing a context summary drops.
+# The "Re-read the plan" assertion is what tells the followup apart from the
+# review prompt: both carry the plan stanza, so a resumed pass handed the review
+# prompt by mistake would satisfy the stanza assertion and re-introduce the whole
+# task from scratch on every cycle.
 cycle "prompts: a resumed plan pass repeats the plan stanza" \
   PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 \
   -- CALLS:2 \
      ARGV:2:"--resume S1" \
+     ARGV:2:"Re-read the plan in pull request" \
      ARGV:2:"do not ask for tests, error handling, or input validation in code that does not exist yet"
 
 cycle "prompts: PLAN_REVIEW_PROMPT reaches Claude verbatim, with no stanzas" \
@@ -640,6 +645,21 @@ cycle "prompts: PLAN_REVIEW_PROMPT_SUFFIX appends to the plan default" \
   PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 PLAN_REVIEW_PROMPT_SUFFIX='And mention the ticket.' STUB_MAX_CYCLES=1 \
   -- ARGV:1:"proposes an approach rather than implementing one" \
      ARGV:1:"And mention the ticket."
+
+cycle "prompts: PLAN_FOLLOWUP_PROMPT reaches Claude verbatim, with no stanzas" \
+  PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 PLAN_FOLLOWUP_PROMPT='just re-read the plan in 1' \
+  -- CALLS:2 \
+     ARGV:2:"--resume S1" \
+     ARGV:2:"just re-read the plan in 1" \
+     NOARGV:2:'do not use `gh pr checks`' \
+     NOARGV:2:"proposes an approach rather than implementing one"
+
+cycle "prompts: PLAN_FOLLOWUP_PROMPT_SUFFIX appends to the plan followup default" \
+  PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 PLAN_FOLLOWUP_PROMPT_SUFFIX='And mention the ticket.' \
+  -- CALLS:2 \
+     ARGV:2:"Re-read the plan in pull request" \
+     ARGV:2:"And mention the ticket." \
+     NOARGV:1:"And mention the ticket."
 
 # The code-mode overrides must not leak into plan mode, or an operator who tuned
 # their code prompt would silently get it on plan PRs too.
