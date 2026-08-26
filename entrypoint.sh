@@ -177,6 +177,7 @@ PLAN_LABEL="${PLAN_LABEL:-plan}"
 pr_modes() {
   jq -r --arg L "$PLAN_LABEL" '
     (if type == "array" then . else [.] end)[]
+    | select(.number != null)
     | "\(.number)\t\(if any(.labels[]?; .name == $L) then "plan" else "code" end)"
   '
 }
@@ -187,7 +188,7 @@ pr_modes() {
 # in the call that was already being made; `ids` has no list call behind it, so
 # it costs one `gh pr view` per PR per cycle.
 enumerate_candidate_prs() {
-  local n raw
+  local n raw out
   case "$PR_SELECTOR" in
     all)      gh pr list -R "$GITHUB_REPOSITORY" --state open --limit 100 --json number,labels | pr_modes ;;
     assignee) gh pr list -R "$GITHUB_REPOSITORY" --state open --assignee "$PR_ASSIGNEE" --limit 100 --json number,labels | pr_modes ;;
@@ -198,9 +199,18 @@ enumerate_candidate_prs() {
         # code mode: a wrong-mode review posts real comments on a real PR and
         # cannot be taken back, where a skip is one log line and a retry next
         # cycle. The log goes to stderr because this function's stdout is the
-        # candidate list.
+        # candidate list. `out` is checked non-empty, not just pr_modes' exit
+        # code: a `gh` that exits 0 with empty/whitespace stdout, or with a
+        # well-formed object missing `number`, makes pr_modes itself exit 0
+        # with nothing on stdout -- silently dropping the PR with no WARN at
+        # all, which is worse than the ordinary failed-lookup case it exists
+        # to guard against.
+        out=""
         if raw="$(gh pr view "$n" -R "$GITHUB_REPOSITORY" --json number,labels 2>/dev/null)"; then
-          printf '%s\n' "$raw" | pr_modes || log "WARN: could not read labels for PR #$n; skipping it this cycle." >&2
+          out="$(printf '%s\n' "$raw" | pr_modes)"
+        fi
+        if [ -n "$out" ]; then
+          printf '%s\n' "$out"
         else
           log "WARN: could not read labels for PR #$n; skipping it this cycle." >&2
         fi

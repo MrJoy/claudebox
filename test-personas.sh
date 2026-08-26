@@ -40,14 +40,25 @@ BIN="$WORK/bin"; mkdir -p "$BIN"
 
 # `gh` now gets asked for a PR's labels, because mode routing decides code-vs-plan
 # from them. Everything else it is asked still just has to succeed.
-#   STUB_PLAN_PRS   -- comma-separated PR numbers that carry the plan label
-#   STUB_LABEL_FAIL -- comma-separated PR numbers whose label lookup fails
+#   STUB_PLAN_PRS      -- comma-separated PR numbers that carry the plan label
+#   STUB_LABEL_FAIL    -- comma-separated PR numbers whose label lookup fails
+#   STUB_LABEL_GARBAGE -- comma-separated PR numbers whose lookup exits 0 but
+#                         prints nothing (a successful, empty response)
+#   STUB_LABEL_NULL    -- comma-separated PR numbers whose lookup exits 0 and
+#                         prints the literal JSON `null` (a well-formed but
+#                         useless response)
 cat >"$BIN/gh" <<'STUB'
 #!/bin/sh
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   n="$3"
   case ",${STUB_LABEL_FAIL:-}," in
     *",$n,"*) echo "gh: could not resolve to a PullRequest" >&2; exit 1 ;;
+  esac
+  case ",${STUB_LABEL_GARBAGE:-}," in
+    *",$n,"*) exit 0 ;;
+  esac
+  case ",${STUB_LABEL_NULL:-}," in
+    *",$n,"*) echo "null"; exit 0 ;;
   esac
   case ",${STUB_PLAN_PRS:-}," in
     *",$n,"*) printf '{"number":%s,"labels":[{"name":"%s"}]}\n' "$n" "${STUB_PLAN_LABEL:-plan}" ;;
@@ -475,6 +486,27 @@ cycle "mode: a failed label lookup skips the PR rather than guessing" \
      LOG:"could not read labels for PR #1" \
      LOG:"Candidate PRs (ids): 2:code" \
      NOLOG:"Reviewing PR #1"
+
+# A `gh` that exits 0 but prints nothing is not a failed lookup by the ordinary
+# check (it succeeded), so it must be caught separately or the PR vanishes from
+# the cycle with no WARN at all -- indistinguishable from having been reviewed
+# clean.
+cycle "mode: a successful but empty label lookup skips the PR, not silently" \
+  PR_IDS=1,2 PERSONAS=red_team STUB_LABEL_GARBAGE=1 STUB_MAX_CYCLES=1 \
+  -- CALLS:1 \
+     LOG:"could not read labels for PR #1" \
+     LOG:"Candidate PRs (ids): 2:code" \
+     NOLOG:"Reviewing PR #1"
+
+# A `gh` that exits 0 with a well-formed but useless body (bare `null`) must not
+# turn into a candidate PR literally numbered "null".
+cycle "mode: a null label response skips the PR rather than reviewing PR #null" \
+  PR_IDS=1,2 PERSONAS=red_team STUB_LABEL_NULL=1 STUB_MAX_CYCLES=1 \
+  -- CALLS:1 \
+     LOG:"could not read labels for PR #1" \
+     LOG:"Candidate PRs (ids): 2:code" \
+     NOLOG:"Reviewing PR #1" \
+     NOLOG:"PR #null"
 
 # Three in a row that are not limits means the provider is unhealthy, not that
 # these particular pairs are cursed. Walking the rest of the list into it costs
