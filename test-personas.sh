@@ -601,6 +601,56 @@ cycle "failures: a success resets the run, so scattered failures do not abandon"
      NOLOG:"Abandoning this cycle" \
      NOLOG:"Not reviewed this cycle"
 
+# --- per-mode prompts --------------------------------------------------------
+# The test stanza asks the reviewer to mentally revert production lines a test
+# depends on. There are none in a plan, and a reviewer handed a design document
+# will otherwise report missing tests in code nobody has written.
+cycle "prompts: plan mode drops the test stanza and code mode keeps it" \
+  PR_IDS=1,2 PERSONAS=red_team PLAN_PERSONAS=red_team STUB_PLAN_PRS=2 STUB_MAX_CYCLES=1 \
+  -- CALLS:2 \
+     ARGV:1:"Treat the tests in this PR as code under review" \
+     NOARGV:2:"Treat the tests in this PR as code under review"
+
+cycle "prompts: the plan default says what a plan review is and is not" \
+  PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 STUB_MAX_CYCLES=1 \
+  -- ARGV:1:"proposes an approach rather than implementing one" \
+     ARGV:1:"do not ask for tests, error handling, or input validation in code that does not exist yet"
+
+# The gh constraints are what the privilege-minimized token can actually do, and
+# they are identical in both modes.
+cycle "prompts: the plan default keeps the gh stanza" \
+  PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 STUB_MAX_CYCLES=1 \
+  -- ARGV:1:'do not use `gh pr checks`'
+
+# Repeated on resumed passes for the same reason the gh stanza is: a long-resumed
+# session's earliest turns are the first thing a context summary drops.
+cycle "prompts: a resumed plan pass repeats the plan stanza" \
+  PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 \
+  -- CALLS:2 \
+     ARGV:2:"--resume S1" \
+     ARGV:2:"do not ask for tests, error handling, or input validation in code that does not exist yet"
+
+cycle "prompts: PLAN_REVIEW_PROMPT reaches Claude verbatim, with no stanzas" \
+  PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 PLAN_REVIEW_PROMPT='just read the plan in 1' STUB_MAX_CYCLES=1 \
+  -- ARGV:1:"just read the plan in 1" \
+     NOARGV:1:'do not use `gh pr checks`' \
+     NOARGV:1:"proposes an approach rather than implementing one"
+
+cycle "prompts: PLAN_REVIEW_PROMPT_SUFFIX appends to the plan default" \
+  PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 PLAN_REVIEW_PROMPT_SUFFIX='And mention the ticket.' STUB_MAX_CYCLES=1 \
+  -- ARGV:1:"proposes an approach rather than implementing one" \
+     ARGV:1:"And mention the ticket."
+
+# The code-mode overrides must not leak into plan mode, or an operator who tuned
+# their code prompt would silently get it on plan PRs too.
+cycle "prompts: a code override does not reach plan mode" \
+  PR_IDS=1,2 PERSONAS=red_team PLAN_PERSONAS=red_team STUB_PLAN_PRS=2 \
+  REVIEW_PROMPT='code only 1' STUB_MAX_CYCLES=1 \
+  -- CALLS:2 \
+     ARGV:1:"code only 1" \
+     NOARGV:2:"code only 1" \
+     ARGV:2:"proposes an approach rather than implementing one"
+
 printf '\n%d passed, %d failed' "$PASS" "$FAIL"
 [ "$SKIP" -gt 0 ] && printf ', %d skipped' "$SKIP"
 printf '\n'

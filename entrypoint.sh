@@ -63,7 +63,9 @@ strip_surrounding_quotes \
   CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN \
   GITHUB_TOKEN GITHUB_REPOSITORY LINEAR_API_KEY \
   PR_ASSIGNEE PR_IDS PR_SEARCH \
-  PERSONAS PLAN_PERSONAS PERSONA_DIR PLAN_LABEL LIMIT_BACKOFF_SECONDS
+  PERSONAS PLAN_PERSONAS PERSONA_DIR PLAN_LABEL LIMIT_BACKOFF_SECONDS \
+  PLAN_REVIEW_PROMPT PLAN_FOLLOWUP_PROMPT \
+  PLAN_REVIEW_PROMPT_SUFFIX PLAN_FOLLOWUP_PROMPT_SUFFIX
 
 # --- Required configuration ------------------------------------------------
 # Provider-specific credentials are validated in "Backend selection" below.
@@ -491,6 +493,11 @@ case "$MAX_PASSES_PER_SESSION" in ''|*[!0-9]*) die "MAX_PASSES_PER_SESSION must 
 # this a good test?" resolves to "it looks like the other tests."
 _test_stanza="Treat the tests in this PR as code under review in their own right, not as evidence that the change works. For each test the PR adds or modifies, run this check explicitly: identify which specific lines of the non-test change it depends on, mentally revert just those lines, and decide whether the test would still pass. A test that passes against the pre-change code is not a regression test, and that it exercises the new code path is not the same thing -- exercising is not asserting. Raise every such test as a finding, and say in the comment which mutation of the production code survives it. Apply the same mutation thinking beyond a straight revert: would the test still pass if a boundary moved by one, a condition were negated, an error branch were deleted, a returned collection came back empty, or the function returned a fixed value? Also flag tests that lock in as-implemented behavior instead of intended behavior -- assertions that restate the implementation, recompute the expected value with the same logic the code under test uses, assert on a mock's own stubbed return, or freeze whatever the code currently emits (snapshots included) without any statement of what is actually required. A test should read as a claim about what the code must do that a reader could check against the ticket or the PR description. Call out tests that cannot fail (no assertion reached, assertions after an early return or inside a never-taken branch, a swallowed exception, a tautological comparison) and tests whose name or docstring promises a behavior the body never checks. Where a change adds a behavior with no test that would catch its removal, say so and name the missing case; where the tests are genuinely adequate, say nothing about them."
 _gh_stanza="Two constraints on the GitHub CLI here, because the token is deliberately privilege-minimized: always pass an explicit --json field list to \`gh pr view\` (a bare \`gh pr view\` also fetches statusCheckRollup, which this token cannot be granted permission for, so it fails outright), and do not use \`gh pr checks\` at all -- it needs that same permission and cannot work. CI status is therefore unavailable to you: review the code on its own merits, and never wait on or refer to check results."
+# The plan stanza does two jobs. It says what to review, and it says what NOT to
+# flag: a code-shaped reviewer handed a design document will reliably report
+# missing error handling in code nobody has written, and a review full of that is
+# a review nobody reads. Like the others it is appended to the DEFAULTS only.
+_plan_stanza="This pull request proposes an approach rather than implementing one. Review the proposal itself: whether the problem is stated correctly, whether this is the simplest thing that solves it, what it fails to account for, what it forecloses, and what would have to be true for it to work. Where you object, say what you would do instead. There is no implementation to inspect, so do not ask for tests, error handling, or input validation in code that does not exist yet; a gap in the plan's own reasoning is a finding, a gap in code it has not written is not."
 DEFAULT_PROMPT="Perform a thorough review of pull request #{{PR}} in this repository. Inspect it with \`gh pr diff {{PR}}\` and \`gh pr view {{PR}} --json number,title,body,author,url,state,isDraft,headRefName,headRefOid,baseRefName,labels,files,commits,comments,reviews\`, and be sure you're looking at the most recent commit on its branch. $_gh_stanza Pay particular attention to test quality/robustness, security, correctness, and architectural coherence/consistency, and whether the approach the PR takes is prudent and robust in light of the issue it addresses. $_test_stanza Post findings as comments on the PR, one comment per finding."
 # Prompt used when RESUMING a PR's session (it already holds context from prior
 # passes on that PR, so this nudges a re-check rather than re-introducing the task).
@@ -502,31 +509,52 @@ DEFAULT_PROMPT="Perform a thorough review of pull request #{{PR}} in this reposi
 # in response to earlier findings -- the pass most likely to see a hastily
 # written test is the one least likely to still remember how to judge one.
 DEFAULT_FOLLOWUP="I've fetched the latest refs. Re-check pull request #{{PR}} for new commits or changes since your last review of it. Apply the same review standard, and only post findings you haven't already raised on this PR. Be sure you're looking at the most recent commit on its branch. $_gh_stanza $_test_stanza"
+# Prompt pair for plan mode. No test stanza -- there is no implementation to
+# mutate. The plan stanza is repeated on the followup for the same
+# context-summary reason the gh stanza is.
+DEFAULT_PLAN_PROMPT="Review the plan or design proposed in pull request #{{PR}} in this repository. Read it with \`gh pr diff {{PR}}\` and \`gh pr view {{PR}} --json number,title,body,author,url,state,isDraft,headRefName,headRefOid,baseRefName,labels,files,commits,comments,reviews\`, and be sure you're looking at the most recent commit on its branch. $_gh_stanza $_plan_stanza Post findings as comments on the PR, one comment per finding."
+DEFAULT_PLAN_FOLLOWUP="I've fetched the latest refs. Re-read the plan in pull request #{{PR}} for revisions since your last review of it. Apply the same review standard, and only post findings you haven't already raised on this PR. A point you raised that the revision addresses is settled; say nothing further about it. Be sure you're looking at the most recent commit on its branch. $_gh_stanza $_plan_stanza"
 # Linear context is added to the DEFAULTS only: an operator who supplied their own
 # prompt gets exactly that prompt, unedited. No-op when LINEAR_API_KEY is unset.
 _linear_stanza="$(linear_stanza)"
 DEFAULT_PROMPT="${DEFAULT_PROMPT}${_linear_stanza}"
 DEFAULT_FOLLOWUP="${DEFAULT_FOLLOWUP}${_linear_stanza}"
-unset _linear_stanza _gh_stanza _test_stanza
-REVIEW_PROMPT="${REVIEW_PROMPT:-$DEFAULT_PROMPT}"
-FOLLOWUP_PROMPT="${FOLLOWUP_PROMPT:-$DEFAULT_FOLLOWUP}"
+DEFAULT_PLAN_PROMPT="${DEFAULT_PLAN_PROMPT}${_linear_stanza}"
+DEFAULT_PLAN_FOLLOWUP="${DEFAULT_PLAN_FOLLOWUP}${_linear_stanza}"
+unset _linear_stanza _gh_stanza _test_stanza _plan_stanza
+# Keyed "$mode". An operator override replaces that mode's default only, so
+# tuning the code prompt cannot silently change what a plan PR is asked.
+declare -A MODE_REVIEW_PROMPT=()
+declare -A MODE_FOLLOWUP_PROMPT=()
+MODE_REVIEW_PROMPT[code]="${REVIEW_PROMPT:-$DEFAULT_PROMPT}"
+MODE_FOLLOWUP_PROMPT[code]="${FOLLOWUP_PROMPT:-$DEFAULT_FOLLOWUP}"
+MODE_REVIEW_PROMPT[plan]="${PLAN_REVIEW_PROMPT:-$DEFAULT_PLAN_PROMPT}"
+MODE_FOLLOWUP_PROMPT[plan]="${PLAN_FOLLOWUP_PROMPT:-$DEFAULT_PLAN_FOLLOWUP}"
 # Suffixes append to whichever prompt is now in effect (default or operator
-# override) — unlike the Linear stanza above, they apply either way. A single
+# override) -- unlike the Linear stanza above, they apply either way. A single
 # space joins them since the prompts above end in '.'.
 if [ -n "${REVIEW_PROMPT_SUFFIX:-}" ]; then
-  REVIEW_PROMPT="${REVIEW_PROMPT} ${REVIEW_PROMPT_SUFFIX}"
+  MODE_REVIEW_PROMPT[code]="${MODE_REVIEW_PROMPT[code]} ${REVIEW_PROMPT_SUFFIX}"
 fi
 if [ -n "${FOLLOWUP_PROMPT_SUFFIX:-}" ]; then
-  FOLLOWUP_PROMPT="${FOLLOWUP_PROMPT} ${FOLLOWUP_PROMPT_SUFFIX}"
+  MODE_FOLLOWUP_PROMPT[code]="${MODE_FOLLOWUP_PROMPT[code]} ${FOLLOWUP_PROMPT_SUFFIX}"
+fi
+if [ -n "${PLAN_REVIEW_PROMPT_SUFFIX:-}" ]; then
+  MODE_REVIEW_PROMPT[plan]="${MODE_REVIEW_PROMPT[plan]} ${PLAN_REVIEW_PROMPT_SUFFIX}"
+fi
+if [ -n "${PLAN_FOLLOWUP_PROMPT_SUFFIX:-}" ]; then
+  MODE_FOLLOWUP_PROMPT[plan]="${MODE_FOLLOWUP_PROMPT[plan]} ${PLAN_FOLLOWUP_PROMPT_SUFFIX}"
 fi
 
 # Validate PR selection now (fail fast, before auth/clone), and warn if a prompt
 # template won't name the PR.
 resolve_pr_selection
 for _mode in $REVIEW_MODES; do resolve_personas "$_mode"; done
+for _mode in $REVIEW_MODES; do
+  case "${MODE_REVIEW_PROMPT[$_mode]}"   in *'{{PR}}'*) : ;; *) log "WARN: the $_mode review prompt has no {{PR}} token; reviews won't name the specific PR." ;; esac
+  case "${MODE_FOLLOWUP_PROMPT[$_mode]}" in *'{{PR}}'*) : ;; *) log "WARN: the $_mode followup prompt has no {{PR}} token; reviews won't name the specific PR." ;; esac
+done
 unset _mode
-case "$REVIEW_PROMPT"   in *'{{PR}}'*) : ;; *) log "WARN: REVIEW_PROMPT has no {{PR}} token; reviews won't name the specific PR." ;; esac
-case "$FOLLOWUP_PROMPT" in *'{{PR}}'*) : ;; *) log "WARN: FOLLOWUP_PROMPT has no {{PR}} token; reviews won't name the specific PR." ;; esac
 
 # --- GitHub auth (gh + git) ------------------------------------------------
 # gh reads GH_TOKEN from the environment; setup-git makes git reuse it for
@@ -1270,10 +1298,10 @@ while true; do
     sid="${PR_SESSION[$key]:-}"
     if [ -z "$sid" ]; then
       log "Reviewing PR #$pr [$mode/$persona] (new session)..."
-      prompt="$(render_prompt "$REVIEW_PROMPT" "$pr")"
+      prompt="$(render_prompt "${MODE_REVIEW_PROMPT[$mode]}" "$pr")"
     else
       log "Reviewing PR #$pr [$mode/$persona] (resuming session $sid)..."
-      prompt="$(render_prompt "$FOLLOWUP_PROMPT" "$pr")"
+      prompt="$(render_prompt "${MODE_FOLLOWUP_PROMPT[$mode]}" "$pr")"
     fi
 
     if run_pass "$prompt" "$sid" "$persona" "$mode"; then
