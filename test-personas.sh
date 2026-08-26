@@ -651,6 +651,7 @@ cycle "prompts: PLAN_FOLLOWUP_PROMPT reaches Claude verbatim, with no stanzas" \
   -- CALLS:2 \
      ARGV:2:"--resume S1" \
      ARGV:2:"just re-read the plan in 1" \
+     NOARGV:1:"just re-read the plan in 1" \
      NOARGV:2:'do not use `gh pr checks`' \
      NOARGV:2:"proposes an approach rather than implementing one"
 

@@ -66,8 +66,9 @@ strip_surrounding_quotes \
   PERSONAS PLAN_PERSONAS PERSONA_DIR PLAN_LABEL LIMIT_BACKOFF_SECONDS
 # The prompt vars (REVIEW_PROMPT, FOLLOWUP_PROMPT, their _SUFFIX forms, and the
 # PLAN_-prefixed counterparts of all four) are deliberately absent from that
-# list. Everything else on it is a URL, an id, or a credential, where a leading
-# or trailing quote is always operator error. A prompt is free text, so a quote
+# list. Everything else on it is a URL, an id, a credential, or a name or number
+# drawn from a fixed vocabulary, where a leading or trailing quote is always
+# operator error. A prompt is free text, so a quote
 # at either end can be exactly what the operator meant to send, and stripping it
 # would edit the prompt behind their back -- against the guarantee that an
 # operator-supplied prompt reaches Claude verbatim.

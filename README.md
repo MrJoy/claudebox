@@ -115,7 +115,7 @@ Whichever provider you pick, the entrypoint pins **every** model tier (`ANTHROPI
 
 ## How it works
 
-The reviewer runs **one Claude session per PR per persona**. Each cycle the entrypoint enumerates the candidate PRs (see [PR selection](#pr-selection)), works out each one's review mode, then reviews it with each persona enabled for that mode in its own session: a pair's first review starts a new session with that mode's review prompt; later cycles `--resume` that pair's session with the mode's followup prompt, so a persona remembers what it already flagged and avoids duplicate comments. The PR number is substituted into the prompt's `{{PR}}` token.
+The reviewer runs **one Claude session per PR per mode per persona**. Each cycle the entrypoint enumerates the candidate PRs (see [PR selection](#pr-selection)), works out each one's review mode, then reviews it with each persona enabled for that mode in its own session: a pair's first review starts a new session with that mode's review prompt; later cycles `--resume` that pair's session with the mode's followup prompt, so a persona remembers what it already flagged and avoids duplicate comments. The PR number is substituted into the prompt's `{{PR}}` token.
 
 ### Two review modes
 
@@ -128,13 +128,13 @@ Change the label with `PLAN_LABEL`. Nothing else has to change to keep today's b
 
 Put a plan in a PR the same way you put code in one. Write the design document on a branch, open the PR, add the label, and the reviewer reads the diff as the proposal. When you revise the plan in response to a comment, push the revision to the same branch: each persona resumes its own session, reads the new revision knowing what it already said about the old one, and drops the points your revision settles.
 
-If a label lookup fails, that PR is skipped for the cycle with a warning in the log and retried next cycle. It is never reviewed in the wrong mode, because a wrong-mode review posts real comments you would have to go and delete.
+With `PR_IDS`, where each PR's labels are looked up one at a time, a lookup that fails skips that PR for the cycle with a warning in the log and retries it next cycle. It is never guessed into the wrong mode, because a wrong-mode review posts real comments you would have to go and delete. The other three selectors read their labels from the `gh pr list` call that finds the PRs in the first place, so there is no per-PR lookup to fail: a failed listing simply yields no candidates that cycle, and the log says so.
 
 A persona is an angle of attack, borrowed from [advocate](https://github.com/jmcentire/advocate): Red Team wants the change to survive assault, Adversarial wants its logic to hold under challenge, Sage wants it simplified, Subject Matter Expert wants a peer to sign off, User wants a stranger to navigate it, Good Friend applies the 3am test. These are **plan-review** personas on loan. advocate wrote them to interrogate a proposal before the work happens, which is why plan mode runs all six and code mode runs the four that survive contact with a diff: `user` and `good_friend` were written against designs and whole projects, so on a narrow diff they reach for material that is not in it. Both sets ship in both modes, so you can opt either one into code review with `PERSONAS` if you want it.
 
 Personas are deliberately **blind to each other**. Nothing tells a persona to defer to another's comments, because that would anchor it to a review it did not do, and avoiding that kind of group-think is the reason this tool exists. Overlapping findings between two angles of attack are a signal that something is worth two comments, not noise to suppress. Each comment is signed with the persona that raised it, e.g. `-claudebox (Red Team)`.
 
-**A cycle is now (candidate PRs x that PR's personas) sequential sessions.** `REVIEW_INTERVAL_SECONDS` is the gap *after* a cycle, so four PRs and four personas is sixteen reviews before the interval starts, and a plan-labeled PR contributes six sessions rather than four. Set `--persona` to one name for the cheapest run.
+**A cycle is now (candidate PRs x that PR's personas) sequential sessions.** `REVIEW_INTERVAL_SECONDS` is the gap *after* a cycle, so four PRs and four personas is sixteen reviews before the interval starts, and a plan-labeled PR contributes six sessions rather than four. Set `--persona` to one name for the cheapest code-mode run; it does not touch `PLAN_PERSONAS`, so a labeled PR still costs six sessions until you set that too.
 
 ```bash
 # CLAUDE_MCP_ARGS is always (--strict-mcp-config), plus (--mcp-config "$MCP_CONFIG_FILE")
@@ -379,7 +379,7 @@ Optional:
 - `REVIEW_PROMPT_SUFFIX` / `FOLLOWUP_PROMPT_SUFFIX` (append extra instructions to the corresponding prompt — default or overridden; also supports the `{{PR}}` token)
 - `PLAN_REVIEW_PROMPT` / `PLAN_FOLLOWUP_PROMPT` and `PLAN_REVIEW_PROMPT_SUFFIX` / `PLAN_FOLLOWUP_PROMPT_SUFFIX` (the plan-mode counterparts of the four above, used for a PR carrying `PLAN_LABEL`; same `{{PR}}` token, same verbatim-override rule)
 
-  > The bare names are code mode, so tuning your code-review prompt never changes what a plan PR is asked. Unlike every other variable here, none of the eight prompt variables has its surrounding quotes stripped: a quote at either end of free text can be exactly what you meant to send.
+  > The bare names are code mode, so tuning your code-review prompt never changes what a plan PR is asked. The URLs, ids, credentials and selector values above each have one matched pair of surrounding quotes stripped at startup; the eight prompt variables deliberately do not, because a quote at either end of free text can be exactly what you meant to send. That is an exemption, not a safety net: quote nothing in your env file, since `docker run --env-file` keeps quotes literally and several values here are stripped by nothing at all.
 - `PLAN_LABEL` (default `plan`), the GitHub label that routes a PR to plan mode; see [Two review modes](#two-review-modes)
 - `MAX_PASSES_PER_SESSION` (rotate a session to a fresh one every N passes, per (PR, mode, persona) pair; `0` = never)
 - `LINEAR_API_KEY` (optional Linear ticket context; use a **read-only** key — see [Linear ticket context](#linear-ticket-context))
