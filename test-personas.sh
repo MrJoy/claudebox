@@ -698,6 +698,15 @@ cycle "prompts: a code override does not reach plan mode" \
      NOARGV:2:"code only 1" \
      ARGV:2:"proposes an approach rather than implementing one"
 
+# The opposite direction: a plan override must not leak into code mode either.
+# The asymmetry is the kind of thing that hides a one-directional bug.
+cycle "prompts: a plan override does not reach code mode" \
+  PR_IDS=1,2 PERSONAS=red_team PLAN_PERSONAS=red_team STUB_PLAN_PRS=2 \
+  PLAN_REVIEW_PROMPT='plan only 2' STUB_MAX_CYCLES=1 \
+  -- CALLS:2 \
+     NOARGV:1:"plan only 2" \
+     ARGV:2:"plan only 2"
+
 printf '\n%d passed, %d failed' "$PASS" "$FAIL"
 [ "$SKIP" -gt 0 ] && printf ', %d skipped' "$SKIP"
 printf '\n'

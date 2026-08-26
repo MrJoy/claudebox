@@ -124,7 +124,9 @@ There are two kinds of review, and a GitHub label picks which one a PR gets.
 - Label a PR **`plan`** and it is reviewed as a proposal: all six personas, a prompt that asks whether the problem is stated correctly and what the approach fails to account for, and an explicit instruction not to ask for tests or error handling in code nobody has written yet.
 - Leave it unlabeled and it gets the code review: four personas and a prompt built around the diff, including the test-quality stanza below.
 
-Change the label with `PLAN_LABEL`. Nothing else has to change to keep today's behavior: an operator who never labels anything sees exactly the code review, since every unlabeled PR is code mode.
+Change the label with `PLAN_LABEL`. Nothing else has to change to keep today's behavior: an operator who never labels anything sees exactly the code review, since every unlabeled PR is code mode. The match is exact and case-sensitive: `PLAN_LABEL=Plan` will not match a label named `plan`, and every PR silently reviews as code mode with no warning to tell that apart from nobody having labeled anything.
+
+Labeling a PR is a review-weakening control, not just a routing switch: plan mode drops the test-quality stanza entirely and tells every persona not to ask about tests or error handling. That's the right tradeoff when labeling requires triage permission, but it means a repo where every contributor has write access is a repo where any contributor can turn off that scrutiny on their own PR.
 
 Put a plan in a PR the same way you put code in one. Write the design document on a branch, open the PR, add the label, and the reviewer reads the diff as the proposal. When you revise the plan in response to a comment, push the revision to the same branch: each persona resumes its own session, reads the new revision knowing what it already said about the old one, and drops the points your revision settles.
 

@@ -68,10 +68,10 @@ strip_surrounding_quotes \
 # PLAN_-prefixed counterparts of all four) are deliberately absent from that
 # list. Everything else on it is a URL, an id, a credential, or a name or number
 # drawn from a fixed vocabulary, where a leading or trailing quote is always
-# operator error. A prompt is free text, so a quote
-# at either end can be exactly what the operator meant to send, and stripping it
-# would edit the prompt behind their back -- against the guarantee that an
-# operator-supplied prompt reaches Claude verbatim.
+# operator error. A prompt is free text, so a quote at either end can be exactly
+# what the operator meant to send, and stripping it would edit the prompt behind
+# their back -- against the guarantee that an operator-supplied prompt reaches
+# Claude verbatim.
 
 # --- Required configuration ------------------------------------------------
 # Provider-specific credentials are validated in "Backend selection" below.
@@ -175,8 +175,9 @@ resolve_pr_selection() {
 # A plan arrives as a pull request whose diff is the plan document, so plan
 # review reuses the whole loop and differs only in which personas and which
 # prompt a PR gets. Routing is by label rather than by a path heuristic or a
-# classifier pass: a label is explicit, per-PR, author-controlled, and puts no
-# nondeterministic decision inside the harness's control flow.
+# classifier pass: a label is explicit, per-PR, set by someone with triage
+# rights, and puts no nondeterministic decision inside the harness's control
+# flow.
 PLAN_LABEL="${PLAN_LABEL:-plan}"
 
 # Read `gh --json number,labels` output on stdin -- an array from `gh pr list`,

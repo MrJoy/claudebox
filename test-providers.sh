@@ -42,13 +42,7 @@ cat >"$BIN/gh" <<'STUB'
 #!/bin/sh
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   n="$3"
-  case ",${STUB_LABEL_FAIL:-}," in
-    *",$n,"*) echo "gh: could not resolve to a PullRequest" >&2; exit 1 ;;
-  esac
-  case ",${STUB_PLAN_PRS:-}," in
-    *",$n,"*) printf '{"number":%s,"labels":[{"name":"%s"}]}\n' "$n" "${STUB_PLAN_LABEL:-plan}" ;;
-    *)        printf '{"number":%s,"labels":[]}\n' "$n" ;;
-  esac
+  printf '{"number":%s,"labels":[]}\n' "$n"
   exit 0
 fi
 exit 0
