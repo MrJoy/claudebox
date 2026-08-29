@@ -27,7 +27,7 @@ The equivalent raw docker (what the launcher assembles):
 ```bash
 docker build -t claudebox .
 docker run -d --name claudebox --restart unless-stopped --env-file .env \
-  -v /path/to/your/repo:/repo:ro \
+  -v /path/to/your/repo/.git:/repo/.git:ro \
   --cap-drop ALL --security-opt no-new-privileges --pids-limit 512 --memory 4g \
   claudebox
 docker logs -f claudebox
@@ -47,7 +47,7 @@ It does NOT prove a provider accepts what gets wired — only that the wiring is
 The design is built entirely around one constraint: **the loop runs unattended in YOLO mode (`--dangerously-skip-permissions`), so it must not be able to cause damage.** Three layered safety boundaries, all of which must be preserved when editing:
 
 1. **Unprivileged user** — `Dockerfile` creates and runs as `reviewer`. This is also load-bearing functionally: Claude Code *refuses* `--dangerously-skip-permissions` as root.
-2. **Read-only source** — the user's repo is mounted at `/repo:ro`. `entrypoint.sh` makes a cheap **local clone** (`git clone --local --no-hardlinks`) into a writable working dir and only ever touches the clone. `--no-hardlinks` is mandatory: a bind mount is a different device, so the default hardlinking clone fails with "Invalid cross-device link". If no git repo is mounted, it falls back to a network clone of `GITHUB_REPOSITORY`.
+2. **Read-only source, and only the object store** — the launcher mounts the host repo's `.git` at `/repo/.git:ro`, not the repo itself. `entrypoint.sh` makes a cheap **local clone** (`git clone --local --no-hardlinks`) into a writable working dir and only ever touches the clone. `--no-hardlinks` is mandatory: a bind mount is a different device, so the default hardlinking clone fails with "Invalid cross-device link". That clone is the *only* read of the mount in the whole entrypoint, which is what justifies narrowing it: a whole-repo mount left every ignored file (a Unity `Library/`, nested worktrees, build output) walkable by the reviewer for the container's entire life, and on a VirtIO-backed mount that walk pins file descriptors hard enough to crash the host. The mount point convention is unchanged (`REPO_PATH`, default `/repo`), which is what keeps a hand-rolled whole-repo `docker run -v repo:/repo:ro` working: its object store sits at the same `$REPO_PATH/.git`. Seed selection is `$REPO_PATH/.git`, then `$REPO_PATH` itself (a bare repo mounted directly), then a network clone of `GITHUB_REPOSITORY`.
 3. **Privilege-minimized GitHub token** — read repo/PRs + write PR comments only; no push/merge/admin. This is the real safety boundary; the README stresses verifying it before running unattended.
 
 `entrypoint.sh` enforces boundaries 1–2 at startup (a "Hardening checks" block): it `die`s if running as root, if `no-new-privileges` isn't set (`NoNewPrivs` in `/proc/self/status`), or if capabilities aren't all dropped (`CapBnd` non-zero). Missing `--pids-limit`/`--memory` only warn (resource bounds, not safety, and detection differs across cgroup v1/v2). `ALLOW_UNHARDENED=1` downgrades the hard failures to warnings for non-Docker runtimes or tests. The token (boundary 3) can't be introspected, so it isn't checked.
@@ -161,7 +161,7 @@ It's unconditional for this provider (`SHIM_NORMALIZE=0` removes the hop) rather
 
 `LINEAR_API_KEY` (optional) gives the reviewer read access to the Linear ticket a PR references. `write_mcp_config` generates `$HOME/mcp.json` (mode 600, built with `jq --arg` so a hostile key can't break the JSON) pointing at `https://mcp.linear.app/mcp` with the key as an `Authorization: Bearer` header — Linear accepts an API key in place of interactive OAuth, which is what keeps the loop headless. `linear_stanza` appends the "check the ticket and its comments" instruction to `DEFAULT_PROMPT`/`DEFAULT_FOLLOWUP` **only**, so an operator-supplied `REVIEW_PROMPT`/`FOLLOWUP_PROMPT` reaches Claude verbatim. Docs tell operators to use a read-only key: in YOLO mode a write-capable key would let the unattended reviewer mutate tickets, and like `GITHUB_TOKEN` its scope can't be checked from inside.
 
-`CLAUDE_MCP_ARGS` carries the MCP flags for both `claude -p` call sites and always includes **`--strict-mcp-config`**, Linear or not. That's load-bearing: `/repo` is untrusted, and without it a reviewed repo shipping a `.mcp.json` could get MCP servers of its choosing loaded into a `--dangerously-skip-permissions` session.
+`CLAUDE_MCP_ARGS` carries the MCP flags for both `claude -p` call sites and always includes **`--strict-mcp-config`**, Linear or not. That's load-bearing: the reviewed repo is untrusted, and without it a repo shipping a `.mcp.json` could get MCP servers of its choosing loaded into a `--dangerously-skip-permissions` session.
 
 ## Configuration
 
@@ -170,7 +170,7 @@ All config is via environment variables (`.env.example` documents them). Always 
 ## Gotchas when editing
 
 - Don't add `--read-only` to the container root fs: the loop must write its working clone under `$HOME`.
-- Mount the **primary** repo, not a `git worktree` of it — a worktree keeps objects in its parent and is structurally unusable mounted alone.
+- Seed from the **primary** repo, not a `git worktree` of it — a worktree keeps objects in its parent and is structurally unusable mounted alone. `claudebox.sh` now enforces this rather than documenting it: in a worktree `.git` is a file, so the `-d "$repo_abs/.git"` guard fails and the launcher dies naming the reason. A bare repo as `--repo` is not supported (no `.git` child to mount).
 - Model versions move fast; the `:cloud` suffix is stable but exact version strings drift (browse https://ollama.com/search?c=cloud).
 - The auto-updater is disabled (`DISABLE_AUTOUPDATER=1`) and onboarding is pre-accepted via a baked `~/.claude.json` so headless runs never block on a first-run prompt.
 - `docker run --env-file` does no shell quote processing, so a quoted env-file value arrives with literal quotes and fails late and confusingly (a quoted `ANTHROPIC_BASE_URL` produces `"https://…"/v1/messages`, an unparseable URL, at request time rather than startup). `strip_surrounding_quotes` removes one matched pair from the operator-supplied vars and warns; `check_url` rejects a non-`http(s)` base URL at startup, and also rejects one ending in an endpoint path (`/v1/messages`, `/v1/chat/completions`, …) because Claude Code appends `/v1/messages` itself and the doubled path 404s every request — a bare trailing `/v1` is left alone, since the Vertex base URL requires one. Keep new operator-facing vars on that list unless the var is a free-text prompt, which is exempt for the reason spelled out in the comment at the list itself, and don't write quoted examples in `.env.example`.

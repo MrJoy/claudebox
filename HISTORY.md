@@ -1,5 +1,12 @@
 # History
 
+## 0.2.1 - 2026-08-28
+
+* **The launcher now mounts the host repo's `.git`, not the host repo.** `claudebox.sh --repo PATH` binds `PATH/.git` read-only at `/repo/.git`, and `entrypoint.sh` local-clones that. The startup clone was always the only thing that read the mount; nothing in the entrypoint touches it again for the rest of the container's life. Mounting the whole tree to serve one read left every ignored file in it (a Unity `Library/`, nested worktrees, build output) reachable by a reviewer that decides to go wandering, and on a VirtIO-backed mount walking a tree that size can pin file descriptors until the host falls over. This was reported twice from a real Unity checkout.
+* The mount point convention did not change: it is still `REPO_PATH`, default `/repo`, with the object store inferred at `$REPO_PATH/.git`. That is what makes a hand-rolled whole-repo `docker run -v /path/to/repo:/repo:ro` keep working with no compatibility branch behind it, since its `.git` is at the same path either way. Seed selection is `$REPO_PATH/.git`, then `$REPO_PATH` itself for a bare repo mounted directly, then `gh repo clone`.
+* "Mount the primary repo, not a worktree" stops being advice and becomes a startup error. In a worktree `.git` is a file rather than a directory, so the guard that finds the object store also catches it, and the launcher dies naming the reason instead of building something structurally unusable. A bare repo as `--repo` is refused for the same reason, with its own message.
+* `test-providers.sh` grew three cases covering the seed order, which meant reaching a block the suite had never run: it pre-creates the working clone in every other case. `PRESEED_WORK=0` leaves that out, and the `git` stub now answers `rev-parse --git-dir` honestly rather than succeeding at everything, so which seed was chosen is something the suite can actually observe.
+
 ## 0.2.0 - 2026-08-25
 
 * **A correction.** advocate's personas are *plan-review* personas: they were written to interrogate a proposal before the work happens. 0.1.0 shipped them as the mechanism for reviewing pull requests in general, which misread what they are for. Sage asking whether the fundamental approach is sound, and SME asking whether the problem is correctly understood, cost almost nothing to act on before code exists, and on a finished PR the only honest answer to either is "start over". So review **mode** is now a first-class axis alongside PR and persona, and claudebox does both jobs.

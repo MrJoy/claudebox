@@ -63,7 +63,7 @@ strip_surrounding_quotes \
   CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN \
   GITHUB_TOKEN GITHUB_REPOSITORY LINEAR_API_KEY \
   PR_ASSIGNEE PR_IDS PR_SEARCH \
-  PERSONAS PLAN_PERSONAS PERSONA_DIR PLAN_LABEL LIMIT_BACKOFF_SECONDS
+  PERSONAS PLAN_PERSONAS PERSONA_DIR PLAN_LABEL LIMIT_BACKOFF_SECONDS REPO_PATH
 # The prompt vars (REVIEW_PROMPT, FOLLOWUP_PROMPT, their _SUFFIX forms, and the
 # PLAN_-prefixed counterparts of all four) are deliberately absent from that
 # list. Everything else on it is a URL, an id, a credential, or a name or number
@@ -443,6 +443,10 @@ if [ "$hardening_failed" = "1" ]; then
 fi
 
 # --- Defaults --------------------------------------------------------------
+# Where the seed repo is mounted. The launcher now mounts only the host repo's
+# object store, at $REPO_PATH/.git, so the path convention is unchanged and a
+# hand-rolled whole-repo `docker run -v repo:/repo:ro` still resolves to the
+# same place. Read exactly once, to make the working clone below.
 REPO_PATH="${REPO_PATH:-/repo}"
 # Working-clone location. Normally a private dir under $HOME. With
 # --export-sessions the launcher sets HOST_REPO_PATH to the *host's* repo path
@@ -1071,9 +1075,9 @@ export ANTHROPIC_DEFAULT_HAIKU_MODEL="$REVIEW_MODEL"
 export ANTHROPIC_SMALL_FAST_MODEL="$REVIEW_MODEL"
 
 # --- MCP servers -----------------------------------------------------------
-# --strict-mcp-config is passed ALWAYS: /repo is untrusted input, and without it
-# a repo under review that ships its own .mcp.json could get MCP servers of its
-# choosing loaded into a --dangerously-skip-permissions session. Strict mode
+# --strict-mcp-config is passed ALWAYS: the reviewed repo is untrusted input,
+# and without it a repo under review that ships its own .mcp.json could get MCP
+# servers of its choosing loaded into a --dangerously-skip-permissions session. Strict mode
 # means the reviewer loads only what we generate here, or nothing at all.
 CLAUDE_MCP_ARGS=(--strict-mcp-config)
 MCP_CONFIG_FILE="$HOME/mcp.json"
@@ -1084,18 +1088,28 @@ if write_mcp_config "$MCP_CONFIG_FILE"; then
 fi
 
 # --- Prepare a writable working copy ---------------------------------------
-# REPO_PATH is the user's primary repo, mounted read-only. We make a cheap LOCAL
-# clone of it: git copies the local object store rather than pulling over the
-# network. --no-hardlinks is required because a bind mount is a different device
-# than the container fs, so hardlinking (git clone --local's default) fails with
-# "Invalid cross-device link". The clone is our own writable repo; the mount is
-# never touched. If no usable repo is mounted, fall back to a network clone.
+# We make a cheap LOCAL clone of whatever seed is mounted: git copies the local
+# object store rather than pulling over the network. --no-hardlinks is required
+# because a bind mount is a different device than the container fs, so
+# hardlinking (git clone --local's default) fails with "Invalid cross-device
+# link". The clone is our own writable repo; the mount is never touched -- and
+# is never read again after this point, which is why the launcher now mounts
+# only the object store at $REPO_PATH/.git (see its --repo help). If no usable
+# seed is mounted, fall back to a network clone.
+git config --global --add safe.directory "$REPO_PATH/.git"
 git config --global --add safe.directory "$REPO_PATH"
 mkdir -p "$WORK_DIR"
 if [ ! -d "$WORK_REPO/.git" ]; then
-  if git -C "$REPO_PATH" rev-parse --git-dir >/dev/null 2>&1; then
-    log "Local-cloning seed repo from $REPO_PATH (no network) -> $WORK_REPO"
-    git clone --local --no-hardlinks "$REPO_PATH" "$WORK_REPO"
+  # The object store first, which is all the launcher mounts and is also where
+  # a whole-repo mount keeps it, so both mount styles land here. $REPO_PATH
+  # itself is the fallback for a bare repo mounted directly.
+  seed=""
+  for candidate in "$REPO_PATH/.git" "$REPO_PATH"; do
+    if git -C "$candidate" rev-parse --git-dir >/dev/null 2>&1; then seed="$candidate"; break; fi
+  done
+  if [ -n "$seed" ]; then
+    log "Local-cloning seed repo from $seed (no network) -> $WORK_REPO"
+    git clone --local --no-hardlinks "$seed" "$WORK_REPO"
   else
     log "No usable git repo at $REPO_PATH; cloning $GITHUB_REPOSITORY over the network"
     gh repo clone "$GITHUB_REPOSITORY" "$WORK_REPO"

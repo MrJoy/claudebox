@@ -45,9 +45,26 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   printf '{"number":%s,"labels":[]}\n' "$n"
   exit 0
 fi
+# `gh repo clone REPO DEST` is the seed-less fallback; like git clone above it
+# must leave a directory behind for the loop to cd into.
+if [ "$1" = "repo" ] && [ "$2" = "clone" ]; then mkdir -p "$4"; fi
 exit 0
 STUB
-printf '#!/bin/sh\nexit 0\n' >"$BIN/git"
+# git succeeds at everything except the one probe whose ANSWER the entrypoint
+# branches on: `git -C DIR rev-parse --git-dir` is how the clone block decides
+# which mounted seed to use, so answer it honestly (does DIR exist?) and let
+# seed selection be asserted. `git clone` stays a no-op: nothing downstream
+# looks at the clone it would have made.
+cat >"$BIN/git" <<'STUB'
+#!/bin/sh
+if [ "$1" = "-C" ] && [ "$3" = "rev-parse" ]; then
+  [ -d "$2" ] || exit 1
+fi
+# A real clone creates its destination, and the loop cd's into it, so make the
+# directory even though nothing is put in it.
+if [ "$1" = "clone" ]; then for a in "$@"; do dest="$a"; done; mkdir -p "$dest"; fi
+exit 0
+STUB
 # One cycle per case: the review loop ends with `sleep $REVIEW_INTERVAL_SECONDS`
 # as its last unprotected command, so a failing sleep makes the entrypoint's own
 # `set -e` end the run right after the first pass. Cheaper and quieter than
@@ -116,7 +133,16 @@ FAILED_LABELS=""
 run_entrypoint() {
   local label="$1"; shift
   HOME_DIR="$WORK/home"; OUT="$WORK/out"; DUMP="$HOME_DIR/dump"
-  rm -rf "$HOME_DIR"; mkdir -p "$HOME_DIR/work/repo/.git" "$HOME_DIR/seed"
+  # A pre-made working clone short-circuits the "Prepare a writable working
+  # copy" block, which is what every case except the seed-selection ones wants:
+  # they are about the provider wiring downstream of it. PRESEED_WORK=0 leaves
+  # it out so the clone block actually runs and its choice can be asserted.
+  # $HOME/seed stands in for the /repo mount point, with its object store at
+  # $HOME/seed/.git -- where the launcher's .git-only mount lands and where a
+  # whole-repo mount keeps it too. $HOME/bare stands in for a bare repo mounted
+  # at the mount point directly, which has no .git under it.
+  rm -rf "$HOME_DIR"; mkdir -p "$HOME_DIR/seed/.git" "$HOME_DIR/bare"
+  [ "${PRESEED_WORK:-1}" = 0 ] || mkdir -p "$HOME_DIR/work/repo/.git"
   # env -i so nothing from the caller's shell leaks in and quietly satisfies a
   # variable the case means to leave unset. Case-supplied vars come last, so a
   # case can override any default below (LITELLM_BIN, to test an image missing
@@ -547,6 +573,22 @@ wires "prompt: a suffix appends to an override" \
   PROVIDER=ollama OLLAMA_API_KEY=k REVIEW_PROMPT='review {{PR}}' \
   REVIEW_PROMPT_SUFFIX='and skip the tests' \
   -- ARGV:'review 1 and skip the tests'
+
+# --- Seed selection ----------------------------------------------------------
+# Which path the working clone is made from. The launcher mounts only the host
+# repo's .git, at $REPO_PATH/.git, which is also where a hand-rolled whole-repo
+# mount keeps it -- so the object store is tried first and $REPO_PATH itself is
+# only the bare-repo fallback. These cases run with PRESEED_WORK=0 so the clone
+# block is actually reached.
+PRESEED_WORK=0 wires "seed: clones the object store under the mount point" \
+  PROVIDER=ollama OLLAMA_API_KEY=k \
+  -- "LOG:Local-cloning seed repo from $WORK/home/seed/.git (no network)"
+PRESEED_WORK=0 wires "seed: falls back to the mount point itself for a bare repo" \
+  PROVIDER=ollama OLLAMA_API_KEY=k REPO_PATH="$WORK/home/bare" \
+  -- "LOG:Local-cloning seed repo from $WORK/home/bare (no network)"
+PRESEED_WORK=0 wires "seed: falls back to a network clone when nothing is mounted" \
+  PROVIDER=ollama OLLAMA_API_KEY=k REPO_PATH=/nonexistent \
+  -- "LOG:cloning owner/repo over the network"
 
 # --- Result -----------------------------------------------------------------
 printf '\n%d passed, %d failed' "$PASS" "$FAIL"

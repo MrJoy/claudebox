@@ -59,9 +59,12 @@ COMMANDS
   status    Show the container's state (and live resource stats if running).
 
 OPTIONS
-  --repo PATH       Host repo to mount read-only at /repo (default: current dir).
-                    The reviewer local-clones this as a seed; omit with --no-repo
-                    to have it network-clone GITHUB_REPOSITORY instead.
+  --repo PATH       Host repo to seed the reviewer from (default: current dir).
+                    Only its .git is mounted, read-only at /repo/.git: the
+                    reviewer local-clones that and never sees your working tree,
+                    so ignored files (Library/, worktrees, build output) are not
+                    exposed to it. Must be a primary repo, not a git worktree.
+                    Omit with --no-repo to network-clone GITHUB_REPOSITORY.
   --no-repo         Don't mount a repo; the reviewer clones over the network.
   --env-file PATH   Env file passed to the container. Default: auto-select from
                     the cwd, preferring .env.claudebox over .env (so a repo can
@@ -249,7 +252,22 @@ build_run_flags() {
   if [ "$MOUNT_REPO" = 1 ]; then
     [ -d "$REPO" ] || die "repo path '$REPO' is not a directory (use --repo PATH, or --no-repo to network-clone)."
     local repo_abs; repo_abs="$(cd "$REPO" && pwd)"
-    RUN_FLAGS+=(-v "$repo_abs:/repo:ro")
+    # Mount the OBJECT STORE, not the working tree. The container needs the repo
+    # only to make its local clone at startup, and that clone reads nothing but
+    # .git -- while a whole-repo mount leaves every ignored file (a Unity
+    # Library/, nested worktrees, build output) exposed for the container's
+    # entire life, where a reviewer that decides to go wandering can walk it.
+    # On a VirtIO-backed mount that walk can pin file descriptors hard enough to
+    # take the host down. Mounting .git alone means there is nothing to walk.
+    # The container path convention is unchanged: the object store lands where
+    # it would sit under a whole-repo mount, so the entrypoint reads one path.
+    if [ ! -d "$repo_abs/.git" ]; then
+      if [ -e "$repo_abs/.git" ]; then
+        die "repo path '$REPO' is a git worktree (.git is a file, not a directory). Mount the PRIMARY repo instead: a worktree keeps its objects in the parent and is structurally unusable on its own."
+      fi
+      die "repo path '$REPO' has no .git directory, so there is no object store to seed from (use --repo PATH on a primary git repo, or --no-repo to network-clone)."
+    fi
+    RUN_FLAGS+=(-v "$repo_abs/.git:/repo/.git:ro")
   fi
 
   if [ "$MOUNT_CLAUDE" = 1 ]; then

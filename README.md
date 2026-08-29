@@ -274,7 +274,7 @@ It stubs `gh`/`git`/`claude` and checks either the startup error the entrypoint 
     cp .env.example .env   # then edit
     ```
 
-4. Run, mounting your **primary repo read-only** at `/repo`. It's a long-running unattended service, so run it **detached** (`-d`), give it a **name** so you can attach to its logs, and let it **restart** if it crashes. Easiest via the launcher:
+4. Run, seeding from your **primary repo**. Only its `.git` is mounted, read-only at `/repo/.git` — the reviewer clones that and never sees your working tree. It's a long-running unattended service, so run it **detached** (`-d`), give it a **name** so you can attach to its logs, and let it **restart** if it crashes. Easiest via the launcher:
 
     ```bash
     ./claudebox.sh run --repo /path/to/your/repo
@@ -286,7 +286,7 @@ It stubs `gh`/`git`/`claude` and checks either the startup error the entrypoint 
     ```bash
     docker run -d --name claudebox --restart unless-stopped \
       --env-file .env \
-      -v /path/to/your/repo:/repo:ro \
+      -v /path/to/your/repo/.git:/repo/.git:ro \
       --cap-drop ALL \
       --security-opt no-new-privileges \
       --pids-limit 512 \
@@ -301,14 +301,16 @@ It stubs `gh`/`git`/`claude` and checks either the startup error the entrypoint 
     ```bash
     ./claudebox.sh test --repo /path/to/your/repo
     # equivalently:
-    docker run --rm -it --env-file .env -v /path/to/your/repo:/repo:ro --cap-drop ALL --security-opt no-new-privileges --pids-limit 512 --memory 4g claudebox
+    docker run --rm -it --env-file .env -v /path/to/your/repo/.git:/repo/.git:ro --cap-drop ALL --security-opt no-new-privileges --pids-limit 512 --memory 4g claudebox
     ```
 
-On startup the reviewer makes a cheap **local clone** of `/repo` into its own writable working dir — it reuses the local git object store, so no objects are downloaded over the network, and your repo is never written to. It then repoints `origin` at GitHub and fetches only the new PR refs each cycle.
+On startup the reviewer makes a cheap **local clone** of `/repo/.git` into its own writable working dir — it reuses the local git object store, so no objects are downloaded over the network, and your repo is never written to. It then repoints `origin` at GitHub and fetches only the new PR refs each cycle.
 
-The mount is optional: if you omit it, the reviewer does a full network clone of `GITHUB_REPOSITORY` on startup. Mounting your primary repo just avoids that initial download.
+**Why only `.git` and not the whole repo.** That startup clone is the only thing that ever reads the mount; nothing touches it again for the rest of the container's life. A whole-repo mount would leave every ignored file in your tree — a Unity `Library/`, nested worktrees, build output — reachable to a reviewer that decides to go wandering, and on a VirtIO-backed mount (Docker Desktop on macOS) walking a tree that size can pin file descriptors hard enough to take the host down. Mounting the object store alone means there is nothing there to walk. The mount point is unchanged (`REPO_PATH`, default `/repo`), so if you drive `docker run` by hand and mount the whole repo at `/repo:ro`, its `.git` sits at the same place and everything still works.
 
-> **Note:** mount the *primary* repo, not a `git worktree` of it. A worktree keeps its objects in the parent repo and only holds a link back to it, so a worktree mounted on its own is structurally unusable inside the container.
+The mount is optional: if you omit it, the reviewer does a full network clone of `GITHUB_REPOSITORY` on startup. Seeding from your primary repo just avoids that initial download.
+
+> **Note:** seed from the *primary* repo, not a `git worktree` of it. A worktree keeps its objects in the parent repo and only holds a link back to it, so a worktree mounted on its own is structurally unusable inside the container. In a worktree `.git` is a file rather than a directory, so `claudebox.sh` refuses one at startup and says so.
 
 ### Hardening (enforced)
 
@@ -426,7 +428,7 @@ Get a key from **Settings → Security & access → Personal API keys**. Linear'
 
 Read-only bounds what the reviewer can change, not what it can see: a personal API key is scoped to your whole Linear workspace, not to the one ticket a PR claims to reference. The reviewer already treats PR titles, bodies, and diffs as untrusted input, and it can post PR comments — so Linear ticket content becomes a second untrusted input channel into a permission-skipped session, and a hostile or careless PR body can in principle steer it into reading unrelated tickets and pasting their contents into a comment on a possibly-public PR. Don't enable `LINEAR_API_KEY` on repos that take PRs from untrusted contributors, and prefer a key from an account with minimal Linear visibility over your main one.
 
-The entrypoint writes the key into a generated MCP config at `$HOME/mcp.json` (mode `600`) and passes it to Claude Code with `--mcp-config`. Every review pass also runs with `--strict-mcp-config`, whether or not Linear is configured: `/repo` is untrusted input, and strict mode means a repository that ships its own `.mcp.json` can't get MCP servers of its choosing loaded into a permission-skipped session.
+The entrypoint writes the key into a generated MCP config at `$HOME/mcp.json` (mode `600`) and passes it to Claude Code with `--mcp-config`. Every review pass also runs with `--strict-mcp-config`, whether or not Linear is configured: the reviewed repo is untrusted input, and strict mode means a repository that ships its own `.mcp.json` can't get MCP servers of its choosing loaded into a permission-skipped session.
 
 ## Notes & caveats
 
