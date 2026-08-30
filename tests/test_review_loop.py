@@ -470,6 +470,24 @@ class ConsecutiveFailureTest(unittest.TestCase):
         self.assertEqual(len(s.attempted), 6)
 
 
+    def test_the_three_strikes_exit_owes_a_narrowed_groups_unrun_siblings(self):
+        # The three-strikes branch computes its debt the same way the limit
+        # branch does, and only a narrowed group tells the two spellings apart:
+        # with the whole group running, `did_not_run` is empty and an exit that
+        # owed nothing would look identical. PR 13 enters owing one persona of
+        # two, so its sibling never runs, and the counter reaches three inside
+        # it. That sibling has to come out owed or a provider outage silently
+        # drops it until something else happens to re-owe the group.
+        s = supervisor([failed(), failed(), failed()])
+        s.owed = {Pair(13, "code", "sage")}
+        groups = s.build_groups([(12, "code"), (13, "code")])
+        with contextlib.redirect_stdout(io.StringIO()):
+            s.run_cycle(groups)
+        self.assertEqual(
+            [p.persona for p in s.attempted if p.pr == 13], ["sage"])
+        self.assertIn(Pair(13, "code", "red_team"), s.owed)
+
+
 class PromptChoiceTest(unittest.TestCase):
     def test_new_session_gets_the_review_prompt_rendered(self):
         seen = []
