@@ -59,6 +59,7 @@ BIN="$WORK/bin"; mkdir -p "$BIN"
 #                         mode case that uses it (see below)
 cat >"$BIN/gh" <<'STUB'
 #!/bin/sh
+printf '%s\n' "$*" >>"$HOME/gh-argv"
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   n="$3"
   case ",${STUB_LABEL_FAIL:-}," in
@@ -265,7 +266,9 @@ refuses() {
 }
 
 # refuses_before_work LABEL EXPECTED-SUBSTRING -- VAR=VALUE...
-# refuses, plus: nothing git-shaped ran before the refusal. A selector or
+# refuses, plus: no git and no gh ran before the refusal. Both recorders matter:
+# `gh auth setup-git` is the first thing past the pre-flight, so watching git
+# alone would still pass if the pre-flight slid below it. A selector or
 # persona typo has to cost a startup error and nothing else -- the old shell
 # validated both immediately after its defaults block, and moving them past the
 # exec bought a network clone of the whole repo and up to 120s of translator
@@ -281,6 +284,8 @@ refuses_before_work() {
     bad "$label" "expected the error to mention: $want"
   elif [ -e "$HOME_DIR/git-argv" ]; then
     bad "$label" "refused only after running git: $(tr '\n' ';' <"$HOME_DIR/git-argv")"
+  elif [ -e "$HOME_DIR/gh-argv" ]; then
+    bad "$label" "refused only after running gh: $(tr '\n' ';' <"$HOME_DIR/gh-argv")"
   else
     ok "$label"
   fi
@@ -406,14 +411,17 @@ refuses_before_work "preflight: a missing PR selector refuses before any git run
   "no PR selector set" \
   -- PR_IDS=
 
-# The control for the two cases above: on a run that is not refused, the git
-# recorder does record. Without it the ordering assertion would pass just as
-# happily against a stub that records nothing.
-L="preflight: the git recorder records on a run that is not refused"
+# The control for the two cases above: on a run that is not refused, both
+# recorders do record. Without it the ordering assertion would pass just as
+# happily against stubs that record nothing.
+L="preflight: the git and gh recorders record on a run that is not refused"
 if selected "$L"; then
   run_entrypoint "$L" PERSONAS=red_team MAX_CYCLES=1
-  if [ -s "$HOME_DIR/git-argv" ]; then ok "$L"
-  else bad "$L" "no git invocations were recorded, so the ordering cases prove nothing"; fi
+  if [ ! -s "$HOME_DIR/git-argv" ]; then
+    bad "$L" "no git invocations were recorded, so the ordering cases prove nothing"
+  elif [ ! -s "$HOME_DIR/gh-argv" ]; then
+    bad "$L" "no gh invocations were recorded, so the ordering cases prove nothing"
+  else ok "$L"; fi
 fi
 
 # --- per-persona passes -----------------------------------------------------

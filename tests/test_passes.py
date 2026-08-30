@@ -36,11 +36,12 @@ class UsageLimitTest(unittest.TestCase):
 
     def test_429_on_its_own_line_in_a_long_stderr(self):
         # A status code alone on a line, buried in a multi-line stderr, is what
-        # a real limit looks like coming back from a provider, and the arm that
-        # catches it is the one whose character classes are easiest to narrow by
-        # accident. It matches through [^0-9] on either side of the line, so
-        # re.MULTILINE is not what makes this pass; what would break it is
-        # tightening [^0-9] to something like [ :] or dropping the arm.
+        # a real limit looks like coming back from a provider. Two things in the
+        # arm can catch it here and either one suffices: [^0-9] matches the
+        # newline on each side, and the anchors match the line boundary under
+        # re.MULTILINE. So this case pins that the arm classifies the shape,
+        # and it survives narrowing [^0-9] on its own or dropping the flag on
+        # its own. Removing the arm is what turns it red.
         stderr = "connecting\nnegotiating\n429\nretrying\n"
         self.assertTrue(passes.is_usage_limit(stderr))
 
