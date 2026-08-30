@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 
 import _path  # noqa: F401
@@ -51,6 +52,7 @@ def supervisor(results, **kwargs):
         mcp_args=[],
         cwd=".",
         max_passes_per_session=0,
+        max_concurrent=1,
     )
     defaults.update(kwargs)
     return FakeSupervisor(results, **defaults)
@@ -499,6 +501,25 @@ class SpawnFailureTest(unittest.TestCase):
         self.assertEqual(s.sessions, {})
         self.assertIn("#13", buf.getvalue())
 
+    def test_a_spawn_failure_inside_a_group_is_caught_per_pass(self):
+        # The same guard has to sit inside each worker, not around the pool: one
+        # thread's EAGAIN escaping would take the pool and PID 1 with it.
+        s = self._raising_supervisor(OSError(11, "Resource temporarily unavailable"))
+        s.personas["code"] = ["red_team", "sage"]
+        s.persona_prompts[("code", "sage")] = "sg"
+        s.max_concurrent = 0
+        group = s.build_groups([(12, "code")])[0]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            results = s.run_group(group, list(group.pairs))
+        self.assertEqual([r.rc for r in results.values()], [1, 1])
+        self.assertFalse(any(r.limited for r in results.values()))
+        self.assertIn("could not run claude", buf.getvalue())
+        # _run_one caught it, so _dispatch's catch-all never saw it. That
+        # distinction is what keeps a spawn failure classified as an ordinary
+        # failed pass rather than as a supervisor bug.
+        self.assertNotIn("pass raised", buf.getvalue())
+
     def test_repeated_spawn_failures_hit_the_three_strikes_rule(self):
         s = self._raising_supervisor(OSError(11, "Resource temporarily unavailable"))
         pairs = [Pair(n, "code", "red_team") for n in (12, 13, 14, 15)]
@@ -507,6 +528,166 @@ class SpawnFailureTest(unittest.TestCase):
             s.run_cycle(pairs)
         self.assertIn("3 passes in a row failed", buf.getvalue())
         self.assertEqual(s.resume_at, Pair(15, "code", "red_team"))
+
+
+class GroupTest(unittest.TestCase):
+    def test_one_group_per_pr_holding_that_modes_personas(self):
+        s = supervisor([])
+        groups = s.build_groups([(12, "code"), (13, "plan")])
+        self.assertEqual([g.pr for g in groups], [12, 13])
+        self.assertEqual(
+            groups[0].pairs,
+            (Pair(12, "code", "red_team"), Pair(12, "code", "sage")),
+        )
+        self.assertEqual(groups[1].pairs, (Pair(13, "plan", "red_team"),))
+
+    def test_no_candidates_yields_no_groups(self):
+        self.assertEqual(supervisor([]).build_groups([]), [])
+
+
+class ConcurrencyTest(unittest.TestCase):
+    def test_cap_of_one_still_uses_the_pool(self):
+        # The whole point: no separate sequential branch exists to drift from
+        # the parallel one, so every inherited ordinal assertion still holds.
+        s = supervisor([ok("A"), ok("B")], max_concurrent=1)
+        group = s.build_groups([(12, "code")])[0]
+        results = s.run_group(group, list(group.pairs))
+        self.assertEqual(set(results), set(group.pairs))
+
+    def test_cap_of_one_is_a_one_worker_pool(self):
+        # Not just "the results came back in order": with one worker no two
+        # passes are ever in flight together, which is what makes the inherited
+        # ordinal assertions safe.
+        s = supervisor([], max_concurrent=1)
+        group = s.build_groups([(12, "code")])[0]
+        self.assertEqual(s.workers_for(group, list(group.pairs)), 1)
+
+    def test_cap_of_one_runs_personas_in_list_order(self):
+        order = []
+
+        class Recorder(FakeSupervisor):
+            def _run_one(self, pair, prompt, session_id):
+                order.append(pair.persona)
+                return ok("S1")
+
+        s = supervisor([], max_concurrent=1)
+        s.__class__ = Recorder
+        group = s.build_groups([(12, "code")])[0]
+        s.run_group(group, list(group.pairs))
+        self.assertEqual(order, ["red_team", "sage"])
+
+    def test_unlimited_runs_the_group_concurrently(self):
+        # A barrier inside the fake pass: it can only be crossed if both passes
+        # are genuinely in flight at once. One worker breaks it on the timeout.
+        barrier = threading.Barrier(2, timeout=2)
+
+        class Concurrent(FakeSupervisor):
+            def _run_one(self, pair, prompt, session_id):
+                barrier.wait()
+                return ok("S1")
+
+        s = supervisor([], max_concurrent=0)
+        s.__class__ = Concurrent
+        group = s.build_groups([(12, "code")])[0]
+        with contextlib.redirect_stdout(io.StringIO()):
+            results = s.run_group(group, list(group.pairs))
+        # rc, not len(results): a broken barrier raises inside the worker and
+        # _dispatch turns that into a failed pass, so a count of two is what a
+        # serialized pool returns too.
+        self.assertEqual([r.rc for r in results.values()], [0, 0])
+
+    def test_a_cap_above_one_overlaps_up_to_the_cap(self):
+        # Four personas, cap of two: the barrier of two is crossed twice, so
+        # the cap is a floor on concurrency as well as a ceiling.
+        barrier = threading.Barrier(2, timeout=2)
+
+        class Concurrent(FakeSupervisor):
+            def _run_one(self, pair, prompt, session_id):
+                barrier.wait()
+                return ok("S1")
+
+        s = supervisor(
+            [], max_concurrent=2,
+            personas={"code": ["red_team", "sage", "sme", "adversarial"]},
+            persona_prompts={("code", p): p for p in
+                             ("red_team", "sage", "sme", "adversarial")},
+        )
+        s.__class__ = Concurrent
+        group = s.build_groups([(12, "code")])[0]
+        with contextlib.redirect_stdout(io.StringIO()):
+            results = s.run_group(group, list(group.pairs))
+        self.assertEqual([r.rc for r in results.values()], [0, 0, 0, 0])
+
+    def test_a_raising_pass_does_not_lose_its_siblings_results(self):
+        class Exploding(FakeSupervisor):
+            def _run_one(self, pair, prompt, session_id):
+                if pair.persona == "red_team":
+                    raise RuntimeError("boom")
+                return ok("S1")
+
+        s = supervisor([], max_concurrent=0)
+        s.__class__ = Exploding
+        group = s.build_groups([(12, "code")])[0]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            results = s.run_group(group, list(group.pairs))
+        self.assertEqual(results[Pair(12, "code", "sage")].rc, 0)
+        # An exception is a non-limit failure, so its pair's session is dropped
+        # like any other. It must not take the group with it.
+        self.assertNotEqual(results[Pair(12, "code", "red_team")].rc, 0)
+        self.assertFalse(results[Pair(12, "code", "red_team")].limited)
+        self.assertIn("pass raised RuntimeError", buf.getvalue())
+
+    def test_to_run_narrows_which_personas_execute(self):
+        s = supervisor([ok("A")], max_concurrent=0)
+        group = s.build_groups([(12, "code")])[0]
+        results = s.run_group(group, [Pair(12, "code", "sage")])
+        self.assertEqual(list(results), [Pair(12, "code", "sage")])
+
+    def test_an_empty_to_run_runs_nothing(self):
+        # A pool with max_workers=0 is a ValueError, so the empty case has to be
+        # answered before the pool is built.
+        s = supervisor([], max_concurrent=0)
+        group = s.build_groups([(12, "code")])[0]
+        self.assertEqual(s.run_group(group, []), {})
+
+    def test_a_resumed_pair_gets_the_followup_prompt(self):
+        seen = {}
+
+        class Recorder(FakeSupervisor):
+            def _run_one(self, pair, prompt, session_id):
+                seen[pair] = (prompt, session_id)
+                return ok("S1")
+
+        s = supervisor([], max_concurrent=0)
+        s.__class__ = Recorder
+        s.sessions[Pair(12, "code", "sage")] = "S9"
+        group = s.build_groups([(12, "code")])[0]
+        with contextlib.redirect_stdout(io.StringIO()):
+            s.run_group(group, list(group.pairs))
+        self.assertEqual(seen[Pair(12, "code", "sage")], ("recheck #12", "S9"))
+        self.assertEqual(seen[Pair(12, "code", "red_team")], ("review #12", None))
+
+
+class ParseMaxConcurrentTest(unittest.TestCase):
+    def test_unset_is_unlimited(self):
+        self.assertEqual(review_loop.parse_max_concurrent({}), 0)
+
+    def test_zero_is_unlimited(self):
+        self.assertEqual(review_loop.parse_max_concurrent({"MAX_CONCURRENT_PASSES": "0"}), 0)
+
+    def test_a_positive_value_is_taken(self):
+        self.assertEqual(review_loop.parse_max_concurrent({"MAX_CONCURRENT_PASSES": "3"}), 3)
+
+    def test_a_non_integer_is_refused(self):
+        from common import ConfigError
+
+        with self.assertRaises(ConfigError):
+            review_loop.parse_max_concurrent({"MAX_CONCURRENT_PASSES": "lots"})
+
+    def test_a_negative_value_is_refused(self):
+        with self.assertRaises(ConfigError):
+            review_loop.parse_max_concurrent({"MAX_CONCURRENT_PASSES": "-1"})
 
 
 REPO_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")

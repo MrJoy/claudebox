@@ -19,6 +19,8 @@ import os
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import gh
@@ -33,6 +35,44 @@ from common import ConfigError, Pair, die, log
 # walking a whole list into a dead endpoint costs a duplicate-comment burst per
 # pair.
 MAX_CONSECUTIVE_FAILURES = 3
+
+
+@dataclass(frozen=True)
+class Group:
+    """One PR's personas, run together behind a barrier.
+
+    The group is the unit of both concurrency and cut-short accounting: a limit
+    reported by one persona cannot recall its in-flight siblings, so the group
+    finishes and only then does the cycle stop.
+    """
+
+    pr: int
+    mode: str
+    pairs: Tuple[Pair, ...]
+
+
+def parse_max_concurrent(env: Mapping[str, str]) -> int:
+    """How many passes may run at once inside a group. 0 means unlimited.
+
+    Unlimited is the default: the group's persona count. An operator who hits
+    rate-limit or memory pressure dials it down without a rebuild.
+
+    A cap of 1 is a one-worker pool rather than a separate sequential path, so
+    there is no second code path to drift from the concurrent one.
+    """
+    raw = env.get("MAX_CONCURRENT_PASSES", "").strip()
+    if not raw:
+        return 0
+    # int() in a try rather than a str.isdigit() gate, for the reason
+    # parse_max_cycles spells out: isdigit() is True for characters int()
+    # refuses, so the gate turns a typo into a traceback.
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ConfigError("MAX_CONCURRENT_PASSES must be a non-negative integer")
+    if value < 0:
+        raise ConfigError("MAX_CONCURRENT_PASSES must be a non-negative integer")
+    return value
 
 
 def parse_max_cycles(env: Mapping[str, str]) -> Optional[int]:
@@ -169,6 +209,7 @@ class Supervisor:
         mcp_args: List[str],
         cwd: str,
         max_passes_per_session: int,
+        max_concurrent: int = 0,
     ):
         self.personas = personas
         self.persona_prompts = persona_prompts
@@ -178,6 +219,7 @@ class Supervisor:
         self.mcp_args = mcp_args
         self.cwd = cwd
         self.max_passes_per_session = max_passes_per_session
+        self.max_concurrent = max_concurrent
 
         self.sessions: Dict[Pair, str] = {}
         self.passes_done: Dict[Pair, int] = {}
@@ -192,6 +234,64 @@ class Supervisor:
             for persona in self.personas[mode]:
                 out.append(Pair(pr, mode, persona))
         return out
+
+    def build_groups(self, candidates: Sequence[Tuple[int, str]]) -> List[Group]:
+        return [
+            Group(
+                pr=pr,
+                mode=mode,
+                pairs=tuple(Pair(pr, mode, p) for p in self.personas[mode]),
+            )
+            for pr, mode in candidates
+        ]
+
+    def workers_for(self, group: Group, to_run: Sequence[Pair]) -> int:
+        """Effective concurrency for this group: the cap, or the group's size."""
+        if self.max_concurrent > 0:
+            return max(1, min(self.max_concurrent, len(to_run)))
+        return max(1, len(to_run))
+
+    def run_group(self, group: Group, to_run: Sequence[Pair]) -> Dict[Pair, "passes.PassResult"]:
+        """Run to_run concurrently and wait for all of them.
+
+        Nothing is killed. A limit reported by one persona leaves its siblings
+        running, because a killed pass may have posted some findings and not
+        others, and its session-id recovery is unreliable.
+        """
+        results: Dict[Pair, passes.PassResult] = {}
+        if not to_run:
+            return results
+
+        with ThreadPoolExecutor(max_workers=self.workers_for(group, to_run)) as pool:
+            futures = {pool.submit(self._dispatch, pair): pair for pair in to_run}
+            for future, pair in futures.items():
+                results[pair] = future.result()
+        return results
+
+    def _dispatch(self, pair: Pair) -> "passes.PassResult":
+        """One pass, chosen prompt and all, on a worker thread.
+
+        Every log line from here goes through common.log's lock, so the
+        interleaving is between lines and never inside one. Ordering across
+        personas is not deterministic; ordering within a persona is.
+        """
+        session_id = self.sessions.get(pair)
+        if session_id:
+            log(f"Reviewing PR #{pair.pr} [{pair.mode}/{pair.persona}] "
+                f"(resuming session {session_id})...")
+            template = self.followup_prompts[pair.mode]
+        else:
+            log(f"Reviewing PR #{pair.pr} [{pair.mode}/{pair.persona}] (new session)...")
+            template = self.review_prompts[pair.mode]
+
+        try:
+            return self._run_one(pair, prompts_mod.render(template, pair.pr), session_id)
+        except Exception as exc:  # noqa: BLE001
+            # A raise here is this supervisor's bug, not the provider's, so it
+            # must not be classified as a limit and must not take the group with
+            # it. Reported as an ordinary non-limit failure.
+            log(f"WARN: pass raised {exc!r}", pair=pair)
+            return passes.PassResult(rc=1, session_id=session_id, limited=False, limit_line="")
 
     def start_index(self, pairs: Sequence[Pair]) -> int:
         """Where this cycle begins.
@@ -371,6 +471,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         interval = _positive_int(env, "REVIEW_INTERVAL_SECONDS", 300)
         backoff = _positive_int(env, "LIMIT_BACKOFF_SECONDS", 1800)
         max_passes = _positive_int(env, "MAX_PASSES_PER_SESSION", 0)
+        max_concurrent = parse_max_concurrent(env)
         review_model = _required(env, "REVIEW_MODEL")
         work_repo = _required(env, "WORK_REPO")
     except ConfigError as exc:
@@ -390,6 +491,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         mcp_args=mcp_args,
         cwd=work_repo,
         max_passes_per_session=max_passes,
+        max_concurrent=max_concurrent,
     )
 
     cycles = 0
