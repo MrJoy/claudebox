@@ -59,6 +59,15 @@ class ShippedPersonasTest(unittest.TestCase):
         got = personas.resolve("code", SHIPPED, {"PERSONAS": "red_team"})
         self.assertNotIn("success:", got[0].prompt)
 
+    def test_unterminated_frontmatter_yields_no_body(self):
+        # What the awk it replaced did: it never set body without a closing
+        # ---. Returning the rest of the file instead would ship the frontmatter
+        # keys into the system prompt and, worse, let a file whose closing
+        # marker was lost in an edit resolve as a working persona.
+        meta, body = personas._split_frontmatter("---\nlabel: Red Team\nAttack it.\n")
+        self.assertEqual(body, "")
+        self.assertEqual(meta.get("label"), "Red Team")
+
     def test_all_selects_every_persona_in_the_tree(self):
         got = personas.resolve("code", SHIPPED, {"PERSONAS": "all"})
         self.assertEqual(len(got), 6)

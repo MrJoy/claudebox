@@ -159,7 +159,7 @@ behavior-preserving.
 
 ### Two porting hazards to encode in the code
 
-**`USAGE_LIMIT_RE` needs `re.MULTILINE`.** The pattern transfers character for
+**`USAGE_LIMIT_RE` carries `re.MULTILINE`.** The pattern transfers character for
 character:
 
 ```
@@ -167,9 +167,14 @@ rate.?limit|usage limit|limit reached|reached your limit|too many requests|quota
 ```
 
 `grep` is line-oriented, while Python's `^` and `$` anchor the whole string
-without `re.MULTILINE`. Without the flag, a bare `429` on its own line stops
-matching, and a missed limit degrades to the ordinary drop-the-session path,
-which is silent. Unit-tested explicitly.
+without the flag, so the intent was to keep a bare `429` on its own line
+matching. Measured after the fact, the flag turns out not to be what does that:
+a newline is a non-digit, so the arm's own `[^0-9]` matches on both sides of
+such a line and the anchors are reached only at the very start and end of the
+string, where they match either way. Removing the flag classifies nothing
+differently. It stays as belt-and-braces against an edit that narrows those
+character classes, and the multi-line cases are unit-tested for the
+classification they produce rather than for the flag.
 
 **stderr keeps going to a temp file.** Reading two pipes from one child is where
 deadlocks live. stdout is the only pipe, read line by line; stderr goes to a
@@ -212,8 +217,8 @@ one-script-per-suite convention. No new image dependency.
 
 These cover what today can only be tested by booting the whole entrypoint:
 
-- `is_usage_limit` against real provider error text, including the
-  429-on-its-own-line case that `re.MULTILINE` exists for
+- `is_usage_limit` against real provider error text, including a bare `429` on
+  its own line inside a long multi-line stderr
 - `pr_modes` label routing, including a missing `labels` key and a null `number`
 - persona resolution, including a frontmatter-only body and the missing
   `_shared.md` refusal

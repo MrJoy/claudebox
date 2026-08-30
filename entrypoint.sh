@@ -9,6 +9,11 @@ set -euo pipefail
 log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
+# The supervisor, at the path the Dockerfile bakes it to. Named once because it
+# has two call sites: the pre-flight --check below, and the exec that hands off
+# to it at the end.
+SUPERVISOR_MAIN=/opt/claudebox/reviewer/review_loop.py
+
 # True (exit 0) when $1 is a truthy flag value: 1 / true / yes (any case).
 # Kept here rather than with the PR selectors it was written for: those moved to
 # reviewer/gh.py, and LITELLM_DEBUG and SHIM_NORMALIZE still read flags in shell.
@@ -73,7 +78,7 @@ strip_surrounding_quotes \
   CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN \
   GITHUB_TOKEN GITHUB_REPOSITORY LINEAR_API_KEY \
   PR_ASSIGNEE PR_IDS PR_SEARCH \
-  PERSONAS PLAN_PERSONAS PERSONA_DIR PLAN_LABEL LIMIT_BACKOFF_SECONDS REPO_PATH
+  PERSONAS PLAN_PERSONAS PERSONA_DIR PLAN_LABEL LIMIT_BACKOFF_SECONDS MAX_CYCLES REPO_PATH
 # The prompt vars (REVIEW_PROMPT, FOLLOWUP_PROMPT, their _SUFFIX forms, and the
 # PLAN_-prefixed counterparts of all four) are deliberately absent from that
 # list. Everything else on it is a URL, an id, a credential, or a name or number
@@ -220,6 +225,16 @@ case "$LIMIT_BACKOFF_SECONDS" in ''|*[!0-9]*) die "LIMIT_BACKOFF_SECONDS must be
 # growth of a long-lived resumed session's context. 0 = never rotate.
 MAX_PASSES_PER_SESSION="${MAX_PASSES_PER_SESSION:-0}"
 case "$MAX_PASSES_PER_SESSION" in ''|*[!0-9]*) die "MAX_PASSES_PER_SESSION must be a non-negative integer";; esac
+
+# --- Pre-flight ------------------------------------------------------------
+# Resolve the PR selector and both modes' persona sets NOW, before auth, before
+# the working clone, and before the translator's blocking startup. The
+# supervisor resolves them again on the other side of the exec -- same code,
+# same message -- but by then a typo'd PERSONAS has already cost a network clone
+# of the whole repo and up to 120s of LiteLLM, on every restart under
+# `--restart unless-stopped`. This reads only what the environment already
+# holds; nothing below exports anything it needs.
+python3 "$SUPERVISOR_MAIN" --check
 
 # --- GitHub auth (gh + git) ------------------------------------------------
 # gh reads GH_TOKEN from the environment; setup-git makes git reuse it for
@@ -727,6 +742,13 @@ MCP_CONFIG_FILE="$HOME/mcp.json"
 rm -f "$MCP_CONFIG_FILE"
 if write_mcp_config "$MCP_CONFIG_FILE"; then
   log "Linear MCP enabled (expects a READ-ONLY Linear API key)."
+else
+  # A write that created the file and then failed partway (jq killed, the disk
+  # full after the open) would otherwise hand claude truncated JSON on every
+  # pass, because the supervisor keys the flag off the file existing. Deleting
+  # it degrades that to "no MCP servers", which is what the shell did when it
+  # keyed the flag off the write succeeding.
+  rm -f "$MCP_CONFIG_FILE"
 fi
 
 # --- Prepare a writable working copy ---------------------------------------
@@ -769,10 +791,13 @@ git -C "$WORK_REPO" remote set-url origin "https://github.com/${GITHUB_REPOSITOR
 # structured per-task results, which is what Python is for. Env is the ONLY
 # thing that crosses this line: no JSON handoff file, no serialized arrays.
 #
-# exec, not a child process: the supervisor becomes PID 1 so `docker stop`
-# signals it directly, and any LiteLLM/shim children started above are inherited
-# rather than orphaned. The supervisor reaps them (see check_litellm) because
-# PID 1 gets no automatic reaping.
+# exec, not a child process: any LiteLLM/shim children started above are
+# inherited by the supervisor rather than orphaned, and it reaps them (see
+# check_litellm) because PID 1 gets no automatic reaping. Being PID 1 does not
+# make `docker stop` graceful -- the kernel drops a default-disposition signal
+# sent to PID 1, and the supervisor installs no SIGTERM handler, so a stop is a
+# no-op followed by the SIGKILL ten seconds later. Bash behaved identically
+# here; a handler that ends the in-flight pass is deferred.
 export WORK_REPO
 export REVIEW_MODEL
 export MCP_CONFIG_FILE
@@ -786,4 +811,4 @@ export LIMIT_BACKOFF_SECONDS
 export MAX_PASSES_PER_SESSION
 
 log "Reviewer ready. repo=$GITHUB_REPOSITORY provider=$PROVIDER_LABEL model=$REVIEW_MODEL interval=${REVIEW_INTERVAL_SECONDS}s"
-exec python3 /opt/claudebox/reviewer/review_loop.py
+exec python3 "$SUPERVISOR_MAIN"

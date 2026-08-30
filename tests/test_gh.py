@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import subprocess
 import unittest
@@ -9,10 +11,10 @@ from common import ConfigError
 
 
 class Result:
-    def __init__(self, returncode=0, stdout=""):
+    def __init__(self, returncode=0, stdout="", stderr=""):
         self.returncode = returncode
         self.stdout = stdout
-        self.stderr = ""
+        self.stderr = stderr
 
 
 def runner(*results):
@@ -69,6 +71,20 @@ class ParsePrIdsTest(unittest.TestCase):
 
     def test_empty_yields_nothing(self):
         self.assertEqual(gh.parse_pr_ids(""), [])
+
+    def test_a_digit_int_refuses_is_a_config_error(self):
+        # str.isdigit() is True for '\u00b2' and int() then raises, so a bare
+        # isdigit() gate turned a typo into a ValueError traceback instead of
+        # the startup error the docs promise.
+        self.assertTrue("\u00b2".isdigit())
+        with self.assertRaises(ConfigError):
+            gh.parse_pr_ids("\u00b2")
+
+    def test_a_non_ascii_numeral_is_refused(self):
+        # The shell's `*[!0-9]*` guard died on these; int() would quietly read
+        # '\u0661\u0662' as 12 and review a PR nobody named.
+        with self.assertRaises(ConfigError):
+            gh.parse_pr_ids("\u0661\u0662")
 
 
 class SelectorTest(unittest.TestCase):
@@ -209,6 +225,81 @@ class EnumerateTest(unittest.TestCase):
         gh.enumerate_candidate_prs("search", dict(self.ENV, PR_SEARCH="is:open"), run=run)
         self.assertIn("--search", run.calls[0])
         self.assertIn("is:open", run.calls[0])
+
+
+def enumerate_log(selector, env, run):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        got = gh.enumerate_candidate_prs(selector, env, run=run)
+    return got, buf.getvalue()
+
+
+class WarningTest(unittest.TestCase):
+    """The log lines are the entire observable effect of two decisions, so
+    nothing else can pin them."""
+
+    ENV = {"GITHUB_REPOSITORY": "owner/repo", "PLAN_LABEL": "plan"}
+
+    def test_a_failed_list_says_so(self):
+        # The one deliberate departure from a faithful port: the shell logged
+        # the same "No candidate PRs" line whether gh failed or there simply
+        # were none, so a broken token read as a quiet repo.
+        _, out = enumerate_log("all", dict(self.ENV, PR_ALL="1"), runner(Result(1, "")))
+        self.assertIn("`gh pr list` failed or returned nothing usable", out)
+        self.assertIn("'all'", out)
+
+    def test_a_list_that_simply_found_nothing_does_not_warn(self):
+        _, out = enumerate_log("all", dict(self.ENV, PR_ALL="1"), runner(Result(0, "[]")))
+        self.assertNotIn("WARN", out)
+
+    def test_an_ids_lookup_that_yields_nothing_says_so(self):
+        # Without the WARN the PR vanishes from the cycle silently, which reads
+        # exactly like having been reviewed clean.
+        _, out = enumerate_log("ids", dict(self.ENV, PR_IDS="12"), runner(Result(0, "   ")))
+        self.assertIn("could not read labels for PR #12", out)
+
+    def test_ghs_own_stderr_reaches_the_log(self):
+        # capture_output means gh no longer writes into the container log
+        # itself, so a rate limit, a 401 and a bad --search query would
+        # otherwise be one indistinguishable generic WARN.
+        run = runner(Result(1, "", "gh: API rate limit exceeded for user"))
+        _, out = enumerate_log("all", dict(self.ENV, PR_ALL="1"), run)
+        self.assertIn("API rate limit exceeded", out)
+
+    def test_ghs_stderr_reaches_the_log_on_the_ids_arm_too(self):
+        run = runner(Result(1, "", "gh: could not resolve to a PullRequest"))
+        _, out = enumerate_log("ids", dict(self.ENV, PR_IDS="12"), run)
+        self.assertIn("could not resolve to a PullRequest", out)
+
+    def test_a_long_stderr_line_is_truncated(self):
+        # gh's stderr is not a stream that can be assumed credential-free, the
+        # same reason the usage-limit line is truncated.
+        run = runner(Result(1, "", "x" * 900))
+        _, out = enumerate_log("all", dict(self.ENV, PR_ALL="1"), run)
+        self.assertIn("x" * 400, out)
+        self.assertNotIn("x" * 401, out)
+
+
+class SpawnFailureTest(unittest.TestCase):
+    """A gh that cannot be spawned at all -- EAGAIN against --pids-limit,
+    ENOMEM against --memory, a gh that is not on PATH. The shell's `|| true`
+    made that an empty cycle; an OSError out of PID 1 restarts the container and
+    loses the in-memory session map, so every pair re-posts what it posted."""
+
+    ENV = {"GITHUB_REPOSITORY": "owner/repo", "PLAN_LABEL": "plan"}
+
+    def _raising(self, *a, **k):
+        raise OSError(11, "Resource temporarily unavailable")
+
+    def test_the_list_arm_degrades_to_an_empty_cycle(self):
+        got, out = enumerate_log("all", dict(self.ENV, PR_ALL="1"), self._raising)
+        self.assertEqual(got, [])
+        self.assertIn("could not run gh", out)
+
+    def test_the_ids_arm_skips_the_pr(self):
+        got, out = enumerate_log("ids", dict(self.ENV, PR_IDS="12"), self._raising)
+        self.assertEqual(got, [])
+        self.assertIn("could not read labels for PR #12", out)
 
 
 if __name__ == "__main__":

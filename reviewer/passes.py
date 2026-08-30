@@ -25,9 +25,13 @@ from common import Pair, log
 # only reachable via `rate.?limit` and `usage limit`, so the near-miss wordings
 # (`5-hour limit reached`, `you have reached your limit`) matched nothing.
 #
-# re.MULTILINE IS LOAD-BEARING. The shell used grep, which is line-oriented.
-# Python's ^ and $ anchor the whole string without it, so the 429/529 arm would
-# silently stop matching a status code on its own line.
+# re.MULTILINE is belt-and-braces, not the thing that makes a status code on its
+# own line match. The 429/529 arm reads (^|[^0-9])(429|529)([^0-9]|$), and a
+# newline is a non-digit, so [^0-9] already covers every line boundary and the
+# anchors are only consulted at the very start and end of the string -- where ^
+# and $ match with or without the flag. It stays because the shell used grep,
+# which is line-oriented, and a future edit that narrows the character classes
+# would need it.
 USAGE_LIMIT_RE = re.compile(
     r"rate.?limit|usage limit|limit reached|reached your limit|too many requests"
     r"|quota|overloaded|(^|[^0-9])(429|529)([^0-9]|$)",
@@ -82,7 +86,10 @@ def format_event(event: Dict[str, Any]) -> List[str]:
                 if text:
                     out.extend(text.split("\n"))
             elif block.get("type") == "tool_use":
-                payload = json.dumps(block.get("input"))[:200]
+                # Compact separators, matching jq's tojson: the shell logged
+                # the same 200 characters of a tool input, and Python's default
+                # ", " / ": " would spend a dozen of them on whitespace.
+                payload = json.dumps(block.get("input"), separators=(",", ":"))[:200]
                 out.append(f"  → {block.get('name')}: {payload}")
         return out
 

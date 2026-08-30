@@ -32,7 +32,12 @@ def parse_pr_ids(raw: str) -> List[int]:
     """Split a comma/whitespace-separated list into ints, refusing anything else."""
     out: List[int] = []
     for token in (raw or "").replace(",", " ").split():
-        if not token.isdigit():
+        # ASCII digits only, which is what the shell's `*[!0-9]*` case guard
+        # accepted. A bare str.isdigit() gate is both too wide and too narrow:
+        # it lets through characters int() then refuses ('\u00b2' among them),
+        # turning a typo into an uncaught ValueError traceback, and it accepts
+        # non-ASCII decimal digits, so PR_IDS=١٢ would quietly review PR 12.
+        if not (token.isascii() and token.isdigit()):
             raise ConfigError(
                 f"PR_IDS contains a non-numeric value: '{token}' (expected e.g. 12,15,20)"
             )
@@ -92,6 +97,18 @@ def pr_modes(payload: Any, plan_label: str) -> List[Candidate]:
     return out
 
 
+def _stderr_tail(result) -> List[str]:
+    """The last few lines of gh's own stderr, ready to log.
+
+    capture_output means gh no longer writes into the container log itself, and
+    without this a rate limit, a 401 and a malformed --search query are the same
+    generic WARN. Truncated for the reason the usage-limit line is: gh's stderr
+    is not a stream that can be assumed credential-free.
+    """
+    text = getattr(result, "stderr", "") or ""
+    return [f"  {line[:400]}" for line in text.splitlines()[-5:] if line.strip()]
+
+
 def _read_json(result) -> Any:
     if result.returncode != 0:
         return None
@@ -114,9 +131,17 @@ def enumerate_candidate_prs(
     plan_label = env.get("PLAN_LABEL") or "plan"
 
     def gh_run(argv):
-        return run(
-            argv, capture_output=True, text=True, check=False
-        )
+        try:
+            return run(
+                argv, capture_output=True, text=True, check=False
+            )
+        except OSError as exc:
+            # A gh that cannot be spawned at all -- EAGAIN against
+            # --pids-limit, ENOMEM against --memory, a gh that is not on PATH.
+            # The shell's `|| true` treated that as an empty result, and an
+            # empty cycle costs one log line where a traceback out of PID 1
+            # restarts the container and loses the session map.
+            return subprocess.CompletedProcess(argv, 1, "", f"could not run gh: {exc}")
 
     if selector == "ids":
         out: List[Candidate] = []
@@ -124,11 +149,14 @@ def enumerate_candidate_prs(
             argv = [
                 "gh", "pr", "view", str(number), "-R", repo, "--json", "number,labels",
             ]
-            got = pr_modes(_read_json(gh_run(argv)) or [], plan_label)
+            result = gh_run(argv)
+            got = pr_modes(_read_json(result) or [], plan_label)
             if got:
                 out.extend(got)
             else:
                 log(f"WARN: could not read labels for PR #{number}; skipping it this cycle.")
+                for line in _stderr_tail(result):
+                    log(line)
         return out
 
     base = ["gh", "pr", "list", "-R", repo]
@@ -146,10 +174,13 @@ def enumerate_candidate_prs(
     else:
         raise ConfigError(f"unknown PR selector '{selector}'.")
 
-    payload = _read_json(gh_run(argv))
+    result = gh_run(argv)
+    payload = _read_json(result)
     if payload is None:
         # Deliberate departure from the shell, which logged the same
         # "No candidate PRs" line whether gh failed or there simply were none.
         log(f"WARN: `gh pr list` failed or returned nothing usable for selector '{selector}'.")
+        for line in _stderr_tail(result):
+            log(line)
         return []
     return pr_modes(payload, plan_label)

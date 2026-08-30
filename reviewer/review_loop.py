@@ -93,9 +93,16 @@ def _positive_int(env: Mapping[str, str], name: str, default: int) -> int:
     raw = env.get(name, "").strip()
     if not raw:
         return default
-    if not raw.isdigit():
+    # int() in a try rather than a str.isdigit() gate, for the reason
+    # parse_max_cycles spells out: isdigit() is True for characters int()
+    # refuses, so the gate turns a typo into a traceback.
+    try:
+        value = int(raw)
+    except ValueError:
         raise ConfigError(f"{name} must be a non-negative integer")
-    return int(raw)
+    if value < 0:
+        raise ConfigError(f"{name} must be a non-negative integer")
+    return value
 
 
 def check_litellm(env: Mapping[str, str]) -> None:
@@ -203,15 +210,25 @@ class Supervisor:
         return index
 
     def _run_one(self, pair: Pair, prompt: str, session_id: Optional[str]):
-        return passes.run_pass(
-            pair=pair,
-            prompt=prompt,
-            session_id=session_id,
-            persona_prompt=self.persona_prompts[(pair.mode, pair.persona)],
-            model=self.model,
-            mcp_args=self.mcp_args,
-            cwd=self.cwd,
-        )
+        try:
+            return passes.run_pass(
+                pair=pair,
+                prompt=prompt,
+                session_id=session_id,
+                persona_prompt=self.persona_prompts[(pair.mode, pair.persona)],
+                model=self.model,
+                mcp_args=self.mcp_args,
+                cwd=self.cwd,
+            )
+        except OSError as exc:
+            # A pass that never gets off the ground is an ordinary failed pass.
+            # EAGAIN against --pids-limit, ENOMEM against --memory, a claude
+            # that is not on PATH: the shell read PIPESTATUS[0] and saw a
+            # non-zero rc for all three. Letting the exception out instead exits
+            # PID 1, and since the session map lives only in memory the restart
+            # makes every pair re-post findings it already posted.
+            log(f"WARN: could not run claude: {exc}", pair=pair)
+            return passes.PassResult(rc=1, session_id=session_id, limited=False, limit_line="")
 
     def run_cycle(self, pairs: Sequence[Pair]) -> bool:
         """Walk the pair list. Returns True when a usage limit cut it short."""
@@ -304,19 +321,47 @@ class Supervisor:
         return was_limited
 
 
-def main() -> int:
-    sys.stdout.reconfigure(line_buffering=True)
+def preflight(env: Mapping[str, str]) -> Tuple[str, Dict[str, List[personas_mod.Persona]]]:
+    """The PR selector and both modes' persona sets.
+
+    Personas are resolved for EVERY mode, even one no PR currently uses, so a
+    broken definition fails at boot rather than the first time somebody adds a
+    label to a PR.
+
+    entrypoint.sh runs this on its own through --check, ahead of gh/git auth,
+    the working clone and the translator's blocking startup. A typo'd PERSONAS
+    would otherwise cost a network clone and 120s of LiteLLM on every restart
+    under `--restart unless-stopped` before the operator got to read the error.
+    Which means it may read only what the environment already holds at that
+    point: nothing entrypoint.sh exports on its way to the exec.
+    """
+    selector = gh.resolve_pr_selection(env)
+    persona_dir = env.get("PERSONA_DIR") or "/opt/claudebox/personas"
+    resolved = {
+        mode: personas_mod.resolve(mode, persona_dir, env)
+        for mode in personas_mod.REVIEW_MODES
+    }
+    return selector, resolved
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    # Line buffering keeps `docker logs -f` live. Guarded because a redirected
+    # stdout (a test capturing the log) is not a real stream and has no
+    # reconfigure.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+    args = list(sys.argv[1:] if argv is None else argv)
+    check_only = "--check" in args
+    unknown = [a for a in args if a != "--check"]
+    if unknown:
+        die(f"unknown argument: {unknown[0]} (the only flag is --check)")
     env = os.environ
 
     try:
-        selector = gh.resolve_pr_selection(env)
-        persona_dir = env.get("PERSONA_DIR") or "/opt/claudebox/personas"
-        # Resolved for EVERY mode at startup, even one no PR currently uses, so
-        # a broken definition fails at boot rather than the first time somebody
-        # adds a label to a PR.
-        resolved = {}
+        selector, resolved = preflight(env)
+        if check_only:
+            return 0
         for mode in personas_mod.REVIEW_MODES:
-            resolved[mode] = personas_mod.resolve(mode, persona_dir, env)
             log(f"{mode} personas: " + " ".join(p.id for p in resolved[mode]))
 
         built = prompts_mod.build(env)
@@ -352,12 +397,18 @@ def main() -> int:
         check_litellm(env)
 
         log("Fetching latest refs...")
-        fetched = subprocess.run(
-            ["git", "fetch", "--all", "--prune", "--quiet"],
-            cwd=supervisor.cwd, capture_output=True, text=True, check=False,
-        )
-        if fetched.returncode != 0:
-            log("WARN: git fetch failed; continuing")
+        try:
+            fetched = subprocess.run(
+                ["git", "fetch", "--all", "--prune", "--quiet"],
+                cwd=supervisor.cwd, capture_output=True, text=True, check=False,
+            )
+            if fetched.returncode != 0:
+                log("WARN: git fetch failed; continuing")
+        except OSError as exc:
+            # The shell wrote `git fetch ... || log WARN`, which covers a git
+            # that cannot be spawned as well as one that exits non-zero. A stale
+            # working clone still reviews; a dead supervisor reviews nothing.
+            log(f"WARN: git fetch could not run ({exc}); continuing")
 
         try:
             candidates = gh.enumerate_candidate_prs(selector, env)

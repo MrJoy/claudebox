@@ -3,6 +3,7 @@ import io
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 
 import _path  # noqa: F401
@@ -434,6 +435,262 @@ class TunableDefaultsTest(unittest.TestCase):
             review_loop._positive_int({"REVIEW_INTERVAL_SECONDS": "60"}, "REVIEW_INTERVAL_SECONDS", 300),
             60,
         )
+
+    def test_a_digit_int_refuses_is_a_config_error(self):
+        # The same gap parse_max_cycles closed. main catches ConfigError and
+        # turns it into an ERROR: line; a ValueError escaping it is a traceback
+        # out of PID 1, which under --restart unless-stopped is a silent crash
+        # loop.
+        with self.assertRaises(ConfigError):
+            review_loop._positive_int({"REVIEW_INTERVAL_SECONDS": "\u00b2"}, "REVIEW_INTERVAL_SECONDS", 300)
+
+    def test_a_negative_value_is_refused(self):
+        with self.assertRaises(ConfigError):
+            review_loop._positive_int({"REVIEW_INTERVAL_SECONDS": "-1"}, "REVIEW_INTERVAL_SECONDS", 300)
+
+
+class SpawnFailureTest(unittest.TestCase):
+    """A pass that never gets off the ground is an ordinary failed pass.
+
+    subprocess.Popen raises OSError for EAGAIN against --pids-limit, ENOMEM
+    against --memory, and a claude that is not on PATH. The shell read
+    PIPESTATUS[0] and saw a non-zero rc for all three. Letting it out of the
+    cycle exits PID 1, and the session map lives only in memory, so the restart
+    makes every pair re-post findings it already posted.
+    """
+
+    def _raising_supervisor(self, exc):
+        s = review_loop.Supervisor(
+            personas={"code": ["red_team"], "plan": []},
+            persona_prompts={("code", "red_team"): "rt"},
+            review_prompts={"code": "review #{{PR}}"},
+            followup_prompts={"code": "recheck #{{PR}}"},
+            model="m",
+            mcp_args=[],
+            cwd=".",
+            max_passes_per_session=0,
+        )
+
+        def boom(**kwargs):
+            raise exc
+
+        self._original = review_loop.passes.run_pass
+        review_loop.passes.run_pass = boom
+        self.addCleanup(setattr, review_loop.passes, "run_pass", self._original)
+        return s
+
+    def test_an_oserror_from_the_spawn_is_an_ordinary_failure(self):
+        s = self._raising_supervisor(OSError(11, "Resource temporarily unavailable"))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            limited_flag = s.run_cycle([Pair(12, "code", "red_team")])
+        self.assertFalse(limited_flag)
+        self.assertIn("could not run claude", buf.getvalue())
+        self.assertIn("starting a fresh session for it next cycle", buf.getvalue())
+
+    def test_a_missing_claude_binary_does_not_take_the_loop_down(self):
+        s = self._raising_supervisor(FileNotFoundError(2, "No such file or directory"))
+        pairs = [Pair(n, "code", "red_team") for n in (12, 13)]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            s.run_cycle(pairs)
+        # Both pairs were attempted rather than the first one killing the cycle,
+        # and neither kept a session.
+        self.assertEqual(s.sessions, {})
+        self.assertIn("#13", buf.getvalue())
+
+    def test_repeated_spawn_failures_hit_the_three_strikes_rule(self):
+        s = self._raising_supervisor(OSError(11, "Resource temporarily unavailable"))
+        pairs = [Pair(n, "code", "red_team") for n in (12, 13, 14, 15)]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            s.run_cycle(pairs)
+        self.assertIn("3 passes in a row failed", buf.getvalue())
+        self.assertEqual(s.resume_at, Pair(15, "code", "red_team"))
+
+
+REPO_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+SHIPPED_PERSONAS = os.path.join(REPO_ROOT, "personas")
+
+
+def preflight_env(**overrides):
+    """Only what entrypoint.sh already has in hand before auth and the clone."""
+    env = {
+        "GITHUB_REPOSITORY": "owner/repo",
+        "PR_IDS": "12",
+        "PERSONA_DIR": SHIPPED_PERSONAS,
+    }
+    env.update(overrides)
+    return env
+
+
+class PreflightTest(unittest.TestCase):
+    """entrypoint.sh runs this through --check before auth, the working clone
+    and the translator's blocking startup, so it must read nothing the shell
+    exports after that point."""
+
+    def test_it_resolves_the_selector_and_both_modes(self):
+        selector, resolved = review_loop.preflight(preflight_env())
+        self.assertEqual(selector, "ids")
+        self.assertEqual(sorted(resolved), ["code", "plan"])
+        self.assertEqual([p.id for p in resolved["code"]], ["red_team", "adversarial", "sme", "sage"])
+
+    def test_a_bad_persona_name_is_a_config_error(self):
+        with self.assertRaises(ConfigError):
+            review_loop.preflight(preflight_env(PERSONAS="saeg"))
+
+    def test_a_broken_plan_set_is_caught_even_with_no_plan_pr(self):
+        with self.assertRaises(ConfigError):
+            review_loop.preflight(preflight_env(PLAN_PERSONAS="saeg"))
+
+    def test_no_selector_is_a_config_error(self):
+        with self.assertRaises(ConfigError):
+            review_loop.preflight(preflight_env(PR_IDS=""))
+
+
+class CheckModeTest(unittest.TestCase):
+    def _run(self, args, env):
+        original = os.environ.copy()
+        os.environ.clear()
+        os.environ.update(env)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(original)))
+        buf, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+            try:
+                rc = review_loop.main(args)
+            except SystemExit as exc:
+                rc = exc.code
+        return rc, buf.getvalue(), err.getvalue()
+
+    def test_check_exits_zero_without_the_vars_exported_after_it(self):
+        # WORK_REPO, REVIEW_MODEL and MCP_CONFIG_FILE are all exported below the
+        # point --check runs at, so needing any of them would make the
+        # pre-flight refuse a configuration that is in fact fine.
+        rc, out, err = self._run(["--check"], preflight_env())
+        self.assertEqual(rc, 0)
+        self.assertEqual(err, "")
+
+    def test_check_refuses_a_bad_persona(self):
+        rc, out, err = self._run(["--check"], preflight_env(PERSONAS="saeg"))
+        self.assertEqual(rc, 1)
+        self.assertIn("unknown persona 'saeg'", err)
+
+    def test_check_refuses_a_missing_selector(self):
+        rc, out, err = self._run(["--check"], preflight_env(PR_IDS=""))
+        self.assertEqual(rc, 1)
+        self.assertIn("no PR selector set", err)
+
+    def test_an_unknown_flag_is_refused(self):
+        rc, out, err = self._run(["--dry-run"], preflight_env())
+        self.assertEqual(rc, 1)
+        self.assertIn("--dry-run", err)
+
+
+class GitFetchFailureTest(unittest.TestCase):
+    """The shell wrote `git fetch ... || log WARN`, which covers a git that
+    cannot be spawned as well as one that exits non-zero."""
+
+    def _one_cycle(self, run):
+        env = preflight_env(
+            WORK_REPO=".", REVIEW_MODEL="m", MAX_CYCLES="1",
+            REVIEW_INTERVAL_SECONDS="0",
+        )
+        original_env = os.environ.copy()
+        os.environ.clear()
+        os.environ.update(env)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(original_env)))
+
+        original_run = review_loop.subprocess.run
+        review_loop.subprocess.run = run
+        self.addCleanup(setattr, review_loop.subprocess, "run", original_run)
+
+        original_enum = review_loop.gh.enumerate_candidate_prs
+        review_loop.gh.enumerate_candidate_prs = lambda *a, **k: []
+        self.addCleanup(setattr, review_loop.gh, "enumerate_candidate_prs", original_enum)
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = review_loop.main([])
+        return rc, buf.getvalue()
+
+    def test_a_git_that_cannot_be_spawned_warns_and_carries_on(self):
+        def run(*a, **k):
+            raise OSError(11, "Resource temporarily unavailable")
+
+        rc, out = self._one_cycle(run)
+        self.assertEqual(rc, 0)
+        self.assertIn("git fetch could not run", out)
+
+    def test_a_git_that_exits_non_zero_warns_and_carries_on(self):
+        def run(*a, **k):
+            return subprocess.CompletedProcess(a[0], 1, "", "fatal: bad remote")
+
+        rc, out = self._one_cycle(run)
+        self.assertEqual(rc, 0)
+        self.assertIn("git fetch failed", out)
+
+
+class McpArgsTest(unittest.TestCase):
+    """--strict-mcp-config is a security boundary, not a preference: the
+    reviewed repo is untrusted, and without it a repo shipping its own
+    .mcp.json gets MCP servers of its choosing loaded into a
+    --dangerously-skip-permissions session. test-personas.sh asserts it at the
+    argv, and so does this, at the layer the decision now lives in."""
+
+    def _argv(self, env):
+        original = os.environ.copy()
+        os.environ.clear()
+        os.environ.update(env)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(original)))
+
+        captured = {}
+
+        class Recorder(review_loop.Supervisor):
+            def _run_one(inner, pair, prompt, session_id):
+                captured["mcp_args"] = list(inner.mcp_args)
+                return ok()
+
+        original_sup = review_loop.Supervisor
+        review_loop.Supervisor = Recorder
+        self.addCleanup(setattr, review_loop, "Supervisor", original_sup)
+
+        original_enum = review_loop.gh.enumerate_candidate_prs
+        review_loop.gh.enumerate_candidate_prs = lambda *a, **k: [(12, "code")]
+        self.addCleanup(setattr, review_loop.gh, "enumerate_candidate_prs", original_enum)
+
+        original_run = review_loop.subprocess.run
+        review_loop.subprocess.run = lambda *a, **k: subprocess.CompletedProcess(a[0], 0, "", "")
+        self.addCleanup(setattr, review_loop.subprocess, "run", original_run)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            review_loop.main([])
+        return captured["mcp_args"]
+
+    def test_strict_is_always_passed(self):
+        argv = self._argv(preflight_env(
+            WORK_REPO=".", REVIEW_MODEL="m", MAX_CYCLES="1", PERSONAS="red_team",
+        ))
+        self.assertEqual(argv, ["--strict-mcp-config"])
+
+    def test_a_generated_config_is_spliced_in_behind_it(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            fh.write("{}")
+            path = fh.name
+        self.addCleanup(os.unlink, path)
+        argv = self._argv(preflight_env(
+            WORK_REPO=".", REVIEW_MODEL="m", MAX_CYCLES="1", PERSONAS="red_team",
+            MCP_CONFIG_FILE=path,
+        ))
+        self.assertEqual(argv, ["--strict-mcp-config", "--mcp-config", path])
+
+    def test_a_config_file_that_is_not_there_is_not_passed(self):
+        # entrypoint.sh deletes the file when write_mcp_config fails, so a
+        # partial write degrades to no MCP servers rather than to truncated JSON.
+        argv = self._argv(preflight_env(
+            WORK_REPO=".", REVIEW_MODEL="m", MAX_CYCLES="1", PERSONAS="red_team",
+            MCP_CONFIG_FILE="/nonexistent/mcp.json",
+        ))
+        self.assertEqual(argv, ["--strict-mcp-config"])
 
 
 if __name__ == "__main__":

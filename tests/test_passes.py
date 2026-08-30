@@ -35,12 +35,28 @@ class UsageLimitTest(unittest.TestCase):
         self.assertTrue(passes.is_usage_limit("quota exhausted"))
 
     def test_429_on_its_own_line_in_a_long_stderr(self):
-        # THE REGRESSION THIS MODULE'S PORTING HAZARD IS ABOUT. grep is
-        # line-oriented; Python's ^ and $ anchor the whole string without
-        # re.MULTILINE. Without the flag this stops matching and a real limit
-        # degrades silently to the ordinary drop-the-session path.
+        # A status code alone on a line, buried in a multi-line stderr, is what
+        # a real limit looks like coming back from a provider, and the arm that
+        # catches it is the one whose character classes are easiest to narrow by
+        # accident. It matches through [^0-9] on either side of the line, so
+        # re.MULTILINE is not what makes this pass; what would break it is
+        # tightening [^0-9] to something like [ :] or dropping the arm.
         stderr = "connecting\nnegotiating\n429\nretrying\n"
         self.assertTrue(passes.is_usage_limit(stderr))
+
+    def test_the_matched_line_is_the_one_reported_out_of_a_long_stderr(self):
+        # The classifier reads the whole stderr while the WARN tails only its
+        # last few lines, so the reported line has to be the one that matched
+        # and not the last one seen.
+        stderr = "connecting\nnegotiating\n429\nretrying\nretrying\nretrying\nretrying\n"
+        self.assertEqual(passes.usage_limit_line(stderr), "429")
+
+    def test_a_multi_line_stderr_with_no_limit_in_it_is_not_a_limit(self):
+        # The multi-line direction that could go wrong the other way: line
+        # boundaries must not manufacture a match out of digits that are not a
+        # status code on their own.
+        stderr = "connecting\nnegotiating\n4290\nHTTP/1.1 400\ninvalid request\n"
+        self.assertFalse(passes.is_usage_limit(stderr))
 
     def test_a_spend_cap_is_not_a_rate_cap(self):
         # Limit-SHAPED but outside the pattern on purpose. This is the
@@ -118,7 +134,9 @@ class FormatEventTest(unittest.TestCase):
                 },
             }
         )
-        self.assertEqual(got, ['  → Bash: {"cmd": "ls"}'])
+        # Compact, like jq's tojson: the separators cost characters out of the
+        # 200-character budget the next case pins.
+        self.assertEqual(got, ['  → Bash: {"cmd":"ls"}'])
 
     def test_tool_use_input_is_truncated_to_200(self):
         big = {"cmd": "x" * 500}

@@ -89,7 +89,15 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
 fi
 exit 0
 STUB
-printf '#!/bin/sh\nexit 0\n' >"$BIN/git"
+# Recording rather than silent, so a case can assert that a refusal happened
+# before the entrypoint did any work at all. The pre-flight --check sits above
+# `gh auth setup-git`, the git config calls and the working clone, so an absent
+# $HOME/git-argv means nothing git-shaped ran.
+cat >"$BIN/git" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$*" >>"$HOME/git-argv"
+exit 0
+STUB
 
 # How many cycles run is now the supervisor's own business (MAX_CYCLES in the
 # baseline below), so `sleep` has no job left here beyond costing nothing: the
@@ -256,6 +264,28 @@ refuses() {
   fi
 }
 
+# refuses_before_work LABEL EXPECTED-SUBSTRING -- VAR=VALUE...
+# refuses, plus: nothing git-shaped ran before the refusal. A selector or
+# persona typo has to cost a startup error and nothing else -- the old shell
+# validated both immediately after its defaults block, and moving them past the
+# exec bought a network clone of the whole repo and up to 120s of translator
+# startup on every restart under --restart unless-stopped.
+refuses_before_work() {
+  local label="$1" want="$2"; shift 2
+  [ "${1:-}" = "--" ] && shift
+  selected "$label" || return 0
+  run_entrypoint "$label" "$@"
+  if [ "$(calls)" != 0 ]; then
+    bad "$label" "expected a startup failure, but a review pass ran"
+  elif ! grep -qF "$want" "$OUT"; then
+    bad "$label" "expected the error to mention: $want"
+  elif [ -e "$HOME_DIR/git-argv" ]; then
+    bad "$label" "refused only after running git: $(tr '\n' ';' <"$HOME_DIR/git-argv")"
+  else
+    ok "$label"
+  fi
+}
+
 # cycle LABEL 'VAR=VALUE...' -- EXPECTATION...
 # Runs the entrypoint, then checks expectations:
 #   CALLS:N              -- exactly N claude invocations happened
@@ -366,6 +396,25 @@ refuses "selection: a persona that is only frontmatter refuses at startup" \
 refuses "selection: a glob is a name, not a pattern" \
   "unknown persona '*'" \
   -- PERSONAS='*'
+
+# --- pre-flight ordering -----------------------------------------------------
+refuses_before_work "preflight: a persona typo refuses before any git runs" \
+  "unknown persona 'saeg'" \
+  -- PERSONAS=saeg
+
+refuses_before_work "preflight: a missing PR selector refuses before any git runs" \
+  "no PR selector set" \
+  -- PR_IDS=
+
+# The control for the two cases above: on a run that is not refused, the git
+# recorder does record. Without it the ordering assertion would pass just as
+# happily against a stub that records nothing.
+L="preflight: the git recorder records on a run that is not refused"
+if selected "$L"; then
+  run_entrypoint "$L" PERSONAS=red_team MAX_CYCLES=1
+  if [ -s "$HOME_DIR/git-argv" ]; then ok "$L"
+  else bad "$L" "no git invocations were recorded, so the ordering cases prove nothing"; fi
+fi
 
 # --- per-persona passes -----------------------------------------------------
 cycle "passes: each persona gets its own pass, in the selected order" \
