@@ -107,7 +107,11 @@ COPY --chown=reviewer:reviewer personas/ /opt/claudebox/personas/
 # The review supervisor: entrypoint.sh execs reviewer/review_loop.py once it has
 # finished setting up the environment and the working clone. Stdlib-only, like
 # the normalizer below, so it runs on the python3 installed above.
-COPY --chown=reviewer:reviewer reviewer/ /opt/claudebox/reviewer/
+# Root-owned, like LITELLM_BIN above and for the same reason: the reviewer needs
+# to read this code, never to write it. The loop reviews untrusted repos under
+# --dangerously-skip-permissions, and under --restart unless-stopped a writable
+# supervisor would be a persistence vector across restarts.
+COPY reviewer/ /opt/claudebox/reviewer/
 # The Workers AI normalizer, which entrypoint.sh runs between LiteLLM and
 # Cloudflare for PROVIDER=workersai. Stdlib-only, so it runs on the python3
 # installed above with no venv of its own. See the file header for why it exists.
