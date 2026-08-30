@@ -325,6 +325,13 @@ stop_shim() {
 }
 # LiteLLM first: it is the one holding a client connection open, and shutting the
 # thing behind it down first would turn a clean stop into a burst of 502s.
+#
+# This covers PRE-EXEC failures only. The exec at the end of this file replaces
+# the process image, so the trap is gone by the time the supervisor runs; both
+# children are inherited by it instead (see check_litellm, which also reaps
+# them). Inside a container that is moot -- PID 1 exiting tears the namespace
+# down -- but on a local ALLOW_UNHARDENED=1 run that exits via MAX_CYCLES, the
+# two processes are left holding their ports.
 trap 'stop_litellm; stop_shim' EXIT
 
 # Write the proxy config. The Cloudflare token is referenced as os.environ/... so
