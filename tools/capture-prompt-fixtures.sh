@@ -194,12 +194,26 @@ else
   PASS=$((PASS+1))
 fi
 
-# Check 8: linear fixture is superset of code-review
+# Check 8: the linear fixture carries the Linear stanza.
 if grep -q "references a Linear ticket" "$OUT_DIR/prompt-code-review-linear.txt"; then
   echo "PASS: code-review-linear contains Linear stanza"
   PASS=$((PASS+1))
 else
   echo "FAIL: code-review-linear missing Linear stanza"
+  FAIL=$((FAIL+1))
+fi
+
+# Check 9: and it really is the plain code-review prompt with that stanza
+# appended, not a separately-composed string. linear_stanza appends, so the
+# plain fixture must be a byte prefix of the Linear one. Grepping for the
+# stanza alone would pass even if the body underneath had drifted.
+_n=$(wc -c <"$OUT_DIR/prompt-code-review.txt")
+if [ "$(head -c "$_n" "$OUT_DIR/prompt-code-review-linear.txt" | cksum)" \
+     = "$(cksum <"$OUT_DIR/prompt-code-review.txt")" ]; then
+  echo "PASS: code-review is a byte prefix of code-review-linear"
+  PASS=$((PASS+1))
+else
+  echo "FAIL: code-review is not a byte prefix of code-review-linear"
   FAIL=$((FAIL+1))
 fi
 
