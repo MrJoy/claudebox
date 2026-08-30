@@ -359,11 +359,7 @@ class CheckLitellmTest(unittest.TestCase):
         # entrypoint.sh's `kill -0 "$SHIM_PID"` rejects junk and dies. Skipping
         # the check instead would leave a dead translator undetected.
         with self.assertRaises(SystemExit):
-            with contextlib.redirect_stdout(io.StringIO()):
-                review_loop.check_litellm(
-                    {"SHIM_PID": "not-a-pid", "HOME": "/nonexistent"}
-                )
-
+            self._check_quietly({"SHIM_PID": "not-a-pid", "HOME": "/nonexistent"})
 
 
 class RequiredEnvTest(unittest.TestCase):

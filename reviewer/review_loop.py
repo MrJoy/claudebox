@@ -105,7 +105,7 @@ def check_litellm(env: Mapping[str, str]) -> None:
     runs them concurrently and the window is always open.
     """
     for var in ("SHIM_PID", "LITELLM_PID"):
-        raw = env.get(var, "").strip()
+        raw = env.get(var, "")
         if not raw:
             continue
         try:
@@ -117,7 +117,7 @@ def check_litellm(env: Mapping[str, str]) -> None:
         ("SHIM_PID", "Workers AI normalizer", "normalizer", "shim.log", 20),
         ("LITELLM_PID", "LiteLLM translator", "translator", "litellm.log", 40),
     ):
-        raw = env.get(var, "").strip()
+        raw = env.get(var, "")
         if not raw:
             continue
         try:
