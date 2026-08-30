@@ -264,7 +264,15 @@ esac
 exit 0
 STUB
 printf '#!/bin/sh\nexit 0\n' >"$BIN/git"
-printf '#!/bin/sh\nexec "$@"\n' >"$BIN/stdbuf"
+# Drop the flags, exec the rest. GNU coreutils stdbuf is absent on macOS, and a
+# stub that execs `-oL` dies with "invalid option", failing every pass — which
+# drops the session and makes cycle 2 a second NEW session, not a resume. Same
+# stub as test-personas.sh:89-93.
+cat >"$BIN/stdbuf" <<'STUB'
+#!/bin/sh
+while [ $# -gt 0 ]; do case "$1" in -*) shift ;; *) break ;; esac; done
+exec "$@"
+STUB
 # Succeeds once so a second cycle runs, which is the only way to see a
 # resumed pass's prompt. Fails after, ending the loop under set -e.
 cat >"$BIN/sleep" <<'STUB'
