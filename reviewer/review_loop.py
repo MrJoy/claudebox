@@ -68,6 +68,19 @@ def prompt_token_warnings(review: Mapping[str, str], followup: Mapping[str, str]
     return out
 
 
+def _required(env: Mapping[str, str], name: str) -> str:
+    """A var entrypoint.sh must export before it execs us.
+
+    A bare KeyError here would surface as a traceback, and under
+    `--restart unless-stopped` that is a silent crash loop rather than a
+    startup error somebody can read.
+    """
+    value = env.get(name, "")
+    if not value:
+        raise ConfigError(f"{name} is not set; entrypoint.sh must export it")
+    return value
+
+
 def _positive_int(env: Mapping[str, str], name: str, default: int) -> int:
     raw = env.get(name, "").strip()
     if not raw:
@@ -296,6 +309,8 @@ def main() -> int:
         interval = _positive_int(env, "REVIEW_INTERVAL_SECONDS", 300)
         backoff = _positive_int(env, "LIMIT_BACKOFF_SECONDS", 1800)
         max_passes = _positive_int(env, "MAX_PASSES_PER_SESSION", 0)
+        review_model = _required(env, "REVIEW_MODEL")
+        work_repo = _required(env, "WORK_REPO")
     except ConfigError as exc:
         die(str(exc))
 
@@ -309,9 +324,9 @@ def main() -> int:
         persona_prompts={(m, p.id): p.prompt for m, ps in resolved.items() for p in ps},
         review_prompts=built.review,
         followup_prompts=built.followup,
-        model=env["REVIEW_MODEL"],
+        model=review_model,
         mcp_args=mcp_args,
-        cwd=env["WORK_REPO"],
+        cwd=work_repo,
         max_passes_per_session=max_passes,
     )
 

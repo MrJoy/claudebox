@@ -8,7 +8,7 @@ import unittest
 import _path  # noqa: F401
 
 import review_loop
-from common import Pair
+from common import ConfigError, Pair
 from passes import PassResult
 
 
@@ -336,3 +336,26 @@ class CheckLitellmTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RequiredEnvTest(unittest.TestCase):
+    """entrypoint.sh exports WORK_REPO and REVIEW_MODEL before it execs us.
+
+    If it stops doing so, the loop must say which var is missing. A bare
+    KeyError traceback under `--restart unless-stopped` is a silent crash loop.
+    """
+
+    def test_missing_var_is_a_config_error_naming_it(self):
+        with self.assertRaises(ConfigError) as caught:
+            review_loop._required({}, "WORK_REPO")
+        self.assertIn("WORK_REPO", str(caught.exception))
+
+    def test_empty_is_treated_as_missing(self):
+        with self.assertRaises(ConfigError):
+            review_loop._required({"REVIEW_MODEL": ""}, "REVIEW_MODEL")
+
+    def test_a_set_var_comes_back(self):
+        self.assertEqual(
+            review_loop._required({"REVIEW_MODEL": "glm-5.2:cloud"}, "REVIEW_MODEL"),
+            "glm-5.2:cloud",
+        )
