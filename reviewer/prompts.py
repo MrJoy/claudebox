@@ -100,5 +100,5 @@ def build(env: Mapping[str, str]) -> Prompts:
 
 
 def render(template: str, pr: int) -> str:
-    """Substitute the {{PR}} token. Overrides included, per entrypoint.sh:483."""
+    """Substitute the {{PR}} token. Overrides included, per entrypoint.sh:231-233."""
     return template.replace("{{PR}}", str(pr))
