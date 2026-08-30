@@ -6,3 +6,11 @@
 # Host-side launcher and tests; the image only needs entrypoint.sh.
 claudebox.sh
 test-providers.sh
+test-personas.sh
+test-shim.sh
+test-python.sh
+tests/
+tools/
+# Host-built bytecode, for a Python that need not match the image's.
+__pycache__/
+*.pyc
