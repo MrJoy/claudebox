@@ -5,18 +5,19 @@
 #
 #   * capture is INDEXED per `claude` invocation, because one cycle now runs one
 #     invocation per (PR, persona) instead of exactly one;
-#   * the `sleep` stub succeeds once before failing, so the loop runs TWO cycles.
-#     That second cycle is the point: a one-cycle harness produces no resumed
-#     invocation, which is why test-providers.sh cannot assert FOLLOWUP_PROMPT's
-#     stanzas, and the most important property of the persona design (the persona
-#     system prompt being re-passed on a resumed pass) lives exactly there.
+#   * the baseline sets MAX_CYCLES=2, so the loop runs TWO cycles. That second
+#     cycle is the point: a one-cycle harness produces no resumed invocation,
+#     which is why test-providers.sh cannot assert FOLLOWUP_PROMPT's stanzas,
+#     and the most important property of the persona design (the persona system
+#     prompt being re-passed on a resumed pass) lives exactly there. Cases that
+#     want a single cycle say MAX_CYCLES=1 for themselves.
 #
 #   ./test-personas.sh            # run everything
 #   ./test-personas.sh resume     # only cases whose label matches 'resume'
 #
-# Needs jq (the entrypoint pipes claude's stream-json through it), mktemp, tee,
-# and bash 4+ for the entrypoint itself. stdbuf is stubbed below rather than
-# required, since macOS does not ship it.
+# Needs jq (the entrypoint generates its MCP and translator config through it),
+# mktemp, python3 (the review supervisor is Python), and bash 4+ for the
+# entrypoint itself.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,6 +34,11 @@ for candidate in "${BASH:-}" "$(command -v bash || true)" /opt/homebrew/bin/bash
   fi
 done
 [ -n "$BASH_BIN" ] || { printf 'ERROR: no bash 4+ found (macOS /bin/bash is 3.2 — `brew install bash`).\n' >&2; exit 1; }
+
+# Resolved here, while a normal PATH is still in scope: the entrypoint runs
+# under `env -i`, so the python3 stub cannot find a real interpreter itself.
+REAL_PYTHON3="$(command -v python3 || true)"
+[ -n "$REAL_PYTHON3" ] || { printf 'ERROR: python3 is required (the review supervisor is Python).\n' >&2; exit 1; }
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -63,9 +69,11 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
     *",$n,"*) echo "null"; exit 0 ;;
   esac
   # STUB_PLAN_AFTER=N: the PR is unlabeled until cycle N has finished, then
-  # labeled. Cycles are counted by the sleep stub, which writes $HOME/sleeps.
+  # labeled. Cycles are counted by the claude stub, which writes one line to
+  # $HOME/calls per invocation -- so this reads "after N passes", which is the
+  # same thing for the single-PR, single-persona-per-mode case that uses it.
   if [ -n "${STUB_PLAN_AFTER:-}" ]; then
-    c=$(cat "$HOME/sleeps" 2>/dev/null || echo 0)
+    c=$(cat "$HOME/calls" 2>/dev/null || echo 0)
     if [ "$c" -ge "$STUB_PLAN_AFTER" ]; then
       printf '{"number":%s,"labels":[{"name":"%s"}]}\n' "$n" "${STUB_PLAN_LABEL:-plan}"
       exit 0
@@ -81,25 +89,21 @@ exit 0
 STUB
 printf '#!/bin/sh\nexit 0\n' >"$BIN/git"
 
-# The entrypoint pipes claude through `stdbuf -oL tee`, and stdbuf is GNU
-# coreutils, which a bare macOS does not ship. test-providers.sh survives its
-# absence because it only reads PIPESTATUS[0], but this suite needs the stream to
-# actually reach tee: that is where the session id comes from, and the session id
-# is what the resume assertions are about. Drop the flags, exec the rest.
-cat >"$BIN/stdbuf" <<'STUB'
-#!/bin/sh
-while [ $# -gt 0 ]; do case "$1" in -*) shift ;; *) break ;; esac; done
-exec "$@"
-STUB
+# How many cycles run is now the supervisor's own business (MAX_CYCLES in the
+# baseline below), so `sleep` has no job left here beyond costing nothing: the
+# entrypoint polls with it while waiting for a translator, and the loop's own
+# interval is time.sleep() inside Python, out of reach of a PATH stub.
+printf '#!/bin/sh\nexit 0\n' >"$BIN/sleep"
 
-# Two cycles by default: succeed on the first sleep, fail on the next so the
-# entrypoint's own `set -e` ends the run. STUB_MAX_CYCLES overrides per case.
-cat >"$BIN/sleep" <<'STUB'
+# entrypoint.sh ends in `exec python3 /opt/claudebox/reviewer/review_loop.py`,
+# an image path that does not exist in a checkout. Remap it to this one; hand
+# anything else to the real interpreter, which `env -i` would otherwise hide.
+cat >"$BIN/python3" <<'STUB'
 #!/bin/sh
-n=$(( $(cat "$HOME/sleeps" 2>/dev/null || echo 0) + 1 ))
-echo "$n" >"$HOME/sleeps"
-[ "$n" -ge "${STUB_MAX_CYCLES:-2}" ] && exit 1
-exit 0
+case "$1" in
+  */reviewer/review_loop.py) shift; exec "$REAL_PYTHON3" "$REVIEWER_MAIN" "$@" ;;
+  *)                         exec "$REAL_PYTHON3" "$@" ;;
+esac
 STUB
 
 # The probe. One dump file per invocation ($HOME/dump.N, N counting from 1),
@@ -188,10 +192,15 @@ run_entrypoint() {
   local label="$1"; shift
   HOME_DIR="$WORK/home"; OUT="$WORK/out"
   rm -rf "$HOME_DIR"; mkdir -p "$HOME_DIR/work/repo/.git" "$HOME_DIR/seed"
+  # Both waits are real time.sleep() calls inside the supervisor now, so both
+  # are pinned to a second: the backoff is 1800s by default, and one limit case
+  # running two cycles would otherwise stall the suite for half an hour.
   env -i PATH="$BIN:$PATH" HOME="$HOME_DIR" \
     ALLOW_UNHARDENED=1 \
     GITHUB_TOKEN=x GITHUB_REPOSITORY=owner/repo PR_IDS=1 \
-    REPO_PATH="$HOME_DIR/seed" REVIEW_INTERVAL_SECONDS=1 \
+    REPO_PATH="$HOME_DIR/seed" REVIEW_INTERVAL_SECONDS=1 LIMIT_BACKOFF_SECONDS=1 \
+    MAX_CYCLES=2 \
+    REAL_PYTHON3="$REAL_PYTHON3" REVIEWER_MAIN="$SCRIPT_DIR/reviewer/review_loop.py" \
     PERSONA_DIR="$SCRIPT_DIR/personas" \
     PROVIDER=ollama OLLAMA_API_KEY=k \
     "$@" "$BASH_BIN" "$ENTRYPOINT" >"$OUT" 2>&1
@@ -419,7 +428,7 @@ cycle "limits: an ordinary failure still drops the session" \
      NOLOG:"Backing off"
 
 cycle "limits: the rest of the cycle is abandoned, not pushed through" \
-  PERSONAS=red_team,sage,sme STUB_FAIL_ON=2 STUB_FAIL_MODE=limit STUB_MAX_CYCLES=1 \
+  PERSONAS=red_team,sage,sme STUB_FAIL_ON=2 STUB_FAIL_MODE=limit MAX_CYCLES=1 \
   -- CALLS:2 \
      LOG:"ending this cycle early"
 
@@ -441,7 +450,7 @@ cycle "limits: the near-miss window wording is classified as a limit" \
 # this goes red rather than the loop quietly backing off for hours on a failure
 # that no amount of waiting fixes.
 cycle "limits: an unrecognised failure degrades to the ordinary path" \
-  PERSONAS=red_team STUB_FAIL_ON=1 STUB_FAIL_MODE=nearmiss STUB_MAX_CYCLES=1 \
+  PERSONAS=red_team STUB_FAIL_ON=1 STUB_FAIL_MODE=nearmiss MAX_CYCLES=1 \
   -- CALLS:1 \
      LOG:"starting a fresh session for it next cycle" \
      NOLOG:"Backing off"
@@ -450,13 +459,13 @@ cycle "limits: an unrecognised failure degrades to the ordinary path" \
 # while the WARN line tails only its last few, so without this a limit reported
 # early in a long stderr is classified right and invisible.
 cycle "limits: the line that read as a limit is logged" \
-  PERSONAS=red_team STUB_FAIL_ON=1 STUB_FAIL_MODE=captured STUB_MAX_CYCLES=1 \
+  PERSONAS=red_team STUB_FAIL_ON=1 STUB_FAIL_MODE=captured MAX_CYCLES=1 \
   -- LOG:"limit reported by claude: Claude AI usage limit reached|1755772800"
 
 # On a genuinely first pass there is no session to keep, and the log used to say
 # there was.
 cycle "limits: a limit before any session does not claim to keep one" \
-  PERSONAS=red_team STUB_FAIL_ON=1 STUB_FAIL_MODE=limit STUB_NO_SESSION=1 STUB_MAX_CYCLES=1 \
+  PERSONAS=red_team STUB_FAIL_ON=1 STUB_FAIL_MODE=limit STUB_NO_SESSION=1 MAX_CYCLES=1 \
   -- LOG:"before it had a session" \
      NOLOG:"keeping its session"
 
@@ -467,8 +476,8 @@ cycle "limits: a limit before any session does not claim to keep one" \
 cycle "resume: the next cycle starts at the pair after the one a limit cut" \
   PERSONAS=red_team,sage,sme STUB_FAIL_ON=2 STUB_FAIL_MODE=limit \
   -- CALLS:5 \
-     LOG:"Not reviewed this cycle: 1:code:sme" \
-     LOG:"Starting this cycle at 1:code:sme, where the last one was cut." \
+     LOG:"Not reviewed this cycle: #1 code/sme" \
+     LOG:"Starting this cycle at #1 code/sme, where the last one was cut." \
      ARGV:3:"You are a Subject Matter Expert" \
      NOARGV:3:"--resume" \
      ARGV:4:"--resume S1" \
@@ -477,27 +486,27 @@ cycle "resume: the next cycle starts at the pair after the one a limit cut" \
 # --- mode routing ------------------------------------------------------------
 # Mode is decided once per PR, inside enumerate_candidate_prs, from its labels.
 cycle "mode: an unlabeled PR is reviewed in code mode" \
-  PERSONAS=red_team STUB_MAX_CYCLES=1 \
+  PERSONAS=red_team MAX_CYCLES=1 \
   -- CALLS:1 \
      LOG:"Candidate PRs (ids): 1:code" \
      LOG:"Reviewing PR #1 [code/red_team]"
 
 cycle "mode: a PR carrying the plan label is reviewed in plan mode" \
-  PERSONAS=red_team PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 STUB_MAX_CYCLES=1 \
+  PERSONAS=red_team PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 MAX_CYCLES=1 \
   -- CALLS:1 \
      LOG:"Candidate PRs (ids): 1:plan" \
      LOG:"Reviewing PR #1 [plan/red_team]"
 
 cycle "mode: PLAN_LABEL names the label that means plan" \
-  PERSONAS=red_team PLAN_PERSONAS=red_team PLAN_LABEL=proposal STUB_PLAN_PRS=1 STUB_PLAN_LABEL=proposal STUB_MAX_CYCLES=1 \
+  PERSONAS=red_team PLAN_PERSONAS=red_team PLAN_LABEL=proposal STUB_PLAN_PRS=1 STUB_PLAN_LABEL=proposal MAX_CYCLES=1 \
   -- CALLS:1 LOG:"1:plan"
 
 cycle "mode: a label that is not PLAN_LABEL leaves the PR in code mode" \
-  PERSONAS=red_team PLAN_LABEL=proposal STUB_PLAN_PRS=1 STUB_PLAN_LABEL=plan STUB_MAX_CYCLES=1 \
+  PERSONAS=red_team PLAN_LABEL=proposal STUB_PLAN_PRS=1 STUB_PLAN_LABEL=plan MAX_CYCLES=1 \
   -- CALLS:1 LOG:"1:code"
 
 cycle "mode: both modes can appear in one cycle" \
-  PR_IDS=1,2 PERSONAS=red_team PLAN_PERSONAS=red_team STUB_PLAN_PRS=2 STUB_MAX_CYCLES=1 \
+  PR_IDS=1,2 PERSONAS=red_team PLAN_PERSONAS=red_team STUB_PLAN_PRS=2 MAX_CYCLES=1 \
   -- CALLS:2 \
      LOG:"Candidate PRs (ids): 1:code 2:plan"
 
@@ -505,7 +514,7 @@ cycle "mode: both modes can appear in one cycle" \
 # comments in the wrong register on a real PR, and there is no undoing that; a
 # skip is one log line and a retry next cycle.
 cycle "mode: a failed label lookup skips the PR rather than guessing" \
-  PR_IDS=1,2 PERSONAS=red_team STUB_LABEL_FAIL=1 STUB_MAX_CYCLES=1 \
+  PR_IDS=1,2 PERSONAS=red_team STUB_LABEL_FAIL=1 MAX_CYCLES=1 \
   -- CALLS:1 \
      LOG:"could not read labels for PR #1" \
      LOG:"Candidate PRs (ids): 2:code" \
@@ -516,7 +525,7 @@ cycle "mode: a failed label lookup skips the PR rather than guessing" \
 # the cycle with no WARN at all -- indistinguishable from having been reviewed
 # clean.
 cycle "mode: a successful but empty label lookup skips the PR, not silently" \
-  PR_IDS=1,2 PERSONAS=red_team STUB_LABEL_GARBAGE=1 STUB_MAX_CYCLES=1 \
+  PR_IDS=1,2 PERSONAS=red_team STUB_LABEL_GARBAGE=1 MAX_CYCLES=1 \
   -- CALLS:1 \
      LOG:"could not read labels for PR #1" \
      LOG:"Candidate PRs (ids): 2:code" \
@@ -525,7 +534,7 @@ cycle "mode: a successful but empty label lookup skips the PR, not silently" \
 # A `gh` that exits 0 with a well-formed but useless body (bare `null`) must not
 # turn into a candidate PR literally numbered "null".
 cycle "mode: a null label response skips the PR rather than reviewing PR #null" \
-  PR_IDS=1,2 PERSONAS=red_team STUB_LABEL_NULL=1 STUB_MAX_CYCLES=1 \
+  PR_IDS=1,2 PERSONAS=red_team STUB_LABEL_NULL=1 MAX_CYCLES=1 \
   -- CALLS:1 \
      LOG:"could not read labels for PR #1" \
      LOG:"Candidate PRs (ids): 2:code" \
@@ -534,15 +543,15 @@ cycle "mode: a null label response skips the PR rather than reviewing PR #null" 
 
 # --- per-mode persona sets ---------------------------------------------------
 cycle "modes: plan mode runs all six personas by default" \
-  STUB_PLAN_PRS=1 STUB_MAX_CYCLES=1 \
+  STUB_PLAN_PRS=1 MAX_CYCLES=1 \
   -- CALLS:6 LOG:"plan personas: adversarial good_friend red_team sage sme user"
 
 cycle "modes: code mode still runs the four code-facing personas by default" \
-  STUB_MAX_CYCLES=1 \
+  MAX_CYCLES=1 \
   -- CALLS:4 LOG:"code personas: red_team adversarial sme sage"
 
 cycle "modes: PLAN_PERSONAS selects the plan set, PERSONAS the code set" \
-  PR_IDS=1,2 PERSONAS=red_team PLAN_PERSONAS=user,sage STUB_PLAN_PRS=2 STUB_MAX_CYCLES=1 \
+  PR_IDS=1,2 PERSONAS=red_team PLAN_PERSONAS=user,sage STUB_PLAN_PRS=2 MAX_CYCLES=1 \
   -- CALLS:3 \
      LOG:"code personas: red_team" \
      LOG:"plan personas: user sage" \
@@ -586,17 +595,17 @@ cycle "modes: a PR that gains the label starts a fresh session, not a resumed on
 # these particular pairs are cursed. Walking the rest of the list into it costs
 # one duplicate-comment burst per pair, since each failure drops its session.
 cycle "failures: a run of non-limit failures abandons the cycle at the ordinary interval" \
-  PR_IDS=1,2 PERSONAS=red_team,sage,sme STUB_FAIL_ON=2,3,4 STUB_FAIL_MODE=other STUB_MAX_CYCLES=1 \
+  PR_IDS=1,2 PERSONAS=red_team,sage,sme STUB_FAIL_ON=2,3,4 STUB_FAIL_MODE=other MAX_CYCLES=1 \
   -- CALLS:4 \
      LOG:"3 passes in a row failed for reasons other than a limit" \
-     LOG:"Not reviewed this cycle: 2:code:sage 2:code:sme" \
-     LOG:"The next cycle starts at 2:code:sage" \
+     LOG:"Not reviewed this cycle: #2 code/sage, #2 code/sme" \
+     LOG:"The next cycle starts at #2 code/sage" \
      NOLOG:"Backing off"
 
 # ... and the counter is consecutive, not cumulative: two failures, a success,
 # another failure is an ordinary bad day, not a dead endpoint.
 cycle "failures: a success resets the run, so scattered failures do not abandon" \
-  PERSONAS=red_team,sage,sme,adversarial STUB_FAIL_ON=1,2,4 STUB_FAIL_MODE=other STUB_MAX_CYCLES=1 \
+  PERSONAS=red_team,sage,sme,adversarial STUB_FAIL_ON=1,2,4 STUB_FAIL_MODE=other MAX_CYCLES=1 \
   -- CALLS:4 \
      NOLOG:"Abandoning this cycle" \
      NOLOG:"Not reviewed this cycle"
@@ -606,20 +615,20 @@ cycle "failures: a success resets the run, so scattered failures do not abandon"
 # depends on. There are none in a plan, and a reviewer handed a design document
 # will otherwise report missing tests in code nobody has written.
 cycle "prompts: plan mode drops the test stanza and code mode keeps it" \
-  PR_IDS=1,2 PERSONAS=red_team PLAN_PERSONAS=red_team STUB_PLAN_PRS=2 STUB_MAX_CYCLES=1 \
+  PR_IDS=1,2 PERSONAS=red_team PLAN_PERSONAS=red_team STUB_PLAN_PRS=2 MAX_CYCLES=1 \
   -- CALLS:2 \
      ARGV:1:"Treat the tests in this PR as code under review" \
      NOARGV:2:"Treat the tests in this PR as code under review"
 
 cycle "prompts: the plan default says what a plan review is and is not" \
-  PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 STUB_MAX_CYCLES=1 \
+  PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 MAX_CYCLES=1 \
   -- ARGV:1:"proposes an approach rather than implementing one" \
      ARGV:1:"do not ask for tests, error handling, or input validation in code that does not exist yet"
 
 # The gh constraints are what the privilege-minimized token can actually do, and
 # they are identical in both modes.
 cycle "prompts: the plan default keeps the gh stanza" \
-  PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 STUB_MAX_CYCLES=1 \
+  PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 MAX_CYCLES=1 \
   -- ARGV:1:'do not use `gh pr checks`'
 
 # The code followup's own coverage: it lived as a bare scalar before this branch
@@ -647,13 +656,13 @@ cycle "prompts: a resumed plan pass repeats the plan stanza" \
      ARGV:2:"do not ask for tests, error handling, or input validation in code that does not exist yet"
 
 cycle "prompts: PLAN_REVIEW_PROMPT reaches Claude verbatim, with no stanzas" \
-  PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 PLAN_REVIEW_PROMPT='just read the plan in 1' STUB_MAX_CYCLES=1 \
+  PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 PLAN_REVIEW_PROMPT='just read the plan in 1' MAX_CYCLES=1 \
   -- ARGV:1:"just read the plan in 1" \
      NOARGV:1:'do not use `gh pr checks`' \
      NOARGV:1:"proposes an approach rather than implementing one"
 
 cycle "prompts: PLAN_REVIEW_PROMPT_SUFFIX appends to the plan default" \
-  PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 PLAN_REVIEW_PROMPT_SUFFIX='And mention the ticket.' STUB_MAX_CYCLES=1 \
+  PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 PLAN_REVIEW_PROMPT_SUFFIX='And mention the ticket.' MAX_CYCLES=1 \
   -- ARGV:1:"proposes an approach rather than implementing one" \
      ARGV:1:"And mention the ticket."
 
@@ -692,7 +701,7 @@ cycle "prompts: PLAN_FOLLOWUP_PROMPT_SUFFIX appends to the plan followup default
 # their code prompt would silently get it on plan PRs too.
 cycle "prompts: a code override does not reach plan mode" \
   PR_IDS=1,2 PERSONAS=red_team PLAN_PERSONAS=red_team STUB_PLAN_PRS=2 \
-  REVIEW_PROMPT='code only 1' STUB_MAX_CYCLES=1 \
+  REVIEW_PROMPT='code only 1' MAX_CYCLES=1 \
   -- CALLS:2 \
      ARGV:1:"code only 1" \
      NOARGV:2:"code only 1" \
@@ -702,10 +711,34 @@ cycle "prompts: a code override does not reach plan mode" \
 # The asymmetry is the kind of thing that hides a one-directional bug.
 cycle "prompts: a plan override does not reach code mode" \
   PR_IDS=1,2 PERSONAS=red_team PLAN_PERSONAS=red_team STUB_PLAN_PRS=2 \
-  PLAN_REVIEW_PROMPT='plan only 2' STUB_MAX_CYCLES=1 \
+  PLAN_REVIEW_PROMPT='plan only 2' MAX_CYCLES=1 \
   -- CALLS:2 \
      NOARGV:1:"plan only 2" \
      ARGV:2:"plan only 2"
+
+# --- MCP flags --------------------------------------------------------------
+# The reviewed repo is untrusted, so --strict-mcp-config is a security boundary,
+# not a preference: without it a repo shipping its own .mcp.json gets MCP servers
+# of its choosing loaded into a --dangerously-skip-permissions session. The
+# supervisor builds these flags itself now, from MCP_CONFIG_FILE, so this asserts
+# the end of that wire rather than the shell array that used to carry it -- on
+# the RESUMED invocation too, since that is the one a per-session flag could be
+# lost on.
+cycle "mcp: every invocation is strict, resumed ones included" \
+  PERSONAS=red_team \
+  -- CALLS:2 \
+     ARGV:1:"--strict-mcp-config" \
+     ARGV:2:"--strict-mcp-config" \
+     NOARGV:1:"--mcp-config"
+
+# ... and with a Linear key the generated config is spliced in behind it, which
+# is what proves MCP_CONFIG_FILE still crosses the exec into the supervisor.
+cycle "mcp: a Linear key adds the generated config to every invocation" \
+  PERSONAS=red_team LINEAR_API_KEY=lin_api_x \
+  -- CALLS:2 \
+     LOG:"Linear MCP enabled" \
+     ARGV:1:"--strict-mcp-config --mcp-config" \
+     ARGV:2:"--strict-mcp-config --mcp-config"
 
 printf '\n%d passed, %d failed' "$PASS" "$FAIL"
 [ "$SKIP" -gt 0 ] && printf ', %d skipped' "$SKIP"

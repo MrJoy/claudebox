@@ -32,6 +32,12 @@ for candidate in "${BASH:-}" "$(command -v bash || true)" /opt/homebrew/bin/bash
 done
 [ -n "$BASH_BIN" ] || { printf 'ERROR: no bash 4+ found; entrypoint.sh needs one (macOS /bin/bash is 3.2 — `brew install bash`).\n' >&2; exit 1; }
 
+# The stubs below run under `env -i`, which is exactly what stops the python3
+# stub from finding a real interpreter on its own. Resolve it here, while a
+# normal PATH is still in scope, and pass it through explicitly.
+REAL_PYTHON3="$(command -v python3 || true)"
+[ -n "$REAL_PYTHON3" ] || { printf 'ERROR: python3 is required (the review supervisor is Python).\n' >&2; exit 1; }
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 BIN="$WORK/bin"; mkdir -p "$BIN"
@@ -65,11 +71,13 @@ fi
 if [ "$1" = "clone" ]; then for a in "$@"; do dest="$a"; done; mkdir -p "$dest"; fi
 exit 0
 STUB
-# One cycle per case: the review loop ends with `sleep $REVIEW_INTERVAL_SECONDS`
-# as its last unprotected command, so a failing sleep makes the entrypoint's own
-# `set -e` end the run right after the first pass. Cheaper and quieter than
-# signalling the supervisor from outside.
-printf '#!/bin/sh\nexit 1\n' >"$BIN/sleep"
+# One cycle per case, asked for directly: MAX_CYCLES=1 in the baseline below
+# tells the supervisor to exit after the first pass. The loop's own interval is
+# time.sleep() inside Python, so the old trick of a failing `sleep` stub ending
+# the run through the entrypoint's `set -e` has nothing left to hook. sleep is
+# still stubbed as a no-op because the entrypoint polls with it while waiting
+# for the translator, and a failing sleep there would kill the run.
+printf '#!/bin/sh\nexit 0\n' >"$BIN/sleep"
 
 # PROVIDER=workersai starts the bundled LiteLLM translator and blocks until it
 # answers its liveness probe. Both halves are stubbed: `litellm` just has to stay
@@ -79,14 +87,30 @@ printf '#!/bin/sh\nexit 1\n' >"$BIN/sleep"
 printf '#!/bin/sh\nprintf "%%s" "$*" >"$HOME/litellm-argv"\nexec tail -f /dev/null\n' >"$BIN/litellm"
 printf '#!/bin/sh\nexit 0\n' >"$BIN/curl"
 
-# The normalizer that runs between the translator and Cloudflare is launched as
-# `python3 <script>`, so python3 is stubbed the same way: record how it was
-# invoked, and stay alive so the entrypoint's kill -0 check passes. Stubbing it
-# rather than running the real thing keeps the suite from binding a real port
-# (and from caring whether one is already in use). The script's own behaviour is
-# not what these cases test — they test that the chain is wired and ordered
-# correctly, and that the credential-bearing hop stays on loopback.
-printf '#!/bin/sh\nprintf "%%s upstream=%%s port=%%s" "$*" "$SHIM_UPSTREAM_URL" "$SHIM_PORT" >"$HOME/shim-argv"\nexec tail -f /dev/null\n' >"$BIN/python3"
+# python3 has two callers now, and only one of them may be stubbed. The
+# normalizer between the translator and Cloudflare is launched as
+# `python3 <script>`: record how it was invoked and stay alive so the
+# entrypoint's kill -0 check passes, which keeps the suite from binding a real
+# port and from caring whether one is already in use (the script's own behaviour
+# is not what these cases test — they test that the chain is wired and ordered
+# correctly, and that the credential-bearing hop stays on loopback). The review
+# supervisor is the other caller, and it is REAL: the entrypoint ends in
+# `exec python3 .../reviewer/review_loop.py`, so a blanket stub would swallow
+# the loop and hang the suite forever on a `tail -f` that never ends. Dispatch
+# on the script, remapping the supervisor's baked-in image path to this
+# checkout, and hand anything else to the real interpreter.
+cat >"$BIN/python3" <<'STUB'
+#!/bin/sh
+case "$1" in
+  *workersai-shim.py)
+    printf '%s upstream=%s port=%s' "$*" "$SHIM_UPSTREAM_URL" "$SHIM_PORT" >"$HOME/shim-argv"
+    exec tail -f /dev/null ;;
+  */reviewer/review_loop.py)
+    shift; exec "$REAL_PYTHON3" "$REVIEWER_MAIN" "$@" ;;
+  *)
+    exec "$REAL_PYTHON3" "$@" ;;
+esac
+STUB
 
 # The `claude` stub is the probe: it records the environment the entrypoint built
 # and the argv it was called with. The entrypoint sends claude's stderr to a temp
@@ -155,8 +179,9 @@ run_entrypoint() {
   env -i PATH="$BIN:$PATH" HOME="$HOME_DIR" \
     ALLOW_UNHARDENED=1 \
     GITHUB_TOKEN=x GITHUB_REPOSITORY=owner/repo PR_IDS=1 \
-    REPO_PATH="$HOME_DIR/seed" REVIEW_INTERVAL_SECONDS=1 \
+    REPO_PATH="$HOME_DIR/seed" REVIEW_INTERVAL_SECONDS=1 MAX_CYCLES=1 \
     LITELLM_BIN="$BIN/litellm" SHIM_BIN="$SCRIPT_DIR/workersai-shim.py" \
+    REAL_PYTHON3="$REAL_PYTHON3" REVIEWER_MAIN="$SCRIPT_DIR/reviewer/review_loop.py" \
     PERSONA_DIR="$SCRIPT_DIR/personas" PERSONAS=red_team \
     "$@" "$BASH_BIN" "$ENTRYPOINT" >"$OUT" 2>&1
 }

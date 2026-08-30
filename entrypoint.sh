@@ -716,15 +716,16 @@ export ANTHROPIC_DEFAULT_HAIKU_MODEL="$REVIEW_MODEL"
 export ANTHROPIC_SMALL_FAST_MODEL="$REVIEW_MODEL"
 
 # --- MCP servers -----------------------------------------------------------
-# --strict-mcp-config is passed ALWAYS: the reviewed repo is untrusted input,
-# and without it a repo under review that ships its own .mcp.json could get MCP
-# servers of its choosing loaded into a --dangerously-skip-permissions session. Strict mode
-# means the reviewer loads only what we generate here, or nothing at all.
-CLAUDE_MCP_ARGS=(--strict-mcp-config)
+# We generate the config; the supervisor builds the flags. It passes
+# --strict-mcp-config ALWAYS, and adds --mcp-config only when this file exists
+# -- which is why the stale one is removed first, so a run without a Linear key
+# cannot inherit the previous run's servers. Strict mode is load-bearing: the
+# reviewed repo is untrusted input, and without it a repo shipping its own
+# .mcp.json could get MCP servers of its choosing loaded into a
+# --dangerously-skip-permissions session.
 MCP_CONFIG_FILE="$HOME/mcp.json"
 rm -f "$MCP_CONFIG_FILE"
 if write_mcp_config "$MCP_CONFIG_FILE"; then
-  CLAUDE_MCP_ARGS+=(--mcp-config "$MCP_CONFIG_FILE")
   log "Linear MCP enabled (expects a READ-ONLY Linear API key)."
 fi
 
