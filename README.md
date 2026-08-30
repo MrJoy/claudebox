@@ -115,7 +115,7 @@ Whichever provider you pick, the entrypoint pins **every** model tier (`ANTHROPI
 
 ## How it works
 
-The reviewer runs **one Claude session per PR per mode per persona**. Each cycle the entrypoint enumerates the candidate PRs (see [PR selection](#pr-selection)), works out each one's review mode, then reviews it with each persona enabled for that mode in its own session: a pair's first review starts a new session with that mode's review prompt; later cycles `--resume` that pair's session with the mode's followup prompt, so a persona remembers what it already flagged and avoids duplicate comments. The PR number is substituted into the prompt's `{{PR}}` token.
+The reviewer runs **one Claude session per PR per mode per persona**. Each cycle the reviewer enumerates the candidate PRs (see [PR selection](#pr-selection)), works out each one's review mode, then reviews it with each persona enabled for that mode in its own session: a pair's first review starts a new session with that mode's review prompt; later cycles `--resume` that pair's session with the mode's followup prompt, so a persona remembers what it already flagged and avoids duplicate comments. The PR number is substituted into the prompt's `{{PR}}` token.
 
 ### Two review modes
 
@@ -139,24 +139,33 @@ Personas are deliberately **blind to each other**. Nothing tells a persona to de
 **A cycle is now (candidate PRs x that PR's personas) sequential sessions.** `REVIEW_INTERVAL_SECONDS` is the gap *after* a cycle, so four PRs and four personas is sixteen reviews before the interval starts, and a plan-labeled PR contributes six sessions rather than four. Set `--persona` to one name for the cheapest code-mode run; it does not touch `PLAN_PERSONAS`, so a labeled PR still costs six sessions until you set that too.
 
 ```bash
-# CLAUDE_MCP_ARGS is always (--strict-mcp-config), plus (--mcp-config "$MCP_CONFIG_FILE")
-# when LINEAR_API_KEY is set. The "--" is load-bearing: --mcp-config is variadic, so
-# without it the prompt would be parsed as another MCP config path.
+# Every invocation carries --strict-mcp-config, and --mcp-config as well when a
+# Linear key produced a config to point it at. The "--" is load-bearing:
+# --mcp-config is variadic, so without it the prompt would be parsed as another
+# MCP config path.
 
 # a (PR, mode, persona) pair's first review — new session
 claude -p --output-format stream-json --verbose --dangerously-skip-permissions \
-  --model "$REVIEW_MODEL" --append-system-prompt "${PERSONA_PROMPT[$mode:$persona]}" \
-  "${CLAUDE_MCP_ARGS[@]}" -- "${MODE_REVIEW_PROMPT[$mode]//\{\{PR\}\}/$pr}"
+  --model <REVIEW_MODEL> --append-system-prompt <that persona's prompt> \
+  --strict-mcp-config [--mcp-config ~/mcp.json] \
+  -- <that mode's review prompt, with {{PR}} replaced by the PR number>
 # later cycles — resume that pair's session
-claude -p --resume "${PR_SESSION[$pr:$mode:$persona]}" --output-format stream-json --verbose \
-  --dangerously-skip-permissions --model "$REVIEW_MODEL" \
-  --append-system-prompt "${PERSONA_PROMPT[$mode:$persona]}" \
-  "${CLAUDE_MCP_ARGS[@]}" -- "${MODE_FOLLOWUP_PROMPT[$mode]//\{\{PR\}\}/$pr}"
+claude -p --resume <that pair's session id> --output-format stream-json --verbose \
+  --dangerously-skip-permissions --model <REVIEW_MODEL> \
+  --append-system-prompt <that persona's prompt> \
+  --strict-mcp-config [--mcp-config ~/mcp.json] \
+  -- <that mode's followup prompt, with {{PR}} replaced>
 ```
 
-Each pass streams as `stream-json`; the entrypoint pretty-prints the events live to its log (so `docker logs -f` shows the play-by-play) and recovers the session id from the stream to resume that pair next cycle.
+Each pass streams as `stream-json`; the reviewer pretty-prints the events live to its log (so `docker logs -f` shows the play-by-play) and takes the session id out of the same stream to resume that pair next cycle. Log lines from inside a pass are prefixed with the pair that produced them, e.g. `[14:22:07] [#12 code/sage] …`.
 
-The entrypoint shell is the supervisor: it controls cadence (`git fetch`, enumerate PRs, review each sequentially, then sleep), keeps an in-memory (PR, mode, persona)→session map, so a PR whose label changes starts fresh in its new mode instead of resuming a session that was reviewing it as something else, and starts a fresh session for a pair if its pass fails (so that persona may re-comment once on that PR). Claude itself uses `gh`/`git` to inspect the PR, check out the latest commit, and post one comment per finding. `MAX_PASSES_PER_SESSION` rotates a pair's session after N passes to bound its context growth (per pair).
+**The container runs two programs, in two languages.** `entrypoint.sh` does startup: the hardening checks, `gh`/`git` auth, the provider environment, the working clone, and the Workers AI translator when one is configured. Then it `exec`s `reviewer/review_loop.py` and hands the container over.
+
+That Python loop is the supervisor. It controls cadence (`git fetch`, enumerate PRs, review each pair sequentially, then sleep), keeps an in-memory (PR, mode, persona)→session map, so a PR whose label changes starts fresh in its new mode instead of resuming a session that was reviewing it as something else, and starts a fresh session for a pair if its pass fails (so that persona may re-comment once on that PR). Claude itself uses `gh`/`git` to inspect the PR, check out the latest commit, and post one comment per finding. `MAX_PASSES_PER_SESSION` rotates a pair's session after N passes to bound its context growth (per pair).
+
+The line between them is what each half produces. Shell is good at building an environment for a child process and poor at holding structured state per task, and structured state per task is all the loop is: which pairs are still owed a review, which session each one resumes, where a cut cycle stopped, whether a failure was a usage limit or a dead endpoint. Almost every bug this thing has had lived on the second side of that line. Nothing about running or configuring it changed with the move, and `reviewer/` is standard-library Python, so the image installs nothing extra to run it.
+
+`MAX_CYCLES` says how many cycles to run before the process exits. Unset or `0` is forever, which is what an unattended container wants; `MAX_CYCLES=1` gives you a single pass over the candidate PRs that you can watch to the end.
 
 `--append-system-prompt` is passed on *both* forms, which is not redundant: the flag does not survive `--resume`. Passed only on the first pass, cycle one would be adversarial and every later cycle would be a generic reviewer wearing the persona's name in the log.
 
@@ -166,7 +175,7 @@ A cycle cut short does not simply start over. The reviewer remembers the pair it
 
 Three failures in a row that are **not** limits — connection refused, a dead translator, a gateway 502 — also end the cycle, with a log line saying so, on the ordinary `REVIEW_INTERVAL_SECONDS` rather than the backoff. Each such failure drops its pair's session, so walking the rest of the list into a dead endpoint would cost a duplicate-comment burst per pair. Any successful pass resets the count.
 
-> Why not `/loop`? Claude Code's `/loop` needs a live *interactive* session — scheduled wake-ups only fire while a session is running and idle, and headless `-p` mode exits after each response. The shell loop + `--resume` gives the same continuous, context-retaining behavior while staying headless and crash-safe.
+> Why not `/loop`? Claude Code's `/loop` needs a live *interactive* session — scheduled wake-ups only fire while a session is running and idle, and headless `-p` mode exits after each response. The supervisor's own loop plus `--resume` gives the same continuous, context-retaining behavior while staying headless and crash-safe.
 
 ## The `claudebox.sh` launcher
 
@@ -244,12 +253,16 @@ mount is skipped and only the path alignment is added.
 Provider wiring — which credential and endpoint variables each `PROVIDER` ends up handing Claude Code — is covered by a test suite that needs no Docker, network, or credentials:
 
 ```bash
+./test-python.sh                 # unit tests for the review loop
 ./test-providers.sh              # all cases
 ./test-providers.sh cloudflare   # only cases whose label matches
 ./test-personas.sh               # persona selection and the per-persona loop
 ./test-shim.sh                   # the workersai normalizer
 bash -n entrypoint.sh && bash -n claudebox.sh   # syntax only
+python3 -m py_compile reviewer/*.py             # the same, for the Python
 ```
+
+`test-python.sh` covers the review loop itself, which is Python: prompt assembly against captured fixtures, persona resolution, PR selection and label routing, usage-limit classification, the stream formatter, and the cycle bookkeeping — the resume point after a cut cycle, the consecutive-failure count, session rotation. It runs in under a second and needs nothing installed. The bash suites below prove the wiring the loop is handed; this one proves the decisions it makes with it.
 
 It stubs `gh`/`git`/`claude` and checks either the startup error the entrypoint refused with or the exact environment it built. That's a narrow claim on purpose: it proves the wiring matches intent, not that a provider accepts it. Before trusting a newly configured provider unattended, do one live `./claudebox.sh test --repo …` and watch it actually get a response.
 
@@ -374,6 +387,7 @@ Optional:
 - `REVIEW_MODEL` (provider-specific default; **required** for `PROVIDER=custom` and `PROVIDER=cloudflare`)
 - `ANTHROPIC_CUSTOM_HEADERS` (optional on any provider; **required** for `GATEWAY_UPSTREAM=bedrock`/`vertex`) — extra request headers, `Name: value` per line
 - `REVIEW_INTERVAL_SECONDS`
+- `MAX_CYCLES` (how many review cycles to run before exiting; unset or `0` runs forever, `1` gives a one-shot run. A value that isn't a non-negative integer is a startup error, not a quiet fall back to forever)
 - `REVIEW_PROMPT` (a (PR, persona) pair's first review, new session; uses the `{{PR}}` token)
 - `FOLLOWUP_PROMPT` (a pair's resumed review; uses the `{{PR}}` token)
 
@@ -428,7 +442,7 @@ Get a key from **Settings → Security & access → Personal API keys**. Linear'
 
 Read-only bounds what the reviewer can change, not what it can see: a personal API key is scoped to your whole Linear workspace, not to the one ticket a PR claims to reference. The reviewer already treats PR titles, bodies, and diffs as untrusted input, and it can post PR comments — so Linear ticket content becomes a second untrusted input channel into a permission-skipped session, and a hostile or careless PR body can in principle steer it into reading unrelated tickets and pasting their contents into a comment on a possibly-public PR. Don't enable `LINEAR_API_KEY` on repos that take PRs from untrusted contributors, and prefer a key from an account with minimal Linear visibility over your main one.
 
-The entrypoint writes the key into a generated MCP config at `$HOME/mcp.json` (mode `600`) and passes it to Claude Code with `--mcp-config`. Every review pass also runs with `--strict-mcp-config`, whether or not Linear is configured: the reviewed repo is untrusted input, and strict mode means a repository that ships its own `.mcp.json` can't get MCP servers of its choosing loaded into a permission-skipped session.
+The entrypoint writes the key into a generated MCP config at `$HOME/mcp.json` (mode `600`), and the review loop passes that file to Claude Code with `--mcp-config`. Every review pass also runs with `--strict-mcp-config`, whether or not Linear is configured: the reviewed repo is untrusted input, and strict mode means a repository that ships its own `.mcp.json` can't get MCP servers of its choosing loaded into a permission-skipped session.
 
 ## Notes & caveats
 
