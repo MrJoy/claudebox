@@ -56,6 +56,15 @@ def usage_limit_line(text: str) -> str:
     return ""
 
 
+def _alt(value: Any, fallback: Any) -> Any:
+    """jq's `//`: falls back only on null or false.
+
+    Python's `or` would also swallow 0 and "", so a numeric result of 0 would
+    log as an empty string where the shell logged "0".
+    """
+    return fallback if value is None or value is False else value
+
+
 def format_event(event: Dict[str, Any]) -> List[str]:
     """Human-readable lines for one stream-json event, or none."""
     etype = event.get("type")
@@ -85,6 +94,11 @@ def format_event(event: Dict[str, Any]) -> List[str]:
             content = block.get("content")
             if isinstance(content, list):
                 text = " ".join(str(c.get("text") or "") for c in content if isinstance(c, dict))
+            elif isinstance(content, (dict, list)):
+                # jq's tostring JSON-encodes a non-string; Python's str() would
+                # render a dict with single quotes, which is not what the shell
+                # put in the log.
+                text = json.dumps(content)
             else:
                 text = "" if content is None else str(content)
             out.append("  ← " + _WHITESPACE.sub(" ", text).strip()[:200])
@@ -92,8 +106,8 @@ def format_event(event: Dict[str, Any]) -> List[str]:
 
     if etype == "result":
         return [
-            f"  ✓ result ({event.get('subtype') or ''}): "
-            + str(event.get("result") or "")[:800]
+            f"  ✓ result ({_alt(event.get('subtype'), '')}): "
+            + str(_alt(event.get("result"), ""))[:800]
         ]
 
     return []

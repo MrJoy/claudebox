@@ -152,6 +152,24 @@ class FormatEventTest(unittest.TestCase):
     def test_unknown_event_is_silent(self):
         self.assertEqual(passes.format_event({"type": "ping"}), [])
 
+    def test_a_zero_result_is_not_swallowed(self):
+        # jq's `//` falls back on null or false only. Python's `or` would also
+        # swallow 0, logging an empty string where the shell logged "0".
+        got = passes.format_event(
+            {"type": "result", "subtype": "success", "result": 0}
+        )
+        self.assertEqual(got, ["  \u2713 result (success): 0"])
+
+    def test_a_dict_tool_result_is_json_encoded(self):
+        # jq's tostring emits JSON. Python's str() would emit single quotes.
+        got = passes.format_event(
+            {
+                "type": "user",
+                "message": {"content": [{"type": "tool_result", "content": {"a": 1}}]},
+            }
+        )
+        self.assertEqual(got, ['  \u2190 {"a": 1}'])
+
 
 class RunPassTest(unittest.TestCase):
     """Drives run_pass against a real subprocess: a tiny python script standing
