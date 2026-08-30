@@ -98,27 +98,36 @@ def check_litellm(env: Mapping[str, str]) -> None:
 
     We are PID 1 after the exec, so a dead child becomes a zombie that os.kill
     would still find. Reap first, non-blockingly, or the check never fires.
-    """
-    while True:
-        try:
-            pid, _ = os.waitpid(-1, os.WNOHANG)
-        except ChildProcessError:
-            break
-        if pid == 0:
-            break
 
-    for var, label, logfile, lines in (
-        ("SHIM_PID", "Workers AI normalizer", "shim.log", 20),
-        ("LITELLM_PID", "LiteLLM translator", "litellm.log", 40),
+    Reaping only these two pids, never waitpid(-1): a wildcard reap would also
+    collect a review pass's own claude, stealing the exit status its Popen is
+    waiting for. Phase A runs one pass at a time so the window is narrow; Phase B
+    runs them concurrently and the window is always open.
+    """
+    for var in ("SHIM_PID", "LITELLM_PID"):
+        raw = env.get(var, "").strip()
+        if not raw:
+            continue
+        try:
+            os.waitpid(int(raw), os.WNOHANG)
+        except (OSError, ValueError):
+            pass
+
+    for var, label, short, logfile, lines in (
+        ("SHIM_PID", "Workers AI normalizer", "normalizer", "shim.log", 20),
+        ("LITELLM_PID", "LiteLLM translator", "translator", "litellm.log", 40),
     ):
         raw = env.get(var, "").strip()
-        if not raw.isdigit():
+        if not raw:
             continue
         try:
             os.kill(int(raw), 0)
-        except OSError:
+        except (OSError, ValueError):
+            # ValueError is junk in the var. The shell's `kill -0 "$SHIM_PID"`
+            # rejects that too and dies, so a garbled pid is a dead translator
+            # here as well rather than a silently skipped check.
             path = os.path.join(env.get("HOME", ""), logfile)
-            log(f"--- last {lines} lines of the {label} log ---")
+            log(f"--- last {lines} lines of the {short} log ---")
             try:
                 with open(path, encoding="utf-8", errors="replace") as fh:
                     for line in fh.read().splitlines()[-lines:]:
@@ -277,7 +286,7 @@ class Supervisor:
             self.resume_at = pairs[(cut_at + 1) % count]
             skipped = [pairs[(start + o) % count] for o in range(cut_offset + 1, count)]
             if skipped:
-                log("Not reviewed this cycle: " + " ".join(str(p) for p in skipped)
+                log("Not reviewed this cycle: " + ", ".join(str(p) for p in skipped)
                     + f". The next cycle starts at {self.resume_at}.")
             else:
                 log(f"The next cycle starts at {self.resume_at}.")

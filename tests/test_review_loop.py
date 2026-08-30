@@ -138,6 +138,18 @@ class CutAndResumeTest(unittest.TestCase):
         self.assertEqual(len(s.attempted), 2)
         self.assertEqual(s.resume_at, self.PAIRS[2])
 
+    def test_the_skipped_pairs_are_named_in_the_log(self):
+        # An operator has to be able to read a stall, not infer one from
+        # comments that never arrive.
+        s = supervisor([ok(), limited()])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            s.run_cycle(self.PAIRS)
+        line = [l for l in buf.getvalue().splitlines() if "Not reviewed" in l]
+        self.assertEqual(len(line), 1)
+        for pair in self.PAIRS[2:]:
+            self.assertIn(str(pair), line[0])
+
     def test_the_next_cycle_starts_where_the_last_one_stopped(self):
         s = supervisor([ok(), limited(), ok(), ok(), ok(), ok()])
         s.run_cycle(self.PAIRS)
@@ -303,7 +315,16 @@ class CheckLitellmTest(unittest.TestCase):
         proc = subprocess.Popen([sys.executable, "-c", ""], stdout=subprocess.PIPE)
         self.assertEqual(proc.stdout.read(), b"")
         proc.stdout.close()
+        # check_litellm reaps this pid, so Popen never learns the child is gone
+        # and __del__ warns that it is "still running". Record the status we
+        # already know, or the suite's output stops being pristine.
+        self.addCleanup(self._mark_reaped, proc)
         return proc
+
+    @staticmethod
+    def _mark_reaped(proc):
+        if proc.returncode is None:
+            proc.returncode = 0
 
     def _check_quietly(self, env):
         """The failure path logs a tail and dies; neither belongs in test output."""
@@ -329,13 +350,20 @@ class CheckLitellmTest(unittest.TestCase):
             proc.kill()
             proc.wait()
 
-    def test_a_missing_or_unusable_pid_is_a_no_op(self):
+    def test_an_unset_or_empty_pid_is_a_no_op(self):
+        # Every provider but workersai leaves these unset.
         review_loop.check_litellm({})
-        review_loop.check_litellm({"LITELLM_PID": "", "SHIM_PID": "not-a-pid"})
+        review_loop.check_litellm({"LITELLM_PID": "", "SHIM_PID": ""})
 
+    def test_a_garbled_pid_is_fatal_like_the_shell(self):
+        # entrypoint.sh's `kill -0 "$SHIM_PID"` rejects junk and dies. Skipping
+        # the check instead would leave a dead translator undetected.
+        with self.assertRaises(SystemExit):
+            with contextlib.redirect_stdout(io.StringIO()):
+                review_loop.check_litellm(
+                    {"SHIM_PID": "not-a-pid", "HOME": "/nonexistent"}
+                )
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class RequiredEnvTest(unittest.TestCase):
@@ -359,3 +387,30 @@ class RequiredEnvTest(unittest.TestCase):
             review_loop._required({"REVIEW_MODEL": "glm-5.2:cloud"}, "REVIEW_MODEL"),
             "glm-5.2:cloud",
         )
+
+
+class TunableDefaultsTest(unittest.TestCase):
+    """The three intervals default to what entrypoint.sh defaulted to.
+
+    A regression to a 30-second interval would be silent and would burn the
+    quota the backoff exists to protect.
+    """
+
+    def test_review_interval(self):
+        self.assertEqual(review_loop._positive_int({}, "REVIEW_INTERVAL_SECONDS", 300), 300)
+
+    def test_limit_backoff(self):
+        self.assertEqual(review_loop._positive_int({}, "LIMIT_BACKOFF_SECONDS", 1800), 1800)
+
+    def test_max_passes_per_session_defaults_to_no_rotation(self):
+        self.assertEqual(review_loop._positive_int({}, "MAX_PASSES_PER_SESSION", 0), 0)
+
+    def test_an_explicit_value_wins(self):
+        self.assertEqual(
+            review_loop._positive_int({"REVIEW_INTERVAL_SECONDS": "60"}, "REVIEW_INTERVAL_SECONDS", 300),
+            60,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
