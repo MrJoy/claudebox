@@ -183,6 +183,15 @@ class EnumerateTest(unittest.TestCase):
             gh.enumerate_candidate_prs("ids", dict(self.ENV, PR_IDS="12"), run=run), []
         )
 
+    def test_ids_unparseable_output_skips(self):
+        # gh exits 0 but stdout is not JSON. Skipping is the only safe answer:
+        # guessing code mode would post a code review on a plan PR, which cannot
+        # be taken back, where a skip costs one WARN and a retry next cycle.
+        run = runner(Result(0, "not json"))
+        self.assertEqual(
+            gh.enumerate_candidate_prs("ids", dict(self.ENV, PR_IDS="12"), run=run), []
+        )
+
     def test_ids_object_without_a_number_skips(self):
         run = runner(Result(0, json.dumps({"labels": []})))
         self.assertEqual(
