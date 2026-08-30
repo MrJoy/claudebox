@@ -39,15 +39,23 @@ def parse_max_cycles(env: Mapping[str, str]) -> Optional[int]:
     """How many cycles to run before exiting. Unset or 0 means forever.
 
     Exists so the acceptance suites can stop the loop deterministically instead
-    of relying on a stubbed `sleep` exiting non-zero, and so `claudebox.sh test`
-    can be a genuine one-shot.
+    of relying on a stubbed `sleep` exiting non-zero. The launcher passes it to
+    nothing, so making `claudebox.sh test` a one-shot means setting it in the
+    env file.
     """
     raw = env.get("MAX_CYCLES", "").strip()
     if not raw:
         return None
-    if not raw.isdigit():
+    # int(), not str.isdigit(): isdigit() is True for characters int() refuses
+    # ('\u00b2' among them), so gating on it turned a typo into an uncaught
+    # ValueError traceback instead of the startup error the docs promise.
+    try:
+        value = int(raw)
+    except ValueError:
         raise ConfigError("MAX_CYCLES must be a non-negative integer")
-    return int(raw) or None
+    if value < 0:
+        raise ConfigError("MAX_CYCLES must be a non-negative integer")
+    return value or None
 
 
 def prompt_token_warnings(review: Mapping[str, str], followup: Mapping[str, str]) -> List[str]:

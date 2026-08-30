@@ -297,6 +297,34 @@ class MaxCyclesTest(unittest.TestCase):
         with self.assertRaises(ConfigError):
             review_loop.parse_max_cycles({"MAX_CYCLES": "soon"})
 
+    def test_a_negative_value_is_refused(self):
+        from common import ConfigError
+
+        with self.assertRaises(ConfigError):
+            review_loop.parse_max_cycles({"MAX_CYCLES": "-1"})
+
+    def test_a_digit_int_refuses_is_a_config_error(self):
+        """The gap str.isdigit() left open.
+
+        '\u00b2'.isdigit() is True and int('\u00b2') raises, so the old gate let
+        it through to an uncaught ValueError traceback rather than the
+        ERROR: line every other bad value gets.
+        """
+        from common import ConfigError
+
+        self.assertTrue("\u00b2".isdigit())
+        with self.assertRaises(ConfigError):
+            review_loop.parse_max_cycles({"MAX_CYCLES": "\u00b2"})
+
+    def test_a_non_ascii_numeral_int_accepts_is_taken(self):
+        """Documented so the behavior is chosen rather than stumbled into.
+
+        int() accepts other decimal digit sets, so '\u0661\u0662' is 12. That is a
+        non-negative integer by the rule the error message states, and
+        rejecting it would need a stricter gate than int() for no gain.
+        """
+        self.assertEqual(review_loop.parse_max_cycles({"MAX_CYCLES": "\u0661\u0662"}), 12)
+
 
 class CheckLitellmTest(unittest.TestCase):
     """The PID-1 zombie hazard. Python is PID 1 after entrypoint.sh execs into

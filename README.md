@@ -163,9 +163,9 @@ Each pass streams as `stream-json`; the reviewer pretty-prints the events live t
 
 That Python loop is the supervisor. It controls cadence (`git fetch`, enumerate PRs, review each pair sequentially, then sleep), keeps an in-memory (PR, mode, persona)→session map, so a PR whose label changes starts fresh in its new mode instead of resuming a session that was reviewing it as something else, and starts a fresh session for a pair if its pass fails (so that persona may re-comment once on that PR). Claude itself uses `gh`/`git` to inspect the PR, check out the latest commit, and post one comment per finding. `MAX_PASSES_PER_SESSION` rotates a pair's session after N passes to bound its context growth (per pair).
 
-The line between them is what each half produces. Shell is good at building an environment for a child process and poor at holding structured state per task, and structured state per task is all the loop is: which pairs are still owed a review, which session each one resumes, where a cut cycle stopped, whether a failure was a usage limit or a dead endpoint. Almost every bug this thing has had lived on the second side of that line. Nothing about running or configuring it changed with the move, and `reviewer/` is standard-library Python, so the image installs nothing extra to run it.
+The line between them is what each half produces. Building an environment for a child process is a job shell handles well. Holding structured state per task is not, and that state is all the loop is: which pairs are still owed a review, which session each one resumes, where a cut cycle stopped, whether a failure was a usage limit or a dead endpoint. Almost every bug this thing has had lived on the second side of that line. Nothing about running or configuring it changed with the move, and `reviewer/` is standard-library Python, so the image installs nothing extra to run it.
 
-`MAX_CYCLES` says how many cycles to run before the process exits. Unset or `0` is forever, which is what an unattended container wants; `MAX_CYCLES=1` gives you a single pass over the candidate PRs that you can watch to the end.
+`MAX_CYCLES` says how many cycles to run before the process exits. Unset or `0` is forever, which is what an unattended container wants; `MAX_CYCLES=1` gives you a single pass over the candidate PRs that you can watch to the end. The launcher has no flag for it, so put it in your env file if you want `./claudebox.sh test` to stop on its own.
 
 `--append-system-prompt` is passed on *both* forms, which is not redundant: the flag does not survive `--resume`. Passed only on the first pass, cycle one would be adversarial and every later cycle would be a generic reviewer wearing the persona's name in the log.
 
@@ -262,9 +262,9 @@ bash -n entrypoint.sh && bash -n claudebox.sh   # syntax only
 python3 -m py_compile reviewer/*.py             # the same, for the Python
 ```
 
-`test-python.sh` covers the review loop itself, which is Python: prompt assembly against captured fixtures, persona resolution, PR selection and label routing, usage-limit classification, the stream formatter, and the cycle bookkeeping — the resume point after a cut cycle, the consecutive-failure count, session rotation. It runs in under a second and needs nothing installed. The bash suites below prove the wiring the loop is handed; this one proves the decisions it makes with it.
+`test-python.sh` covers the review loop itself, which is Python: prompt assembly against captured fixtures, persona resolution, PR selection and label routing, usage-limit classification, the stream formatter, and the cycle bookkeeping — the resume point after a cut cycle, the consecutive-failure count, session rotation. It runs in under a second and needs nothing installed. The bash suites below cover the wiring the loop gets handed. This one covers what it decides once it has it.
 
-It stubs `gh`/`git`/`claude` and checks either the startup error the entrypoint refused with or the exact environment it built. That's a narrow claim on purpose: it proves the wiring matches intent, not that a provider accepts it. Before trusting a newly configured provider unattended, do one live `./claudebox.sh test --repo …` and watch it actually get a response.
+It stubs `gh`/`git`/`claude`, plus `curl`, `sleep`, and a `python3` that dispatches on the script path (the Workers AI normalizer is faked, the review supervisor is the real one), and checks either the startup error the entrypoint refused with or the exact environment it built. That's a narrow claim on purpose: it proves the wiring matches intent, not that a provider accepts it. Before trusting a newly configured provider unattended, do one live `./claudebox.sh test --repo …` and watch it actually get a response.
 
 `test-personas.sh` covers persona selection and the per-persona review loop. It runs **two** cycles rather than one, because the property that matters most cannot be observed in a single cycle: `--append-system-prompt` does not survive `--resume`, so the assertion that has to exist is that a *resumed* pass still carries its persona. It captures one dump per `claude` invocation and asserts the invocation count, each invocation's argv, the resume targets, and the usage-limit path. It also covers review-mode routing: that a labeled PR resolves the plan persona set and the plan prompts, that an unlabeled PR in the same cycle resolves the code set, that a PR gaining the label starts a fresh session rather than resuming a code-mode one, and that an override written for one mode never reaches the other.
 
@@ -387,7 +387,7 @@ Optional:
 - `REVIEW_MODEL` (provider-specific default; **required** for `PROVIDER=custom` and `PROVIDER=cloudflare`)
 - `ANTHROPIC_CUSTOM_HEADERS` (optional on any provider; **required** for `GATEWAY_UPSTREAM=bedrock`/`vertex`) — extra request headers, `Name: value` per line
 - `REVIEW_INTERVAL_SECONDS`
-- `MAX_CYCLES` (how many review cycles to run before exiting; unset or `0` runs forever, `1` gives a one-shot run. A value that isn't a non-negative integer is a startup error, not a quiet fall back to forever)
+- `MAX_CYCLES` (how many review cycles to run before exiting; unset or `0` runs forever, `1` gives a one-shot run)
 - `REVIEW_PROMPT` (a (PR, persona) pair's first review, new session; uses the `{{PR}}` token)
 - `FOLLOWUP_PROMPT` (a pair's resumed review; uses the `{{PR}}` token)
 
