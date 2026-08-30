@@ -81,9 +81,9 @@ printf '#!/bin/sh\nexit 0\n' >"$BIN/sleep"
 
 # PROVIDER=workersai starts the bundled LiteLLM translator and blocks until it
 # answers its liveness probe. Both halves are stubbed: `litellm` just has to stay
-# alive so the entrypoint's kill -0 check passes (`tail -f`, not `sleep`, since
-# sleep is the stub that ends the loop), and `curl` reports it ready at once so
-# the readiness wait never reaches that failing sleep.
+# alive so the entrypoint's kill -0 check passes (`tail -f`, since the `sleep`
+# stub above returns at once and would leave nothing running), and `curl`
+# reports it ready on the first poll so the readiness wait returns immediately.
 printf '#!/bin/sh\nprintf "%%s" "$*" >"$HOME/litellm-argv"\nexec tail -f /dev/null\n' >"$BIN/litellm"
 printf '#!/bin/sh\nexit 0\n' >"$BIN/curl"
 
@@ -151,6 +151,26 @@ chmod +x "$BIN"/*
 PASS=0; FAIL=0; SKIP=0
 FAILED_LABELS=""
 
+# A run that never ends is a suite that never ends. MAX_CYCLES is the only thing
+# that stops the supervisor now, and a *missing* one means "loop forever": an
+# unparsable value is a hard ConfigError, but a baseline that lost the variable
+# entirely would hang here instead of failing. Kill anything still alive after
+# two minutes and note it in the captured output, so the case fails on its own
+# assertions with the reason visible rather than stalling the run.
+watchdog_wait() {
+  local pid="$1" i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    i=$((i + 1))
+    if [ "$i" -gt 1200 ]; then
+      kill -9 "$pid" 2>/dev/null
+      printf 'WATCHDOG: run exceeded 120s and was killed\n' >>"$OUT"
+      break
+    fi
+    sleep 0.1
+  done
+  wait "$pid" 2>/dev/null
+}
+
 # Run the entrypoint once. $1 = label, rest = VAR=VALUE for its environment.
 # Leaves the log in $OUT and the claude-stub dump in $DUMP (absent if the
 # entrypoint died before starting a pass).
@@ -183,7 +203,8 @@ run_entrypoint() {
     LITELLM_BIN="$BIN/litellm" SHIM_BIN="$SCRIPT_DIR/workersai-shim.py" \
     REAL_PYTHON3="$REAL_PYTHON3" REVIEWER_MAIN="$SCRIPT_DIR/reviewer/review_loop.py" \
     PERSONA_DIR="$SCRIPT_DIR/personas" PERSONAS=red_team \
-    "$@" "$BASH_BIN" "$ENTRYPOINT" >"$OUT" 2>&1
+    "$@" "$BASH_BIN" "$ENTRYPOINT" >"$OUT" 2>&1 &
+  watchdog_wait $!
 }
 
 ok()   { PASS=$((PASS + 1)); printf 'ok   %s\n' "$1"; }

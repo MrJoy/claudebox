@@ -53,8 +53,10 @@ BIN="$WORK/bin"; mkdir -p "$BIN"
 #   STUB_LABEL_NULL    -- comma-separated PR numbers whose lookup exits 0 and
 #                         prints the literal JSON `null` (a well-formed but
 #                         useless response)
-#   STUB_PLAN_AFTER    -- the PR is unlabeled until cycle N has finished, then
-#                         labeled (see below)
+#   STUB_PLAN_AFTER    -- the PR is unlabeled until N claude invocations have
+#                         been made, then labeled. That is the same as "after
+#                         cycle N" only for the single-PR, single-persona-per-
+#                         mode case that uses it (see below)
 cat >"$BIN/gh" <<'STUB'
 #!/bin/sh
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
@@ -187,6 +189,26 @@ cp "$SCRIPT_DIR/personas/code/_shared.md" "$SCRIPT_DIR/personas/code/red_team.md
 PASS=0; FAIL=0; SKIP=0
 FAILED_LABELS=""
 
+# A run that never ends is a suite that never ends. MAX_CYCLES is the only thing
+# that stops the supervisor now, and a *missing* one means "loop forever": an
+# unparsable value is a hard ConfigError, but a baseline that lost the variable
+# entirely would hang here instead of failing. Kill anything still alive after
+# two minutes and note it in the captured output, so the case fails on its own
+# assertions with the reason visible rather than stalling the run.
+watchdog_wait() {
+  local pid="$1" i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    i=$((i + 1))
+    if [ "$i" -gt 1200 ]; then
+      kill -9 "$pid" 2>/dev/null
+      printf 'WATCHDOG: run exceeded 120s and was killed\n' >>"$OUT"
+      break
+    fi
+    sleep 0.1
+  done
+  wait "$pid" 2>/dev/null
+}
+
 # Run the entrypoint once. $1 = label, rest = VAR=VALUE.
 run_entrypoint() {
   local label="$1"; shift
@@ -203,7 +225,8 @@ run_entrypoint() {
     REAL_PYTHON3="$REAL_PYTHON3" REVIEWER_MAIN="$SCRIPT_DIR/reviewer/review_loop.py" \
     PERSONA_DIR="$SCRIPT_DIR/personas" \
     PROVIDER=ollama OLLAMA_API_KEY=k \
-    "$@" "$BASH_BIN" "$ENTRYPOINT" >"$OUT" 2>&1
+    "$@" "$BASH_BIN" "$ENTRYPOINT" >"$OUT" 2>&1 &
+  watchdog_wait $!
 }
 
 ok()  { PASS=$((PASS + 1)); printf 'ok   %s\n' "$1"; }
