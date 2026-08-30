@@ -19,7 +19,7 @@ import os
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -223,17 +223,12 @@ class Supervisor:
 
         self.sessions: Dict[Pair, str] = {}
         self.passes_done: Dict[Pair, int] = {}
-        # The pair the next cycle starts at. None means "start at the first".
+        # Pairs the last cycle owed but did not run: the personas a limit cut,
+        # plus everything in the groups it never reached. Normally empty.
         # Without it, a limit that allows only a few passes per backoff window
         # would review the leading pairs forever and the trailing ones never.
-        self.resume_at: Optional[Pair] = None
-
-    def build_pairs(self, candidates: Sequence[Tuple[int, str]]) -> List[Pair]:
-        out: List[Pair] = []
-        for pr, mode in candidates:
-            for persona in self.personas[mode]:
-                out.append(Pair(pr, mode, persona))
-        return out
+        # In memory alongside the session map; surviving a restart is deferred.
+        self.owed: set = set()
 
     def build_groups(self, candidates: Sequence[Tuple[int, str]]) -> List[Group]:
         return [
@@ -246,7 +241,7 @@ class Supervisor:
         ]
 
     def workers_for(self, group: Group, to_run: Sequence[Pair]) -> int:
-        """Effective concurrency for this group: the cap, or the group's size."""
+        """Effective concurrency for this group: the cap, or how many pairs run."""
         if self.max_concurrent > 0:
             return max(1, min(self.max_concurrent, len(to_run)))
         return max(1, len(to_run))
@@ -263,7 +258,22 @@ class Supervisor:
             return results
 
         with ThreadPoolExecutor(max_workers=self.workers_for(group, to_run)) as pool:
-            futures = {pool.submit(self._dispatch, pair): pair for pair in to_run}
+            futures: Dict[Future, Pair] = {}
+            for pair in to_run:
+                try:
+                    futures[pool.submit(self._dispatch, pair)] = pair
+                except RuntimeError as exc:
+                    # A container out of threads raises this on the submitting
+                    # thread, so neither _run_one's OSError guard nor
+                    # _dispatch's catch-all is anywhere near it. Letting it out
+                    # would discard the results the pool already holds, and
+                    # those passes have posted their comments. Stop submitting
+                    # instead: the caller sees a pair with no result and owes it
+                    # to the next cycle. The rest of to_run goes unsubmitted
+                    # because the next submit would hit the same wall.
+                    log(f"WARN: could not start a worker for {pair} ({exc}); "
+                        "leaving it and the rest of its group for the next cycle.")
+                    break
             for future, pair in futures.items():
                 results[pair] = future.result()
         return results
@@ -293,22 +303,6 @@ class Supervisor:
             log(f"WARN: pass raised {exc!r}", pair=pair)
             return passes.PassResult(rc=1, session_id=session_id, limited=False, limit_line="")
 
-    def start_index(self, pairs: Sequence[Pair]) -> int:
-        """Where this cycle begins.
-
-        A resume point that no longer exists (its PR closed, the persona set
-        changed) falls back to the head of the list rather than skipping a cycle.
-        """
-        if self.resume_at is None:
-            return 0
-        try:
-            index = pairs.index(self.resume_at)
-        except ValueError:
-            return 0
-        if index:
-            log(f"Starting this cycle at {pairs[index]}, where the last one was cut.")
-        return index
-
     def _run_one(self, pair: Pair, prompt: str, session_id: Optional[str]):
         try:
             return passes.run_pass(
@@ -330,95 +324,143 @@ class Supervisor:
             log(f"WARN: could not run claude: {exc}", pair=pair)
             return passes.PassResult(rc=1, session_id=session_id, limited=False, limit_line="")
 
-    def run_cycle(self, pairs: Sequence[Pair]) -> bool:
-        """Walk the pair list. Returns True when a usage limit cut it short."""
-        count = len(pairs)
-        if not count:
-            # An empty list keeps the resume point rather than clearing it:
+    def pairs_to_run(self, group: Group) -> List[Pair]:
+        """Which of this group's personas run this cycle.
+
+        A group that owes something runs ONLY what it owes: those personas were
+        cut, and the rest of the group ran successfully in the interrupted
+        cycle. A group that owes nothing runs in full. So an under-served group
+        is under-served for exactly one cycle.
+        """
+        owed_here = [p for p in group.pairs if p in self.owed]
+        return owed_here if owed_here else list(group.pairs)
+
+    def order_groups(self, groups: List[Group]) -> List[Group]:
+        """Owed groups first, in enumeration order; the rest after, in order.
+
+        The rest still run, which is what keeps a persistent limit from
+        starving the tail of the candidate list.
+        """
+        owed_groups = [g for g in groups if any(p in self.owed for p in g.pairs)]
+        rest = [g for g in groups if not any(p in self.owed for p in g.pairs)]
+        if owed_groups:
+            log("Resuming with " + " ".join(str(p) for g in owed_groups
+                                            for p in self.pairs_to_run(g)) + ".")
+        return owed_groups + rest
+
+    def run_cycle(self, groups: List[Group]) -> bool:
+        """Walk the groups. Returns True when a usage limit cut the cycle."""
+        if not groups:
+            # An empty list keeps what is owed rather than clearing it:
             # enumeration failures degrade to an empty candidate list, and that
-            # must not silently send the next cycle back to the head.
+            # must not silently cancel the debt.
             return False
 
-        start = self.start_index(pairs)
+        ordered = self.order_groups(groups)
         consecutive_failures = 0
-        cut_at: Optional[int] = None
-        cut_offset = -1
+        cut_index: Optional[int] = None
+        cut_owes: set = set()
         was_limited = False
 
-        for offset in range(count):
-            index = (start + offset) % count
-            pair = pairs[index]
-            session_id = self.sessions.get(pair)
+        for index, group in enumerate(ordered):
+            to_run = self.pairs_to_run(group)
+            results = self.run_group(group, to_run)
 
-            if session_id:
-                log(f"Reviewing PR #{pair.pr} [{pair.mode}/{pair.persona}] "
-                    f"(resuming session {session_id})...")
-                template = self.followup_prompts[pair.mode]
-            else:
-                log(f"Reviewing PR #{pair.pr} [{pair.mode}/{pair.persona}] (new session)...")
-                template = self.review_prompts[pair.mode]
+            any_success = False
+            group_failures = 0
+            limited_here = set()
+            # A pair the pool could not accept. It did not run, so it is neither
+            # a success nor a failure, and its session stands.
+            unstarted = [p for p in to_run if p not in results]
 
-            result = self._run_one(pair, prompts_mod.render(template, pair.pr), session_id)
-
-            if result.rc == 0:
-                consecutive_failures = 0
-                if result.session_id:
-                    self.sessions[pair] = result.session_id
-                self.passes_done[pair] = self.passes_done.get(pair, 0) + 1
-                log(f"PR #{pair.pr} [{pair.mode}/{pair.persona}] review complete "
-                    f"(session {self.sessions.get(pair)}, pass {self.passes_done[pair]}).")
-                if (
-                    self.max_passes_per_session > 0
-                    and self.passes_done[pair] >= self.max_passes_per_session
-                ):
-                    log(f"PR #{pair.pr} [{pair.mode}/{pair.persona}] reached "
-                        f"MAX_PASSES_PER_SESSION={self.max_passes_per_session}; "
-                        "rotating its session next cycle.")
-                    self.sessions.pop(pair, None)
-                    self.passes_done[pair] = 0
-                continue
-
-            if result.limited:
-                # Keep the session. Abandon the rest of the cycle rather than
-                # walking the remaining pairs into the same wall.
-                if result.session_id:
-                    self.sessions[pair] = result.session_id
-                    log(f"WARN: PR #{pair.pr} [{pair.mode}/{pair.persona}] hit a usage or "
-                        "rate limit; keeping its session and ending this cycle early.")
+            for pair in to_run:
+                result = results.get(pair)
+                if result is None:
+                    continue
+                if result.rc == 0:
+                    any_success = True
+                    self._record_success(pair, result)
+                elif result.limited:
+                    limited_here.add(pair)
+                    self._record_limit(pair, result)
                 else:
-                    log(f"WARN: PR #{pair.pr} [{pair.mode}/{pair.persona}] hit a usage or "
-                        "rate limit before it had a session; ending this cycle early.")
-                if result.limit_line:
-                    log(f"  limit reported by claude: {result.limit_line}")
-                was_limited = True
-                cut_at, cut_offset = index, offset
+                    group_failures += 1
+                    self._record_failure(pair)
+
+            # Evaluated at the barrier rather than per pass. A success anywhere
+            # in the group resets it: the provider is alive.
+            if any_success:
+                consecutive_failures = 0
+            else:
+                consecutive_failures += group_failures
+
+            if limited_here or unstarted:
+                was_limited = bool(limited_here)
+                cut_index, cut_owes = index, limited_here | set(unstarted)
                 break
 
-            log(f"WARN: PR #{pair.pr} [{pair.mode}/{pair.persona}] review failed; "
-                "starting a fresh session for it next cycle.")
-            self.sessions.pop(pair, None)
-            self.passes_done[pair] = 0
-            consecutive_failures += 1
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                # Not a limit, so no backoff: the next cycle comes at the
-                # ordinary interval, and starts where this one stopped.
                 log(f"WARN: {consecutive_failures} passes in a row failed for reasons "
                     "other than a limit; the provider looks unhealthy. Abandoning this cycle.")
-                cut_at, cut_offset = index, offset
+                cut_index, cut_owes = index, set()
                 break
 
-        if cut_at is not None:
-            self.resume_at = pairs[(cut_at + 1) % count]
-            skipped = [pairs[(start + o) % count] for o in range(cut_offset + 1, count)]
-            if skipped:
-                log("Not reviewed this cycle: " + ", ".join(str(p) for p in skipped)
-                    + f". The next cycle starts at {self.resume_at}.")
-            else:
-                log(f"The next cycle starts at {self.resume_at}.")
-        else:
-            self.resume_at = None
+        # Both exits rebuild `owed` from this cycle's own groups, which is what
+        # keeps a debt whose PR closed out of it: a dead pair matches no live
+        # group while the cycle runs, and does not survive the end of it.
+        if cut_index is None:
+            self.owed = set()
+            return was_limited
 
+        # Owe the cut group's limited personas, plus whatever each unreached
+        # group would have run.
+        new_owed = set(cut_owes)
+        skipped: List[Pair] = []
+        for group in ordered[cut_index + 1:]:
+            for pair in self.pairs_to_run(group):
+                new_owed.add(pair)
+                skipped.append(pair)
+        self.owed = new_owed
+
+        if skipped:
+            log("Not reviewed this cycle: " + " ".join(str(p) for p in skipped) + ".")
+        if new_owed:
+            log("Owed next cycle: " + " ".join(str(p) for p in sorted(new_owed)) + ".")
         return was_limited
+
+    def _record_success(self, pair: Pair, result) -> None:
+        if result.session_id:
+            self.sessions[pair] = result.session_id
+        self.passes_done[pair] = self.passes_done.get(pair, 0) + 1
+        log(f"review complete (session {self.sessions.get(pair)}, "
+            f"pass {self.passes_done[pair]}).", pair=pair)
+        if (
+            self.max_passes_per_session > 0
+            and self.passes_done[pair] >= self.max_passes_per_session
+        ):
+            log(f"reached MAX_PASSES_PER_SESSION={self.max_passes_per_session}; "
+                "rotating its session next cycle.", pair=pair)
+            self.sessions.pop(pair, None)
+            self.passes_done[pair] = 0
+
+    def _record_limit(self, pair: Pair, result) -> None:
+        # The session is kept. Dropping it would make the next attempt re-read
+        # the whole PR and re-post findings already posted, spending more of the
+        # resource that just ran out.
+        if result.session_id:
+            self.sessions[pair] = result.session_id
+            log("WARN: hit a usage or rate limit; keeping its session and "
+                "ending this cycle after the group finishes.", pair=pair)
+        else:
+            log("WARN: hit a usage or rate limit before it had a session; "
+                "ending this cycle after the group finishes.", pair=pair)
+        if result.limit_line:
+            log(f"  limit reported by claude: {result.limit_line}", pair=pair)
+
+    def _record_failure(self, pair: Pair) -> None:
+        log("WARN: review failed; starting a fresh session for it next cycle.", pair=pair)
+        self.sessions.pop(pair, None)
+        self.passes_done[pair] = 0
 
 
 def preflight(env: Mapping[str, str]) -> Tuple[str, Dict[str, List[personas_mod.Persona]]]:
@@ -523,7 +565,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             log(f"Candidate PRs ({selector}): "
                 + " ".join(f"{pr}:{mode}" for pr, mode in candidates))
 
-        limited = supervisor.run_cycle(supervisor.build_pairs(candidates))
+        limited = supervisor.run_cycle(supervisor.build_groups(candidates))
 
         cycles += 1
         if max_cycles is not None and cycles >= max_cycles:

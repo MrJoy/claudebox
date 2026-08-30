@@ -58,63 +58,61 @@ def supervisor(results, **kwargs):
     return FakeSupervisor(results, **defaults)
 
 
-class BuildPairsTest(unittest.TestCase):
-    def test_one_pair_per_pr_per_persona_of_that_prs_mode(self):
-        s = supervisor([])
-        got = s.build_pairs([(12, "code"), (13, "plan")])
-        self.assertEqual(
-            got,
-            [
-                Pair(12, "code", "red_team"),
-                Pair(12, "code", "sage"),
-                Pair(13, "plan", "red_team"),
-            ],
-        )
+def grouped(*pairs):
+    """One group per PR over exactly these pairs.
 
-    def test_no_candidates_yields_no_pairs(self):
-        self.assertEqual(supervisor([]).build_pairs([]), [])
+    run_cycle takes groups now, and a case that wants to pin the pair list
+    rather than the supervisor's persona set builds them here.
+    """
+    out = []
+    for pair in pairs:
+        if out and out[-1].pr == pair.pr and out[-1].mode == pair.mode:
+            out[-1] = review_loop.Group(pair.pr, pair.mode, out[-1].pairs + (pair,))
+        else:
+            out.append(review_loop.Group(pair.pr, pair.mode, (pair,)))
+    return out
 
 
 class SessionTest(unittest.TestCase):
     def test_first_pass_starts_a_new_session_and_records_it(self):
         s = supervisor([ok("S9")])
-        s.run_cycle([Pair(12, "code", "red_team")])
+        s.run_cycle(grouped(Pair(12, "code", "red_team")))
         self.assertEqual(s.sessions[Pair(12, "code", "red_team")], "S9")
         self.assertEqual(s.passes_done[Pair(12, "code", "red_team")], 1)
 
     def test_second_pass_resumes(self):
         s = supervisor([ok("S9"), ok("S9")])
         pair = Pair(12, "code", "red_team")
-        s.run_cycle([pair])
-        s.run_cycle([pair])
+        s.run_cycle(grouped(pair))
+        s.run_cycle(grouped(pair))
         self.assertEqual(s.passes_done[pair], 2)
 
     def test_the_same_pr_in_two_modes_holds_two_sessions(self):
         s = supervisor([ok("Sc"), ok("Sp")])
-        s.run_cycle([Pair(12, "code", "red_team"), Pair(12, "plan", "red_team")])
+        s.run_cycle(grouped(Pair(12, "code", "red_team"), Pair(12, "plan", "red_team")))
         self.assertEqual(s.sessions[Pair(12, "code", "red_team")], "Sc")
         self.assertEqual(s.sessions[Pair(12, "plan", "red_team")], "Sp")
 
     def test_a_non_limit_failure_drops_the_session(self):
         pair = Pair(12, "code", "red_team")
         s = supervisor([ok("S9"), failed()])
-        s.run_cycle([pair])
-        s.run_cycle([pair])
+        s.run_cycle(grouped(pair))
+        s.run_cycle(grouped(pair))
         self.assertNotIn(pair, s.sessions)
         self.assertEqual(s.passes_done.get(pair, 0), 0)
 
     def test_a_limit_keeps_the_session(self):
         pair = Pair(12, "code", "red_team")
         s = supervisor([limited("S9")])
-        s.run_cycle([pair])
+        s.run_cycle(grouped(pair))
         self.assertEqual(s.sessions[pair], "S9")
 
     def test_max_passes_rotates_the_session(self):
         pair = Pair(12, "code", "red_team")
         s = supervisor([ok("S9"), ok("S9")], max_passes_per_session=2)
-        s.run_cycle([pair])
+        s.run_cycle(grouped(pair))
         self.assertIn(pair, s.sessions)
-        s.run_cycle([pair])
+        s.run_cycle(grouped(pair))
         self.assertNotIn(pair, s.sessions)
         self.assertEqual(s.passes_done[pair], 0)
 
@@ -122,74 +120,166 @@ class SessionTest(unittest.TestCase):
         pair = Pair(12, "code", "red_team")
         s = supervisor([ok("S9")] * 5, max_passes_per_session=0)
         for _ in range(5):
-            s.run_cycle([pair])
+            s.run_cycle(grouped(pair))
         self.assertIn(pair, s.sessions)
 
 
-class CutAndResumeTest(unittest.TestCase):
-    PAIRS = [
-        Pair(12, "code", "red_team"),
-        Pair(12, "code", "sage"),
-        Pair(13, "code", "red_team"),
-        Pair(13, "code", "sage"),
-    ]
+class OwedTest(unittest.TestCase):
+    """Groups are 12 and 13, two personas each.
 
-    def test_a_limit_ends_the_cycle_and_sets_the_resume_point(self):
-        s = supervisor([ok(), limited()])
-        was_limited = s.run_cycle(self.PAIRS)
-        self.assertTrue(was_limited)
-        self.assertEqual(len(s.attempted), 2)
-        self.assertEqual(s.resume_at, self.PAIRS[2])
+    A cycle cut by a limit owes: the limited personas of the cut group, plus
+    everything in the groups that never started. The successful personas of the
+    cut group are NOT owed -- they ran, and recently.
+    """
+
+    CANDIDATES = [(12, "code"), (13, "code")]
+    RT12 = Pair(12, "code", "red_team")
+    SG12 = Pair(12, "code", "sage")
+    RT13 = Pair(13, "code", "red_team")
+    SG13 = Pair(13, "code", "sage")
+
+    def cycle(self, s, results_by_pair):
+        class Scripted(FakeSupervisor):
+            def _run_one(inner, pair, prompt, session_id):
+                inner.attempted.append(pair)
+                return results_by_pair.get(pair, ok("S1"))
+
+        s.__class__ = Scripted
+        with contextlib.redirect_stdout(io.StringIO()):
+            return s.run_cycle(s.build_groups(self.CANDIDATES))
+
+    def test_a_clean_cycle_owes_nothing(self):
+        s = supervisor([], max_concurrent=0)
+        self.assertFalse(self.cycle(s, {}))
+        self.assertEqual(s.owed, set())
+
+    def test_a_limit_owes_the_limited_persona_and_the_untouched_group(self):
+        s = supervisor([], max_concurrent=0)
+        limited_result = self.cycle(s, {self.SG12: limited("S9")})
+        self.assertTrue(limited_result)
+        self.assertEqual(s.owed, {self.SG12, self.RT13, self.SG13})
+
+    def test_the_successful_sibling_of_a_limited_persona_is_not_owed(self):
+        s = supervisor([], max_concurrent=0)
+        self.cycle(s, {self.SG12: limited("S9")})
+        self.assertNotIn(self.RT12, s.owed)
+
+    def test_the_whole_group_finishes_before_the_cycle_stops(self):
+        s = supervisor([], max_concurrent=0)
+        self.cycle(s, {self.RT12: limited("S9")})
+        self.assertIn(self.SG12, s.attempted)
+
+    def test_a_limited_pair_keeps_its_session(self):
+        s = supervisor([], max_concurrent=0)
+        self.cycle(s, {self.SG12: limited("S9")})
+        self.assertEqual(s.sessions[self.SG12], "S9")
+
+    def test_the_next_cycle_runs_only_what_is_owed_in_the_cut_group(self):
+        s = supervisor([], max_concurrent=0)
+        self.cycle(s, {self.SG12: limited("S9")})
+        s.attempted.clear()
+        self.cycle(s, {})
+        self.assertEqual(
+            set(p for p in s.attempted if p.pr == 12), {self.SG12}
+        )
+
+    def test_the_untouched_group_runs_in_full_on_the_next_cycle(self):
+        s = supervisor([], max_concurrent=0)
+        self.cycle(s, {self.SG12: limited("S9")})
+        s.attempted.clear()
+        self.cycle(s, {})
+        self.assertEqual(
+            set(p for p in s.attempted if p.pr == 13), {self.RT13, self.SG13}
+        )
+
+    def test_owed_groups_run_first(self):
+        s = supervisor([], max_concurrent=0)
+        # Cut in group 13, so 13 is owed and 12 is not.
+        self.cycle(s, {self.SG13: limited("S9")})
+        s.attempted.clear()
+        self.cycle(s, {})
+        self.assertEqual(s.attempted[0].pr, 13)
+
+    def test_a_group_that_completed_before_the_cut_still_runs_after_the_owed_ones(self):
+        # This is what preserves the wrap-around, and it is what keeps a
+        # persistent limit from starving the tail of the list forever.
+        s = supervisor([], max_concurrent=0)
+        self.cycle(s, {self.SG13: limited("S9")})
+        s.attempted.clear()
+        self.cycle(s, {})
+        self.assertEqual(set(p.pr for p in s.attempted), {12, 13})
+
+    def test_two_clean_cycles_after_a_cut_return_to_full_service(self):
+        s = supervisor([], max_concurrent=0)
+        self.cycle(s, {self.SG12: limited("S9")})
+        self.cycle(s, {})
+        s.attempted.clear()
+        self.cycle(s, {})
+        self.assertEqual(len(s.attempted), 4)
 
     def test_the_skipped_pairs_are_named_in_the_log(self):
         # An operator has to be able to read a stall, not infer one from
         # comments that never arrive.
-        s = supervisor([ok(), limited()])
+        s = supervisor([], max_concurrent=0)
+
+        class Scripted(FakeSupervisor):
+            def _run_one(inner, pair, prompt, session_id):
+                inner.attempted.append(pair)
+                return limited("S9") if pair == OwedTest.SG12 else ok("S1")
+
+        s.__class__ = Scripted
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            s.run_cycle(self.PAIRS)
+            s.run_cycle(s.build_groups(self.CANDIDATES))
         line = [l for l in buf.getvalue().splitlines() if "Not reviewed" in l]
         self.assertEqual(len(line), 1)
-        for pair in self.PAIRS[2:]:
+        for pair in (self.RT13, self.SG13):
             self.assertIn(str(pair), line[0])
+        self.assertNotIn(str(self.RT12), line[0])
 
-    def test_the_next_cycle_starts_where_the_last_one_stopped(self):
-        s = supervisor([ok(), limited(), ok(), ok(), ok(), ok()])
-        s.run_cycle(self.PAIRS)
+    def test_the_resume_log_names_what_the_next_cycle_owes(self):
+        s = supervisor([], max_concurrent=0)
+        self.cycle(s, {self.SG12: limited("S9")})
+
+        class Scripted(FakeSupervisor):
+            def _run_one(inner, pair, prompt, session_id):
+                inner.attempted.append(pair)
+                return ok("S1")
+
+        s.__class__ = Scripted
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            s.run_cycle(s.build_groups(self.CANDIDATES))
+        line = [l for l in buf.getvalue().splitlines() if "Resuming with" in l]
+        self.assertEqual(len(line), 1)
+        self.assertIn(str(self.SG12), line[0])
+        self.assertNotIn(str(self.RT12), line[0])
+
+    def test_a_closed_pr_drops_out_of_owed(self):
+        s = supervisor([], max_concurrent=0)
+        self.cycle(s, {self.SG13: limited("S9")})
+
+        class Scripted(FakeSupervisor):
+            def _run_one(inner, pair, prompt, session_id):
+                inner.attempted.append(pair)
+                return ok("S1")
+
+        s.__class__ = Scripted
         s.attempted.clear()
-        s.run_cycle(self.PAIRS)
-        self.assertEqual(s.attempted[0], self.PAIRS[2])
+        with contextlib.redirect_stdout(io.StringIO()):
+            s.run_cycle(s.build_groups([(12, "code")]))
+        self.assertEqual(s.owed, set())
+        self.assertEqual(set(p.pr for p in s.attempted), {12})
 
-    def test_the_resumed_cycle_wraps_around(self):
-        s = supervisor([ok(), limited()] + [ok()] * 4)
-        s.run_cycle(self.PAIRS)
-        s.attempted.clear()
-        s.run_cycle(self.PAIRS)
-        self.assertEqual(
-            s.attempted, [self.PAIRS[2], self.PAIRS[3], self.PAIRS[0], self.PAIRS[1]]
-        )
-
-    def test_a_complete_cycle_clears_the_resume_point(self):
-        s = supervisor([ok()] * 4)
-        s.run_cycle(self.PAIRS)
-        self.assertIsNone(s.resume_at)
-
-    def test_a_stale_resume_point_falls_back_to_the_head(self):
-        s = supervisor([ok(), limited()] + [ok()] * 2)
-        s.run_cycle(self.PAIRS)
-        s.attempted.clear()
-        shorter = self.PAIRS[:2]
-        s.run_cycle(shorter)
-        self.assertEqual(s.attempted[0], shorter[0])
-
-    def test_an_empty_candidate_list_keeps_the_resume_point(self):
-        # Enumeration failures are swallowed, so "no candidate PRs" can mean gh
-        # had a bad minute. That must not silently send the next cycle back to
-        # the head.
-        s = supervisor([ok(), limited()])
-        s.run_cycle(self.PAIRS)
+    def test_an_empty_candidate_list_keeps_owed(self):
+        # Enumeration failures degrade to an empty candidate list, so "no
+        # candidate PRs" can mean gh had a bad minute. That must not silently
+        # clear the debt.
+        s = supervisor([], max_concurrent=0)
+        self.cycle(s, {self.SG12: limited("S9")})
+        before = set(s.owed)
         s.run_cycle([])
-        self.assertEqual(s.resume_at, self.PAIRS[2])
+        self.assertEqual(s.owed, before)
 
 
 class ConsecutiveFailureTest(unittest.TestCase):
@@ -197,21 +287,52 @@ class ConsecutiveFailureTest(unittest.TestCase):
 
     def test_three_non_limit_failures_abandon_the_cycle(self):
         s = supervisor([failed(), failed(), failed()])
-        was_limited = s.run_cycle(self.PAIRS)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            was_limited = s.run_cycle(grouped(*self.PAIRS))
         self.assertFalse(was_limited)
         self.assertEqual(len(s.attempted), 3)
-        self.assertEqual(s.resume_at, self.PAIRS[3])
+        # The pairs that failed are not owed: they ran. The ones the cycle never
+        # reached are.
+        self.assertEqual(s.owed, {self.PAIRS[3], self.PAIRS[4]})
 
     def test_a_success_resets_the_counter(self):
         s = supervisor([failed(), failed(), ok(), failed(), failed()])
-        s.run_cycle(self.PAIRS)
+        with contextlib.redirect_stdout(io.StringIO()):
+            s.run_cycle(grouped(*self.PAIRS))
         self.assertEqual(len(s.attempted), 5)
 
     def test_limits_do_not_feed_the_non_limit_counter(self):
         s = supervisor([failed(), failed(), limited()])
-        s.run_cycle(self.PAIRS)
+        with contextlib.redirect_stdout(io.StringIO()):
+            s.run_cycle(grouped(*self.PAIRS))
         self.assertEqual(len(s.attempted), 3)
-        self.assertEqual(s.resume_at, self.PAIRS[3])
+        self.assertEqual(s.owed, {self.PAIRS[2], self.PAIRS[3], self.PAIRS[4]})
+
+    def test_the_count_is_taken_at_the_barrier_so_a_group_finishes(self):
+        # Four personas on one PR, every one of them failing. Counting per pass
+        # would abandon after the third and leave the fourth unrun; the group is
+        # the unit, so all four run and the cycle stops at the barrier.
+        personas = ["red_team", "sage", "sme", "adversarial"]
+        s = supervisor(
+            [failed()] * 4,
+            personas={"code": personas},
+            persona_prompts={("code", p): p for p in personas},
+        )
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            s.run_cycle(s.build_groups([(12, "code")]))
+        self.assertEqual(len(s.attempted), 4)
+        self.assertIn("4 passes in a row failed", buf.getvalue())
+
+    def test_a_success_anywhere_in_the_group_resets_the_count(self):
+        # A group that reviewed something proves the provider is alive, whatever
+        # its siblings did, so two groups of a failure-plus-a-success never
+        # reach the three-strikes rule.
+        s = supervisor([failed(), ok(), failed(), ok(), failed(), ok()])
+        with contextlib.redirect_stdout(io.StringIO()):
+            s.run_cycle(s.build_groups([(12, "code"), (13, "code"), (14, "code")]))
+        self.assertEqual(len(s.attempted), 6)
 
 
 class PromptChoiceTest(unittest.TestCase):
@@ -225,7 +346,7 @@ class PromptChoiceTest(unittest.TestCase):
 
         s = supervisor([])
         s.__class__ = Recorder
-        s.run_cycle([Pair(12, "code", "red_team")])
+        s.run_cycle(grouped(Pair(12, "code", "red_team")))
         self.assertEqual(seen[0], ("review #12", None))
 
     def test_resumed_session_gets_the_followup_prompt(self):
@@ -239,8 +360,8 @@ class PromptChoiceTest(unittest.TestCase):
         s = supervisor([])
         s.__class__ = Recorder
         pair = Pair(12, "code", "red_team")
-        s.run_cycle([pair])
-        s.run_cycle([pair])
+        s.run_cycle(grouped(pair))
+        s.run_cycle(grouped(pair))
         self.assertEqual(seen[1], ("recheck #12", "S1"))
 
     def test_plan_mode_uses_the_plan_prompts(self):
@@ -253,7 +374,7 @@ class PromptChoiceTest(unittest.TestCase):
 
         s = supervisor([])
         s.__class__ = Recorder
-        s.run_cycle([Pair(13, "plan", "red_team")])
+        s.run_cycle(grouped(Pair(13, "plan", "red_team")))
         self.assertEqual(seen[0], "plan #13")
 
 
@@ -485,7 +606,7 @@ class SpawnFailureTest(unittest.TestCase):
         s = self._raising_supervisor(OSError(11, "Resource temporarily unavailable"))
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            limited_flag = s.run_cycle([Pair(12, "code", "red_team")])
+            limited_flag = s.run_cycle(grouped(Pair(12, "code", "red_team")))
         self.assertFalse(limited_flag)
         self.assertIn("could not run claude", buf.getvalue())
         self.assertIn("starting a fresh session for it next cycle", buf.getvalue())
@@ -495,7 +616,7 @@ class SpawnFailureTest(unittest.TestCase):
         pairs = [Pair(n, "code", "red_team") for n in (12, 13)]
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            s.run_cycle(pairs)
+            s.run_cycle(grouped(*pairs))
         # Both pairs were attempted rather than the first one killing the cycle,
         # and neither kept a session.
         self.assertEqual(s.sessions, {})
@@ -525,9 +646,9 @@ class SpawnFailureTest(unittest.TestCase):
         pairs = [Pair(n, "code", "red_team") for n in (12, 13, 14, 15)]
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            s.run_cycle(pairs)
+            s.run_cycle(grouped(*pairs))
         self.assertIn("3 passes in a row failed", buf.getvalue())
-        self.assertEqual(s.resume_at, Pair(15, "code", "red_team"))
+        self.assertEqual(s.owed, {Pair(15, "code", "red_team")})
 
 
 class GroupTest(unittest.TestCase):
@@ -667,6 +788,116 @@ class ConcurrencyTest(unittest.TestCase):
             s.run_group(group, list(group.pairs))
         self.assertEqual(seen[Pair(12, "code", "sage")], ("recheck #12", "S9"))
         self.assertEqual(seen[Pair(12, "code", "red_team")], ("review #12", None))
+
+
+class SubmitFailureTest(unittest.TestCase):
+    """A container out of threads cannot accept the next pass.
+
+    ThreadPoolExecutor.submit raises RuntimeError, which is not an OSError and
+    is raised on the submitting thread, so neither _run_one's guard nor
+    _dispatch's catch-all is anywhere near it. Letting it out would discard the
+    results the pool already holds -- passes that have posted their comments and
+    hold resumable sessions.
+    """
+
+    def _cap_submissions(self, allowed):
+        """Patch the pool so only `allowed` submissions per group succeed.
+
+        Returns the real class, so a case that needs a second, healthy cycle can
+        put it back.
+        """
+        real = review_loop.ThreadPoolExecutor
+
+        class Exhausted(real):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._accepted = 0
+
+            def submit(self, *args, **kwargs):
+                if self._accepted >= allowed:
+                    raise RuntimeError("can't start new thread")
+                self._accepted += 1
+                return super().submit(*args, **kwargs)
+
+        review_loop.ThreadPoolExecutor = Exhausted
+        self.addCleanup(setattr, review_loop, "ThreadPoolExecutor", real)
+        return real
+
+    def test_the_pairs_the_pool_refused_have_no_result(self):
+        self._cap_submissions(1)
+        s = supervisor([ok("S1")], max_concurrent=1)
+        group = s.build_groups([(12, "code")])[0]
+        with contextlib.redirect_stdout(io.StringIO()):
+            results = s.run_group(group, list(group.pairs))
+        self.assertEqual(list(results), [Pair(12, "code", "red_team")])
+
+    def test_the_results_already_collected_survive(self):
+        self._cap_submissions(1)
+        s = supervisor([ok("S9")], max_concurrent=1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            s.run_cycle(s.build_groups([(12, "code")]))
+        self.assertEqual(s.sessions[Pair(12, "code", "red_team")], "S9")
+        self.assertEqual(s.passes_done[Pair(12, "code", "red_team")], 1)
+
+    def test_a_refused_pair_is_owed_rather_than_failed(self):
+        self._cap_submissions(1)
+        s = supervisor([ok("S9")], max_concurrent=1)
+        s.sessions[Pair(12, "code", "sage")] = "S8"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            s.run_cycle(s.build_groups([(12, "code")]))
+        self.assertIn(Pair(12, "code", "sage"), s.owed)
+        # It did not run, so it is not a failed pass: its session stands.
+        self.assertEqual(s.sessions[Pair(12, "code", "sage")], "S8")
+        self.assertNotIn("review failed", buf.getvalue())
+        self.assertIn("could not start a worker", buf.getvalue())
+
+    def test_the_cycle_stops_and_owes_the_groups_it_never_reached(self):
+        self._cap_submissions(1)
+        s = supervisor([ok("S9")], max_concurrent=1)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            was_limited = s.run_cycle(s.build_groups([(12, "code"), (13, "code")]))
+        # Not a limit, so the next cycle comes at the ordinary interval.
+        self.assertFalse(was_limited)
+        self.assertEqual(set(p.pr for p in s.attempted), {12})
+        self.assertEqual(
+            s.owed,
+            {Pair(12, "code", "sage"),
+             Pair(13, "code", "red_team"), Pair(13, "code", "sage")},
+        )
+
+    def test_one_refusal_stops_the_group_being_submitted(self):
+        # The next submit would hit the same wall, so it is not attempted: one
+        # WARN names the pair the pool refused, and the rest of the group is
+        # owed without a line each.
+        self._cap_submissions(1)
+        personas = ["red_team", "sage", "sme"]
+        s = supervisor(
+            [ok("S9")], max_concurrent=1,
+            personas={"code": personas},
+            persona_prompts={("code", p): p for p in personas},
+        )
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            s.run_cycle(s.build_groups([(12, "code")]))
+        refusals = [l for l in buf.getvalue().splitlines() if "could not start a worker" in l]
+        self.assertEqual(len(refusals), 1)
+        self.assertIn(str(Pair(12, "code", "sage")), refusals[0])
+        self.assertEqual(
+            s.owed, {Pair(12, "code", "sage"), Pair(12, "code", "sme")}
+        )
+
+    def test_the_next_cycle_runs_what_the_pool_refused(self):
+        real = self._cap_submissions(1)
+        s = supervisor([ok("S9")], max_concurrent=1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            s.run_cycle(s.build_groups([(12, "code")]))
+        review_loop.ThreadPoolExecutor = real
+        s.attempted.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            s.run_cycle(s.build_groups([(12, "code")]))
+        self.assertEqual(s.attempted, [Pair(12, "code", "sage")])
 
 
 class ParseMaxConcurrentTest(unittest.TestCase):

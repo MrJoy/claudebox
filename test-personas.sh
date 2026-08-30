@@ -12,6 +12,12 @@
 #     prompt being re-passed on a resumed pass) lives exactly there. Cases that
 #     want a single cycle say MAX_CYCLES=1 for themselves.
 #
+#   The baseline also pins MAX_CONCURRENT_PASSES=1. A PR's personas run
+#   concurrently by default, so which invocation is the second one is a race,
+#   and every ARGV:N and STUB_FAIL_ON here is an ordinal. A cap of one is a
+#   one-worker pool on the same code path as any other cap, so pinning it buys
+#   determinism without testing a path that does not exist in production.
+#
 #   ./test-personas.sh            # run everything
 #   ./test-personas.sh resume     # only cases whose label matches 'resume'
 #
@@ -230,7 +236,7 @@ run_entrypoint() {
     ALLOW_UNHARDENED=1 \
     GITHUB_TOKEN=x GITHUB_REPOSITORY=owner/repo PR_IDS=1 \
     REPO_PATH="$HOME_DIR/seed" REVIEW_INTERVAL_SECONDS=1 LIMIT_BACKOFF_SECONDS=1 \
-    MAX_CYCLES=2 \
+    MAX_CYCLES=2 MAX_CONCURRENT_PASSES=1 \
     REAL_PYTHON3="$REAL_PYTHON3" REVIEWER_MAIN="$SCRIPT_DIR/reviewer/review_loop.py" \
     PERSONA_DIR="$SCRIPT_DIR/personas" \
     PROVIDER=ollama OLLAMA_API_KEY=k \
@@ -481,7 +487,7 @@ cycle "resume: MAX_PASSES_PER_SESSION rotates per (PR, persona) pair" \
   -- CALLS:4 \
      NOARGV:3:"--resume" \
      NOARGV:4:"--resume" \
-     LOG:"PR #1 [code/red_team] reached MAX_PASSES_PER_SESSION=1"
+     LOG:"[#1 code/red_team] reached MAX_PASSES_PER_SESSION=1"
 
 cycle "model: every tier still points at the one review model" \
   PERSONAS=red_team \
@@ -507,10 +513,21 @@ cycle "limits: an ordinary failure still drops the session" \
      LOG:"starting a fresh session for it next cycle" \
      NOLOG:"Backing off"
 
-cycle "limits: the rest of the cycle is abandoned, not pushed through" \
+# A limit cannot recall the siblings already in flight, and killing them would
+# leave a pass that posted some of its findings and not the rest. So the group
+# finishes and the cycle stops at the barrier.
+cycle "limits: the limited persona's siblings still finish their pass" \
   PERSONAS=red_team,sage,sme STUB_FAIL_ON=2 STUB_FAIL_MODE=limit MAX_CYCLES=1 \
-  -- CALLS:2 \
-     LOG:"ending this cycle early"
+  -- CALLS:3 \
+     LOG:"ending this cycle after the group finishes"
+
+# What the cut does abandon is every group after it: walking the remaining PRs
+# into the same wall spends more of the resource that just ran out.
+cycle "limits: the PRs after the cut are not reviewed" \
+  PR_IDS=1,2 PERSONAS=red_team STUB_FAIL_ON=1 STUB_FAIL_MODE=limit MAX_CYCLES=1 \
+  -- CALLS:1 \
+     LOG:"Not reviewed this cycle: #2 code/red_team" \
+     NOLOG:"Reviewing PR #2"
 
 cycle "limits: a real captured limit message is classified as a limit" \
   PERSONAS=red_team STUB_FAIL_ON=1 STUB_FAIL_MODE=captured \
@@ -553,15 +570,15 @@ cycle "limits: a limit before any session does not claim to keep one" \
 # A cycle that always restarted at the first pair would, under a limit that only
 # allows a few passes per backoff window, review the leading pairs forever and
 # the trailing ones never.
-cycle "resume: the next cycle starts at the pair after the one a limit cut" \
+cycle "resume: the next cycle re-runs only the persona the limit cut" \
   PERSONAS=red_team,sage,sme STUB_FAIL_ON=2 STUB_FAIL_MODE=limit \
-  -- CALLS:5 \
-     LOG:"Not reviewed this cycle: #1 code/sme" \
-     LOG:"Starting this cycle at #1 code/sme, where the last one was cut." \
+  -- CALLS:4 \
+     LOG:"Resuming with #1 code/sage." \
+     NOLOG:"Not reviewed this cycle" \
      ARGV:3:"You are a Subject Matter Expert" \
      NOARGV:3:"--resume" \
-     ARGV:4:"--resume S1" \
-     ARGV:5:"--resume S2"
+     ARGV:4:"You are a Sage" \
+     ARGV:4:"--resume S2"
 
 # --- mode routing ------------------------------------------------------------
 # Mode is decided once per PR, inside enumerate_candidate_prs, from its labels.
@@ -674,21 +691,40 @@ cycle "modes: a PR that gains the label starts a fresh session, not a resumed on
 # Three in a row that are not limits means the provider is unhealthy, not that
 # these particular pairs are cursed. Walking the rest of the list into it costs
 # one duplicate-comment burst per pair, since each failure drops its session.
+# The count is taken at each barrier rather than per pass, so this is three
+# whole groups that reviewed nothing.
 cycle "failures: a run of non-limit failures abandons the cycle at the ordinary interval" \
-  PR_IDS=1,2 PERSONAS=red_team,sage,sme STUB_FAIL_ON=2,3,4 STUB_FAIL_MODE=other MAX_CYCLES=1 \
-  -- CALLS:4 \
+  PR_IDS=1,2,3,4 PERSONAS=red_team STUB_FAIL_ON=1,2,3 STUB_FAIL_MODE=other MAX_CYCLES=1 \
+  -- CALLS:3 \
      LOG:"3 passes in a row failed for reasons other than a limit" \
-     LOG:"Not reviewed this cycle: #2 code/sage, #2 code/sme" \
-     LOG:"The next cycle starts at #2 code/sage" \
+     LOG:"Not reviewed this cycle: #4 code/red_team" \
+     NOLOG:"Reviewing PR #4" \
      NOLOG:"Backing off"
 
-# ... and the counter is consecutive, not cumulative: two failures, a success,
-# another failure is an ordinary bad day, not a dead endpoint.
+# ... and the counter is consecutive, not cumulative: two failures, a group that
+# reviewed something, another failure is an ordinary bad day, not a dead
+# endpoint.
 cycle "failures: a success resets the run, so scattered failures do not abandon" \
-  PERSONAS=red_team,sage,sme,adversarial STUB_FAIL_ON=1,2,4 STUB_FAIL_MODE=other MAX_CYCLES=1 \
+  PR_IDS=1,2,3,4 PERSONAS=red_team STUB_FAIL_ON=1,2,4 STUB_FAIL_MODE=other MAX_CYCLES=1 \
   -- CALLS:4 \
      NOLOG:"Abandoning this cycle" \
      NOLOG:"Not reviewed this cycle"
+
+# Every failure in a group counts, not one per group: a PR whose whole persona
+# set failed is three strikes on its own, and the next PR is not walked into the
+# same wall.
+cycle "failures: a whole group failing is counted pass by pass" \
+  PR_IDS=1,2 PERSONAS=red_team,sage,sme STUB_FAIL_ON=1,2,3 STUB_FAIL_MODE=other MAX_CYCLES=1 \
+  -- CALLS:3 \
+     LOG:"3 passes in a row failed for reasons other than a limit" \
+     NOLOG:"Reviewing PR #2"
+
+# A group that reviewed something proves the provider is alive whatever its
+# siblings did, so the failures inside it do not feed the count.
+cycle "failures: one success in a group forgives its failing siblings" \
+  PR_IDS=1,2 PERSONAS=red_team,sage,sme STUB_FAIL_ON=1,2,4,5 STUB_FAIL_MODE=other MAX_CYCLES=1 \
+  -- CALLS:6 \
+     NOLOG:"Abandoning this cycle"
 
 # --- per-mode prompts --------------------------------------------------------
 # The test stanza asks the reviewer to mentally revert production lines a test
