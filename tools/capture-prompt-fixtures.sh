@@ -30,7 +30,13 @@ esac
 exit 0
 STUB
 printf '#!/bin/sh\nexit 0\n' >"$BIN/git"
-printf '#!/bin/sh\nexec "$@"\n' >"$BIN/stdbuf"
+# GNU coreutils stdbuf is absent on macOS. The stream must reach tee, where
+# the session id comes from; drop the flags and exec the rest.
+cat >"$BIN/stdbuf" <<'STUB'
+#!/bin/sh
+while [ $# -gt 0 ]; do case "$1" in -*) shift ;; *) break ;; esac; done
+exec "$@"
+STUB
 # Succeeds once so a second cycle runs, which is the only way to see a
 # resumed pass's prompt. Fails after, ending the loop under set -e.
 cat >"$BIN/sleep" <<'STUB'
@@ -116,3 +122,87 @@ env -i PATH="$BIN:$PATH" HOME="$HOME_DIR" \
   "$BASH_BIN" "$SCRIPT_DIR/entrypoint.sh" >/dev/null 2>&1 || true
 cp "$HOME_DIR/prompt.1" "$OUT_DIR/prompt-code-review-linear.txt"
 echo "wrote prompt-code-review-linear.txt"
+
+# Verification checks to ensure fixtures differ and are correct
+echo ""
+echo "=== Verification ==="
+PASS=0
+FAIL=0
+
+# Check 1: code-review and code-followup differ
+if cmp -s "$OUT_DIR/prompt-code-review.txt" "$OUT_DIR/prompt-code-followup.txt"; then
+  echo "FAIL: code-review and code-followup are identical"
+  FAIL=$((FAIL+1))
+else
+  echo "PASS: code-review and code-followup differ"
+  PASS=$((PASS+1))
+fi
+
+# Check 2: plan-review and plan-followup differ
+if cmp -s "$OUT_DIR/prompt-plan-review.txt" "$OUT_DIR/prompt-plan-followup.txt"; then
+  echo "FAIL: plan-review and plan-followup are identical"
+  FAIL=$((FAIL+1))
+else
+  echo "PASS: plan-review and plan-followup differ"
+  PASS=$((PASS+1))
+fi
+
+# Check 3: code-followup contains followup-specific language
+if grep -q "only post findings you haven't already raised" "$OUT_DIR/prompt-code-followup.txt"; then
+  echo "PASS: code-followup contains followup instruction"
+  PASS=$((PASS+1))
+else
+  echo "FAIL: code-followup missing followup instruction"
+  FAIL=$((FAIL+1))
+fi
+
+# Check 4: plan-followup contains followup-specific language
+if grep -q "A point you raised that the revision addresses is settled" "$OUT_DIR/prompt-plan-followup.txt"; then
+  echo "PASS: plan-followup contains followup instruction"
+  PASS=$((PASS+1))
+else
+  echo "FAIL: plan-followup missing followup instruction"
+  FAIL=$((FAIL+1))
+fi
+
+# Check 5: all fixtures contain #1
+for file in "$OUT_DIR/prompt-"*.txt; do
+  if ! grep -q '#1' "$file"; then
+    echo "FAIL: $file missing #1 token"
+    FAIL=$((FAIL+1))
+  else
+    echo "PASS: $(basename "$file") contains #1"
+    PASS=$((PASS+1))
+  fi
+done
+
+# Check 6: code fixtures contain test stanza
+if grep -q "mentally revert" "$OUT_DIR/prompt-code-review.txt"; then
+  echo "PASS: code-review contains test stanza"
+  PASS=$((PASS+1))
+else
+  echo "FAIL: code-review missing test stanza"
+  FAIL=$((FAIL+1))
+fi
+
+# Check 7: plan fixtures do not contain test stanza
+if grep -q "mentally revert" "$OUT_DIR/prompt-plan-review.txt"; then
+  echo "FAIL: plan-review contains test stanza (should not)"
+  FAIL=$((FAIL+1))
+else
+  echo "PASS: plan-review does not contain test stanza"
+  PASS=$((PASS+1))
+fi
+
+# Check 8: linear fixture is superset of code-review
+if grep -q "references a Linear ticket" "$OUT_DIR/prompt-code-review-linear.txt"; then
+  echo "PASS: code-review-linear contains Linear stanza"
+  PASS=$((PASS+1))
+else
+  echo "FAIL: code-review-linear missing Linear stanza"
+  FAIL=$((FAIL+1))
+fi
+
+echo ""
+echo "Verification: $PASS passed, $FAIL failed"
+[ $FAIL -eq 0 ] || exit 1
