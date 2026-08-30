@@ -21,7 +21,7 @@ import sys
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import gh
 import passes
@@ -228,7 +228,12 @@ class Supervisor:
         # Without it, a limit that allows only a few passes per backoff window
         # would review the leading pairs forever and the trailing ones never.
         # In memory alongside the session map; surviving a restart is deferred.
-        self.owed: set = set()
+        self.owed: Set[Pair] = set()
+        # The group a cut stopped in, so the next cycle can start at the one
+        # after it. Serving the debt first instead would let a PR whose persona
+        # reports a limit on every attempt re-cut the cycle at the head of the
+        # list forever, and nothing else would ever be reviewed again.
+        self.cut_group: Optional[Tuple[int, str]] = None
 
     def build_groups(self, candidates: Sequence[Tuple[int, str]]) -> List[Group]:
         return [
@@ -327,26 +332,38 @@ class Supervisor:
     def pairs_to_run(self, group: Group) -> List[Pair]:
         """Which of this group's personas run this cycle.
 
-        A group that owes something runs ONLY what it owes: those personas were
-        cut, and the rest of the group ran successfully in the interrupted
-        cycle. A group that owes nothing runs in full. So an under-served group
-        is under-served for exactly one cycle.
+        A group that owes something runs ONLY what it owes: those personas did
+        not run last cycle, and the rest of the group did. A group that owes
+        nothing runs in full. The narrowing lasts until the group is served
+        without being cut again, which is one cycle in the ordinary case and
+        longer while a pair keeps reporting a limit -- the siblings a narrowed
+        group leaves out are owed by the cut that stopped it, so they come back
+        on the visit after.
         """
         owed_here = [p for p in group.pairs if p in self.owed]
         return owed_here if owed_here else list(group.pairs)
 
     def order_groups(self, groups: List[Group]) -> List[Group]:
-        """Owed groups first, in enumeration order; the rest after, in order.
+        """This cycle's groups, rotated to start after the last cut.
 
-        The rest still run, which is what keeps a persistent limit from
-        starving the tail of the candidate list.
+        Phase A resumed at the pair after the one a limit cut and wrapped
+        around; this is that rotation, at group granularity. Serving the debt
+        first instead reads as the obvious thing and is a trap: a pair that
+        reports a limit on every attempt would re-cut the cycle at the head of
+        the list every time, and no other PR would ever be reviewed again. The
+        cut group goes last, keeps its debt, and is served when the rotation
+        reaches it.
         """
-        owed_groups = [g for g in groups if any(p in self.owed for p in g.pairs)]
-        rest = [g for g in groups if not any(p in self.owed for p in g.pairs)]
-        if owed_groups:
-            log("Resuming with " + " ".join(str(p) for g in owed_groups
-                                            for p in self.pairs_to_run(g)) + ".")
-        return owed_groups + rest
+        if self.cut_group is None:
+            return list(groups)
+        keys = [(g.pr, g.mode) for g in groups]
+        try:
+            start = keys.index(self.cut_group) + 1
+        except ValueError:
+            # The group the cut stopped in is gone -- closed, or relabelled into
+            # the other mode. Start at the head rather than skipping a cycle.
+            return list(groups)
+        return list(groups[start:]) + list(groups[:start])
 
     def run_cycle(self, groups: List[Group]) -> bool:
         """Walk the groups. Returns True when a usage limit cut the cycle."""
@@ -357,9 +374,13 @@ class Supervisor:
             return False
 
         ordered = self.order_groups(groups)
+        owed_now = [p for g in ordered for p in self.pairs_to_run(g) if p in self.owed]
+        if owed_now:
+            log("Resuming with " + " ".join(str(p) for p in owed_now) + ".")
+
         consecutive_failures = 0
         cut_index: Optional[int] = None
-        cut_owes: set = set()
+        cut_owes: Set[Pair] = set()
         was_limited = False
 
         for index, group in enumerate(ordered):
@@ -394,15 +415,23 @@ class Supervisor:
             else:
                 consecutive_failures += group_failures
 
+            # Everything in the group that did not run: the pairs the pool
+            # refused, and the siblings a narrowed group left out. A pair that
+            # ran and failed is not here -- it had its turn, and its session was
+            # dropped, so the next cycle to reach the group starts it fresh.
+            did_not_run = {p for p in group.pairs if p not in results}
+
             if limited_here or unstarted:
                 was_limited = bool(limited_here)
-                cut_index, cut_owes = index, limited_here | set(unstarted)
+                if unstarted and not limited_here:
+                    log("WARN: the worker pool refused a pass; abandoning this cycle.")
+                cut_index, cut_owes = index, limited_here | did_not_run
                 break
 
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                 log(f"WARN: {consecutive_failures} passes in a row failed for reasons "
                     "other than a limit; the provider looks unhealthy. Abandoning this cycle.")
-                cut_index, cut_owes = index, set()
+                cut_index, cut_owes = index, did_not_run
                 break
 
         # Both exits rebuild `owed` from this cycle's own groups, which is what
@@ -410,17 +439,20 @@ class Supervisor:
         # group while the cycle runs, and does not survive the end of it.
         if cut_index is None:
             self.owed = set()
+            self.cut_group = None
             return was_limited
 
-        # Owe the cut group's limited personas, plus whatever each unreached
-        # group would have run.
+        # The cut group's own debt, plus every pair of every group the cycle
+        # never reached. Their whole persona set is owed, narrowed or not: none
+        # of them ran.
         new_owed = set(cut_owes)
         skipped: List[Pair] = []
         for group in ordered[cut_index + 1:]:
-            for pair in self.pairs_to_run(group):
+            for pair in group.pairs:
                 new_owed.add(pair)
                 skipped.append(pair)
         self.owed = new_owed
+        self.cut_group = (ordered[cut_index].pr, ordered[cut_index].mode)
 
         if skipped:
             log("Not reviewed this cycle: " + " ".join(str(p) for p in skipped) + ".")

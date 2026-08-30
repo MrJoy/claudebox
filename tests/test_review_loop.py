@@ -192,15 +192,24 @@ class OwedTest(unittest.TestCase):
             set(p for p in s.attempted if p.pr == 13), {self.RT13, self.SG13}
         )
 
-    def test_owed_groups_run_first(self):
+    def test_the_next_cycle_starts_after_the_group_the_cut_stopped_in(self):
+        # Phase A's wrap-around, at group granularity. Starting at the debt
+        # instead is what StarvationTest below rules out.
         s = supervisor([], max_concurrent=0)
-        # Cut in group 13, so 13 is owed and 12 is not.
         self.cycle(s, {self.SG13: limited("S9")})
         s.attempted.clear()
         self.cycle(s, {})
-        self.assertEqual(s.attempted[0].pr, 13)
+        self.assertEqual(s.attempted[0].pr, 12)
 
-    def test_a_group_that_completed_before_the_cut_still_runs_after_the_owed_ones(self):
+    def test_the_cut_group_goes_last_and_still_gets_its_debt_served(self):
+        s = supervisor([], max_concurrent=0)
+        self.cycle(s, {self.SG12: limited("S9")})
+        s.attempted.clear()
+        self.cycle(s, {})
+        self.assertEqual(s.attempted[0].pr, 13)
+        self.assertEqual(s.attempted[-1], self.SG12)
+
+    def test_a_group_that_completed_before_the_cut_still_runs_on_the_next_cycle(self):
         # This is what preserves the wrap-around, and it is what keeps a
         # persistent limit from starving the tail of the list forever.
         s = supervisor([], max_concurrent=0)
@@ -208,6 +217,21 @@ class OwedTest(unittest.TestCase):
         s.attempted.clear()
         self.cycle(s, {})
         self.assertEqual(set(p.pr for p in s.attempted), {12, 13})
+
+    def test_a_cut_group_that_disappears_leaves_the_order_alone(self):
+        s = supervisor([], max_concurrent=0)
+        self.cycle(s, {self.SG13: limited("S9")})
+
+        class Scripted(FakeSupervisor):
+            def _run_one(inner, pair, prompt, session_id):
+                inner.attempted.append(pair)
+                return ok("S1")
+
+        s.__class__ = Scripted
+        s.attempted.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            s.run_cycle(s.build_groups([(12, "code")]))
+        self.assertEqual(set(p.pr for p in s.attempted), {12})
 
     def test_two_clean_cycles_after_a_cut_return_to_full_service(self):
         s = supervisor([], max_concurrent=0)
@@ -271,6 +295,33 @@ class OwedTest(unittest.TestCase):
         self.assertEqual(s.owed, set())
         self.assertEqual(set(p.pr for p in s.attempted), {12})
 
+    def test_an_unreached_group_owes_its_whole_persona_set(self):
+        # Group 12 carries a one-persona debt from cycle 1 and is then not
+        # reached at all by cycle 2's cut. None of it ran, so all of it is owed:
+        # the narrowing was justified by a cut two cycles back, and red_team's
+        # last pass is that old.
+        candidates = [(12, "code"), (13, "code"), (14, "code")]
+
+        def scripted(limited_pairs):
+            class Scripted(FakeSupervisor):
+                def _run_one(inner, pair, prompt, session_id):
+                    inner.attempted.append(pair)
+                    return limited("S9") if pair in limited_pairs else ok("S1")
+            return Scripted
+
+        s = supervisor([], max_concurrent=0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            s.__class__ = scripted({self.SG12})
+            s.run_cycle(s.build_groups(candidates))
+            s.__class__ = scripted({Pair(13, "code", "sage")})
+            s.run_cycle(s.build_groups(candidates))
+            s.__class__ = scripted(set())
+            s.attempted.clear()
+            s.run_cycle(s.build_groups(candidates))
+        self.assertEqual(
+            [p for p in s.attempted if p.pr == 12], [self.RT12, self.SG12]
+        )
+
     def test_an_empty_candidate_list_keeps_owed(self):
         # Enumeration failures degrade to an empty candidate list, so "no
         # candidate PRs" can mean gh had a bad minute. That must not silently
@@ -280,6 +331,90 @@ class OwedTest(unittest.TestCase):
         before = set(s.owed)
         s.run_cycle([])
         self.assertEqual(s.owed, before)
+
+
+class StarvationTest(unittest.TestCase):
+    """One pair reports a limit on every attempt, forever.
+
+    It is reachable without account-level exhaustion: the limit classifier
+    matches 429, 529, quota and overloaded, so one PR with a diff big enough to
+    trip a per-request ceiling does it. Serving the debt first would re-cut the
+    cycle at the head of the list every time and no other PR would ever be
+    reviewed again -- silently, one `Resuming with` line per cycle and no error.
+    Phase A served every pair under exactly this condition, so the rotation is
+    not an improvement, it is the property being kept.
+    """
+
+    CANDIDATES = [(12, "code"), (13, "code")]
+    RT12 = Pair(12, "code", "red_team")
+    SG12 = Pair(12, "code", "sage")
+
+    def cycles(self, s, limited_pairs, count=6):
+        class Scripted(FakeSupervisor):
+            def _run_one(inner, pair, prompt, session_id):
+                inner.attempted.append(pair)
+                return limited("S9") if pair in limited_pairs else ok("S1")
+
+        s.__class__ = Scripted
+        seen = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            for _ in range(count):
+                s.attempted.clear()
+                s.run_cycle(s.build_groups(self.CANDIDATES))
+                seen.append(list(s.attempted))
+        return seen
+
+    def test_the_other_pr_is_reviewed_on_every_cycle(self):
+        s = supervisor([], max_concurrent=0)
+        seen = self.cycles(s, {self.SG12})
+        for index, attempted in enumerate(seen[1:], start=2):
+            self.assertEqual(
+                set(p.pr for p in attempted if p.pr == 13), {13},
+                f"PR 13 was not reviewed on cycle {index}: {attempted}",
+            )
+
+    def test_the_pr_13_group_runs_in_full_once_its_debt_clears(self):
+        s = supervisor([], max_concurrent=0)
+        seen = self.cycles(s, {self.SG12})
+        self.assertEqual(
+            [p for p in seen[2] if p.pr == 13],
+            [Pair(13, "code", "red_team"), Pair(13, "code", "sage")],
+        )
+
+    def test_the_limited_pairs_sibling_is_not_starved_either(self):
+        # A narrowed group leaves its siblings unrun, and a cut owes what did
+        # not run, so red_team comes back on the visit after.
+        s = supervisor([], max_concurrent=0)
+        seen = self.cycles(s, {self.SG12})
+        served = [i for i, attempted in enumerate(seen) if self.RT12 in attempted]
+        self.assertGreaterEqual(len(served), 3, f"red_team ran on cycles {served}")
+
+    def test_the_limited_pair_is_retried_every_cycle(self):
+        s = supervisor([], max_concurrent=0)
+        seen = self.cycles(s, {self.SG12})
+        for index, attempted in enumerate(seen, start=1):
+            self.assertIn(self.SG12, attempted, f"cycle {index}: {attempted}")
+
+    def test_an_exhausted_provider_still_makes_no_progress(self):
+        # The other direction. When every pair is limited there is nothing to
+        # rotate towards, and the loop must not manufacture progress: each cycle
+        # runs one group, reports the limit, and backs off.
+        every = {Pair(pr, "code", persona)
+                 for pr in (12, 13) for persona in ("red_team", "sage")}
+        s = supervisor([], max_concurrent=0)
+        seen = self.cycles(s, every)
+        self.assertTrue(all(len(attempted) == 2 for attempted in seen), seen)
+        self.assertEqual(s.owed, every)
+
+    def test_it_recovers_on_the_first_cycle_that_succeeds(self):
+        every = {Pair(pr, "code", persona)
+                 for pr in (12, 13) for persona in ("red_team", "sage")}
+        s = supervisor([], max_concurrent=0)
+        self.cycles(s, every)
+        recovered = self.cycles(s, set(), count=1)
+        self.assertEqual(len(recovered[0]), 4)
+        self.assertEqual(s.owed, set())
+        self.assertIsNone(s.cut_group)
 
 
 class ConsecutiveFailureTest(unittest.TestCase):
@@ -851,6 +986,10 @@ class SubmitFailureTest(unittest.TestCase):
         self.assertEqual(s.sessions[Pair(12, "code", "sage")], "S8")
         self.assertNotIn("review failed", buf.getvalue())
         self.assertIn("could not start a worker", buf.getvalue())
+        # An operator grepping for the cut finds it: the limit path says
+        # "ending this cycle", three strikes says "Abandoning this cycle", and
+        # this one used to say neither.
+        self.assertIn("abandoning this cycle", buf.getvalue())
 
     def test_the_cycle_stops_and_owes_the_groups_it_never_reached(self):
         self._cap_submissions(1)
