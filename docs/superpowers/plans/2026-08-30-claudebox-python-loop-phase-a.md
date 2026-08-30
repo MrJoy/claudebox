@@ -306,8 +306,8 @@ capture() {
   echo "wrote $new_out and $resumed_out"
 }
 
-# The gh stub returns an empty label list, so PLAN_LABEL='' makes `any(.labels[]?;
-# .name == "")` false and the PR is code mode; there is no label to match on.
+# The gh stub above returns an empty label list, so no PR matches PLAN_LABEL and
+# both cycles run in code mode.
 capture plan prompt-code-review.txt prompt-code-followup.txt
 
 # Force plan mode by relabeling: a gh stub that returns the plan label.
@@ -324,6 +324,9 @@ chmod +x "$BIN/gh"
 capture plan prompt-plan-review.txt prompt-plan-followup.txt
 
 # Back to code mode, with Linear configured, to capture the linear stanza tail.
+# Only the NEW-session prompt is wanted here, so this does not reuse `capture`
+# (which insists on writing both files and would need a throwaway path for the
+# second).
 cat >"$BIN/gh" <<'STUB'
 #!/bin/sh
 case "$1 $2" in
@@ -334,7 +337,19 @@ esac
 exit 0
 STUB
 chmod +x "$BIN/gh"
-capture plan prompt-code-review-linear.txt /dev/null LINEAR_API_KEY=lin_test
+HOME_DIR="$WORK/home"
+rm -rf "$HOME_DIR"; mkdir -p "$HOME_DIR/work/repo/.git" "$HOME_DIR/seed"
+env -i PATH="$BIN:$PATH" HOME="$HOME_DIR" \
+  ALLOW_UNHARDENED=1 \
+  GITHUB_TOKEN=x GITHUB_REPOSITORY=owner/repo PR_IDS=1 \
+  REPO_PATH="$HOME_DIR/seed" REVIEW_INTERVAL_SECONDS=1 \
+  PERSONA_DIR="$SCRIPT_DIR/personas" \
+  PERSONAS=red_team PLAN_PERSONAS=red_team PLAN_LABEL=plan \
+  PROVIDER=ollama OLLAMA_API_KEY=k \
+  LINEAR_API_KEY=lin_test \
+  "$BASH_BIN" "$SCRIPT_DIR/entrypoint.sh" >/dev/null 2>&1 || true
+cp "$HOME_DIR/prompt.1" "$OUT_DIR/prompt-code-review-linear.txt"
+echo "wrote prompt-code-review-linear.txt"
 ```
 
 - [ ] **Step 2: Run it and confirm the fixtures are non-trivial**
@@ -2345,6 +2360,33 @@ class PromptChoiceTest(unittest.TestCase):
         self.assertEqual(seen[0], "plan #13")
 
 
+class PromptTokenWarningTest(unittest.TestCase):
+    """Ports entrypoint.sh:567-572. An override that drops {{PR}} makes every
+    review ask about an unnamed PR, which reads in the log as the reviewer
+    ignoring instructions rather than as a config mistake."""
+
+    def test_warns_for_a_prompt_with_no_token(self):
+        got = review_loop.prompt_token_warnings(
+            review={"code": "review it", "plan": "plan #{{PR}}"},
+            followup={"code": "recheck #{{PR}}", "plan": "replan #{{PR}}"},
+        )
+        self.assertEqual(len(got), 1)
+        self.assertIn("code review prompt", got[0])
+
+    def test_warns_separately_for_review_and_followup(self):
+        got = review_loop.prompt_token_warnings(
+            review={"code": "a", "plan": "b"}, followup={"code": "c", "plan": "d"}
+        )
+        self.assertEqual(len(got), 4)
+
+    def test_silent_when_every_prompt_names_the_pr(self):
+        got = review_loop.prompt_token_warnings(
+            review={"code": "#{{PR}}", "plan": "#{{PR}}"},
+            followup={"code": "#{{PR}}", "plan": "#{{PR}}"},
+        )
+        self.assertEqual(got, [])
+
+
 class MaxCyclesTest(unittest.TestCase):
     def test_unset_means_forever(self):
         self.assertIsNone(review_loop.parse_max_cycles({}))
@@ -2426,6 +2468,24 @@ def parse_max_cycles(env: Mapping[str, str]) -> Optional[int]:
     if not raw.isdigit():
         raise ConfigError("MAX_CYCLES must be a non-negative integer")
     return int(raw) or None
+
+
+def prompt_token_warnings(review: Mapping[str, str], followup: Mapping[str, str]) -> List[str]:
+    """One warning per prompt that will not name the PR it is reviewing.
+
+    Reachable only through an operator override, and worth a line because the
+    resulting reviews look like a model ignoring instructions rather than like
+    a configuration mistake.
+    """
+    out = []
+    for label, table in (("review", review), ("followup", followup)):
+        for mode in sorted(table):
+            if "{{PR}}" not in table[mode]:
+                out.append(
+                    f"WARN: the {mode} {label} prompt has no {{{{PR}}}} token; "
+                    "reviews won't name the specific PR."
+                )
+    return out
 
 
 def _positive_int(env: Mapping[str, str], name: str, default: int) -> int:
@@ -2650,6 +2710,8 @@ def main() -> int:
             log(f"{mode} personas: " + " ".join(p.id for p in resolved[mode]))
 
         built = prompts_mod.build(env)
+        for warning in prompt_token_warnings(built.review, built.followup):
+            log(warning)
         max_cycles = parse_max_cycles(env)
         interval = _positive_int(env, "REVIEW_INTERVAL_SECONDS", 300)
         backoff = _positive_int(env, "LIMIT_BACKOFF_SECONDS", 1800)
@@ -2741,24 +2803,36 @@ git commit -m "feat(reviewer): port the review loop supervisor"
 
 - [ ] **Step 1: Delete the ported blocks from `entrypoint.sh`**
 
-Remove these, and only these:
+Line numbers below were verified against the file at commit `df8f489`. Work **bottom-up** so earlier deletions do not shift later ranges.
 
 | Lines | What |
 |---|---|
-| 127-133 | `pr_truthy` |
-| 135-151 | `parse_pr_ids` |
-| 154-172 | `resolve_pr_selection` |
-| 174-227 | `PLAN_LABEL`, `pr_modes`, `enumerate_candidate_prs` |
-| 229-232 | `render_prompt` |
-| 234-460 | the whole persona registry (`PERSONA_DIR` through `resolve_personas`) |
-| 393-399 | `linear_stanza` |
-| 484-556 | the prompt defaults, stanzas, `MODE_*` tables, suffix composition |
+| 1126-end | `# --- Review loop` header, the session maps, `is_usage_limit`, `usage_limit_line`, `run_pass`, `format_stream`, `cd "$WORK_REPO"`, and the whole `while true` loop |
 | 823-834 | `check_litellm` |
-| 1140-1399 | the session maps, `is_usage_limit`, `usage_limit_line`, `run_pass`, `format_stream`, and the whole `while true` loop |
+| 483-573 | the prompt block: its long comment, the four stanzas, the four defaults, the Linear composition, the `MODE_*` tables, the four suffix blocks, and the startup calls to `resolve_pr_selection` / `resolve_personas` / the `{{PR}}`-token warning loop |
+| 395-400 | `linear_stanza` and its two-line comment |
+| 235-384 | the whole persona registry section, from `# --- Persona registry` through the end of `resolve_personas` |
+| 174-233 | `# --- Review mode` header, `PLAN_LABEL`, `pr_modes`, `enumerate_candidate_prs`, `render_prompt` |
+| 123-172 | `# --- PR selection` header, `pr_truthy`, `parse_pr_ids`, `resolve_pr_selection` |
 
-Keep `PERSONA_DIR`'s default assignment out of the shell entirely; Python reads the env var and defaults it.
+**Do not delete**, and check each by name after the deletions:
 
-**Do not delete** `strip_surrounding_quotes`, `check_url`, `linear_stanza`'s sibling `write_mcp_config`, `write_litellm_config`, `start_litellm`, or anything in the provider `case`.
+- `write_mcp_config` (408-443) — the earlier draft of this table had a range that swallowed it. It generates `$HOME/mcp.json` and `test-providers.sh` asserts the result.
+- 445-482: the `WORK_DIR`/`WORK_REPO` resolution and the `REVIEW_INTERVAL_SECONDS` / `LIMIT_BACKOFF_SECONDS` / `MAX_PASSES_PER_SESSION` defaults and validators.
+- `strip_surrounding_quotes`, `check_url`, `write_litellm_config`, `start_litellm`, everything in the provider `case`, the MCP block at 1077-1089, and the clone prep at 1090-1125.
+
+`PERSONA_DIR`'s default assignment goes with the persona registry; Python reads the env var and defaults it.
+
+Verify with:
+
+```bash
+for f in write_mcp_config write_litellm_config start_litellm strip_surrounding_quotes check_url; do
+  printf '%s: %s\n' "$f" "$(grep -c "^$f()" entrypoint.sh)"
+done
+grep -c 'WORK_REPO=' entrypoint.sh
+```
+
+Expected: each function count is 1, and `WORK_REPO=` still appears.
 
 - [ ] **Step 2: Add the handoff and the exec**
 
@@ -2780,6 +2854,12 @@ export REVIEW_MODEL
 export MCP_CONFIG_FILE
 export LITELLM_PID="${LITELLM_PID:-}"
 export SHIM_PID="${SHIM_PID:-}"
+# Exported even though Python defaults them identically, so the value this
+# script validated and logged is the value the supervisor uses. Two defaults in
+# two languages is how the two drift.
+export REVIEW_INTERVAL_SECONDS
+export LIMIT_BACKOFF_SECONDS
+export MAX_PASSES_PER_SESSION
 
 log "Reviewer ready. repo=$GITHUB_REPOSITORY provider=$PROVIDER_LABEL model=$REVIEW_MODEL interval=${REVIEW_INTERVAL_SECONDS}s"
 exec python3 /opt/claudebox/reviewer/review_loop.py
