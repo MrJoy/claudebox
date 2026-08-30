@@ -262,7 +262,7 @@ bash -n entrypoint.sh && bash -n claudebox.sh   # syntax only
 python3 -m py_compile reviewer/*.py             # the same, for the Python
 ```
 
-`test-python.sh` covers the review loop itself, which is Python: prompt assembly against captured fixtures, persona resolution, PR selection and label routing, usage-limit classification, the stream formatter, and the cycle bookkeeping — the resume point after a cut cycle, the consecutive-failure count, session rotation. It runs in under a second and needs nothing installed. The bash suites below cover the wiring the loop gets handed. This one covers what it decides once it has it.
+`test-python.sh` covers the review loop itself, which is Python: prompt assembly against captured fixtures, persona resolution, PR selection and label routing, usage-limit classification, the stream formatter, and the cycle bookkeeping — the resume point after a cut cycle, the consecutive-failure count, session rotation. It runs in under a second and needs nothing installed. What the bash suites below check is the environment the loop gets handed, down to which credential var ends up set. Everything the loop then decides with it is checked here.
 
 It stubs `gh`/`git`/`claude`, plus `curl`, `sleep`, and a `python3` that dispatches on the script path (the Workers AI normalizer is faked, the review supervisor is the real one), and checks either the startup error the entrypoint refused with or the exact environment it built. That's a narrow claim on purpose: it proves the wiring matches intent, not that a provider accepts it. Before trusting a newly configured provider unattended, do one live `./claudebox.sh test --repo …` and watch it actually get a response.
 
