@@ -157,7 +157,11 @@ New variables, both read by the supervisor and both added to
   `--check` so a typo fails at boot.
 * `REVIEW_ON_CHANGE`, default on. Setting it to `0` restores
   fixed-interval behavior, which is the escape hatch for an operator who
-  suspects the gate is wrong.
+  suspects the gate is wrong. An operator who reaches for it should also
+  raise `REVIEW_INTERVAL_SECONDS` back toward 300, since the lower
+  default was chosen on the assumption that most cycles review nothing.
+  Stage two is skipped entirely when it is off, so the extra requests go
+  away with the gate.
 
 ## Failure behavior
 
