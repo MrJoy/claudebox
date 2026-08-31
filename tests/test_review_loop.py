@@ -1626,13 +1626,14 @@ class GitDirLockTest(unittest.TestCase):
         review_loop.unlock_git_dir(self.repo)
         self.assertEqual(stat.S_IMODE(os.stat(git_dir).st_mode), 0o775)
 
-    def test_a_missing_git_dir_is_reported_rather_than_ignored(self):
+    def test_a_missing_git_dir_refuses_rather_than_warning(self):
+        # Nothing but the concurrent path calls this, and by the time it runs
+        # every persona has already been told the working copy is protected.
         empty = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, empty, ignore_errors=True)
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        with self.assertRaises(ConfigError) as caught:
             review_loop.lock_git_dir(empty)
-        self.assertIn("WARN", out.getvalue())
+        self.assertIn("no .git at", str(caught.exception))
 
 
 @unittest.skipUnless(shutil.which("git"), "git not available")
@@ -1703,6 +1704,17 @@ class GitDirLockWiringTest(unittest.TestCase):
         # plan mode locks it even on a cycle whose candidates are all code.
         self._main(PERSONAS="red_team", PLAN_PERSONAS="red_team")
         self.assertTrue(self._can_write())
+
+    def test_a_clone_that_cannot_be_locked_kills_the_run(self):
+        # The same ERROR-on-stderr, exit 1 every other startup failure gives,
+        # rather than six personas against a tree with no enforcement.
+        shutil.rmtree(os.path.join(self.repo, ".git"))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit) as caught:
+                self._main()
+        self.assertEqual(caught.exception.code, 1)
+        self.assertIn("no .git at", err.getvalue())
 
     def test_a_concurrent_plan_mode_alone_locks_it(self):
         # The lock is a property of the clone, not of a mode, and a plan PR can

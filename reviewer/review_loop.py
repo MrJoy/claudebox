@@ -134,8 +134,10 @@ def lock_git_dir(work_repo: str) -> None:
     half of a pull; config.lock covers config and remote; gc.pid.lock covers gc;
     packed-refs.lock covers pack-refs. Under .git/refs: branch, tag, update-ref,
     notes add, checkout -b and worktree add all fail on <ref>.lock, and a fetch
-    fails on the remote-tracking ref it would move. Reading creates nothing, so
-    log, show, diff, status, blame, cat-file and for-each-ref keep working.
+    fails on the remote-tracking ref it would move -- including under
+    --no-write-fetch-head, which skips the .git half of the lock and still
+    cannot move a ref. Reading creates nothing, so log, show, diff, status,
+    blame, cat-file and for-each-ref keep working.
 
     The refs subtree is here because the ref namespace is reachable from a
     review and reads out of one. `git update-ref refs/remotes/origin/main HEAD`
@@ -156,16 +158,25 @@ def lock_git_dir(work_repo: str) -> None:
     file does not hit a confusing error. A scratch file cannot corrupt another
     persona's review, because reviews read the diff through `gh pr diff`.
 
+    Raises ConfigError when there is no .git to lock, which main turns into the
+    same ERROR-on-stderr and exit 1 every other startup failure produces.
+
     Measured against git 2.54 on 2026-08-30, as an unprivileged user.
     """
     paths = _locked_dirs(work_repo)
     if not paths:
-        # Never reached through entrypoint.sh, which makes the clone before it
-        # execs us. Logged rather than returned silently because a no-op here
-        # is an enforcement boundary that is not there, and the whole point of
-        # this function is that it cannot fail quietly.
-        log(f"WARN: no .git at {_git_dir(work_repo)}; the working clone is NOT locked.")
-        return
+        # Refused rather than warned past. Reaching here means concurrency is
+        # on, since that is the only thing that calls this, and prompts.build
+        # has already put WORKTREE_STANZA in front of every persona telling it
+        # the working copy is shared and protected. Six personas against an
+        # unenforced tree after saying that is the failure the stanza exists to
+        # prevent. Unreachable through entrypoint.sh, which makes the clone
+        # before it execs us, so a container that gets here is broken in a way
+        # that should be loud.
+        raise ConfigError(
+            f"no .git at {_git_dir(work_repo)}; refusing to run personas "
+            "concurrently against an unenforced working copy"
+        )
     for path in paths:
         mode = os.stat(path).st_mode
         _ORIGINAL_MODES.setdefault(path, mode)
@@ -690,17 +701,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_passes = _positive_int(env, "MAX_PASSES_PER_SESSION", 0)
         review_model = _required(env, "REVIEW_MODEL")
         work_repo = _required(env, "WORK_REPO")
+
+        # The enforcement half of the shared-worktree constraint the stanza
+        # states. Tied to the same set, so a run whose personas do not overlap
+        # gets neither the instruction nor the read-only clone. Inside the try
+        # because a clone it cannot lock is a startup failure like any other.
+        enforce_lock = bool(worktree_modes)
+        if enforce_lock:
+            lock_git_dir(work_repo)
+            log("The working clone's .git is read-only between cycles "
+                "(shared-worktree enforcement).")
     except ConfigError as exc:
         die(str(exc))
-
-    # The enforcement half of the shared-worktree constraint the stanza states.
-    # Tied to the same set, so a run whose personas do not overlap gets neither
-    # the instruction nor the read-only clone.
-    enforce_lock = bool(worktree_modes)
-    if enforce_lock:
-        lock_git_dir(work_repo)
-        log("The working clone's .git is read-only between cycles "
-            "(shared-worktree enforcement).")
 
     mcp_args = ["--strict-mcp-config"]
     mcp_config = env.get("MCP_CONFIG_FILE", "")

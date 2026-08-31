@@ -52,8 +52,9 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   exit 0
 fi
 # `gh repo clone REPO DEST` is the seed-less fallback; like git clone above it
-# must leave a directory behind for the loop to cd into.
-if [ "$1" = "repo" ] && [ "$2" = "clone" ]; then mkdir -p "$4"; fi
+# must leave a working clone behind, .git included -- the supervisor refuses to
+# start when it cannot lock one.
+if [ "$1" = "repo" ] && [ "$2" = "clone" ]; then mkdir -p "$4/.git"; fi
 exit 0
 STUB
 # git succeeds at everything except the one probe whose ANSWER the entrypoint
@@ -66,9 +67,10 @@ cat >"$BIN/git" <<'STUB'
 if [ "$1" = "-C" ] && [ "$3" = "rev-parse" ]; then
   [ -d "$2" ] || exit 1
 fi
-# A real clone creates its destination, and the loop cd's into it, so make the
-# directory even though nothing is put in it.
-if [ "$1" = "clone" ]; then for a in "$@"; do dest="$a"; done; mkdir -p "$dest"; fi
+# A real clone creates its destination and puts a .git in it, and the loop cd's
+# into it. The .git is not decoration: the supervisor locks it before the first
+# pass and refuses to run concurrent personas against a clone it cannot lock.
+if [ "$1" = "clone" ]; then for a in "$@"; do dest="$a"; done; mkdir -p "$dest/.git"; fi
 exit 0
 STUB
 # One cycle per case, asked for directly: MAX_CYCLES=1 in the baseline below
