@@ -559,6 +559,14 @@ wires "single-quoted values are unwrapped too" \
 wires "an interior quote is left alone" \
   PROVIDER=custom ANTHROPIC_BASE_URL=https://example.test/ REVIEW_MODEL=m ANTHROPIC_AUTH_TOKEN='ab"cd' \
   -- 'ANTHROPIC_AUTH_TOKEN=ab"cd'
+# Not a var claude itself reads -- the supervisor does -- so this asserts the
+# repair through the log rather than the dump. `wires` also requires the run to
+# reach a review pass, which is the other half: unrepaired, the supervisor
+# refuses the quoted value with a message about non-negative integers that says
+# nothing about quoting, and no pass ever starts.
+wires "quoted concurrency cap is unwrapped rather than refused" \
+  PROVIDER=ollama OLLAMA_API_KEY=k MAX_CONCURRENT_PASSES='"2"' \
+  -- 'LOG:MAX_CONCURRENT_PASSES was wrapped in quotes'
 refuses "quoted vertex project id still fails on a bad URL" "must be an http(s) URL" \
   -- PROVIDER=cloudflare GATEWAY_UPSTREAM=vertex REVIEW_MODEL=m \
      ANTHROPIC_VERTEX_BASE_URL=gw.test/v1 ANTHROPIC_VERTEX_PROJECT_ID='"proj"' \

@@ -1671,6 +1671,19 @@ class GitDirLockWiringTest(unittest.TestCase):
             review_loop.main([])
         return out.getvalue()
 
+    def _with_upstream(self):
+        upstream = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, upstream, ignore_errors=True)
+        for args in (
+            ["git", "init", "-q", upstream],
+            ["git", "-C", upstream, "config", "user.email", "t@t"],
+            ["git", "-C", upstream, "config", "user.name", "t"],
+            ["git", "-C", upstream, "commit", "-qm", "i", "--allow-empty"],
+            ["git", "-C", self.repo, "remote", "add", "origin", upstream],
+        ):
+            subprocess.run(args, check=True)
+        return upstream
+
     def _can_write(self):
         return subprocess.run(
             ["git", "-C", self.repo, "checkout", "-b", "probe"],
@@ -1686,17 +1699,60 @@ class GitDirLockWiringTest(unittest.TestCase):
         # clone and not lifting it around the fetch leaves the working copy
         # frozen at the revision it was cloned at, and the only symptom is one
         # WARN a cycle.
-        upstream = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, upstream, ignore_errors=True)
-        subprocess.run(["git", "init", "-q", upstream], check=True)
-        subprocess.run(["git", "-C", upstream, "config", "user.email", "t@t"], check=True)
-        subprocess.run(["git", "-C", upstream, "config", "user.name", "t"], check=True)
-        subprocess.run(["git", "-C", upstream, "commit", "-qm", "i", "--allow-empty"], check=True)
-        subprocess.run(["git", "-C", self.repo, "remote", "add", "origin", upstream], check=True)
-
+        self._with_upstream()
         log = self._main()
         self.assertNotIn("git fetch failed", log)
         self.assertFalse(self._can_write())
+
+    def test_a_restart_into_a_locked_clone_can_still_fetch(self):
+        # The whole restart sequence, because the bug lived between the runs.
+        # entrypoint.sh restores $WORK_REPO/.git and nothing under it, so the
+        # second run met a writable .git over a read-only .git/refs, recorded
+        # THOSE as the originals, and restored them faithfully on every unlock.
+        # The fetch window opened with refs unwritable for the life of the
+        # container, and the working clone silently stopped advancing while
+        # every review kept reading a frozen tree.
+        self._with_upstream()
+
+        review_loop.lock_git_dir(self.repo)
+        # The process dies: the recorded modes go with it, the chmods do not.
+        review_loop._ORIGINAL_MODES.clear()
+        # entrypoint.sh, on its way to the exec.
+        git_dir = os.path.join(self.repo, ".git")
+        os.chmod(git_dir, os.stat(git_dir).st_mode | stat.S_IWUSR)
+
+        log = self._main()
+        self.assertNotIn("git fetch failed", log)
+        # The repair must not have cost the enforcement.
+        self.assertFalse(self._can_write())
+
+    def test_a_restart_with_concurrency_off_can_still_fetch(self):
+        # The same inherited lock, on a run that will not lock anything itself.
+        # It has the same frozen clone and the same silent WARN, so the repair
+        # cannot be conditional on this run's concurrency.
+        self._with_upstream()
+        review_loop.lock_git_dir(self.repo)
+        review_loop._ORIGINAL_MODES.clear()
+
+        log = self._main(PERSONAS="red_team", PLAN_PERSONAS="red_team")
+        self.assertNotIn("git fetch failed", log)
+        self.assertTrue(self._can_write())
+
+    def test_a_restart_leaves_the_owner_able_to_write_every_locked_dir(self):
+        # The mode half of the sequence, and the honest limit of the repair: a
+        # 775 .git comes back 755 and stays there. Nothing carries 775 across a
+        # process boundary, and the fallback adds the owner bit only, which
+        # never loosens what it found.
+        git_dir = os.path.join(self.repo, ".git")
+        os.chmod(git_dir, 0o775)
+        review_loop.lock_git_dir(self.repo)
+        review_loop._ORIGINAL_MODES.clear()
+        os.chmod(git_dir, os.stat(git_dir).st_mode | stat.S_IWUSR)
+
+        self._main(PERSONAS="red_team", PLAN_PERSONAS="red_team")
+        for path in review_loop._locked_dirs(self.repo):
+            self.assertTrue(os.access(path, os.W_OK), path)
+        self.assertEqual(stat.S_IMODE(os.stat(git_dir).st_mode), 0o755)
 
     def test_a_single_persona_run_leaves_it_writable(self):
         # Nothing runs beside it, so there is nothing to defend against. BOTH

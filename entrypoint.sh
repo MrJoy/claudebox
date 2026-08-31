@@ -78,7 +78,8 @@ strip_surrounding_quotes \
   CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN \
   GITHUB_TOKEN GITHUB_REPOSITORY LINEAR_API_KEY \
   PR_ASSIGNEE PR_IDS PR_SEARCH \
-  PERSONAS PLAN_PERSONAS PERSONA_DIR PLAN_LABEL LIMIT_BACKOFF_SECONDS MAX_CYCLES REPO_PATH
+  PERSONAS PLAN_PERSONAS PERSONA_DIR PLAN_LABEL LIMIT_BACKOFF_SECONDS MAX_CYCLES \
+  MAX_CONCURRENT_PASSES REPO_PATH
 # The prompt vars (REVIEW_PROMPT, FOLLOWUP_PROMPT, their _SUFFIX forms, and the
 # PLAN_-prefixed counterparts of all four) are deliberately absent from that
 # list. Everything else on it is a URL, an id, a credential, or a name or number
@@ -766,6 +767,13 @@ fi
 # unlocks it on the way down. `git remote set-url` below writes .git/config
 # through .git/config.lock, so without this the second boot dies under set -e
 # and `--restart unless-stopped` turns that into a silent crash loop.
+#
+# Deliberately narrow: .git itself, not the .git/refs subtree the supervisor
+# also locks. This line exists to serve the one write below it, and that write
+# needs .git alone. Repairing the rest here would put a second copy of the
+# repair in the one file the bash suites cannot exercise, since they stub git --
+# so the supervisor repairs the whole subtree itself, unconditionally, before it
+# records any mode. See the unlock_git_dir call at the top of its main().
 #
 # No `|| true` on the chmod, deliberately: a chmod we cannot perform means the
 # clone is unwritable, and dying here says so where dying four lines down at

@@ -188,9 +188,16 @@ def unlock_git_dir(work_repo: str) -> None:
 
     The recorded mode rather than a bare u+w: the lock drops group and other as
     well, so adding only the owner bit back would quietly walk a 775 .git down
-    to 755 and leave it there. A path with nothing recorded -- a clone this
-    process never locked -- falls back to u+w, which is what the container's
-    own umask would have given it.
+    to 755 within a single run and leave it there.
+
+    A path with nothing recorded falls back to adding the owner bit to what it
+    finds. That is the case main leans on at startup to repair a clone a
+    previous container left locked, since the modes that lock recorded died
+    with that process. The fallback only ever adds, so it cannot loosen a
+    directory an operator deliberately tightened -- at the cost of not being
+    able to put back what it never saw: a 775 .git comes back 755 after a
+    restart and stays there. Harmless in the container, which is single-user
+    under umask 022, and 755 is what that umask would have produced anyway.
     """
     for path in _locked_dirs(work_repo):
         recorded = _ORIGINAL_MODES.pop(path, None)
@@ -701,6 +708,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_passes = _positive_int(env, "MAX_PASSES_PER_SESSION", 0)
         review_model = _required(env, "REVIEW_MODEL")
         work_repo = _required(env, "WORK_REPO")
+
+        # A clone this container has run before comes back LOCKED: the process
+        # that locked it recorded the modes in memory and took them with it,
+        # and entrypoint.sh restores $WORK_REPO/.git alone. Without this, the
+        # lock below records the still-read-only .git/refs modes as the
+        # originals and every unlock restores them faithfully, so the fetch
+        # window opens with refs unwritable for the life of the container and
+        # the working clone silently stops advancing.
+        #
+        # Unconditional, not gated on enforce_lock: a run with concurrency off
+        # inherits the same locked clone and its fetch fails the same way, and
+        # it has no lock of its own to repair it. A no-op on a clone nobody
+        # locked, and on a WORK_REPO with no .git at all -- the refusal for
+        # that case belongs to lock_git_dir, below.
+        unlock_git_dir(work_repo)
 
         # The enforcement half of the shared-worktree constraint the stanza
         # states. Tied to the same set, so a run whose personas do not overlap
