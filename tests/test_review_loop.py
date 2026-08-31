@@ -1089,41 +1089,13 @@ def scratch_repo(case):
 
     main() chmods its WORK_REPO now, so a test that passes "." makes the
     checkout the suite is running from read-only and leaves it that way. The
-    tearDownModule below is the net under this; use the helper instead of
+    atexit guard in _path.py is the net under this; use the helper instead of
     landing in it.
     """
     repo = tempfile.mkdtemp()
     os.mkdir(os.path.join(repo, ".git"))
     case.addCleanup(shutil.rmtree, repo, ignore_errors=True)
     return repo
-
-
-def tearDownModule():
-    """No test may leave this checkout's .git read-only.
-
-    Repaired as well as reported: a developer who trips this should not be left
-    with a repo git refuses to write, which is how it presents from the outside.
-
-    .git and its immediate children, not a full walk: an accidentally recursive
-    lock reaches .git/objects, and checking that is O(1) where walking the
-    object store under it is the cost the whole design avoids. The repair is
-    the recursive one, because by then something is already broken.
-    """
-    own = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".git")
-    if not os.path.isdir(own):
-        return
-    shallow = [own] + [
-        os.path.join(own, name) for name in os.listdir(own)
-        if os.path.isdir(os.path.join(own, name))
-    ]
-    if all(os.access(path, os.W_OK) for path in shallow):
-        return
-    for root, dirs, _files in os.walk(own):
-        for name in [root] + [os.path.join(root, d) for d in dirs]:
-            os.chmod(name, os.stat(name).st_mode | stat.S_IWUSR)
-    raise AssertionError(
-        f"a test left {own} read-only; point its WORK_REPO at scratch_repo(self)"
-    )
 
 
 def preflight_env(**overrides):
@@ -1414,10 +1386,6 @@ class WorktreeStanzaWiringTest(unittest.TestCase):
         self.assertNotIn(review_loop.prompts_mod.WORKTREE_STANZA, prompt)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 @unittest.skipUnless(shutil.which("git"), "git not available")
 class GitDirLockTest(unittest.TestCase):
     """What the read-only .git actually stops, exercised through real git.
@@ -1444,6 +1412,7 @@ class GitDirLockTest(unittest.TestCase):
         open(os.path.join(path, "f.txt"), "w").close()
         subprocess.run(["git", "-C", path, "add", "f.txt"], check=True)
         subprocess.run(["git", "-C", path, "commit", "-qm", "init"], check=True)
+        subprocess.run(["git", "-C", path, "commit", "-qm", "two", "--allow-empty"], check=True)
 
     def _cleanup(self):
         review_loop.unlock_git_dir(self.repo)
@@ -1462,6 +1431,8 @@ class GitDirLockTest(unittest.TestCase):
         self.assertNotEqual(self.git("checkout", "-b", "after").returncode, 0)
 
     def test_reading_git_still_works_when_locked(self):
+        # for-each-ref is in the list because the lock now covers .git/refs:
+        # enumerating refs must survive locking the directories they live in.
         review_loop.lock_git_dir(self.repo)
         for args in (
             ("log", "-1", "--oneline"),
@@ -1469,6 +1440,8 @@ class GitDirLockTest(unittest.TestCase):
             ("diff", "HEAD"),
             ("status", "--porcelain"),
             ("cat-file", "-p", "HEAD"),
+            ("for-each-ref",),
+            ("branch", "--list"),
         ):
             self.assertEqual(self.git(*args).returncode, 0, args)
 
@@ -1485,18 +1458,50 @@ class GitDirLockTest(unittest.TestCase):
         ):
             self.assertNotEqual(self.git(*args).returncode, 0, args)
 
-    def test_branch_creation_fails_when_locked(self):
-        # checkout -b, not `git branch`: the checkout locks HEAD directly in
-        # .git, where `git branch` only writes under .git/refs and still
-        # succeeds. See lock_git_dir's docstring on where the wall has gaps.
+    def test_the_ref_writers_fail_when_locked(self):
+        # The reason the lock covers .git/refs. Under a .git-only lock these all
+        # exit 0, and two of them change what a sibling reads: update-ref on a
+        # remote-tracking ref empties `git log origin/main..HEAD`, and a note
+        # renders inside `git log` and `git show` as commit metadata.
         review_loop.lock_git_dir(self.repo)
-        self.assertNotEqual(self.git("checkout", "-b", "feature").returncode, 0)
+        for args in (
+            ("update-ref", "refs/remotes/origin/main", "HEAD"),
+            ("notes", "add", "-f", "-m", "injected", "HEAD"),
+            ("branch", "nb"),
+            ("tag", "t1"),
+            ("checkout", "-b", "feature"),
+            ("worktree", "add", os.path.join(self.repo, "..", "wt")),
+        ):
+            self.assertNotEqual(self.git(*args).returncode, 0, args)
+        # A failed checkout -b or worktree add used to leave refs/heads/<name>
+        # behind. With refs locked they cannot, which is worth asserting rather
+        # than assuming.
+        self.assertEqual(self.git("rev-parse", "--verify", "-q", "feature").returncode, 1)
+        self.assertEqual(self.git("rev-parse", "--verify", "-q", "wt").returncode, 1)
+
+    def test_a_sibling_still_reads_the_pr_it_started_with(self):
+        # The consequence the ref lock exists for, stated as the sibling sees
+        # it: one commit ahead of origin/main before the attack, and still one
+        # commit ahead after it.
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD~1")
+        before = self.git("log", "--oneline", "refs/remotes/origin/main..HEAD").stdout
+        self.assertEqual(len(before.splitlines()), 1)
+
+        review_loop.lock_git_dir(self.repo)
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        self.git("notes", "add", "-f", "-m", "injected", "HEAD")
+
+        after = self.git("log", "--oneline", "refs/remotes/origin/main..HEAD")
+        self.assertEqual(after.returncode, 0)
+        self.assertEqual(after.stdout, before)
+        self.assertNotIn("injected", self.git("log", "-1").stdout)
 
     def _upstream(self):
         upstream = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, upstream, ignore_errors=True)
         self._init(upstream)
         subprocess.run(["git", "-C", self.repo, "remote", "add", "up", upstream], check=True)
+        return upstream
 
     def test_the_supervisors_own_fetch_needs_the_unlock(self):
         # git fetch opens .git/FETCH_HEAD, so the loop's once-a-cycle fetch is
@@ -1509,21 +1514,24 @@ class GitDirLockTest(unittest.TestCase):
         open(os.path.join(self.repo, "g.txt"), "w").close()
         self.assertNotEqual(self.git("add", "g.txt").returncode, 0)
 
-    def test_a_fetch_the_supervisor_already_ran_leaves_fetch_open(self):
-        # The measured limit of chmod on a directory: it stops entries being
-        # CREATED, and FETCH_HEAD survives the supervisor's own fetch as an
-        # ordinary writable file, so a persona's fetch stops being blocked after
-        # the first cycle. Pinned rather than described, so lock_git_dir's list
-        # of gaps goes red if a git version closes this one.
-        #
-        # It stays a gap rather than a hole: fetch moves remote-tracking refs
-        # and touches neither the index nor the working tree, so it cannot
-        # change what a sibling persona reads.
-        self._upstream()
+    def test_a_fetch_cannot_move_a_ref_once_the_supervisor_has_fetched_once(self):
+        # FETCH_HEAD survives the supervisor's own fetch as an ordinary writable
+        # file, so the .git half of the lock stops blocking fetch after cycle
+        # one -- and --no-write-fetch-head walks past it even on cycle one. The
+        # refs half is what holds: a fetch that would move a remote-tracking ref
+        # fails on that ref's lock, so the part of a fetch a sibling can observe
+        # is closed even though the command is not.
+        upstream = self._upstream()
         review_loop.lock_git_dir(self.repo)
         with review_loop.unlocked_git_dir(self.repo, enabled=True):
-            self.git("fetch", "up")
-        self.assertEqual(self.git("fetch", "up").returncode, 0)
+            self.assertEqual(self.git("fetch", "up").returncode, 0)
+        before = self.git("rev-parse", "refs/remotes/up/HEAD@{0}").stdout
+
+        subprocess.run(["git", "-C", upstream, "commit", "-qm", "three", "--allow-empty"],
+                       check=True)
+        for args in (("fetch", "up"), ("fetch", "--no-write-fetch-head", "up")):
+            self.assertNotEqual(self.git(*args).returncode, 0, args)
+        self.assertEqual(self.git("rev-parse", "refs/remotes/up/HEAD@{0}").stdout, before)
 
     def test_a_stale_lock_blocks_the_entrypoints_clone_prep(self):
         # entrypoint.sh runs `git remote set-url` on a clone that survived a
@@ -1580,13 +1588,43 @@ class GitDirLockTest(unittest.TestCase):
             open(os.path.join(self.repo, "g.txt"), "w").close()
             self.assertNotEqual(self.git("add", "g.txt").returncode, 0)
 
-    def test_locking_is_not_recursive(self):
-        # chmod -R on .git is O(object count), which is the operation that
-        # produced the file-count guard in commit fdd0ac1. Only the inode moves.
+    def test_the_object_store_is_never_walked(self):
+        # The property commit fdd0ac1's file-count guard cares about: a chmod
+        # over .git/objects is O(object count). Asserted on the deepest fanout
+        # directory as well as the root, since a walk would reach both.
         objects = os.path.join(self.repo, ".git", "objects")
-        before = os.stat(objects).st_mode
+        subdirs = [
+            os.path.join(objects, name) for name in os.listdir(objects)
+            if os.path.isdir(os.path.join(objects, name))
+        ]
+        self.assertTrue(subdirs, "the fixture repo should have loose objects")
+        watched = [objects] + subdirs
+        before = [os.stat(path).st_mode for path in watched]
         review_loop.lock_git_dir(self.repo)
-        self.assertEqual(os.stat(objects).st_mode, before)
+        self.assertEqual([os.stat(path).st_mode for path in watched], before)
+
+    def test_locking_is_recursive_over_refs_and_nowhere_else(self):
+        # Recursive over refs, because a ref write locks beside the ref rather
+        # than in .git. Nowhere else, because everything else under .git is
+        # either O(object count) or holds nothing a review can reach.
+        refs = os.path.join(self.repo, ".git", "refs")
+        os.makedirs(os.path.join(refs, "remotes", "origin"), exist_ok=True)
+        logs = os.path.join(self.repo, ".git", "logs")
+        os.makedirs(logs, exist_ok=True)
+        review_loop.lock_git_dir(self.repo)
+        for root, dirs, _files in os.walk(refs):
+            for path in [root] + [os.path.join(root, d) for d in dirs]:
+                self.assertFalse(os.access(path, os.W_OK), path)
+        self.assertTrue(os.access(logs, os.W_OK))
+
+    def test_unlocking_restores_the_mode_the_lock_found(self):
+        # Not a bare u+w: the lock drops group and other too, so restoring only
+        # the owner bit walks a 775 .git down to 755 and leaves it there.
+        git_dir = os.path.join(self.repo, ".git")
+        os.chmod(git_dir, 0o775)
+        review_loop.lock_git_dir(self.repo)
+        review_loop.unlock_git_dir(self.repo)
+        self.assertEqual(stat.S_IMODE(os.stat(git_dir).st_mode), 0o775)
 
     def test_a_missing_git_dir_is_reported_rather_than_ignored(self):
         empty = tempfile.mkdtemp()

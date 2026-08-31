@@ -766,6 +766,12 @@ fi
 # unlocks it on the way down. `git remote set-url` below writes .git/config
 # through .git/config.lock, so without this the second boot dies under set -e
 # and `--restart unless-stopped` turns that into a silent crash loop.
+#
+# No `|| true` on the chmod, deliberately: a chmod we cannot perform means the
+# clone is unwritable, and dying here says so where dying four lines down at
+# `git remote set-url` says "could not lock config file". The `[ -d ]` guard is
+# not the last command of the AND-list, so a first boot with no clone yet does
+# not trip errexit.
 [ -d "$WORK_REPO/.git" ] && chmod u+w "$WORK_REPO/.git"
 
 git config --global --add safe.directory "$REPO_PATH/.git"

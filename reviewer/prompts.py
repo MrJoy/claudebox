@@ -65,9 +65,10 @@ _DEFAULT_FOLLOWUP_PLAN = (
 # concurrency corrupts what its siblings are reading, and the operator whose
 # prompt is being edited is not the one who pays for that. The other half of the
 # defense is review_loop.lock_git_dir, which drops the write bit on the clone's
-# .git directory. That stops the commands that take a lock file there -- add,
-# commit, checkout, reset, stash, config -- and its docstring lists what it does
-# not stop; this stanza is what keeps a persona from routing around either.
+# .git directory and on the .git/refs subtree. That stops the commands taking a
+# lock file in either -- add, commit, checkout, reset, stash, config, and the
+# ref writers behind branch, tag, update-ref and notes -- and its docstring
+# lists what it does not stop; this stanza keeps a persona off both.
 WORKTREE_STANZA = (
     "One more constraint. The git working copy in your current directory is shared "
     "with other reviewers reading this same pull request at this same moment, so "

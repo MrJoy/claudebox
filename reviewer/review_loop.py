@@ -96,62 +96,96 @@ def shared_worktree_modes(personas: Dict[str, List[str]], max_concurrent: int) -
     )
 
 
+# What lock_git_dir cleared, so unlock_git_dir can put it back exactly. Keyed by
+# path; entries are popped on unlock, so a lock/unlock/lock round trip re-reads
+# the restored mode. Only ever touched from the main thread -- the startup lock
+# and the cycle's fetch both run before any worker exists.
+_ORIGINAL_MODES: Dict[str, int] = {}
+
+
 def _git_dir(work_repo: str) -> str:
     return os.path.join(work_repo, ".git")
 
 
+def _locked_dirs(work_repo: str) -> List[str]:
+    """The .git inode, plus .git/refs and every directory under it.
+
+    .git/refs and NOT .git/objects, because that is where the cost lives: refs
+    is O(ref count) -- a handful of directories on any repo -- where objects is
+    the O(object count) walk the file-count guard in commit fdd0ac1 exists to
+    avoid. Every ref write takes its lock beside the ref it is writing, so the
+    refs subtree is what closes them and the object store buys nothing.
+    """
+    path = _git_dir(work_repo)
+    if not os.path.isdir(path):
+        return []
+    out = [path]
+    for root, _dirs, _files in os.walk(os.path.join(path, "refs")):
+        out.append(root)
+    return out
+
+
 def lock_git_dir(work_repo: str) -> None:
-    """Drop write permission on the .git DIRECTORY INODE. Not recursive.
+    """Drop write permission on .git and on the .git/refs subtree.
 
     Creating a file in a directory needs write permission on that directory, so
-    every git operation that takes a lock file sitting directly in .git stops
-    here: index.lock covers add, commit, checkout, stash, reset and the merge
-    half of a pull, config.lock covers config and remote, gc.pid.lock covers gc.
-    Reading never creates anything in .git, so log, show, diff, status, blame
-    and cat-file keep working.
+    this stops every git operation that has to make a lock file in one of them.
+    In .git: index.lock covers add, commit, checkout, stash, reset and the merge
+    half of a pull; config.lock covers config and remote; gc.pid.lock covers gc;
+    packed-refs.lock covers pack-refs. Under .git/refs: branch, tag, update-ref,
+    notes add, checkout -b and worktree add all fail on <ref>.lock, and a fetch
+    fails on the remote-tracking ref it would move. Reading creates nothing, so
+    log, show, diff, status, blame, cat-file and for-each-ref keep working.
 
-    One inode, so this is O(1) and can be toggled around the supervisor's own
-    fetch. A recursive chmod would be O(object count), which is the operation
-    that produced the file-count guard in commit fdd0ac1.
+    The refs subtree is here because the ref namespace is reachable from a
+    review and reads out of one. `git update-ref refs/remotes/origin/main HEAD`
+    empties `git log origin/main..HEAD`, so a sibling sees a PR containing
+    nothing; `git notes add` puts attacker-chosen text into `git log` and
+    `git show`, where it renders as commit metadata. Both exit 0 against a lock
+    that covers .git alone.
 
-    It is a CHOKEPOINT, not a wall, and the gaps are worth naming rather than
-    papering over. Measured against git 2.54 on 2026-08-30: `git branch`,
-    `git tag`, `git update-ref` and `git notes add` write under .git/refs and
-    still succeed, and `git fetch` joins them from the second cycle on, because
-    dropping a directory's write bit stops entries being CREATED in it and
-    FETCH_HEAD is an ordinary writable file once the supervisor's own fetch has
-    made it (`git fetch --no-write-fetch-head` skips FETCH_HEAD outright, so
-    fetch was never blocked on principle). Object writes into .git/objects/**
-    would likewise succeed on their own, and nothing reaches them without first
-    taking a lock this does stop.
-
-    None of those touches the index or the working tree, which is why they are
-    gaps and not holes: they cannot change what a sibling persona reads.
-    prompts.WORKTREE_STANZA is the other half of the defense rather than a
-    redundant restatement of this one.
+    What stays open: object writes into .git/objects/**, so a fetch can still
+    download, and writes to files that already sit directly in .git, since
+    dropping a directory's write bit stops entries being CREATED in it rather
+    than writes to what is already inside. Neither moves a ref or touches the
+    index, and file permissions cannot narrow them further without the walk this
+    design exists to avoid. prompts.WORKTREE_STANZA is the other half of the
+    defense rather than a redundant restatement of this one.
 
     The working tree itself is left writable, so a persona that drops a scratch
     file does not hit a confusing error. A scratch file cannot corrupt another
     persona's review, because reviews read the diff through `gh pr diff`.
+
+    Measured against git 2.54 on 2026-08-30, as an unprivileged user.
     """
-    path = _git_dir(work_repo)
-    if not os.path.isdir(path):
+    paths = _locked_dirs(work_repo)
+    if not paths:
         # Never reached through entrypoint.sh, which makes the clone before it
         # execs us. Logged rather than returned silently because a no-op here
         # is an enforcement boundary that is not there, and the whole point of
         # this function is that it cannot fail quietly.
-        log(f"WARN: no .git at {path}; the working clone is NOT locked.")
+        log(f"WARN: no .git at {_git_dir(work_repo)}; the working clone is NOT locked.")
         return
-    mode = os.stat(path).st_mode
-    os.chmod(path, mode & ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
+    for path in paths:
+        mode = os.stat(path).st_mode
+        _ORIGINAL_MODES.setdefault(path, mode)
+        os.chmod(path, mode & ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
 
 
 def unlock_git_dir(work_repo: str) -> None:
-    """Give the owner its write bit back. Group and other stay as they were."""
-    path = _git_dir(work_repo)
-    if not os.path.isdir(path):
-        return
-    os.chmod(path, os.stat(path).st_mode | stat.S_IWUSR)
+    """Put back exactly what the lock cleared.
+
+    The recorded mode rather than a bare u+w: the lock drops group and other as
+    well, so adding only the owner bit back would quietly walk a 775 .git down
+    to 755 and leave it there. A path with nothing recorded -- a clone this
+    process never locked -- falls back to u+w, which is what the container's
+    own umask would have given it.
+    """
+    for path in _locked_dirs(work_repo):
+        recorded = _ORIGINAL_MODES.pop(path, None)
+        if recorded is None:
+            recorded = os.stat(path).st_mode | stat.S_IWUSR
+        os.chmod(path, recorded)
 
 
 @contextmanager
@@ -161,6 +195,9 @@ def unlocked_git_dir(work_repo: str, enabled: bool):
     The finally is the point: `git fetch` is already allowed to fail, and an
     exception on the way out would otherwise leave the clone writable for every
     pass of every remaining cycle with nothing in the log to say so.
+
+    The relock walks the refs subtree again, so a directory the fetch created
+    under refs/remotes is locked along with the rest.
 
     Groups are strictly serialized after the fetch, so no pass ever observes
     the window this opens.
