@@ -64,8 +64,10 @@ _DEFAULT_FOLLOWUP_PLAN = (
 # verbatim-prompt guarantee gives way: a persona that checks out a branch under
 # concurrency corrupts what its siblings are reading, and the operator whose
 # prompt is being edited is not the one who pays for that. The other half of the
-# defense is a read-only .git directory, added in the loop. The chmod stops the
-# git commands; this stanza is what keeps a persona from routing around them.
+# defense is review_loop.lock_git_dir, which drops the write bit on the clone's
+# .git directory. That stops the commands that take a lock file there -- add,
+# commit, checkout, reset, stash, config -- and its docstring lists what it does
+# not stop; this stanza is what keeps a persona from routing around either.
 WORKTREE_STANZA = (
     "One more constraint. The git working copy in your current directory is shared "
     "with other reviewers reading this same pull request at this same moment, so "

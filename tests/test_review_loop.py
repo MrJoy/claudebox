@@ -1,6 +1,8 @@
 import contextlib
 import io
 import os
+import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1082,6 +1084,48 @@ REPO_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 SHIPPED_PERSONAS = os.path.join(REPO_ROOT, "personas")
 
 
+def scratch_repo(case):
+    """A throwaway WORK_REPO, cleaned up with the case.
+
+    main() chmods its WORK_REPO now, so a test that passes "." makes the
+    checkout the suite is running from read-only and leaves it that way. The
+    tearDownModule below is the net under this; use the helper instead of
+    landing in it.
+    """
+    repo = tempfile.mkdtemp()
+    os.mkdir(os.path.join(repo, ".git"))
+    case.addCleanup(shutil.rmtree, repo, ignore_errors=True)
+    return repo
+
+
+def tearDownModule():
+    """No test may leave this checkout's .git read-only.
+
+    Repaired as well as reported: a developer who trips this should not be left
+    with a repo git refuses to write, which is how it presents from the outside.
+
+    .git and its immediate children, not a full walk: an accidentally recursive
+    lock reaches .git/objects, and checking that is O(1) where walking the
+    object store under it is the cost the whole design avoids. The repair is
+    the recursive one, because by then something is already broken.
+    """
+    own = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".git")
+    if not os.path.isdir(own):
+        return
+    shallow = [own] + [
+        os.path.join(own, name) for name in os.listdir(own)
+        if os.path.isdir(os.path.join(own, name))
+    ]
+    if all(os.access(path, os.W_OK) for path in shallow):
+        return
+    for root, dirs, _files in os.walk(own):
+        for name in [root] + [os.path.join(root, d) for d in dirs]:
+            os.chmod(name, os.stat(name).st_mode | stat.S_IWUSR)
+    raise AssertionError(
+        f"a test left {own} read-only; point its WORK_REPO at scratch_repo(self)"
+    )
+
+
 def preflight_env(**overrides):
     """Only what entrypoint.sh already has in hand before auth and the clone."""
     env = {
@@ -1161,7 +1205,7 @@ class GitFetchFailureTest(unittest.TestCase):
 
     def _one_cycle(self, run):
         env = preflight_env(
-            WORK_REPO=".", REVIEW_MODEL="m", MAX_CYCLES="1",
+            WORK_REPO=scratch_repo(self), REVIEW_MODEL="m", MAX_CYCLES="1",
             REVIEW_INTERVAL_SECONDS="0",
         )
         original_env = os.environ.copy()
@@ -1237,7 +1281,7 @@ class McpArgsTest(unittest.TestCase):
 
     def test_strict_is_always_passed(self):
         argv = self._argv(preflight_env(
-            WORK_REPO=".", REVIEW_MODEL="m", MAX_CYCLES="1", PERSONAS="red_team",
+            WORK_REPO=scratch_repo(self), REVIEW_MODEL="m", MAX_CYCLES="1", PERSONAS="red_team",
         ))
         self.assertEqual(argv, ["--strict-mcp-config"])
 
@@ -1247,7 +1291,7 @@ class McpArgsTest(unittest.TestCase):
             path = fh.name
         self.addCleanup(os.unlink, path)
         argv = self._argv(preflight_env(
-            WORK_REPO=".", REVIEW_MODEL="m", MAX_CYCLES="1", PERSONAS="red_team",
+            WORK_REPO=scratch_repo(self), REVIEW_MODEL="m", MAX_CYCLES="1", PERSONAS="red_team",
             MCP_CONFIG_FILE=path,
         ))
         self.assertEqual(argv, ["--strict-mcp-config", "--mcp-config", path])
@@ -1256,7 +1300,7 @@ class McpArgsTest(unittest.TestCase):
         # entrypoint.sh deletes the file when write_mcp_config fails, so a
         # partial write degrades to no MCP servers rather than to truncated JSON.
         argv = self._argv(preflight_env(
-            WORK_REPO=".", REVIEW_MODEL="m", MAX_CYCLES="1", PERSONAS="red_team",
+            WORK_REPO=scratch_repo(self), REVIEW_MODEL="m", MAX_CYCLES="1", PERSONAS="red_team",
             MCP_CONFIG_FILE="/nonexistent/mcp.json",
         ))
         self.assertEqual(argv, ["--strict-mcp-config"])
@@ -1352,21 +1396,281 @@ class WorktreeStanzaWiringTest(unittest.TestCase):
 
     def test_a_multi_persona_run_carries_it(self):
         prompt = self._prompt(preflight_env(
-            WORK_REPO=".", REVIEW_MODEL="m", MAX_CYCLES="1",
+            WORK_REPO=scratch_repo(self), REVIEW_MODEL="m", MAX_CYCLES="1",
         ))
         self.assertIn(review_loop.prompts_mod.WORKTREE_STANZA, prompt)
 
     def test_a_single_persona_run_does_not(self):
         prompt = self._prompt(preflight_env(
-            WORK_REPO=".", REVIEW_MODEL="m", MAX_CYCLES="1", PERSONAS="red_team",
+            WORK_REPO=scratch_repo(self), REVIEW_MODEL="m", MAX_CYCLES="1", PERSONAS="red_team",
         ))
         self.assertNotIn(review_loop.prompts_mod.WORKTREE_STANZA, prompt)
 
     def test_a_cap_of_one_does_not(self):
         prompt = self._prompt(preflight_env(
-            WORK_REPO=".", REVIEW_MODEL="m", MAX_CYCLES="1", MAX_CONCURRENT_PASSES="1",
+            WORK_REPO=scratch_repo(self), REVIEW_MODEL="m", MAX_CYCLES="1",
+            MAX_CONCURRENT_PASSES="1",
         ))
         self.assertNotIn(review_loop.prompts_mod.WORKTREE_STANZA, prompt)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+@unittest.skipUnless(shutil.which("git"), "git not available")
+class GitDirLockTest(unittest.TestCase):
+    """What the read-only .git actually stops, exercised through real git.
+
+    Asserting the mode bits would prove only that os.chmod works. Every test
+    here runs a git command and reads its exit code, because the mode bits are
+    the mechanism and the exit code is the claim.
+    """
+
+    def setUp(self):
+        if os.geteuid() == 0:
+            # root ignores the write bit, so every "this fails" assertion below
+            # would pass a locked directory and go green having tested nothing.
+            # The container runs as `reviewer` for exactly this reason.
+            self.skipTest("root writes through a read-only directory")
+        self.repo = tempfile.mkdtemp()
+        self.addCleanup(self._cleanup)
+        self._init(self.repo)
+
+    def _init(self, path):
+        subprocess.run(["git", "init", "-q", path], check=True)
+        subprocess.run(["git", "-C", path, "config", "user.email", "t@t"], check=True)
+        subprocess.run(["git", "-C", path, "config", "user.name", "t"], check=True)
+        open(os.path.join(path, "f.txt"), "w").close()
+        subprocess.run(["git", "-C", path, "add", "f.txt"], check=True)
+        subprocess.run(["git", "-C", path, "commit", "-qm", "init"], check=True)
+
+    def _cleanup(self):
+        review_loop.unlock_git_dir(self.repo)
+        shutil.rmtree(self.repo, ignore_errors=True)
+
+    def git(self, *args):
+        return subprocess.run(
+            ["git", "-C", self.repo, *args], capture_output=True, text=True, check=False
+        )
+
+    def test_the_lock_is_the_reason_a_write_fails(self):
+        # Ties the exit codes below to the mechanism: unlocked, the same command
+        # succeeds, so a green from the locked case is not some other failure.
+        self.assertEqual(self.git("checkout", "-b", "before").returncode, 0)
+        review_loop.lock_git_dir(self.repo)
+        self.assertNotEqual(self.git("checkout", "-b", "after").returncode, 0)
+
+    def test_reading_git_still_works_when_locked(self):
+        review_loop.lock_git_dir(self.repo)
+        for args in (
+            ("log", "-1", "--oneline"),
+            ("show", "--stat", "HEAD"),
+            ("diff", "HEAD"),
+            ("status", "--porcelain"),
+            ("cat-file", "-p", "HEAD"),
+        ):
+            self.assertEqual(self.git(*args).returncode, 0, args)
+
+    def test_the_index_writers_fail_when_locked(self):
+        # All four take .git/index.lock, which needs write permission on the
+        # .git directory inode. This is the whole mechanism.
+        review_loop.lock_git_dir(self.repo)
+        open(os.path.join(self.repo, "g.txt"), "w").close()
+        for args in (
+            ("add", "g.txt"),
+            ("commit", "--allow-empty", "-m", "x"),
+            ("stash",),
+            ("reset", "--hard", "HEAD"),
+        ):
+            self.assertNotEqual(self.git(*args).returncode, 0, args)
+
+    def test_branch_creation_fails_when_locked(self):
+        # checkout -b, not `git branch`: the checkout locks HEAD directly in
+        # .git, where `git branch` only writes under .git/refs and still
+        # succeeds. See lock_git_dir's docstring on where the wall has gaps.
+        review_loop.lock_git_dir(self.repo)
+        self.assertNotEqual(self.git("checkout", "-b", "feature").returncode, 0)
+
+    def _upstream(self):
+        upstream = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, upstream, ignore_errors=True)
+        self._init(upstream)
+        subprocess.run(["git", "-C", self.repo, "remote", "add", "up", upstream], check=True)
+
+    def test_the_supervisors_own_fetch_needs_the_unlock(self):
+        # git fetch opens .git/FETCH_HEAD, so the loop's once-a-cycle fetch is
+        # itself blocked. unlocked_git_dir exists for this and nothing else.
+        self._upstream()
+        review_loop.lock_git_dir(self.repo)
+        self.assertNotEqual(self.git("fetch", "up").returncode, 0)
+        with review_loop.unlocked_git_dir(self.repo, enabled=True):
+            self.assertEqual(self.git("fetch", "up").returncode, 0)
+        open(os.path.join(self.repo, "g.txt"), "w").close()
+        self.assertNotEqual(self.git("add", "g.txt").returncode, 0)
+
+    def test_a_fetch_the_supervisor_already_ran_leaves_fetch_open(self):
+        # The measured limit of chmod on a directory: it stops entries being
+        # CREATED, and FETCH_HEAD survives the supervisor's own fetch as an
+        # ordinary writable file, so a persona's fetch stops being blocked after
+        # the first cycle. Pinned rather than described, so lock_git_dir's list
+        # of gaps goes red if a git version closes this one.
+        #
+        # It stays a gap rather than a hole: fetch moves remote-tracking refs
+        # and touches neither the index nor the working tree, so it cannot
+        # change what a sibling persona reads.
+        self._upstream()
+        review_loop.lock_git_dir(self.repo)
+        with review_loop.unlocked_git_dir(self.repo, enabled=True):
+            self.git("fetch", "up")
+        self.assertEqual(self.git("fetch", "up").returncode, 0)
+
+    def test_a_stale_lock_blocks_the_entrypoints_clone_prep(self):
+        # entrypoint.sh runs `git remote set-url` on a clone that survived a
+        # restart, and set-url writes .git/config through .git/config.lock. This
+        # is the failure the chmod u+w in the clone-prep block recovers from;
+        # without it the shell dies under set -e and the container crash-loops.
+        review_loop.lock_git_dir(self.repo)
+        self.assertNotEqual(
+            self.git("remote", "set-url", "origin", "https://example.invalid/x.git").returncode, 0
+        )
+        self.assertNotEqual(
+            self.git("remote", "add", "origin", "https://example.invalid/x.git").returncode, 0
+        )
+        review_loop.unlock_git_dir(self.repo)
+        self.assertEqual(
+            self.git("remote", "add", "origin", "https://example.invalid/x.git").returncode, 0
+        )
+
+    def test_unlocking_restores_writability(self):
+        review_loop.lock_git_dir(self.repo)
+        review_loop.unlock_git_dir(self.repo)
+        open(os.path.join(self.repo, "g.txt"), "w").close()
+        self.assertEqual(self.git("add", "g.txt").returncode, 0)
+
+    def test_the_context_manager_relocks_after_a_clean_exit(self):
+        review_loop.lock_git_dir(self.repo)
+        with review_loop.unlocked_git_dir(self.repo, enabled=True):
+            pass
+        open(os.path.join(self.repo, "g.txt"), "w").close()
+        self.assertNotEqual(self.git("add", "g.txt").returncode, 0)
+
+    def test_the_context_manager_relocks_after_a_raise(self):
+        # git fetch is already allowed to fail. A raise on the way out must not
+        # leave the clone writable for the whole cycle with nothing in the log.
+        review_loop.lock_git_dir(self.repo)
+        with self.assertRaises(RuntimeError):
+            with review_loop.unlocked_git_dir(self.repo, enabled=True):
+                raise RuntimeError("fetch blew up")
+        open(os.path.join(self.repo, "g.txt"), "w").close()
+        self.assertNotEqual(self.git("add", "g.txt").returncode, 0)
+
+    def test_disabled_leaves_an_unlocked_clone_alone(self):
+        with review_loop.unlocked_git_dir(self.repo, enabled=False):
+            pass
+        open(os.path.join(self.repo, "g.txt"), "w").close()
+        self.assertEqual(self.git("add", "g.txt").returncode, 0)
+
+    def test_disabled_does_not_unlock_a_locked_clone(self):
+        # A sequential run never locks, so this cannot arise there. It is
+        # asserted anyway because the flag reads like "unlock unless disabled",
+        # and a disabled pass that unlocked would be an enforcement hole.
+        review_loop.lock_git_dir(self.repo)
+        with review_loop.unlocked_git_dir(self.repo, enabled=False):
+            open(os.path.join(self.repo, "g.txt"), "w").close()
+            self.assertNotEqual(self.git("add", "g.txt").returncode, 0)
+
+    def test_locking_is_not_recursive(self):
+        # chmod -R on .git is O(object count), which is the operation that
+        # produced the file-count guard in commit fdd0ac1. Only the inode moves.
+        objects = os.path.join(self.repo, ".git", "objects")
+        before = os.stat(objects).st_mode
+        review_loop.lock_git_dir(self.repo)
+        self.assertEqual(os.stat(objects).st_mode, before)
+
+    def test_a_missing_git_dir_is_reported_rather_than_ignored(self):
+        empty = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, empty, ignore_errors=True)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            review_loop.lock_git_dir(empty)
+        self.assertIn("WARN", out.getvalue())
+
+
+@unittest.skipUnless(shutil.which("git"), "git not available")
+class GitDirLockWiringTest(unittest.TestCase):
+    """Whether main() locks its own clone, which no test of lock_git_dir sees.
+
+    Driven end to end and asserted on a real git command, so computing the
+    concurrency correctly and then never calling the lock reads as a failure.
+    """
+
+    def setUp(self):
+        if os.geteuid() == 0:
+            self.skipTest("root writes through a read-only directory")
+        self.repo = tempfile.mkdtemp()
+        self.addCleanup(self._cleanup)
+        subprocess.run(["git", "init", "-q", self.repo], check=True)
+
+    def _cleanup(self):
+        review_loop.unlock_git_dir(self.repo)
+        shutil.rmtree(self.repo, ignore_errors=True)
+
+    def _main(self, **env):
+        original = os.environ.copy()
+        os.environ.clear()
+        os.environ.update(preflight_env(
+            WORK_REPO=self.repo, REVIEW_MODEL="m", MAX_CYCLES="1", **env
+        ))
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(original)))
+
+        original_enum = review_loop.gh.enumerate_candidate_prs
+        review_loop.gh.enumerate_candidate_prs = lambda *a, **k: []
+        self.addCleanup(setattr, review_loop.gh, "enumerate_candidate_prs", original_enum)
+
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            review_loop.main([])
+        return out.getvalue()
+
+    def _can_write(self):
+        return subprocess.run(
+            ["git", "-C", self.repo, "checkout", "-b", "probe"],
+            capture_output=True, text=True, check=False,
+        ).returncode == 0
+
+    def test_a_concurrent_run_leaves_the_clone_locked(self):
+        self._main()
+        self.assertFalse(self._can_write())
+
+    def test_the_cycles_own_fetch_still_runs(self):
+        # A real remote, so the fetch has something to succeed at. Locking the
+        # clone and not lifting it around the fetch leaves the working copy
+        # frozen at the revision it was cloned at, and the only symptom is one
+        # WARN a cycle.
+        upstream = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, upstream, ignore_errors=True)
+        subprocess.run(["git", "init", "-q", upstream], check=True)
+        subprocess.run(["git", "-C", upstream, "config", "user.email", "t@t"], check=True)
+        subprocess.run(["git", "-C", upstream, "config", "user.name", "t"], check=True)
+        subprocess.run(["git", "-C", upstream, "commit", "-qm", "i", "--allow-empty"], check=True)
+        subprocess.run(["git", "-C", self.repo, "remote", "add", "origin", upstream], check=True)
+
+        log = self._main()
+        self.assertNotIn("git fetch failed", log)
+        self.assertFalse(self._can_write())
+
+    def test_a_single_persona_run_leaves_it_writable(self):
+        # Nothing runs beside it, so there is nothing to defend against. BOTH
+        # modes have to be narrowed: one clone serves both, so a six-persona
+        # plan mode locks it even on a cycle whose candidates are all code.
+        self._main(PERSONAS="red_team", PLAN_PERSONAS="red_team")
+        self.assertTrue(self._can_write())
+
+    def test_a_concurrent_plan_mode_alone_locks_it(self):
+        # The lock is a property of the clone, not of a mode, and a plan PR can
+        # arrive on any cycle. Narrowing only code mode must not disarm it.
+        self._main(PERSONAS="red_team")
+        self.assertFalse(self._can_write())
 
 
 if __name__ == "__main__":

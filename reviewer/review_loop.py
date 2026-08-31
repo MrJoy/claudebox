@@ -16,10 +16,12 @@ the LiteLLM translator when one is running.
 """
 
 import os
+import stat
 import subprocess
 import sys
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
 
@@ -92,6 +94,85 @@ def shared_worktree_modes(personas: Dict[str, List[str]], max_concurrent: int) -
         for mode, ids in personas.items()
         if (len(ids) if max_concurrent <= 0 else min(max_concurrent, len(ids))) > 1
     )
+
+
+def _git_dir(work_repo: str) -> str:
+    return os.path.join(work_repo, ".git")
+
+
+def lock_git_dir(work_repo: str) -> None:
+    """Drop write permission on the .git DIRECTORY INODE. Not recursive.
+
+    Creating a file in a directory needs write permission on that directory, so
+    every git operation that takes a lock file sitting directly in .git stops
+    here: index.lock covers add, commit, checkout, stash, reset and the merge
+    half of a pull, config.lock covers config and remote, gc.pid.lock covers gc.
+    Reading never creates anything in .git, so log, show, diff, status, blame
+    and cat-file keep working.
+
+    One inode, so this is O(1) and can be toggled around the supervisor's own
+    fetch. A recursive chmod would be O(object count), which is the operation
+    that produced the file-count guard in commit fdd0ac1.
+
+    It is a CHOKEPOINT, not a wall, and the gaps are worth naming rather than
+    papering over. Measured against git 2.54 on 2026-08-30: `git branch`,
+    `git tag`, `git update-ref` and `git notes add` write under .git/refs and
+    still succeed, and `git fetch` joins them from the second cycle on, because
+    dropping a directory's write bit stops entries being CREATED in it and
+    FETCH_HEAD is an ordinary writable file once the supervisor's own fetch has
+    made it (`git fetch --no-write-fetch-head` skips FETCH_HEAD outright, so
+    fetch was never blocked on principle). Object writes into .git/objects/**
+    would likewise succeed on their own, and nothing reaches them without first
+    taking a lock this does stop.
+
+    None of those touches the index or the working tree, which is why they are
+    gaps and not holes: they cannot change what a sibling persona reads.
+    prompts.WORKTREE_STANZA is the other half of the defense rather than a
+    redundant restatement of this one.
+
+    The working tree itself is left writable, so a persona that drops a scratch
+    file does not hit a confusing error. A scratch file cannot corrupt another
+    persona's review, because reviews read the diff through `gh pr diff`.
+    """
+    path = _git_dir(work_repo)
+    if not os.path.isdir(path):
+        # Never reached through entrypoint.sh, which makes the clone before it
+        # execs us. Logged rather than returned silently because a no-op here
+        # is an enforcement boundary that is not there, and the whole point of
+        # this function is that it cannot fail quietly.
+        log(f"WARN: no .git at {path}; the working clone is NOT locked.")
+        return
+    mode = os.stat(path).st_mode
+    os.chmod(path, mode & ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
+
+
+def unlock_git_dir(work_repo: str) -> None:
+    """Give the owner its write bit back. Group and other stay as they were."""
+    path = _git_dir(work_repo)
+    if not os.path.isdir(path):
+        return
+    os.chmod(path, os.stat(path).st_mode | stat.S_IWUSR)
+
+
+@contextmanager
+def unlocked_git_dir(work_repo: str, enabled: bool):
+    """Writable for the duration, locked again on the way out, raise or not.
+
+    The finally is the point: `git fetch` is already allowed to fail, and an
+    exception on the way out would otherwise leave the clone writable for every
+    pass of every remaining cycle with nothing in the log to say so.
+
+    Groups are strictly serialized after the fetch, so no pass ever observes
+    the window this opens.
+    """
+    if not enabled:
+        yield
+        return
+    unlock_git_dir(work_repo)
+    try:
+        yield
+    finally:
+        lock_git_dir(work_repo)
 
 
 def parse_max_cycles(env: Mapping[str, str]) -> Optional[int]:
@@ -575,6 +656,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except ConfigError as exc:
         die(str(exc))
 
+    # The enforcement half of the shared-worktree constraint the stanza states.
+    # Tied to the same set, so a run whose personas do not overlap gets neither
+    # the instruction nor the read-only clone.
+    enforce_lock = bool(worktree_modes)
+    if enforce_lock:
+        lock_git_dir(work_repo)
+        log("The working clone's .git is read-only between cycles "
+            "(shared-worktree enforcement).")
+
     mcp_args = ["--strict-mcp-config"]
     mcp_config = env.get("MCP_CONFIG_FILE", "")
     if mcp_config and os.path.isfile(mcp_config):
@@ -598,10 +688,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         log("Fetching latest refs...")
         try:
-            fetched = subprocess.run(
-                ["git", "fetch", "--all", "--prune", "--quiet"],
-                cwd=supervisor.cwd, capture_output=True, text=True, check=False,
-            )
+            # FETCH_HEAD lands directly in .git, so the lock stops our own fetch
+            # as surely as it stops a persona's. Lifted only here, and only for
+            # as long as the fetch runs.
+            with unlocked_git_dir(supervisor.cwd, enforce_lock):
+                fetched = subprocess.run(
+                    ["git", "fetch", "--all", "--prune", "--quiet"],
+                    cwd=supervisor.cwd, capture_output=True, text=True, check=False,
+                )
             if fetched.returncode != 0:
                 log("WARN: git fetch failed; continuing")
         except OSError as exc:

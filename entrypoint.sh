@@ -760,6 +760,14 @@ fi
 # is never read again after this point, which is why the launcher now mounts
 # only the object store at $REPO_PATH/.git (see its --repo help). If no usable
 # seed is mounted, fall back to a network clone.
+
+# A clone made by an earlier run of this container survives a restart with its
+# .git read-only, because the supervisor locks it (lock_git_dir) and nothing
+# unlocks it on the way down. `git remote set-url` below writes .git/config
+# through .git/config.lock, so without this the second boot dies under set -e
+# and `--restart unless-stopped` turns that into a silent crash loop.
+[ -d "$WORK_REPO/.git" ] && chmod u+w "$WORK_REPO/.git"
+
 git config --global --add safe.directory "$REPO_PATH/.git"
 git config --global --add safe.directory "$REPO_PATH"
 mkdir -p "$WORK_DIR"
