@@ -183,8 +183,13 @@ The `Candidate PRs` line keeps its shape. Three companions join it:
 
 * what was skipped as unchanged,
 * what is settling and how long it has left,
-* for each PR that runs, the reason: `new head 3f2a1b0`, `2 new
-  comments`, `mode changed to plan`, `no session`.
+* for each PR that runs, the reason: `new head 3f2a1b0`, `new comment
+  activity`, `mode changed to plan`, `first review`, `no session`.
+
+A count of new comments is deliberately not reported, because carrying one
+would mean putting it in the fingerprint, and a count in the fingerprint makes
+a deleted comment look like a change. The newest unsigned timestamp is the
+whole comment signal.
 
 An operator asking why a review happened should be able to read the
 answer instead of inferring it from which comments appeared.
