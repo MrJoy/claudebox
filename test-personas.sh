@@ -133,10 +133,41 @@ STUB
 # failing invocation still emits its init event first, because that is what
 # really happens: the session exists and then a request fails, which is exactly
 # the case where throwing the session id away is the wrong move.
+#
+# STUB_FAIL_PERSONA fails by persona label instead of by ordinal, which is what
+# the parallel cases need: under concurrency nothing chooses which pass is the
+# third one. STUB_HOLD holds each invocation open for that many seconds, so the
+# in-flight high-water mark the stub records is a fact about the supervisor
+# rather than a race with process spawn.
 cat >"$BIN/claude" <<'STUB'
 #!/usr/bin/env bash
+# The invocation number is allocated under a mkdir lock. mkdir is atomic on
+# every filesystem we care about, and a busy-wait is fine at this scale. Without
+# it, concurrent passes collide and dump files are silently overwritten, which
+# would make a parallel case pass while proving nothing.
+#
+# The same lock keeps the in-flight high-water mark, which is the only thing in
+# this harness that can tell a group that really overlapped from one that ran
+# fast in sequence: CALLS:8 is satisfied either way. STUB_HOLD (seconds, passed
+# to /bin/sleep because the `sleep` on PATH is a no-op stub) makes the overlap
+# window wide enough to observe without depending on process-spawn timing.
+hold_lock() { while ! mkdir "$HOME/calls.lock" 2>/dev/null; do :; done; }
+hold_lock
 n=$(( $(cat "$HOME/calls" 2>/dev/null || echo 0) + 1 ))
 echo "$n" >"$HOME/calls"
+inflight=$(( $(cat "$HOME/inflight" 2>/dev/null || echo 0) + 1 ))
+echo "$inflight" >"$HOME/inflight"
+[ "$inflight" -gt "$(cat "$HOME/maxinflight" 2>/dev/null || echo 0)" ] \
+  && echo "$inflight" >"$HOME/maxinflight"
+rmdir "$HOME/calls.lock"
+# Every exit path, the failing ones included, or the mark drifts upward on a
+# case whose passes merely followed one another.
+release() {
+  hold_lock
+  echo $(( $(cat "$HOME/inflight" 2>/dev/null || echo 1) - 1 )) >"$HOME/inflight"
+  rmdir "$HOME/calls.lock"
+}
+trap release EXIT
 {
   echo "ARGV $*"
   for v in ANTHROPIC_MODEL ANTHROPIC_DEFAULT_FABLE_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL \
@@ -145,33 +176,43 @@ echo "$n" >"$HOME/calls"
     if [ -n "${!v+set}" ]; then echo "ENV $v=${!v}"; else echo "ENV $v=<unset>"; fi
   done
 } >"$HOME/dump.$n"
+[ -n "${STUB_HOLD:-}" ] && /bin/sleep "$STUB_HOLD"
+should_fail=
 case ",${STUB_FAIL_ON:-},"  in
-  *",$n,"*)
-    # STUB_NO_SESSION suppresses the init event, which is the one case where the
-    # supervisor really has no session id to keep: the request died before the
-    # session existed.
-    [ -n "${STUB_NO_SESSION:-}" ] || printf '{"type":"system","subtype":"init","session_id":"S%s"}\n' "$n"
-    case "${STUB_FAIL_MODE:-limit}" in
-      # Hand-written, and deliberately so: it is the shape the classifier was
-      # first written against, not evidence about any upstream.
-      limit)    echo "API Error: 429 rate limit exceeded" >&2 ;;
-      # CAPTURED, NOT COMPOSED. This is Claude Code's own message when the
-      # account allowance is exhausted, epoch and all -- the same string the
-      # design review quoted when it asked for a real fixture here. Do not
-      # paraphrase it, do not tidy the pipe: an upstream rewording is precisely
-      # what this fixture exists to turn red.
-      captured) echo "Claude AI usage limit reached|1755772800" >&2 ;;
-      # The near-miss wording that motivated the `limit reached` alternative in
-      # USAGE_LIMIT_RE: no `rate limit`, no `usage limit`, no 429.
-      window)   echo "5-hour limit reached, resets at 3pm" >&2 ;;
-      # Limit-SHAPED but outside the pattern on purpose: a spend cap, not a rate
-      # cap. This is the classifier's negative direction, and it must stay a
-      # miss if the pattern grows further.
-      nearmiss) echo "API Error: 403 Your credit balance is too low to continue" >&2 ;;
-      *)        echo "API Error: 400 invalid request" >&2 ;;
-    esac
-    exit 1 ;;
+  *",$n,"*) should_fail=1 ;;
 esac
+# STUB_FAIL_PERSONA: fail every invocation whose --append-system-prompt carries
+# this label. Ordinal STUB_FAIL_ON still works and is what the cap-of-1 cases
+# use; this is for the parallel block, where "invocation 3" names nothing.
+if [ -n "${STUB_FAIL_PERSONA:-}" ] && printf '%s' "$*" | grep -qF -- "$STUB_FAIL_PERSONA"; then
+  should_fail=1
+fi
+if [ -n "$should_fail" ]; then
+  # STUB_NO_SESSION suppresses the init event, which is the one case where the
+  # supervisor really has no session id to keep: the request died before the
+  # session existed.
+  [ -n "${STUB_NO_SESSION:-}" ] || printf '{"type":"system","subtype":"init","session_id":"S%s"}\n' "$n"
+  case "${STUB_FAIL_MODE:-limit}" in
+    # Hand-written, and deliberately so: it is the shape the classifier was
+    # first written against, not evidence about any upstream.
+    limit)    echo "API Error: 429 rate limit exceeded" >&2 ;;
+    # CAPTURED, NOT COMPOSED. This is Claude Code's own message when the
+    # account allowance is exhausted, epoch and all -- the same string the
+    # design review quoted when it asked for a real fixture here. Do not
+    # paraphrase it, do not tidy the pipe: an upstream rewording is precisely
+    # what this fixture exists to turn red.
+    captured) echo "Claude AI usage limit reached|1755772800" >&2 ;;
+    # The near-miss wording that motivated the `limit reached` alternative in
+    # USAGE_LIMIT_RE: no `rate limit`, no `usage limit`, no 429.
+    window)   echo "5-hour limit reached, resets at 3pm" >&2 ;;
+    # Limit-SHAPED but outside the pattern on purpose: a spend cap, not a rate
+    # cap. This is the classifier's negative direction, and it must stay a
+    # miss if the pattern grows further.
+    nearmiss) echo "API Error: 403 Your credit balance is too low to continue" >&2 ;;
+    *)        echo "API Error: 400 invalid request" >&2 ;;
+  esac
+  exit 1
+fi
 printf '{"type":"system","subtype":"init","session_id":"S%s"}\n' "$n"
 printf '{"type":"result","subtype":"success","session_id":"S%s","result":"ok"}\n' "$n"
 exit 0
@@ -256,6 +297,42 @@ selected() {
 # How many times the claude stub was called.
 calls() { cat "$HOME_DIR/calls" 2>/dev/null || echo 0; }
 
+# The most claude invocations that were ever alive at once. 1 means the passes
+# strictly followed one another; anything higher is direct evidence of overlap,
+# which no count of invocations can give.
+max_inflight() { cat "$HOME_DIR/maxinflight" 2>/dev/null || echo 0; }
+
+# One dump's argv, isolated the way the ARGV assertions isolate it: everything
+# before the first ENV line, because a persona's system prompt is
+# multi-paragraph and contains blank lines.
+dump_argv() { awk '/^ENV /{exit} {print}' "$1"; }
+
+# Under concurrency the dump INDEX means nothing, so assertions address a dump
+# by what is in it. The selector is one or more substrings joined by `&&`, and a
+# dump matches when its argv carries all of them -- which is how a case names
+# "the resumed pass belonging to Red Team" without knowing its number.
+dump_matches() {
+  local d="$1" rest="$2" part
+  while :; do
+    case "$rest" in
+      *"&&"*) part="${rest%%&&*}"; rest="${rest#*&&}" ;;
+      *)      part="$rest"; rest="" ;;
+    esac
+    grep -qF -- "$part" <(dump_argv "$d") || return 1
+    [ -n "$rest" ] || return 0
+  done
+}
+
+# How many dumps match the selector.
+count_matching() {
+  local n=0 d
+  for d in "$HOME_DIR"/dump.*; do
+    [ -e "$d" ] || continue
+    dump_matches "$d" "$1" && n=$((n + 1))
+  done
+  printf '%s' "$n"
+}
+
 # refuses LABEL EXPECTED-SUBSTRING -- VAR=VALUE...
 refuses() {
   local label="$1" want="$2"; shift 2
@@ -305,6 +382,12 @@ refuses_before_work() {
 #   ENV:N:VAR=value      -- invocation N saw exactly that value
 #   LOG:substring        -- the run's log contains substring
 #   NOLOG:substring      -- the run's log does not contain substring
+#   MAXINFLIGHT:N        -- exactly N claude processes were alive at once at the
+#                           peak: the one assertion here that can tell overlap
+#                           from a fast sequence
+#   MATCHCOUNT:sel:N     -- exactly N dumps' argv match sel, where sel is one or
+#                           more substrings joined by `&&`. Content-keyed, for
+#                           the parallel cases where "dump 3" names nothing
 cycle() {
   local label="$1"; shift
   local -a env_in=()
@@ -331,6 +414,14 @@ cycle() {
           NOARGV:*) grep -qF -- "$rest" <(awk '/^ENV /{exit} {print}' "$dump") && missing="$missing [argv $n should not have: $rest]" ;;
           ENV:*)    grep -qxF "ENV $rest" "$dump" || missing="$missing [env $n: $rest (was: $(grep "^ENV ${rest%%=*}=" "$dump" | sed 's/^ENV //'))]" ;;
         esac ;;
+      MAXINFLIGHT:*)
+        [ "$(max_inflight)" = "${expect#MAXINFLIGHT:}" ] \
+          || missing="$missing [expected ${expect#MAXINFLIGHT:} passes in flight at the peak, got $(max_inflight)]" ;;
+      # The count is the tail, so a selector may itself contain a colon.
+      MATCHCOUNT:*)
+        rest="${expect#MATCHCOUNT:}"; n="${rest##*:}"; rest="${rest%:*}"
+        [ "$(count_matching "$rest")" = "$n" ] \
+          || missing="$missing [expected $n dumps matching $rest, got $(count_matching "$rest")]" ;;
       LOG:*)   grep -qF "${expect#LOG:}" "$OUT" || missing="$missing [log missing: ${expect#LOG:}]" ;;
       NOLOG:*) grep -qF "${expect#NOLOG:}" "$OUT" && missing="$missing [log should not have: ${expect#NOLOG:}]" ;;
       *) missing="$missing [unknown expectation: $expect]" ;;
@@ -855,6 +946,138 @@ cycle "mcp: a Linear key adds the generated config to every invocation" \
      LOG:"Linear MCP enabled" \
      ARGV:1:"--strict-mcp-config --mcp-config" \
      ARGV:2:"--strict-mcp-config --mcp-config"
+
+# --- parallel dispatch -------------------------------------------------------
+# Everything above runs at MAX_CONCURRENT_PASSES=1 so its ordinal assertions
+# mean something. These cases unset the cap, which is production's default, and
+# address dumps by content instead. PR 12 rather than PR 1 throughout, so that
+# "#12" in a prompt is a selector that cannot also match "#1".
+
+# The floor: a group's personas each get their own pass, on both cycles.
+cycle "parallel: every code persona of a group gets its own pass, both cycles" \
+  PR_IDS=12 MAX_CONCURRENT_PASSES= \
+  -- CALLS:8 \
+     MATCHCOUNT:"You are a Red Team security reviewer":2 \
+     MATCHCOUNT:"You are an Adversarial reviewer":2 \
+     MATCHCOUNT:"You are a Subject Matter Expert":2 \
+     MATCHCOUNT:"You are a Sage":2
+
+# ... and they really do overlap. This is the assertion CALLS:8 cannot make: a
+# supervisor that ran the four one after another satisfies every count above.
+# STUB_HOLD keeps each pass alive long enough that the peak is a property of the
+# dispatch rather than of how fast a process starts.
+cycle "parallel: the personas of a group are in flight at the same time" \
+  PR_IDS=12 MAX_CONCURRENT_PASSES= STUB_HOLD=0.3 MAX_CYCLES=1 \
+  -- CALLS:4 MAXINFLIGHT:4
+
+# The control for the case above, and the guarantee the whole inherited suite
+# rests on: at a cap of one the group is strictly sequential, so the ordinal
+# assertions up there are not a race that happens to be winning.
+cycle "parallel: a cap of one runs the group one pass at a time" \
+  PR_IDS=12 STUB_HOLD=0.3 MAX_CYCLES=1 \
+  -- CALLS:4 MAXINFLIGHT:1
+
+# ... and a cap between the two is honoured rather than rounded to either end.
+cycle "parallel: MAX_CONCURRENT_PASSES caps the peak without dropping a pass" \
+  PR_IDS=12 MAX_CONCURRENT_PASSES=2 STUB_HOLD=0.3 MAX_CYCLES=1 \
+  -- CALLS:4 MAXINFLIGHT:2
+
+# The property the persona design rests on, now under concurrency:
+# --append-system-prompt does not survive --resume, so cycle two has to re-pass
+# it. Four resumed passes, and each carries its OWN persona -- the part that a
+# session map keyed on something coarser than the pair would break, and that
+# MATCHCOUNT:--resume:4 on its own would not notice.
+cycle "parallel: a resumed pass still carries its own persona" \
+  PR_IDS=12 MAX_CONCURRENT_PASSES= \
+  -- CALLS:8 \
+     MATCHCOUNT:"--resume":4 \
+     MATCHCOUNT:"--resume&&--append-system-prompt&&You are a Red Team security reviewer":1 \
+     MATCHCOUNT:"--resume&&--append-system-prompt&&You are an Adversarial reviewer":1 \
+     MATCHCOUNT:"--resume&&--append-system-prompt&&You are a Subject Matter Expert":1 \
+     MATCHCOUNT:"--resume&&--append-system-prompt&&You are a Sage":1
+
+# --- the shared working copy -------------------------------------------------
+# The stanza is the half of the shared-clone defense the model can act on, and
+# every pass needs it: a persona that checks out a branch corrupts what its
+# siblings are reading, and a resumed pass is as able to do that as a new one.
+cycle "worktree: the shared-copy stanza reaches every pass, resumed ones included" \
+  PR_IDS=12 MAX_CONCURRENT_PASSES= \
+  -- CALLS:8 \
+     MATCHCOUNT:"One more constraint":8 \
+     LOG:"Shared-worktree constraint active for: code plan"
+
+# Nothing runs beside a pass at a cap of one, so the constraint is not true and
+# is not asserted. Both modes have to be narrowed for real -- one clone serves
+# both, and a plan PR can arrive on any cycle -- which the cap does by making
+# each mode's effective concurrency one.
+cycle "worktree: no shared-copy stanza when nothing runs beside the pass" \
+  PR_IDS=12 \
+  -- CALLS:8 \
+     MATCHCOUNT:"One more constraint":0 \
+     NOLOG:"Shared-worktree constraint active"
+
+# The one place the verbatim-operator-prompt guarantee gives way. An operator
+# who replaces REVIEW_PROMPT is not the person who pays for a persona writing to
+# the shared tree, so the stanza is appended to the override too -- while the
+# stanzas that are defaults-only stay away, which is what the two zero counts
+# say.
+cycle "worktree: the stanza is appended even to an operator prompt override" \
+  PR_IDS=12 MAX_CONCURRENT_PASSES= REVIEW_PROMPT='look at #{{PR}}' MAX_CYCLES=1 \
+  -- CALLS:4 \
+     MATCHCOUNT:"look at #12":4 \
+     MATCHCOUNT:"You are a Red Team security reviewer&&look at #12&&One more constraint":1 \
+     MATCHCOUNT:"Perform a thorough review of pull request":0 \
+     MATCHCOUNT:"Treat the tests in this PR as code under review":0
+
+# --- limits and failures inside a group --------------------------------------
+# A limit cannot recall the siblings already in flight, and killing them would
+# leave a pass that posted some findings and not the rest, so the group finishes
+# and the cycle stops at the barrier. What the cut owes is that persona alone:
+# the next cycle re-runs Red Team and nobody else, and re-runs it RESUMED,
+# because a limit is not a broken session.
+cycle "parallel: a limit owes only the persona it cut, and its siblings finish" \
+  PR_IDS=12 MAX_CONCURRENT_PASSES= STUB_FAIL_PERSONA="Red Team" STUB_FAIL_MODE=limit \
+  -- CALLS:5 \
+     MATCHCOUNT:"You are an Adversarial reviewer":1 \
+     MATCHCOUNT:"You are a Subject Matter Expert":1 \
+     MATCHCOUNT:"You are a Sage":1 \
+     MATCHCOUNT:"You are a Red Team security reviewer":2 \
+     MATCHCOUNT:"--resume":1 \
+     MATCHCOUNT:"--resume&&You are a Red Team security reviewer":1 \
+     LOG:"Owed next cycle: #12 code/red_team." \
+     LOG:"Resuming with #12 code/red_team." \
+     LOG:"Backing off" \
+     NOLOG:"Not reviewed this cycle"
+
+# The groups after the cut are abandoned whole -- walking them into the same
+# wall spends more of the resource that just ran out -- and the next cycle
+# starts PAST the cut rather than at the debt. Serving the debt first reads as
+# the obvious thing and starves everything else: Red Team reports a limit on
+# every attempt here, so a cycle that returned to #12 first would review #13
+# never.
+cycle "parallel: the cut abandons the groups after it and the next cycle starts past it" \
+  PR_IDS=12,13 MAX_CONCURRENT_PASSES= STUB_FAIL_PERSONA="Red Team" STUB_FAIL_MODE=limit \
+  -- CALLS:8 \
+     MATCHCOUNT:"request #12":4 \
+     MATCHCOUNT:"request #13":4 \
+     MATCHCOUNT:"--resume":0 \
+     LOG:"Not reviewed this cycle: #13 code/red_team #13 code/adversarial #13 code/sme #13 code/sage." \
+     LOG:"Resuming with #13 code/red_team #13 code/adversarial #13 code/sme #13 code/sage #12 code/red_team." \
+     LOG:"Not reviewed this cycle: #12 code/red_team #12 code/adversarial #12 code/sme #12 code/sage."
+
+# A non-limit failure is not a cut: the group finishes, the cycle carries on to
+# the next group, and the three siblings keep the sessions they opened. Red Team
+# has none to keep -- it has never completed a pass -- which is why the compound
+# count is zero rather than one.
+cycle "parallel: a non-limit failure neither cuts the cycle nor costs its siblings their sessions" \
+  PR_IDS=12 MAX_CONCURRENT_PASSES= STUB_FAIL_PERSONA="Red Team" STUB_FAIL_MODE=other \
+  -- CALLS:8 \
+     MATCHCOUNT:"--resume":3 \
+     MATCHCOUNT:"--resume&&You are a Red Team security reviewer":0 \
+     MATCHCOUNT:"You are a Red Team security reviewer":2 \
+     LOG:"starting a fresh session for it next cycle" \
+     NOLOG:"Not reviewed this cycle" \
+     NOLOG:"Backing off"
 
 printf '\n%d passed, %d failed' "$PASS" "$FAIL"
 [ "$SKIP" -gt 0 ] && printf ', %d skipped' "$SKIP"
