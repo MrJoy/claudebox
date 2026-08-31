@@ -151,23 +151,46 @@ cat >"$BIN/claude" <<'STUB'
 # fast in sequence: CALLS:8 is satisfied either way. STUB_HOLD (seconds, passed
 # to /bin/sleep because the `sleep` on PATH is a no-op stub) makes the overlap
 # window wide enough to observe without depending on process-spawn timing.
-hold_lock() { while ! mkdir "$HOME/calls.lock" 2>/dev/null; do :; done; }
+# Bounded, because an unbounded spin is worse here than a wrong answer: the
+# watchdog kills the entrypoint pid, not a stub that outlived it, so an orphan
+# holding the lock would spin a core until somebody noticed. Thirty seconds is
+# far longer than any real holder, which does four file operations, so reaching
+# the cap means the holder is gone; steal the lock and carry on.
+hold_lock() {
+  local waited=0
+  while ! mkdir "$HOME/calls.lock" 2>/dev/null; do
+    /bin/sleep 0.01
+    waited=$((waited + 1))
+    if [ "$waited" -ge 3000 ]; then
+      echo "stub: stale calls.lock after 30s, stealing it" >&2
+      rmdir "$HOME/calls.lock" 2>/dev/null || true
+      waited=0
+    fi
+  done
+}
+# Armed before the increment, not after: a kill in between would otherwise leak
+# the in-flight count upward and hand a later case a peak it never reached.
+# counted guards the other direction, so an exit before the increment does not
+# decrement a count this process never added to.
+counted=0
+release() {
+  [ "$counted" = 1 ] || return 0
+  hold_lock
+  echo $(( $(cat "$HOME/inflight" 2>/dev/null || echo 1) - 1 )) >"$HOME/inflight"
+  rmdir "$HOME/calls.lock"
+}
+# Every exit path, the failing ones included, or the mark drifts upward on a
+# case whose passes merely followed one another.
+trap release EXIT
 hold_lock
 n=$(( $(cat "$HOME/calls" 2>/dev/null || echo 0) + 1 ))
 echo "$n" >"$HOME/calls"
 inflight=$(( $(cat "$HOME/inflight" 2>/dev/null || echo 0) + 1 ))
 echo "$inflight" >"$HOME/inflight"
+counted=1
 [ "$inflight" -gt "$(cat "$HOME/maxinflight" 2>/dev/null || echo 0)" ] \
   && echo "$inflight" >"$HOME/maxinflight"
 rmdir "$HOME/calls.lock"
-# Every exit path, the failing ones included, or the mark drifts upward on a
-# case whose passes merely followed one another.
-release() {
-  hold_lock
-  echo $(( $(cat "$HOME/inflight" 2>/dev/null || echo 1) - 1 )) >"$HOME/inflight"
-  rmdir "$HOME/calls.lock"
-}
-trap release EXIT
 {
   echo "ARGV $*"
   for v in ANTHROPIC_MODEL ANTHROPIC_DEFAULT_FABLE_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL \
