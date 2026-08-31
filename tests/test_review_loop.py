@@ -1262,5 +1262,112 @@ class McpArgsTest(unittest.TestCase):
         self.assertEqual(argv, ["--strict-mcp-config"])
 
 
+class SharedWorktreeModesTest(unittest.TestCase):
+    """Which modes are told their working copy is shared.
+
+    Per mode, because effective concurrency is min(cap, that mode's persona
+    count). Telling a mode that runs one persona at a time it is sharing a tree
+    would be a false statement in the prompt.
+    """
+
+    def test_a_mode_with_one_persona_is_never_concurrent(self):
+        got = review_loop.shared_worktree_modes(
+            personas={"code": ["red_team"], "plan": ["a", "b"]}, max_concurrent=0
+        )
+        self.assertEqual(got, frozenset({"plan"}))
+
+    def test_a_cap_of_one_makes_no_mode_concurrent(self):
+        got = review_loop.shared_worktree_modes(
+            personas={"code": ["a", "b"], "plan": ["a", "b"]}, max_concurrent=1
+        )
+        self.assertEqual(got, frozenset())
+
+    def test_unlimited_makes_every_multi_persona_mode_concurrent(self):
+        got = review_loop.shared_worktree_modes(
+            personas={"code": ["a", "b"], "plan": ["a", "b", "c"]}, max_concurrent=0
+        )
+        self.assertEqual(got, frozenset({"code", "plan"}))
+
+    def test_a_cap_above_one_is_concurrent(self):
+        got = review_loop.shared_worktree_modes(
+            personas={"code": ["a", "b", "c"]}, max_concurrent=2
+        )
+        self.assertEqual(got, frozenset({"code"}))
+
+    def test_an_empty_mode_is_not_concurrent(self):
+        got = review_loop.shared_worktree_modes(personas={"code": []}, max_concurrent=0)
+        self.assertEqual(got, frozenset())
+
+    def test_it_agrees_with_the_worker_count_the_group_gets(self):
+        # The stanza claims something the pool has to make true. If these two
+        # disagree, a persona is told it is alone while a sibling runs, or told
+        # to avoid a conflict that cannot happen.
+        for cap in (0, 1, 2, 5):
+            for count in (1, 2, 4):
+                sup = review_loop.Supervisor(
+                    personas={"code": ["p%d" % i for i in range(count)]},
+                    persona_prompts={}, review_prompts={}, followup_prompts={},
+                    model="m", mcp_args=[], cwd=".", max_passes_per_session=0,
+                    max_concurrent=cap,
+                )
+                group = sup.build_groups([(1, "code")])[0]
+                workers = sup.workers_for(group, group.pairs)
+                said = "code" in review_loop.shared_worktree_modes(
+                    personas=sup.personas, max_concurrent=cap
+                )
+                self.assertEqual(said, workers > 1, "cap=%d count=%d" % (cap, count))
+
+
+class WorktreeStanzaWiringTest(unittest.TestCase):
+    """The stanza has to reach an actual pass, not only prompts.build."""
+
+    def _prompt(self, env):
+        original = os.environ.copy()
+        os.environ.clear()
+        os.environ.update(env)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(original)))
+
+        captured = {}
+
+        class Recorder(review_loop.Supervisor):
+            def _run_one(inner, pair, prompt, session_id):
+                captured["prompt"] = prompt
+                return ok()
+
+        original_sup = review_loop.Supervisor
+        review_loop.Supervisor = Recorder
+        self.addCleanup(setattr, review_loop, "Supervisor", original_sup)
+
+        original_enum = review_loop.gh.enumerate_candidate_prs
+        review_loop.gh.enumerate_candidate_prs = lambda *a, **k: [(12, "code")]
+        self.addCleanup(setattr, review_loop.gh, "enumerate_candidate_prs", original_enum)
+
+        original_run = review_loop.subprocess.run
+        review_loop.subprocess.run = lambda *a, **k: subprocess.CompletedProcess(a[0], 0, "", "")
+        self.addCleanup(setattr, review_loop.subprocess, "run", original_run)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            review_loop.main([])
+        return captured["prompt"]
+
+    def test_a_multi_persona_run_carries_it(self):
+        prompt = self._prompt(preflight_env(
+            WORK_REPO=".", REVIEW_MODEL="m", MAX_CYCLES="1",
+        ))
+        self.assertIn(review_loop.prompts_mod.WORKTREE_STANZA, prompt)
+
+    def test_a_single_persona_run_does_not(self):
+        prompt = self._prompt(preflight_env(
+            WORK_REPO=".", REVIEW_MODEL="m", MAX_CYCLES="1", PERSONAS="red_team",
+        ))
+        self.assertNotIn(review_loop.prompts_mod.WORKTREE_STANZA, prompt)
+
+    def test_a_cap_of_one_does_not(self):
+        prompt = self._prompt(preflight_env(
+            WORK_REPO=".", REVIEW_MODEL="m", MAX_CYCLES="1", MAX_CONCURRENT_PASSES="1",
+        ))
+        self.assertNotIn(review_loop.prompts_mod.WORKTREE_STANZA, prompt)
+
+
 if __name__ == "__main__":
     unittest.main()

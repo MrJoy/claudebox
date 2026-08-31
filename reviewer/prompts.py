@@ -4,7 +4,8 @@ Four defaults, one per (mode, new-or-resumed) combination, plus the stanzas
 appended to them. Two rules govern the whole module and neither is cosmetic:
 
   * A stanza is appended to the DEFAULTS ONLY. An operator who supplies
-    REVIEW_PROMPT gets exactly that prompt, unedited.
+    REVIEW_PROMPT gets exactly that prompt, unedited. WORKTREE_STANZA is the
+    single exception, for the reason written above it.
   * A SUFFIX is appended to whichever prompt is in effect, default or override.
 
 The bare names (REVIEW_PROMPT, FOLLOWUP_PROMPT) mean code mode, so tuning the
@@ -12,7 +13,7 @@ code prompt cannot silently change what a plan PR gets asked.
 """
 
 from dataclasses import dataclass
-from typing import Dict, Mapping
+from typing import Dict, FrozenSet, Mapping
 
 # Extracted from entrypoint.sh by tools/extract-stanzas.py. See the long
 # comments there for why each exists; the short version:
@@ -58,6 +59,27 @@ _DEFAULT_FOLLOWUP_PLAN = (
 )
 
 
+# Emitted only for a mode whose personas actually run together. It goes onto an
+# operator OVERRIDE as well as onto the defaults, which is the one place the
+# verbatim-prompt guarantee gives way: a persona that checks out a branch under
+# concurrency corrupts what its siblings are reading, and the operator whose
+# prompt is being edited is not the one who pays for that. The other half of the
+# defense is a read-only .git directory, added in the loop. The chmod stops the
+# git commands; this stanza is what keeps a persona from routing around them.
+WORKTREE_STANZA = (
+    "One more constraint. The git working copy in your current directory is shared "
+    "with other reviewers reading this same pull request at this same moment, so "
+    "anything you write there lands in the middle of their review. Read the change "
+    "through `gh pr diff` and `gh pr view`. Run no git command that writes: no "
+    "checkout, no fetch, no pull, no branch, no stash, no commit, no reset. Read-only "
+    "git is fine, so `git log`, `git show`, `git diff` and `git cat-file` remain "
+    "available. Do not edit, create or delete files in the working copy, and do not "
+    "copy or re-clone it somewhere writable to work around this. A writing command "
+    "will fail on a permission error; when one does, reach for gh instead of "
+    "retrying it."
+)
+
+
 @dataclass(frozen=True)
 class Prompts:
     review: Dict[str, str]
@@ -74,7 +96,9 @@ def linear_stanza(env: Mapping[str, str]) -> str:
     return _LINEAR_STANZA
 
 
-def build(env: Mapping[str, str]) -> Prompts:
+def build(
+    env: Mapping[str, str], shared_worktree_modes: FrozenSet[str] = frozenset()
+) -> Prompts:
     ls = linear_stanza(env)
 
     # Stanza on the default only. An override is verbatim.
@@ -95,6 +119,13 @@ def build(env: Mapping[str, str]) -> Prompts:
     for key, mode in (("FOLLOWUP_PROMPT_SUFFIX", "code"), ("PLAN_FOLLOWUP_PROMPT_SUFFIX", "plan")):
         if env.get(key):
             followup[mode] = f"{followup[mode]} {env[key]}"
+
+    # Last, so it is the final thing in the prompt, and after the suffix so an
+    # operator's own last word cannot displace it.
+    for mode in ("code", "plan"):
+        if mode in shared_worktree_modes:
+            review[mode] = f"{review[mode]} {WORKTREE_STANZA}"
+            followup[mode] = f"{followup[mode]} {WORKTREE_STANZA}"
 
     return Prompts(review=review, followup=followup)
 

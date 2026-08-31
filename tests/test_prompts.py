@@ -129,6 +129,71 @@ class OverrideTest(unittest.TestCase):
         self.assertIn(prompts.TEST_STANZA, p.review["code"])
 
 
+
+class WorktreeStanzaTest(unittest.TestCase):
+    def test_absent_when_no_mode_is_concurrent(self):
+        p = prompts.build({})
+        for table in (p.review, p.followup):
+            for mode in ("code", "plan"):
+                self.assertNotIn(prompts.WORKTREE_STANZA, table[mode])
+
+    def test_present_on_both_prompts_of_a_concurrent_mode(self):
+        p = prompts.build({}, shared_worktree_modes=frozenset({"code"}))
+        self.assertIn(prompts.WORKTREE_STANZA, p.review["code"])
+        self.assertIn(prompts.WORKTREE_STANZA, p.followup["code"])
+
+    def test_absent_from_a_mode_that_is_not_concurrent(self):
+        p = prompts.build({}, shared_worktree_modes=frozenset({"code"}))
+        self.assertNotIn(prompts.WORKTREE_STANZA, p.review["plan"])
+        self.assertNotIn(prompts.WORKTREE_STANZA, p.followup["plan"])
+
+    def test_appended_to_an_operator_override_too(self):
+        # THE ONE PLACE THE VERBATIM GUARANTEE IS BROKEN, deliberately. A prompt
+        # that lets a persona check out a branch under concurrency corrupts the
+        # other personas' reviews, so it is not an operator-level opt-out.
+        p = prompts.build(
+            {"REVIEW_PROMPT": "just look at #{{PR}}"},
+            shared_worktree_modes=frozenset({"code"}),
+        )
+        self.assertTrue(p.review["code"].startswith("just look at #{{PR}}"))
+        self.assertIn(prompts.WORKTREE_STANZA, p.review["code"])
+
+    def test_appended_to_a_followup_override_too(self):
+        p = prompts.build(
+            {"FOLLOWUP_PROMPT": "re-check #{{PR}}"},
+            shared_worktree_modes=frozenset({"code"}),
+        )
+        self.assertTrue(p.followup["code"].startswith("re-check #{{PR}}"))
+        self.assertIn(prompts.WORKTREE_STANZA, p.followup["code"])
+
+    def test_lands_after_the_suffix(self):
+        p = prompts.build(
+            {"REVIEW_PROMPT_SUFFIX": "Be terse."},
+            shared_worktree_modes=frozenset({"code"}),
+        )
+        self.assertTrue(p.review["code"].endswith(prompts.WORKTREE_STANZA))
+        self.assertIn(" Be terse. ", p.review["code"])
+
+    def test_plan_mode_is_wired_on_its_own(self):
+        p = prompts.build({}, shared_worktree_modes=frozenset({"plan"}))
+        self.assertIn(prompts.WORKTREE_STANZA, p.review["plan"])
+        self.assertIn(prompts.WORKTREE_STANZA, p.followup["plan"])
+        self.assertNotIn(prompts.WORKTREE_STANZA, p.review["code"])
+
+    def test_forbids_the_commands_that_take_index_lock(self):
+        for verb in ("checkout", "fetch", "branch", "stash"):
+            self.assertIn(verb, prompts.WORKTREE_STANZA)
+
+    def test_names_the_read_path(self):
+        self.assertIn("gh pr diff", prompts.WORKTREE_STANZA)
+        self.assertIn("gh pr view", prompts.WORKTREE_STANZA)
+
+    def test_forbids_editing_the_files_directly(self):
+        # A persona told only "no git writes" can route around the constraint by
+        # rewriting a file in place, which corrupts a sibling's read the same way.
+        self.assertIn("edit", prompts.WORKTREE_STANZA)
+
+
 class RenderTest(unittest.TestCase):
     def test_replaces_every_occurrence(self):
         self.assertEqual(prompts.render("#{{PR}} and #{{PR}}", 12), "#12 and #12")

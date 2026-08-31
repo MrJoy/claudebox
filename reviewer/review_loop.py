@@ -21,7 +21,7 @@ import sys
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
 
 import gh
 import passes
@@ -73,6 +73,25 @@ def parse_max_concurrent(env: Mapping[str, str]) -> int:
     if value < 0:
         raise ConfigError("MAX_CONCURRENT_PASSES must be a non-negative integer")
     return value
+
+
+def shared_worktree_modes(personas: Dict[str, List[str]], max_concurrent: int) -> FrozenSet[str]:
+    """Modes whose personas actually run together this run.
+
+    Per mode rather than globally, because effective concurrency is
+    min(cap, that mode's persona count): a mode dialed down to one persona has
+    nothing running beside it and gets byte-identical prompts to the sequential
+    loop. Persona sets are fixed for the life of the container, so a resumed
+    session cannot gain or lose the stanza between passes.
+
+    This has to agree with Supervisor.workers_for, which is what makes the
+    claim true.
+    """
+    return frozenset(
+        mode
+        for mode, ids in personas.items()
+        if (len(ids) if max_concurrent <= 0 else min(max_concurrent, len(ids))) > 1
+    )
 
 
 def parse_max_cycles(env: Mapping[str, str]) -> Optional[int]:
@@ -538,14 +557,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for mode in personas_mod.REVIEW_MODES:
             log(f"{mode} personas: " + " ".join(p.id for p in resolved[mode]))
 
-        built = prompts_mod.build(env)
+        max_concurrent = parse_max_concurrent(env)
+        persona_ids = {m: [p.id for p in ps] for m, ps in resolved.items()}
+        worktree_modes = shared_worktree_modes(persona_ids, max_concurrent)
+        if worktree_modes:
+            log("Shared-worktree constraint active for: " + " ".join(sorted(worktree_modes)))
+
+        built = prompts_mod.build(env, shared_worktree_modes=worktree_modes)
         for warning in prompt_token_warnings(built.review, built.followup):
             log(warning)
         max_cycles = parse_max_cycles(env)
         interval = _positive_int(env, "REVIEW_INTERVAL_SECONDS", 300)
         backoff = _positive_int(env, "LIMIT_BACKOFF_SECONDS", 1800)
         max_passes = _positive_int(env, "MAX_PASSES_PER_SESSION", 0)
-        max_concurrent = parse_max_concurrent(env)
         review_model = _required(env, "REVIEW_MODEL")
         work_repo = _required(env, "WORK_REPO")
     except ConfigError as exc:
@@ -557,7 +581,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         mcp_args += ["--mcp-config", mcp_config]
 
     supervisor = Supervisor(
-        personas={m: [p.id for p in ps] for m, ps in resolved.items()},
+        personas=persona_ids,
         persona_prompts={(m, p.id): p.prompt for m, ps in resolved.items() for p in ps},
         review_prompts=built.review,
         followup_prompts=built.followup,
