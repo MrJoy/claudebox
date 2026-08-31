@@ -115,7 +115,7 @@ Whichever provider you pick, the entrypoint pins **every** model tier (`ANTHROPI
 
 ## How it works
 
-The reviewer runs **one Claude session per PR per mode per persona**. Each cycle the entrypoint enumerates the candidate PRs (see [PR selection](#pr-selection)), works out each one's review mode, then reviews it with each persona enabled for that mode in its own session: a pair's first review starts a new session with that mode's review prompt; later cycles `--resume` that pair's session with the mode's followup prompt, so a persona remembers what it already flagged and avoids duplicate comments. The PR number is substituted into the prompt's `{{PR}}` token.
+The reviewer runs **one Claude session per PR per mode per persona**. Each cycle the reviewer enumerates the candidate PRs (see [PR selection](#pr-selection)), works out each one's review mode, then reviews it with each persona enabled for that mode in its own session: a pair's first review starts a new session with that mode's review prompt; later cycles `--resume` that pair's session with the mode's followup prompt, so a persona remembers what it already flagged and avoids duplicate comments. The PR number is substituted into the prompt's `{{PR}}` token.
 
 ### Two review modes
 
@@ -136,37 +136,50 @@ A persona is an angle of attack, borrowed from [advocate](https://github.com/jmc
 
 Personas are deliberately **blind to each other**. Nothing tells a persona to defer to another's comments, because that would anchor it to a review it did not do, and avoiding that kind of group-think is the reason this tool exists. Overlapping findings between two angles of attack are a signal that something is worth two comments, not noise to suppress. Each comment is signed with the persona that raised it, e.g. `-claudebox (Red Team)`.
 
-**A cycle is now (candidate PRs x that PR's personas) sequential sessions.** `REVIEW_INTERVAL_SECONDS` is the gap *after* a cycle, so four PRs and four personas is sixteen reviews before the interval starts, and a plan-labeled PR contributes six sessions rather than four. Set `--persona` to one name for the cheapest code-mode run; it does not touch `PLAN_PERSONAS`, so a labeled PR still costs six sessions until you set that too.
+**A cycle is (candidate PRs x that PR's personas) sessions, and a PR's personas run at the same time.** The reviewer takes one PR, starts all of that PR's personas together, waits for every one of them to finish, and only then moves to the next PR. So four PRs and four personas is still sixteen reviews before `REVIEW_INTERVAL_SECONDS` starts counting, but they take about four PRs' worth of wall clock rather than sixteen reviews' worth, and a plan-labeled PR contributes six sessions rather than four. Set `--persona` to one name for the cheapest code-mode run; it does not touch `PLAN_PERSONAS`, so a labeled PR still costs six sessions until you set that too.
+
+The PR is the unit of fan-out because it is what bounds how much of your usage allowance is in flight at any moment: one PR's worth of passes, never the whole candidate list at once. `--max-concurrent-passes N` (or `MAX_CONCURRENT_PASSES`) caps it further, to at most N of a PR's personas at a time; `1` reviews one persona at a time, which is what the reviewer did before this. Nothing is ever killed mid-pass, including when one persona hits a usage limit: a killed pass may have posted some of its findings and not others, so the rest of the PR's personas are left to finish and the cycle ends after them.
+
+> **Concurrency changes what the reviewer is told, and what it can do.** All of a PR's personas share one git working copy, so a persona running `git checkout` would change the diff its siblings are reading mid-review. Two things stop that, and both switch on only when a mode really does run more than one persona at once. The reviewer is told the working copy is shared and to read the change through `gh pr diff`/`gh pr view` rather than writing to it — and that instruction is appended to your `REVIEW_PROMPT`/`FOLLOWUP_PROMPT` override too, the one thing that ever reaches Claude on top of a prompt you supplied. And the working clone's `.git` is made read-only for the whole run, lifted only for the cycle's own `git fetch`, so a persona that tries anyway gets a permission error instead of corrupting the review. `MAX_CONCURRENT_PASSES=1` turns both off, in every mode, whatever your persona lists say.
 
 ```bash
-# CLAUDE_MCP_ARGS is always (--strict-mcp-config), plus (--mcp-config "$MCP_CONFIG_FILE")
-# when LINEAR_API_KEY is set. The "--" is load-bearing: --mcp-config is variadic, so
-# without it the prompt would be parsed as another MCP config path.
+# Every invocation carries --strict-mcp-config, and --mcp-config as well when a
+# Linear key produced a config to point it at. The "--" is load-bearing:
+# --mcp-config is variadic, so without it the prompt would be parsed as another
+# MCP config path.
 
 # a (PR, mode, persona) pair's first review — new session
 claude -p --output-format stream-json --verbose --dangerously-skip-permissions \
-  --model "$REVIEW_MODEL" --append-system-prompt "${PERSONA_PROMPT[$mode:$persona]}" \
-  "${CLAUDE_MCP_ARGS[@]}" -- "${MODE_REVIEW_PROMPT[$mode]//\{\{PR\}\}/$pr}"
+  --model <REVIEW_MODEL> --append-system-prompt <that persona's prompt> \
+  --strict-mcp-config [--mcp-config ~/mcp.json] \
+  -- <that mode's review prompt, with {{PR}} replaced by the PR number>
 # later cycles — resume that pair's session
-claude -p --resume "${PR_SESSION[$pr:$mode:$persona]}" --output-format stream-json --verbose \
-  --dangerously-skip-permissions --model "$REVIEW_MODEL" \
-  --append-system-prompt "${PERSONA_PROMPT[$mode:$persona]}" \
-  "${CLAUDE_MCP_ARGS[@]}" -- "${MODE_FOLLOWUP_PROMPT[$mode]//\{\{PR\}\}/$pr}"
+claude -p --resume <that pair's session id> --output-format stream-json --verbose \
+  --dangerously-skip-permissions --model <REVIEW_MODEL> \
+  --append-system-prompt <that persona's prompt> \
+  --strict-mcp-config [--mcp-config ~/mcp.json] \
+  -- <that mode's followup prompt, with {{PR}} replaced>
 ```
 
-Each pass streams as `stream-json`; the entrypoint pretty-prints the events live to its log (so `docker logs -f` shows the play-by-play) and recovers the session id from the stream to resume that pair next cycle.
+Each pass streams as `stream-json`; the reviewer pretty-prints the events live to its log (so `docker logs -f` shows the play-by-play) and takes the session id out of the same stream to resume that pair next cycle. Log lines from inside a pass are prefixed with the pair that produced them, e.g. `[14:22:07] [#12 code/sage] …`.
 
-The entrypoint shell is the supervisor: it controls cadence (`git fetch`, enumerate PRs, review each sequentially, then sleep), keeps an in-memory (PR, mode, persona)→session map, so a PR whose label changes starts fresh in its new mode instead of resuming a session that was reviewing it as something else, and starts a fresh session for a pair if its pass fails (so that persona may re-comment once on that PR). Claude itself uses `gh`/`git` to inspect the PR, check out the latest commit, and post one comment per finding. `MAX_PASSES_PER_SESSION` rotates a pair's session after N passes to bound its context growth (per pair).
+**The container runs two programs, in two languages.** `entrypoint.sh` does startup: the hardening checks, `gh`/`git` auth, the provider environment, the working clone, and the Workers AI translator when one is configured. Then it `exec`s `reviewer/review_loop.py` and hands the container over.
+
+That Python loop is the supervisor. It controls cadence (`git fetch`, enumerate PRs, review one PR at a time with its personas running together, then sleep), keeps an in-memory (PR, mode, persona)→session map, so a PR whose label changes starts fresh in its new mode instead of resuming a session that was reviewing it as something else, and starts a fresh session for a pair if its pass fails (so that persona may re-comment once on that PR). Claude itself uses `gh` (and read-only `git`) to inspect the PR and post one comment per finding. `MAX_PASSES_PER_SESSION` rotates a pair's session after N passes to bound its context growth (per pair).
+
+The line between them is what each half produces. Building an environment for a child process is a job shell handles well. Holding structured state per task is not, and that state is all the loop is: which pairs are still owed a review, which session each one resumes, where a cut cycle stopped, whether a failure was a usage limit or a dead endpoint. Almost every bug this thing has had lived on the second side of that line. Nothing about running or configuring it changed with the move, and `reviewer/` is standard-library Python, so the image installs nothing extra to run it.
+
+`MAX_CYCLES` says how many cycles to run before the process exits. Unset or `0` is forever, which is what an unattended container wants; `MAX_CYCLES=1` gives you a single pass over the candidate PRs that you can watch to the end. The launcher has no flag for it, so put it in your env file if you want `./claudebox.sh test` to stop on its own.
 
 `--append-system-prompt` is passed on *both* forms, which is not redundant: the flag does not survive `--resume`. Passed only on the first pass, cycle one would be adversarial and every later cycle would be a generic reviewer wearing the persona's name in the log.
 
-A pass that fails on a usage or rate limit is treated differently from one that fails for any other reason: it keeps its session, ends the cycle early instead of walking the remaining pairs into the same limit, and waits `LIMIT_BACKOFF_SECONDS` (default 1800). Dropping the session there would make the next attempt re-read the whole PR and re-post findings already posted, spending more of the allowance that just ran out.
+A pass that fails on a usage or rate limit is treated differently from one that fails for any other reason: it keeps its session, ends the cycle once the rest of that PR's personas have finished instead of walking the remaining PRs into the same limit, and waits `LIMIT_BACKOFF_SECONDS` (default 1800). Dropping the session there would make the next attempt re-read the whole PR and re-post findings already posted, spending more of the allowance that just ran out.
 
-A cycle cut short does not simply start over. The reviewer remembers the pair it was cut at and the next cycle begins at the pair *after* it, wrapping around, so an allowance that only covers a few passes per backoff window still works its way through the whole set instead of reviewing the first few pairs forever. The pairs a cut skipped are named in the log. That memory is in-process, so a container restart loses it and the next cycle starts at the first pair.
+A cycle cut short does not simply start over, and it remembers two things. It remembers the PR it was cut at, and the next cycle begins at the PR *after* it, wrapping around, so an allowance that only covers a few passes per backoff window works its way through the whole set instead of reviewing the first few PRs forever. And it remembers which personas were owed: the ones the limit prevented, plus every persona of every PR the cycle never reached. When the rotation comes back round to a PR that is owed something, it runs only what it owes, because the rest of that PR's personas already had their turn. Both the skipped pairs and the owed ones are named in the log. That memory is in-process, so a container restart loses it and the next cycle starts at the first PR with nothing owed.
 
-Three failures in a row that are **not** limits — connection refused, a dead translator, a gateway 502 — also end the cycle, with a log line saying so, on the ordinary `REVIEW_INTERVAL_SECONDS` rather than the backoff. Each such failure drops its pair's session, so walking the rest of the list into a dead endpoint would cost a duplicate-comment burst per pair. Any successful pass resets the count.
+Three failures in a row that are **not** limits — connection refused, a dead translator, a gateway 502 — also end the cycle, with a log line saying so, on the ordinary `REVIEW_INTERVAL_SECONDS` rather than the backoff. Each such failure drops its pair's session, so walking the rest of the list into a dead endpoint would cost a duplicate-comment burst per pair. The count is taken once per PR, after its personas finish, and any successful pass on that PR resets it — a success anywhere means the provider is alive.
 
-> Why not `/loop`? Claude Code's `/loop` needs a live *interactive* session — scheduled wake-ups only fire while a session is running and idle, and headless `-p` mode exits after each response. The shell loop + `--resume` gives the same continuous, context-retaining behavior while staying headless and crash-safe.
+> Why not `/loop`? Claude Code's `/loop` needs a live *interactive* session — scheduled wake-ups only fire while a session is running and idle, and headless `-p` mode exits after each response. The supervisor's own loop plus `--resume` gives the same continuous, context-retaining behavior while staying headless and crash-safe.
 
 ## The `claudebox.sh` launcher
 
@@ -244,14 +257,18 @@ mount is skipped and only the path alignment is added.
 Provider wiring — which credential and endpoint variables each `PROVIDER` ends up handing Claude Code — is covered by a test suite that needs no Docker, network, or credentials:
 
 ```bash
+./test-python.sh                 # unit tests for the review loop
 ./test-providers.sh              # all cases
 ./test-providers.sh cloudflare   # only cases whose label matches
 ./test-personas.sh               # persona selection and the per-persona loop
 ./test-shim.sh                   # the workersai normalizer
 bash -n entrypoint.sh && bash -n claudebox.sh   # syntax only
+python3 -m py_compile reviewer/*.py             # the same, for the Python
 ```
 
-It stubs `gh`/`git`/`claude` and checks either the startup error the entrypoint refused with or the exact environment it built. That's a narrow claim on purpose: it proves the wiring matches intent, not that a provider accepts it. Before trusting a newly configured provider unattended, do one live `./claudebox.sh test --repo …` and watch it actually get a response.
+`test-python.sh` covers the review loop itself, which is Python: prompt assembly against captured fixtures, persona resolution, PR selection and label routing, usage-limit classification, the stream formatter, and the cycle bookkeeping — the resume point after a cut cycle, the consecutive-failure count, session rotation. It runs in under a second and needs nothing installed. What the bash suites below check is the environment the loop gets handed, down to which credential var ends up set. Everything the loop then decides with it is checked here.
+
+It stubs `gh`/`git`/`claude`, plus `curl`, `sleep`, and a `python3` that dispatches on the script path (the Workers AI normalizer is faked, the review supervisor is the real one), and checks either the startup error the entrypoint refused with or the exact environment it built. That's a narrow claim on purpose: it proves the wiring matches intent, not that a provider accepts it. Before trusting a newly configured provider unattended, do one live `./claudebox.sh test --repo …` and watch it actually get a response.
 
 `test-personas.sh` covers persona selection and the per-persona review loop. It runs **two** cycles rather than one, because the property that matters most cannot be observed in a single cycle: `--append-system-prompt` does not survive `--resume`, so the assertion that has to exist is that a *resumed* pass still carries its persona. It captures one dump per `claude` invocation and asserts the invocation count, each invocation's argv, the resume targets, and the usage-limit path. It also covers review-mode routing: that a labeled PR resolves the plan persona set and the plan prompts, that an unlabeled PR in the same cycle resolves the code set, that a PR gaining the label starts a fresh session rather than resuming a code-mode one, and that an override written for one mode never reaches the other.
 
@@ -374,18 +391,20 @@ Optional:
 - `REVIEW_MODEL` (provider-specific default; **required** for `PROVIDER=custom` and `PROVIDER=cloudflare`)
 - `ANTHROPIC_CUSTOM_HEADERS` (optional on any provider; **required** for `GATEWAY_UPSTREAM=bedrock`/`vertex`) — extra request headers, `Name: value` per line
 - `REVIEW_INTERVAL_SECONDS`
+- `MAX_CYCLES` (how many review cycles to run before exiting; unset or `0` runs forever, `1` gives a one-shot run)
 - `REVIEW_PROMPT` (a (PR, persona) pair's first review, new session; uses the `{{PR}}` token)
 - `FOLLOWUP_PROMPT` (a pair's resumed review; uses the `{{PR}}` token)
 
-  > The default prompts tell the reviewer how to work within the minimized token: pass an explicit `--json` field list to `gh pr view`, and don't use `gh pr checks` at all. Both need a permission a fine-grained PAT can't be granted — a bare `gh pr view` implicitly fetches `statusCheckRollup` and fails outright, which reads like a broken token rather than a missing permission. **If you override `REVIEW_PROMPT`/`FOLLOWUP_PROMPT` you get your text verbatim, so carry those constraints over yourself** (or add them via the `_SUFFIX` variables, which apply to overrides too). CI status is simply unavailable to the reviewer; it judges the code, not the build.
+  > The default prompts tell the reviewer how to work within the minimized token: pass an explicit `--json` field list to `gh pr view`, and don't use `gh pr checks` at all. Both need a permission a fine-grained PAT can't be granted — a bare `gh pr view` implicitly fetches `statusCheckRollup` and fails outright, which reads like a broken token rather than a missing permission. **If you override `REVIEW_PROMPT`/`FOLLOWUP_PROMPT` you get your text verbatim, so carry those constraints over yourself** (or add them via the `_SUFFIX` variables, which apply to overrides too). Verbatim has exactly one exception: when a PR's personas run concurrently, the shared-worktree constraint is appended to your override as well, after your `_SUFFIX`. It is the only thing that is, and `MAX_CONCURRENT_PASSES=1` removes it. CI status is simply unavailable to the reviewer; it judges the code, not the build.
   >
   > They also carry a test-quality stanza, for a failure mode plain "review the tests" doesn't catch: a PR whose new tests pass unchanged with the production change reverted. The stanza turns that into a procedure the reviewer runs per added test — work out which lines of the non-test change the test depends on, mentally revert them, and ask whether it would still pass — plus the related mutations (a moved boundary, a negated condition, a deleted error branch, a constant return), and the as-implemented smells: assertions that restate the implementation, recompute the expected value the same way the code does, assert a mock's own stubbed return, or freeze current output as a snapshot. Overriding the prompt drops this too.
 - `REVIEW_PROMPT_SUFFIX` / `FOLLOWUP_PROMPT_SUFFIX` (append extra instructions to the corresponding prompt — default or overridden; also supports the `{{PR}}` token)
-- `PLAN_REVIEW_PROMPT` / `PLAN_FOLLOWUP_PROMPT` and `PLAN_REVIEW_PROMPT_SUFFIX` / `PLAN_FOLLOWUP_PROMPT_SUFFIX` (the plan-mode counterparts of the four above, used for a PR carrying `PLAN_LABEL`; same `{{PR}}` token, same verbatim-override rule)
+- `PLAN_REVIEW_PROMPT` / `PLAN_FOLLOWUP_PROMPT` and `PLAN_REVIEW_PROMPT_SUFFIX` / `PLAN_FOLLOWUP_PROMPT_SUFFIX` (the plan-mode counterparts of the four above, used for a PR carrying `PLAN_LABEL`; same `{{PR}}` token, same verbatim-override rule and the same shared-worktree exception to it)
 
   > The bare names are code mode, so tuning your code-review prompt never changes what a plan PR is asked. The URLs, ids, credentials and selector values above each have one matched pair of surrounding quotes stripped at startup; the eight prompt variables deliberately do not, because a quote at either end of free text can be exactly what you meant to send. That is an exemption, not a safety net: quote nothing in your env file, since `docker run --env-file` keeps quotes literally and several values here are stripped by nothing at all.
 - `PLAN_LABEL` (default `plan`), the GitHub label that routes a PR to plan mode; see [Two review modes](#two-review-modes)
 - `MAX_PASSES_PER_SESSION` (rotate a session to a fresh one every N passes, per (PR, mode, persona) pair; `0` = never)
+- `MAX_CONCURRENT_PASSES` / `--max-concurrent-passes` (how many of a PR's personas review it at the same time; unset or `0` is all of them, `1` reviews one at a time — see [Personas](#personas))
 - `LINEAR_API_KEY` (optional Linear ticket context; use a **read-only** key — see [Linear ticket context](#linear-ticket-context))
 - `--export-sessions` (launcher flag, not an env var) — export review transcripts to the host and align the session folder; see [Exporting review sessions to your host](#exporting-review-sessions-to-your-host)
 
@@ -409,6 +428,7 @@ All eight prompt variables use a `{{PR}}` token (substituted with the PR number)
 | `PERSONAS` | `--persona` | `red_team,adversarial,sme,sage` | Code-mode personas. Comma list of ids, or `all`. Order is honoured. An unknown name is a startup error. |
 | `PLAN_PERSONAS` | — | all six | Plan-mode personas. Same spelling and the same rules as `PERSONAS`. |
 | `PLAN_LABEL` | — | `plan` | The GitHub label that puts a PR in plan mode. |
+| `MAX_CONCURRENT_PASSES` | `--max-concurrent-passes` | `0` (all of them) | How many of a PR's personas review it at the same time. `1` reviews one at a time. Not a non-negative integer is a startup error. |
 | `PERSONA_DIR` | — | `/opt/claudebox/personas` | Where definitions are read from. Point it at a read-only mount to supply your own set. |
 | `LIMIT_BACKOFF_SECONDS` | — | `1800` | How long to wait after a pass fails on a usage or rate limit, instead of `REVIEW_INTERVAL_SECONDS`. |
 
@@ -418,9 +438,11 @@ Available ids in both modes: `red_team`, `adversarial`, `sage`, `sme`, `user`, `
 
 Each persona multiplies the sessions per cycle, and a plan-labeled PR runs six of them by default rather than four. On a fixed-price plan the binding resource is usage allowance, so start with one or two personas and widen once you have seen what a cycle costs you.
 
+A PR's personas run at the same time, so widening the set costs allowance rather than wall clock. `MAX_CONCURRENT_PASSES` caps how many of them are in flight at once, which is the knob to reach for when the provider starts rate-limiting you or the container runs into its `--memory` ceiling: every concurrent pass is another `claude` process inside the same limits. Setting it to `1` reviews one persona at a time and also switches off the shared-worktree instruction and the read-only `.git` that concurrency brings with it, in every mode.
+
 ### Linear ticket context
 
-Set `LINEAR_API_KEY` and the reviewer also reads the Linear ticket a PR references — its description *and* its comments, where later feedback and revised requirements usually live — and raises divergence from what the ticket asked for as a finding, alongside the usual code findings. Unset, nothing about the review changes. This only happens with the default prompts, though (the plan-mode defaults carry the same Linear stanza): the Linear instructions are appended to those defaults, not injected independently, so if you override either prompt, your prompt runs verbatim with the Linear MCP server available but no instruction to use it — tell the reviewer yourself to consult the ticket if you want that behavior with a custom prompt. If you just want to add your own instructions on top of the defaults (Linear stanza included), `REVIEW_PROMPT_SUFFIX`/`FOLLOWUP_PROMPT_SUFFIX` are the cleaner route — they append to whichever prompt is in effect instead of replacing it.
+Set `LINEAR_API_KEY` and the reviewer also reads the Linear ticket a PR references — its description *and* its comments, where later feedback and revised requirements usually live — and raises divergence from what the ticket asked for as a finding, alongside the usual code findings. Unset, nothing about the review changes. This only happens with the default prompts, though (the plan-mode defaults carry the same Linear stanza): the Linear instructions are appended to those defaults, not injected independently, so if you override either prompt, your prompt runs verbatim (bar the shared-worktree constraint under concurrency) with the Linear MCP server available but no instruction to use it — tell the reviewer yourself to consult the ticket if you want that behavior with a custom prompt. If you just want to add your own instructions on top of the defaults (Linear stanza included), `REVIEW_PROMPT_SUFFIX`/`FOLLOWUP_PROMPT_SUFFIX` are the cleaner route — they append to whichever prompt is in effect instead of replacing it.
 
 Get a key from **Settings → Security & access → Personal API keys**. Linear's MCP server accepts an API key straight through as an `Authorization: Bearer` header ([Linear docs](https://linear.app/docs/mcp)), so there is no interactive OAuth step and the loop stays headless.
 
@@ -428,7 +450,7 @@ Get a key from **Settings → Security & access → Personal API keys**. Linear'
 
 Read-only bounds what the reviewer can change, not what it can see: a personal API key is scoped to your whole Linear workspace, not to the one ticket a PR claims to reference. The reviewer already treats PR titles, bodies, and diffs as untrusted input, and it can post PR comments — so Linear ticket content becomes a second untrusted input channel into a permission-skipped session, and a hostile or careless PR body can in principle steer it into reading unrelated tickets and pasting their contents into a comment on a possibly-public PR. Don't enable `LINEAR_API_KEY` on repos that take PRs from untrusted contributors, and prefer a key from an account with minimal Linear visibility over your main one.
 
-The entrypoint writes the key into a generated MCP config at `$HOME/mcp.json` (mode `600`) and passes it to Claude Code with `--mcp-config`. Every review pass also runs with `--strict-mcp-config`, whether or not Linear is configured: the reviewed repo is untrusted input, and strict mode means a repository that ships its own `.mcp.json` can't get MCP servers of its choosing loaded into a permission-skipped session.
+The entrypoint writes the key into a generated MCP config at `$HOME/mcp.json` (mode `600`), and the review loop passes that file to Claude Code with `--mcp-config`. Every review pass also runs with `--strict-mcp-config`, whether or not Linear is configured: the reviewed repo is untrusted input, and strict mode means a repository that ships its own `.mcp.json` can't get MCP servers of its choosing loaded into a permission-skipped session.
 
 ## Notes & caveats
 

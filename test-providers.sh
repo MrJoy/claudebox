@@ -32,6 +32,12 @@ for candidate in "${BASH:-}" "$(command -v bash || true)" /opt/homebrew/bin/bash
 done
 [ -n "$BASH_BIN" ] || { printf 'ERROR: no bash 4+ found; entrypoint.sh needs one (macOS /bin/bash is 3.2 — `brew install bash`).\n' >&2; exit 1; }
 
+# The stubs below run under `env -i`, which is exactly what stops the python3
+# stub from finding a real interpreter on its own. Resolve it here, while a
+# normal PATH is still in scope, and pass it through explicitly.
+REAL_PYTHON3="$(command -v python3 || true)"
+[ -n "$REAL_PYTHON3" ] || { printf 'ERROR: python3 is required (the review supervisor is Python).\n' >&2; exit 1; }
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 BIN="$WORK/bin"; mkdir -p "$BIN"
@@ -46,8 +52,9 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   exit 0
 fi
 # `gh repo clone REPO DEST` is the seed-less fallback; like git clone above it
-# must leave a directory behind for the loop to cd into.
-if [ "$1" = "repo" ] && [ "$2" = "clone" ]; then mkdir -p "$4"; fi
+# must leave a working clone behind, .git included -- the supervisor refuses to
+# start when it cannot lock one.
+if [ "$1" = "repo" ] && [ "$2" = "clone" ]; then mkdir -p "$4/.git"; fi
 exit 0
 STUB
 # git succeeds at everything except the one probe whose ANSWER the entrypoint
@@ -60,33 +67,52 @@ cat >"$BIN/git" <<'STUB'
 if [ "$1" = "-C" ] && [ "$3" = "rev-parse" ]; then
   [ -d "$2" ] || exit 1
 fi
-# A real clone creates its destination, and the loop cd's into it, so make the
-# directory even though nothing is put in it.
-if [ "$1" = "clone" ]; then for a in "$@"; do dest="$a"; done; mkdir -p "$dest"; fi
+# A real clone creates its destination and puts a .git in it, and the loop cd's
+# into it. The .git is not decoration: the supervisor locks it before the first
+# pass and refuses to run concurrent personas against a clone it cannot lock.
+if [ "$1" = "clone" ]; then for a in "$@"; do dest="$a"; done; mkdir -p "$dest/.git"; fi
 exit 0
 STUB
-# One cycle per case: the review loop ends with `sleep $REVIEW_INTERVAL_SECONDS`
-# as its last unprotected command, so a failing sleep makes the entrypoint's own
-# `set -e` end the run right after the first pass. Cheaper and quieter than
-# signalling the supervisor from outside.
-printf '#!/bin/sh\nexit 1\n' >"$BIN/sleep"
+# One cycle per case, asked for directly: MAX_CYCLES=1 in the baseline below
+# tells the supervisor to exit after the first pass. The loop's own interval is
+# time.sleep() inside Python, so the old trick of a failing `sleep` stub ending
+# the run through the entrypoint's `set -e` has nothing left to hook. sleep is
+# still stubbed as a no-op because the entrypoint polls with it while waiting
+# for the translator, and a failing sleep there would kill the run.
+printf '#!/bin/sh\nexit 0\n' >"$BIN/sleep"
 
 # PROVIDER=workersai starts the bundled LiteLLM translator and blocks until it
 # answers its liveness probe. Both halves are stubbed: `litellm` just has to stay
-# alive so the entrypoint's kill -0 check passes (`tail -f`, not `sleep`, since
-# sleep is the stub that ends the loop), and `curl` reports it ready at once so
-# the readiness wait never reaches that failing sleep.
+# alive so the entrypoint's kill -0 check passes (`tail -f`, since the `sleep`
+# stub above returns at once and would leave nothing running), and `curl`
+# reports it ready on the first poll so the readiness wait returns immediately.
 printf '#!/bin/sh\nprintf "%%s" "$*" >"$HOME/litellm-argv"\nexec tail -f /dev/null\n' >"$BIN/litellm"
 printf '#!/bin/sh\nexit 0\n' >"$BIN/curl"
 
-# The normalizer that runs between the translator and Cloudflare is launched as
-# `python3 <script>`, so python3 is stubbed the same way: record how it was
-# invoked, and stay alive so the entrypoint's kill -0 check passes. Stubbing it
-# rather than running the real thing keeps the suite from binding a real port
-# (and from caring whether one is already in use). The script's own behaviour is
-# not what these cases test — they test that the chain is wired and ordered
-# correctly, and that the credential-bearing hop stays on loopback.
-printf '#!/bin/sh\nprintf "%%s upstream=%%s port=%%s" "$*" "$SHIM_UPSTREAM_URL" "$SHIM_PORT" >"$HOME/shim-argv"\nexec tail -f /dev/null\n' >"$BIN/python3"
+# python3 has two callers now, and only one of them may be stubbed. The
+# normalizer between the translator and Cloudflare is launched as
+# `python3 <script>`: record how it was invoked and stay alive so the
+# entrypoint's kill -0 check passes, which keeps the suite from binding a real
+# port and from caring whether one is already in use (the script's own behaviour
+# is not what these cases test — they test that the chain is wired and ordered
+# correctly, and that the credential-bearing hop stays on loopback). The review
+# supervisor is the other caller, and it is REAL: the entrypoint ends in
+# `exec python3 .../reviewer/review_loop.py`, so a blanket stub would swallow
+# the loop and hang the suite forever on a `tail -f` that never ends. Dispatch
+# on the script, remapping the supervisor's baked-in image path to this
+# checkout, and hand anything else to the real interpreter.
+cat >"$BIN/python3" <<'STUB'
+#!/bin/sh
+case "$1" in
+  *workersai-shim.py)
+    printf '%s upstream=%s port=%s' "$*" "$SHIM_UPSTREAM_URL" "$SHIM_PORT" >"$HOME/shim-argv"
+    exec tail -f /dev/null ;;
+  */reviewer/review_loop.py)
+    shift; exec "$REAL_PYTHON3" "$REVIEWER_MAIN" "$@" ;;
+  *)
+    exec "$REAL_PYTHON3" "$@" ;;
+esac
+STUB
 
 # The `claude` stub is the probe: it records the environment the entrypoint built
 # and the argv it was called with. The entrypoint sends claude's stderr to a temp
@@ -127,6 +153,26 @@ chmod +x "$BIN"/*
 PASS=0; FAIL=0; SKIP=0
 FAILED_LABELS=""
 
+# A run that never ends is a suite that never ends. MAX_CYCLES is the only thing
+# that stops the supervisor now, and a *missing* one means "loop forever": an
+# unparsable value is a hard ConfigError, but a baseline that lost the variable
+# entirely would hang here instead of failing. Kill anything still alive after
+# two minutes and note it in the captured output, so the case fails on its own
+# assertions with the reason visible rather than stalling the run.
+watchdog_wait() {
+  local pid="$1" i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    i=$((i + 1))
+    if [ "$i" -gt 1200 ]; then
+      kill -9 "$pid" 2>/dev/null
+      printf 'WATCHDOG: run exceeded 120s and was killed\n' >>"$OUT"
+      break
+    fi
+    sleep 0.1
+  done
+  wait "$pid" 2>/dev/null
+}
+
 # Run the entrypoint once. $1 = label, rest = VAR=VALUE for its environment.
 # Leaves the log in $OUT and the claude-stub dump in $DUMP (absent if the
 # entrypoint died before starting a pass).
@@ -155,10 +201,12 @@ run_entrypoint() {
   env -i PATH="$BIN:$PATH" HOME="$HOME_DIR" \
     ALLOW_UNHARDENED=1 \
     GITHUB_TOKEN=x GITHUB_REPOSITORY=owner/repo PR_IDS=1 \
-    REPO_PATH="$HOME_DIR/seed" REVIEW_INTERVAL_SECONDS=1 \
+    REPO_PATH="$HOME_DIR/seed" REVIEW_INTERVAL_SECONDS=1 MAX_CYCLES=1 \
     LITELLM_BIN="$BIN/litellm" SHIM_BIN="$SCRIPT_DIR/workersai-shim.py" \
+    REAL_PYTHON3="$REAL_PYTHON3" REVIEWER_MAIN="$SCRIPT_DIR/reviewer/review_loop.py" \
     PERSONA_DIR="$SCRIPT_DIR/personas" PERSONAS=red_team \
-    "$@" "$BASH_BIN" "$ENTRYPOINT" >"$OUT" 2>&1
+    "$@" "$BASH_BIN" "$ENTRYPOINT" >"$OUT" 2>&1 &
+  watchdog_wait $!
 }
 
 ok()   { PASS=$((PASS + 1)); printf 'ok   %s\n' "$1"; }
@@ -511,6 +559,14 @@ wires "single-quoted values are unwrapped too" \
 wires "an interior quote is left alone" \
   PROVIDER=custom ANTHROPIC_BASE_URL=https://example.test/ REVIEW_MODEL=m ANTHROPIC_AUTH_TOKEN='ab"cd' \
   -- 'ANTHROPIC_AUTH_TOKEN=ab"cd'
+# Not a var claude itself reads -- the supervisor does -- so this asserts the
+# repair through the log rather than the dump. `wires` also requires the run to
+# reach a review pass, which is the other half: unrepaired, the supervisor
+# refuses the quoted value with a message about non-negative integers that says
+# nothing about quoting, and no pass ever starts.
+wires "quoted concurrency cap is unwrapped rather than refused" \
+  PROVIDER=ollama OLLAMA_API_KEY=k MAX_CONCURRENT_PASSES='"2"' \
+  -- 'LOG:MAX_CONCURRENT_PASSES was wrapped in quotes'
 refuses "quoted vertex project id still fails on a bad URL" "must be an http(s) URL" \
   -- PROVIDER=cloudflare GATEWAY_UPSTREAM=vertex REVIEW_MODEL=m \
      ANTHROPIC_VERTEX_BASE_URL=gw.test/v1 ANTHROPIC_VERTEX_PROJECT_ID='"proj"' \

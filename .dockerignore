@@ -6,3 +6,14 @@
 # Host-side launcher and tests; the image only needs entrypoint.sh.
 claudebox.sh
 test-providers.sh
+test-personas.sh
+test-shim.sh
+test-python.sh
+tests/
+tools/
+# Host-built bytecode, for a Python that need not match the image's. The `**/`
+# is load-bearing: docker matches ignore patterns against the whole relative
+# path and `*` does not cross a `/`, so a bare `__pycache__/` would exclude only
+# a context-root one and miss reviewer/__pycache__/ entirely.
+**/__pycache__/
+**/*.pyc

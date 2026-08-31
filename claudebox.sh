@@ -42,6 +42,10 @@ PR_SEL_NAMES=""
 # bash 3.2 on macOS, and the entrypoint is authoritative anyway).
 PERSONAS=""
 
+# How many of a PR's personas review it at once (validated by the supervisor,
+# not here, for the same reason PERSONAS isn't).
+MAX_CONCURRENT_PASSES=""
+
 usage() {
   cat <<'EOF'
 claudebox — launcher for the unattended PR-reviewer container.
@@ -103,7 +107,13 @@ OPTIONS
   --persona LIST    Review with these adversarial personas only (comma list, or
                     'all'). Default: red_team,adversarial,sme,sage. Also
                     available: user, good_friend. One session per PR per persona,
-                    so a cycle is (PRs x personas) sequential reviews.
+                    so a cycle is (PRs x personas) reviews, a PR's personas
+                    running together -- see --max-concurrent-passes.
+  --max-concurrent-passes N
+                    How many of a PR's personas review it at the same time.
+                    Default (unset or 0): all of them. Lower it if you hit
+                    provider rate limits or the container's memory ceiling; 1
+                    reviews one persona at a time.
   --dry-run         Print the docker command instead of executing it.
   -h, --help        Show this help.
 
@@ -152,6 +162,8 @@ while [ $# -gt 0 ]; do
     --prs)         PR_IDS="${2:?--prs requires a comma/space list of PR numbers}"; PR_SEL_COUNT=$((PR_SEL_COUNT + 1)); PR_SEL_NAMES="$PR_SEL_NAMES --prs"; shift ;;
     --search)      PR_SEARCH="${2:?--search requires a gh search query}"; PR_SEL_COUNT=$((PR_SEL_COUNT + 1)); PR_SEL_NAMES="$PR_SEL_NAMES --search"; shift ;;
     --persona)     PERSONAS="${2:?--persona requires a comma-separated list of persona names}"; shift ;;
+    --max-concurrent-passes)
+                   MAX_CONCURRENT_PASSES="${2:?--max-concurrent-passes requires a non-negative integer}"; shift ;;
     --dry-run)     DRY_RUN=1 ;;
     -h|--help)     usage; exit 0 ;;
     --)            shift; EXTRA=("$@"); break ;;
@@ -309,6 +321,7 @@ build_run_flags() {
   [ -n "$PR_IDS" ]      && RUN_FLAGS+=(-e "PR_IDS=$PR_IDS")
   [ -n "$PR_SEARCH" ]   && RUN_FLAGS+=(-e "PR_SEARCH=$PR_SEARCH")
   [ -n "$PERSONAS" ]    && RUN_FLAGS+=(-e "PERSONAS=$PERSONAS")
+  [ -n "$MAX_CONCURRENT_PASSES" ] && RUN_FLAGS+=(-e "MAX_CONCURRENT_PASSES=$MAX_CONCURRENT_PASSES")
   true  # keep the function's exit status 0: the last `[ ... ] && ...` above
         # would otherwise make build_run_flags itself fail under `set -e`
         # whenever PR_SEARCH is unset (the test-then-&& idiom is only safe

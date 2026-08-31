@@ -5,18 +5,25 @@
 #
 #   * capture is INDEXED per `claude` invocation, because one cycle now runs one
 #     invocation per (PR, persona) instead of exactly one;
-#   * the `sleep` stub succeeds once before failing, so the loop runs TWO cycles.
-#     That second cycle is the point: a one-cycle harness produces no resumed
-#     invocation, which is why test-providers.sh cannot assert FOLLOWUP_PROMPT's
-#     stanzas, and the most important property of the persona design (the persona
-#     system prompt being re-passed on a resumed pass) lives exactly there.
+#   * the baseline sets MAX_CYCLES=2, so the loop runs TWO cycles. That second
+#     cycle is the point: a one-cycle harness produces no resumed invocation,
+#     which is why test-providers.sh cannot assert FOLLOWUP_PROMPT's stanzas,
+#     and the most important property of the persona design (the persona system
+#     prompt being re-passed on a resumed pass) lives exactly there. Cases that
+#     want a single cycle say MAX_CYCLES=1 for themselves.
+#
+#   The baseline also pins MAX_CONCURRENT_PASSES=1. A PR's personas run
+#   concurrently by default, so which invocation is the second one is a race,
+#   and every ARGV:N and STUB_FAIL_ON here is an ordinal. A cap of one is a
+#   one-worker pool on the same code path as any other cap, so pinning it buys
+#   determinism without testing a path that does not exist in production.
 #
 #   ./test-personas.sh            # run everything
 #   ./test-personas.sh resume     # only cases whose label matches 'resume'
 #
-# Needs jq (the entrypoint pipes claude's stream-json through it), mktemp, tee,
-# and bash 4+ for the entrypoint itself. stdbuf is stubbed below rather than
-# required, since macOS does not ship it.
+# Needs jq (the entrypoint generates its MCP and translator config through it),
+# mktemp, python3 (the review supervisor is Python), and bash 4+ for the
+# entrypoint itself.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,6 +41,11 @@ for candidate in "${BASH:-}" "$(command -v bash || true)" /opt/homebrew/bin/bash
 done
 [ -n "$BASH_BIN" ] || { printf 'ERROR: no bash 4+ found (macOS /bin/bash is 3.2 — `brew install bash`).\n' >&2; exit 1; }
 
+# Resolved here, while a normal PATH is still in scope: the entrypoint runs
+# under `env -i`, so the python3 stub cannot find a real interpreter itself.
+REAL_PYTHON3="$(command -v python3 || true)"
+[ -n "$REAL_PYTHON3" ] || { printf 'ERROR: python3 is required (the review supervisor is Python).\n' >&2; exit 1; }
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 BIN="$WORK/bin"; mkdir -p "$BIN"
@@ -47,10 +59,13 @@ BIN="$WORK/bin"; mkdir -p "$BIN"
 #   STUB_LABEL_NULL    -- comma-separated PR numbers whose lookup exits 0 and
 #                         prints the literal JSON `null` (a well-formed but
 #                         useless response)
-#   STUB_PLAN_AFTER    -- the PR is unlabeled until cycle N has finished, then
-#                         labeled (see below)
+#   STUB_PLAN_AFTER    -- the PR is unlabeled until N claude invocations have
+#                         been made, then labeled. That is the same as "after
+#                         cycle N" only for the single-PR, single-persona-per-
+#                         mode case that uses it (see below)
 cat >"$BIN/gh" <<'STUB'
 #!/bin/sh
+printf '%s\n' "$*" >>"$HOME/gh-argv"
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   n="$3"
   case ",${STUB_LABEL_FAIL:-}," in
@@ -63,9 +78,11 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
     *",$n,"*) echo "null"; exit 0 ;;
   esac
   # STUB_PLAN_AFTER=N: the PR is unlabeled until cycle N has finished, then
-  # labeled. Cycles are counted by the sleep stub, which writes $HOME/sleeps.
+  # labeled. Cycles are counted by the claude stub, which writes one line to
+  # $HOME/calls per invocation -- so this reads "after N passes", which is the
+  # same thing for the single-PR, single-persona-per-mode case that uses it.
   if [ -n "${STUB_PLAN_AFTER:-}" ]; then
-    c=$(cat "$HOME/sleeps" 2>/dev/null || echo 0)
+    c=$(cat "$HOME/calls" 2>/dev/null || echo 0)
     if [ "$c" -ge "$STUB_PLAN_AFTER" ]; then
       printf '{"number":%s,"labels":[{"name":"%s"}]}\n' "$n" "${STUB_PLAN_LABEL:-plan}"
       exit 0
@@ -79,27 +96,31 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
 fi
 exit 0
 STUB
-printf '#!/bin/sh\nexit 0\n' >"$BIN/git"
-
-# The entrypoint pipes claude through `stdbuf -oL tee`, and stdbuf is GNU
-# coreutils, which a bare macOS does not ship. test-providers.sh survives its
-# absence because it only reads PIPESTATUS[0], but this suite needs the stream to
-# actually reach tee: that is where the session id comes from, and the session id
-# is what the resume assertions are about. Drop the flags, exec the rest.
-cat >"$BIN/stdbuf" <<'STUB'
+# Recording rather than silent, so a case can assert that a refusal happened
+# before the entrypoint did any work at all. The pre-flight --check sits above
+# `gh auth setup-git`, the git config calls and the working clone, so an absent
+# $HOME/git-argv means nothing git-shaped ran.
+cat >"$BIN/git" <<'STUB'
 #!/bin/sh
-while [ $# -gt 0 ]; do case "$1" in -*) shift ;; *) break ;; esac; done
-exec "$@"
+printf '%s\n' "$*" >>"$HOME/git-argv"
+exit 0
 STUB
 
-# Two cycles by default: succeed on the first sleep, fail on the next so the
-# entrypoint's own `set -e` ends the run. STUB_MAX_CYCLES overrides per case.
-cat >"$BIN/sleep" <<'STUB'
+# How many cycles run is now the supervisor's own business (MAX_CYCLES in the
+# baseline below), so `sleep` has no job left here beyond costing nothing: the
+# entrypoint polls with it while waiting for a translator, and the loop's own
+# interval is time.sleep() inside Python, out of reach of a PATH stub.
+printf '#!/bin/sh\nexit 0\n' >"$BIN/sleep"
+
+# entrypoint.sh ends in `exec python3 /opt/claudebox/reviewer/review_loop.py`,
+# an image path that does not exist in a checkout. Remap it to this one; hand
+# anything else to the real interpreter, which `env -i` would otherwise hide.
+cat >"$BIN/python3" <<'STUB'
 #!/bin/sh
-n=$(( $(cat "$HOME/sleeps" 2>/dev/null || echo 0) + 1 ))
-echo "$n" >"$HOME/sleeps"
-[ "$n" -ge "${STUB_MAX_CYCLES:-2}" ] && exit 1
-exit 0
+case "$1" in
+  */reviewer/review_loop.py) shift; exec "$REAL_PYTHON3" "$REVIEWER_MAIN" "$@" ;;
+  *)                         exec "$REAL_PYTHON3" "$@" ;;
+esac
 STUB
 
 # The probe. One dump file per invocation ($HOME/dump.N, N counting from 1),
@@ -112,10 +133,64 @@ STUB
 # failing invocation still emits its init event first, because that is what
 # really happens: the session exists and then a request fails, which is exactly
 # the case where throwing the session id away is the wrong move.
+#
+# STUB_FAIL_PERSONA fails by persona label instead of by ordinal, which is what
+# the parallel cases need: under concurrency nothing chooses which pass is the
+# third one. STUB_HOLD holds each invocation open for that many seconds, so the
+# in-flight high-water mark the stub records is a fact about the supervisor
+# rather than a race with process spawn.
 cat >"$BIN/claude" <<'STUB'
 #!/usr/bin/env bash
+# The invocation number is allocated under a mkdir lock. mkdir is atomic on
+# every filesystem we care about, and a busy-wait is fine at this scale. Without
+# it, concurrent passes collide and dump files are silently overwritten, which
+# would make a parallel case pass while proving nothing.
+#
+# The same lock keeps the in-flight high-water mark, which is the only thing in
+# this harness that can tell a group that really overlapped from one that ran
+# fast in sequence: CALLS:8 is satisfied either way. STUB_HOLD (seconds, passed
+# to /bin/sleep because the `sleep` on PATH is a no-op stub) makes the overlap
+# window wide enough to observe without depending on process-spawn timing.
+# Bounded, because an unbounded spin is worse here than a wrong answer: the
+# watchdog kills the entrypoint pid, not a stub that outlived it, so an orphan
+# holding the lock would spin a core until somebody noticed. Thirty seconds is
+# far longer than any real holder, which does four file operations, so reaching
+# the cap means the holder is gone; steal the lock and carry on.
+hold_lock() {
+  local waited=0
+  while ! mkdir "$HOME/calls.lock" 2>/dev/null; do
+    /bin/sleep 0.01
+    waited=$((waited + 1))
+    if [ "$waited" -ge 3000 ]; then
+      echo "stub: stale calls.lock after 30s, stealing it" >&2
+      rmdir "$HOME/calls.lock" 2>/dev/null || true
+      waited=0
+    fi
+  done
+}
+# Armed before the increment, not after: a kill in between would otherwise leak
+# the in-flight count upward and hand a later case a peak it never reached.
+# counted guards the other direction, so an exit before the increment does not
+# decrement a count this process never added to.
+counted=0
+release() {
+  [ "$counted" = 1 ] || return 0
+  hold_lock
+  echo $(( $(cat "$HOME/inflight" 2>/dev/null || echo 1) - 1 )) >"$HOME/inflight"
+  rmdir "$HOME/calls.lock"
+}
+# Every exit path, the failing ones included, or the mark drifts upward on a
+# case whose passes merely followed one another.
+trap release EXIT
+hold_lock
 n=$(( $(cat "$HOME/calls" 2>/dev/null || echo 0) + 1 ))
 echo "$n" >"$HOME/calls"
+inflight=$(( $(cat "$HOME/inflight" 2>/dev/null || echo 0) + 1 ))
+echo "$inflight" >"$HOME/inflight"
+counted=1
+[ "$inflight" -gt "$(cat "$HOME/maxinflight" 2>/dev/null || echo 0)" ] \
+  && echo "$inflight" >"$HOME/maxinflight"
+rmdir "$HOME/calls.lock"
 {
   echo "ARGV $*"
   for v in ANTHROPIC_MODEL ANTHROPIC_DEFAULT_FABLE_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL \
@@ -124,33 +199,43 @@ echo "$n" >"$HOME/calls"
     if [ -n "${!v+set}" ]; then echo "ENV $v=${!v}"; else echo "ENV $v=<unset>"; fi
   done
 } >"$HOME/dump.$n"
+[ -n "${STUB_HOLD:-}" ] && /bin/sleep "$STUB_HOLD"
+should_fail=
 case ",${STUB_FAIL_ON:-},"  in
-  *",$n,"*)
-    # STUB_NO_SESSION suppresses the init event, which is the one case where the
-    # supervisor really has no session id to keep: the request died before the
-    # session existed.
-    [ -n "${STUB_NO_SESSION:-}" ] || printf '{"type":"system","subtype":"init","session_id":"S%s"}\n' "$n"
-    case "${STUB_FAIL_MODE:-limit}" in
-      # Hand-written, and deliberately so: it is the shape the classifier was
-      # first written against, not evidence about any upstream.
-      limit)    echo "API Error: 429 rate limit exceeded" >&2 ;;
-      # CAPTURED, NOT COMPOSED. This is Claude Code's own message when the
-      # account allowance is exhausted, epoch and all -- the same string the
-      # design review quoted when it asked for a real fixture here. Do not
-      # paraphrase it, do not tidy the pipe: an upstream rewording is precisely
-      # what this fixture exists to turn red.
-      captured) echo "Claude AI usage limit reached|1755772800" >&2 ;;
-      # The near-miss wording that motivated the `limit reached` alternative in
-      # USAGE_LIMIT_RE: no `rate limit`, no `usage limit`, no 429.
-      window)   echo "5-hour limit reached, resets at 3pm" >&2 ;;
-      # Limit-SHAPED but outside the pattern on purpose: a spend cap, not a rate
-      # cap. This is the classifier's negative direction, and it must stay a
-      # miss if the pattern grows further.
-      nearmiss) echo "API Error: 403 Your credit balance is too low to continue" >&2 ;;
-      *)        echo "API Error: 400 invalid request" >&2 ;;
-    esac
-    exit 1 ;;
+  *",$n,"*) should_fail=1 ;;
 esac
+# STUB_FAIL_PERSONA: fail every invocation whose --append-system-prompt carries
+# this label. Ordinal STUB_FAIL_ON still works and is what the cap-of-1 cases
+# use; this is for the parallel block, where "invocation 3" names nothing.
+if [ -n "${STUB_FAIL_PERSONA:-}" ] && printf '%s' "$*" | grep -qF -- "$STUB_FAIL_PERSONA"; then
+  should_fail=1
+fi
+if [ -n "$should_fail" ]; then
+  # STUB_NO_SESSION suppresses the init event, which is the one case where the
+  # supervisor really has no session id to keep: the request died before the
+  # session existed.
+  [ -n "${STUB_NO_SESSION:-}" ] || printf '{"type":"system","subtype":"init","session_id":"S%s"}\n' "$n"
+  case "${STUB_FAIL_MODE:-limit}" in
+    # Hand-written, and deliberately so: it is the shape the classifier was
+    # first written against, not evidence about any upstream.
+    limit)    echo "API Error: 429 rate limit exceeded" >&2 ;;
+    # CAPTURED, NOT COMPOSED. This is Claude Code's own message when the
+    # account allowance is exhausted, epoch and all -- the same string the
+    # design review quoted when it asked for a real fixture here. Do not
+    # paraphrase it, do not tidy the pipe: an upstream rewording is precisely
+    # what this fixture exists to turn red.
+    captured) echo "Claude AI usage limit reached|1755772800" >&2 ;;
+    # The near-miss wording that motivated the `limit reached` alternative in
+    # USAGE_LIMIT_RE: no `rate limit`, no `usage limit`, no 429.
+    window)   echo "5-hour limit reached, resets at 3pm" >&2 ;;
+    # Limit-SHAPED but outside the pattern on purpose: a spend cap, not a rate
+    # cap. This is the classifier's negative direction, and it must stay a
+    # miss if the pattern grows further.
+    nearmiss) echo "API Error: 403 Your credit balance is too low to continue" >&2 ;;
+    *)        echo "API Error: 400 invalid request" >&2 ;;
+  esac
+  exit 1
+fi
 printf '{"type":"system","subtype":"init","session_id":"S%s"}\n' "$n"
 printf '{"type":"result","subtype":"success","session_id":"S%s","result":"ok"}\n' "$n"
 exit 0
@@ -183,18 +268,44 @@ cp "$SCRIPT_DIR/personas/code/_shared.md" "$SCRIPT_DIR/personas/code/red_team.md
 PASS=0; FAIL=0; SKIP=0
 FAILED_LABELS=""
 
+# A run that never ends is a suite that never ends. MAX_CYCLES is the only thing
+# that stops the supervisor now, and a *missing* one means "loop forever": an
+# unparsable value is a hard ConfigError, but a baseline that lost the variable
+# entirely would hang here instead of failing. Kill anything still alive after
+# two minutes and note it in the captured output, so the case fails on its own
+# assertions with the reason visible rather than stalling the run.
+watchdog_wait() {
+  local pid="$1" i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    i=$((i + 1))
+    if [ "$i" -gt 1200 ]; then
+      kill -9 "$pid" 2>/dev/null
+      printf 'WATCHDOG: run exceeded 120s and was killed\n' >>"$OUT"
+      break
+    fi
+    sleep 0.1
+  done
+  wait "$pid" 2>/dev/null
+}
+
 # Run the entrypoint once. $1 = label, rest = VAR=VALUE.
 run_entrypoint() {
   local label="$1"; shift
   HOME_DIR="$WORK/home"; OUT="$WORK/out"
   rm -rf "$HOME_DIR"; mkdir -p "$HOME_DIR/work/repo/.git" "$HOME_DIR/seed"
+  # Both waits are real time.sleep() calls inside the supervisor now, so both
+  # are pinned to a second: the backoff is 1800s by default, and one limit case
+  # running two cycles would otherwise stall the suite for half an hour.
   env -i PATH="$BIN:$PATH" HOME="$HOME_DIR" \
     ALLOW_UNHARDENED=1 \
     GITHUB_TOKEN=x GITHUB_REPOSITORY=owner/repo PR_IDS=1 \
-    REPO_PATH="$HOME_DIR/seed" REVIEW_INTERVAL_SECONDS=1 \
+    REPO_PATH="$HOME_DIR/seed" REVIEW_INTERVAL_SECONDS=1 LIMIT_BACKOFF_SECONDS=1 \
+    MAX_CYCLES=2 MAX_CONCURRENT_PASSES=1 \
+    REAL_PYTHON3="$REAL_PYTHON3" REVIEWER_MAIN="$SCRIPT_DIR/reviewer/review_loop.py" \
     PERSONA_DIR="$SCRIPT_DIR/personas" \
     PROVIDER=ollama OLLAMA_API_KEY=k \
-    "$@" "$BASH_BIN" "$ENTRYPOINT" >"$OUT" 2>&1
+    "$@" "$BASH_BIN" "$ENTRYPOINT" >"$OUT" 2>&1 &
+  watchdog_wait $!
 }
 
 ok()  { PASS=$((PASS + 1)); printf 'ok   %s\n' "$1"; }
@@ -208,6 +319,42 @@ selected() {
 
 # How many times the claude stub was called.
 calls() { cat "$HOME_DIR/calls" 2>/dev/null || echo 0; }
+
+# The most claude invocations that were ever alive at once. 1 means the passes
+# strictly followed one another; anything higher is direct evidence of overlap,
+# which no count of invocations can give.
+max_inflight() { cat "$HOME_DIR/maxinflight" 2>/dev/null || echo 0; }
+
+# One dump's argv, isolated the way the ARGV assertions isolate it: everything
+# before the first ENV line, because a persona's system prompt is
+# multi-paragraph and contains blank lines.
+dump_argv() { awk '/^ENV /{exit} {print}' "$1"; }
+
+# Under concurrency the dump INDEX means nothing, so assertions address a dump
+# by what is in it. The selector is one or more substrings joined by `&&`, and a
+# dump matches when its argv carries all of them -- which is how a case names
+# "the resumed pass belonging to Red Team" without knowing its number.
+dump_matches() {
+  local d="$1" rest="$2" part
+  while :; do
+    case "$rest" in
+      *"&&"*) part="${rest%%&&*}"; rest="${rest#*&&}" ;;
+      *)      part="$rest"; rest="" ;;
+    esac
+    grep -qF -- "$part" <(dump_argv "$d") || return 1
+    [ -n "$rest" ] || return 0
+  done
+}
+
+# How many dumps match the selector.
+count_matching() {
+  local n=0 d
+  for d in "$HOME_DIR"/dump.*; do
+    [ -e "$d" ] || continue
+    dump_matches "$d" "$1" && n=$((n + 1))
+  done
+  printf '%s' "$n"
+}
 
 # refuses LABEL EXPECTED-SUBSTRING -- VAR=VALUE...
 refuses() {
@@ -224,6 +371,32 @@ refuses() {
   fi
 }
 
+# refuses_before_work LABEL EXPECTED-SUBSTRING -- VAR=VALUE...
+# refuses, plus: no git and no gh ran before the refusal. Both recorders matter:
+# `gh auth setup-git` is the first thing past the pre-flight, so watching git
+# alone would still pass if the pre-flight slid below it. A selector or
+# persona typo has to cost a startup error and nothing else -- the old shell
+# validated both immediately after its defaults block, and moving them past the
+# exec bought a network clone of the whole repo and up to 120s of translator
+# startup on every restart under --restart unless-stopped.
+refuses_before_work() {
+  local label="$1" want="$2"; shift 2
+  [ "${1:-}" = "--" ] && shift
+  selected "$label" || return 0
+  run_entrypoint "$label" "$@"
+  if [ "$(calls)" != 0 ]; then
+    bad "$label" "expected a startup failure, but a review pass ran"
+  elif ! grep -qF "$want" "$OUT"; then
+    bad "$label" "expected the error to mention: $want"
+  elif [ -e "$HOME_DIR/git-argv" ]; then
+    bad "$label" "refused only after running git: $(tr '\n' ';' <"$HOME_DIR/git-argv")"
+  elif [ -e "$HOME_DIR/gh-argv" ]; then
+    bad "$label" "refused only after running gh: $(tr '\n' ';' <"$HOME_DIR/gh-argv")"
+  else
+    ok "$label"
+  fi
+}
+
 # cycle LABEL 'VAR=VALUE...' -- EXPECTATION...
 # Runs the entrypoint, then checks expectations:
 #   CALLS:N              -- exactly N claude invocations happened
@@ -232,6 +405,12 @@ refuses() {
 #   ENV:N:VAR=value      -- invocation N saw exactly that value
 #   LOG:substring        -- the run's log contains substring
 #   NOLOG:substring      -- the run's log does not contain substring
+#   MAXINFLIGHT:N        -- exactly N claude processes were alive at once at the
+#                           peak: the one assertion here that can tell overlap
+#                           from a fast sequence
+#   MATCHCOUNT:sel:N     -- exactly N dumps' argv match sel, where sel is one or
+#                           more substrings joined by `&&`. Content-keyed, for
+#                           the parallel cases where "dump 3" names nothing
 cycle() {
   local label="$1"; shift
   local -a env_in=()
@@ -258,6 +437,14 @@ cycle() {
           NOARGV:*) grep -qF -- "$rest" <(awk '/^ENV /{exit} {print}' "$dump") && missing="$missing [argv $n should not have: $rest]" ;;
           ENV:*)    grep -qxF "ENV $rest" "$dump" || missing="$missing [env $n: $rest (was: $(grep "^ENV ${rest%%=*}=" "$dump" | sed 's/^ENV //'))]" ;;
         esac ;;
+      MAXINFLIGHT:*)
+        [ "$(max_inflight)" = "${expect#MAXINFLIGHT:}" ] \
+          || missing="$missing [expected ${expect#MAXINFLIGHT:} passes in flight at the peak, got $(max_inflight)]" ;;
+      # The count is the tail, so a selector may itself contain a colon.
+      MATCHCOUNT:*)
+        rest="${expect#MATCHCOUNT:}"; n="${rest##*:}"; rest="${rest%:*}"
+        [ "$(count_matching "$rest")" = "$n" ] \
+          || missing="$missing [expected $n dumps matching $rest, got $(count_matching "$rest")]" ;;
       LOG:*)   grep -qF "${expect#LOG:}" "$OUT" || missing="$missing [log missing: ${expect#LOG:}]" ;;
       NOLOG:*) grep -qF "${expect#NOLOG:}" "$OUT" && missing="$missing [log should not have: ${expect#NOLOG:}]" ;;
       *) missing="$missing [unknown expectation: $expect]" ;;
@@ -335,6 +522,28 @@ refuses "selection: a glob is a name, not a pattern" \
   "unknown persona '*'" \
   -- PERSONAS='*'
 
+# --- pre-flight ordering -----------------------------------------------------
+refuses_before_work "preflight: a persona typo refuses before any git runs" \
+  "unknown persona 'saeg'" \
+  -- PERSONAS=saeg
+
+refuses_before_work "preflight: a missing PR selector refuses before any git runs" \
+  "no PR selector set" \
+  -- PR_IDS=
+
+# The control for the two cases above: on a run that is not refused, both
+# recorders do record. Without it the ordering assertion would pass just as
+# happily against stubs that record nothing.
+L="preflight: the git and gh recorders record on a run that is not refused"
+if selected "$L"; then
+  run_entrypoint "$L" PERSONAS=red_team MAX_CYCLES=1
+  if [ ! -s "$HOME_DIR/git-argv" ]; then
+    bad "$L" "no git invocations were recorded, so the ordering cases prove nothing"
+  elif [ ! -s "$HOME_DIR/gh-argv" ]; then
+    bad "$L" "no gh invocations were recorded, so the ordering cases prove nothing"
+  else ok "$L"; fi
+fi
+
 # --- per-persona passes -----------------------------------------------------
 cycle "passes: each persona gets its own pass, in the selected order" \
   PERSONAS=red_team,sage \
@@ -392,7 +601,7 @@ cycle "resume: MAX_PASSES_PER_SESSION rotates per (PR, persona) pair" \
   -- CALLS:4 \
      NOARGV:3:"--resume" \
      NOARGV:4:"--resume" \
-     LOG:"PR #1 [code/red_team] reached MAX_PASSES_PER_SESSION=1"
+     LOG:"[#1 code/red_team] reached MAX_PASSES_PER_SESSION=1"
 
 cycle "model: every tier still points at the one review model" \
   PERSONAS=red_team \
@@ -418,10 +627,21 @@ cycle "limits: an ordinary failure still drops the session" \
      LOG:"starting a fresh session for it next cycle" \
      NOLOG:"Backing off"
 
-cycle "limits: the rest of the cycle is abandoned, not pushed through" \
-  PERSONAS=red_team,sage,sme STUB_FAIL_ON=2 STUB_FAIL_MODE=limit STUB_MAX_CYCLES=1 \
-  -- CALLS:2 \
-     LOG:"ending this cycle early"
+# A limit cannot recall the siblings already in flight, and killing them would
+# leave a pass that posted some of its findings and not the rest. So the group
+# finishes and the cycle stops at the barrier.
+cycle "limits: the limited persona's siblings still finish their pass" \
+  PERSONAS=red_team,sage,sme STUB_FAIL_ON=2 STUB_FAIL_MODE=limit MAX_CYCLES=1 \
+  -- CALLS:3 \
+     LOG:"ending this cycle after the group finishes"
+
+# What the cut does abandon is every group after it: walking the remaining PRs
+# into the same wall spends more of the resource that just ran out.
+cycle "limits: the PRs after the cut are not reviewed" \
+  PR_IDS=1,2 PERSONAS=red_team STUB_FAIL_ON=1 STUB_FAIL_MODE=limit MAX_CYCLES=1 \
+  -- CALLS:1 \
+     LOG:"Not reviewed this cycle: #2 code/red_team" \
+     NOLOG:"Reviewing PR #2"
 
 cycle "limits: a real captured limit message is classified as a limit" \
   PERSONAS=red_team STUB_FAIL_ON=1 STUB_FAIL_MODE=captured \
@@ -441,7 +661,7 @@ cycle "limits: the near-miss window wording is classified as a limit" \
 # this goes red rather than the loop quietly backing off for hours on a failure
 # that no amount of waiting fixes.
 cycle "limits: an unrecognised failure degrades to the ordinary path" \
-  PERSONAS=red_team STUB_FAIL_ON=1 STUB_FAIL_MODE=nearmiss STUB_MAX_CYCLES=1 \
+  PERSONAS=red_team STUB_FAIL_ON=1 STUB_FAIL_MODE=nearmiss MAX_CYCLES=1 \
   -- CALLS:1 \
      LOG:"starting a fresh session for it next cycle" \
      NOLOG:"Backing off"
@@ -450,13 +670,13 @@ cycle "limits: an unrecognised failure degrades to the ordinary path" \
 # while the WARN line tails only its last few, so without this a limit reported
 # early in a long stderr is classified right and invisible.
 cycle "limits: the line that read as a limit is logged" \
-  PERSONAS=red_team STUB_FAIL_ON=1 STUB_FAIL_MODE=captured STUB_MAX_CYCLES=1 \
+  PERSONAS=red_team STUB_FAIL_ON=1 STUB_FAIL_MODE=captured MAX_CYCLES=1 \
   -- LOG:"limit reported by claude: Claude AI usage limit reached|1755772800"
 
 # On a genuinely first pass there is no session to keep, and the log used to say
 # there was.
 cycle "limits: a limit before any session does not claim to keep one" \
-  PERSONAS=red_team STUB_FAIL_ON=1 STUB_FAIL_MODE=limit STUB_NO_SESSION=1 STUB_MAX_CYCLES=1 \
+  PERSONAS=red_team STUB_FAIL_ON=1 STUB_FAIL_MODE=limit STUB_NO_SESSION=1 MAX_CYCLES=1 \
   -- LOG:"before it had a session" \
      NOLOG:"keeping its session"
 
@@ -464,40 +684,40 @@ cycle "limits: a limit before any session does not claim to keep one" \
 # A cycle that always restarted at the first pair would, under a limit that only
 # allows a few passes per backoff window, review the leading pairs forever and
 # the trailing ones never.
-cycle "resume: the next cycle starts at the pair after the one a limit cut" \
+cycle "resume: the next cycle re-runs only the persona the limit cut" \
   PERSONAS=red_team,sage,sme STUB_FAIL_ON=2 STUB_FAIL_MODE=limit \
-  -- CALLS:5 \
-     LOG:"Not reviewed this cycle: 1:code:sme" \
-     LOG:"Starting this cycle at 1:code:sme, where the last one was cut." \
+  -- CALLS:4 \
+     LOG:"Resuming with #1 code/sage." \
+     NOLOG:"Not reviewed this cycle" \
      ARGV:3:"You are a Subject Matter Expert" \
      NOARGV:3:"--resume" \
-     ARGV:4:"--resume S1" \
-     ARGV:5:"--resume S2"
+     ARGV:4:"You are a Sage" \
+     ARGV:4:"--resume S2"
 
 # --- mode routing ------------------------------------------------------------
 # Mode is decided once per PR, inside enumerate_candidate_prs, from its labels.
 cycle "mode: an unlabeled PR is reviewed in code mode" \
-  PERSONAS=red_team STUB_MAX_CYCLES=1 \
+  PERSONAS=red_team MAX_CYCLES=1 \
   -- CALLS:1 \
      LOG:"Candidate PRs (ids): 1:code" \
      LOG:"Reviewing PR #1 [code/red_team]"
 
 cycle "mode: a PR carrying the plan label is reviewed in plan mode" \
-  PERSONAS=red_team PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 STUB_MAX_CYCLES=1 \
+  PERSONAS=red_team PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 MAX_CYCLES=1 \
   -- CALLS:1 \
      LOG:"Candidate PRs (ids): 1:plan" \
      LOG:"Reviewing PR #1 [plan/red_team]"
 
 cycle "mode: PLAN_LABEL names the label that means plan" \
-  PERSONAS=red_team PLAN_PERSONAS=red_team PLAN_LABEL=proposal STUB_PLAN_PRS=1 STUB_PLAN_LABEL=proposal STUB_MAX_CYCLES=1 \
+  PERSONAS=red_team PLAN_PERSONAS=red_team PLAN_LABEL=proposal STUB_PLAN_PRS=1 STUB_PLAN_LABEL=proposal MAX_CYCLES=1 \
   -- CALLS:1 LOG:"1:plan"
 
 cycle "mode: a label that is not PLAN_LABEL leaves the PR in code mode" \
-  PERSONAS=red_team PLAN_LABEL=proposal STUB_PLAN_PRS=1 STUB_PLAN_LABEL=plan STUB_MAX_CYCLES=1 \
+  PERSONAS=red_team PLAN_LABEL=proposal STUB_PLAN_PRS=1 STUB_PLAN_LABEL=plan MAX_CYCLES=1 \
   -- CALLS:1 LOG:"1:code"
 
 cycle "mode: both modes can appear in one cycle" \
-  PR_IDS=1,2 PERSONAS=red_team PLAN_PERSONAS=red_team STUB_PLAN_PRS=2 STUB_MAX_CYCLES=1 \
+  PR_IDS=1,2 PERSONAS=red_team PLAN_PERSONAS=red_team STUB_PLAN_PRS=2 MAX_CYCLES=1 \
   -- CALLS:2 \
      LOG:"Candidate PRs (ids): 1:code 2:plan"
 
@@ -505,7 +725,7 @@ cycle "mode: both modes can appear in one cycle" \
 # comments in the wrong register on a real PR, and there is no undoing that; a
 # skip is one log line and a retry next cycle.
 cycle "mode: a failed label lookup skips the PR rather than guessing" \
-  PR_IDS=1,2 PERSONAS=red_team STUB_LABEL_FAIL=1 STUB_MAX_CYCLES=1 \
+  PR_IDS=1,2 PERSONAS=red_team STUB_LABEL_FAIL=1 MAX_CYCLES=1 \
   -- CALLS:1 \
      LOG:"could not read labels for PR #1" \
      LOG:"Candidate PRs (ids): 2:code" \
@@ -516,7 +736,7 @@ cycle "mode: a failed label lookup skips the PR rather than guessing" \
 # the cycle with no WARN at all -- indistinguishable from having been reviewed
 # clean.
 cycle "mode: a successful but empty label lookup skips the PR, not silently" \
-  PR_IDS=1,2 PERSONAS=red_team STUB_LABEL_GARBAGE=1 STUB_MAX_CYCLES=1 \
+  PR_IDS=1,2 PERSONAS=red_team STUB_LABEL_GARBAGE=1 MAX_CYCLES=1 \
   -- CALLS:1 \
      LOG:"could not read labels for PR #1" \
      LOG:"Candidate PRs (ids): 2:code" \
@@ -525,7 +745,7 @@ cycle "mode: a successful but empty label lookup skips the PR, not silently" \
 # A `gh` that exits 0 with a well-formed but useless body (bare `null`) must not
 # turn into a candidate PR literally numbered "null".
 cycle "mode: a null label response skips the PR rather than reviewing PR #null" \
-  PR_IDS=1,2 PERSONAS=red_team STUB_LABEL_NULL=1 STUB_MAX_CYCLES=1 \
+  PR_IDS=1,2 PERSONAS=red_team STUB_LABEL_NULL=1 MAX_CYCLES=1 \
   -- CALLS:1 \
      LOG:"could not read labels for PR #1" \
      LOG:"Candidate PRs (ids): 2:code" \
@@ -534,15 +754,15 @@ cycle "mode: a null label response skips the PR rather than reviewing PR #null" 
 
 # --- per-mode persona sets ---------------------------------------------------
 cycle "modes: plan mode runs all six personas by default" \
-  STUB_PLAN_PRS=1 STUB_MAX_CYCLES=1 \
+  STUB_PLAN_PRS=1 MAX_CYCLES=1 \
   -- CALLS:6 LOG:"plan personas: adversarial good_friend red_team sage sme user"
 
 cycle "modes: code mode still runs the four code-facing personas by default" \
-  STUB_MAX_CYCLES=1 \
+  MAX_CYCLES=1 \
   -- CALLS:4 LOG:"code personas: red_team adversarial sme sage"
 
 cycle "modes: PLAN_PERSONAS selects the plan set, PERSONAS the code set" \
-  PR_IDS=1,2 PERSONAS=red_team PLAN_PERSONAS=user,sage STUB_PLAN_PRS=2 STUB_MAX_CYCLES=1 \
+  PR_IDS=1,2 PERSONAS=red_team PLAN_PERSONAS=user,sage STUB_PLAN_PRS=2 MAX_CYCLES=1 \
   -- CALLS:3 \
      LOG:"code personas: red_team" \
      LOG:"plan personas: user sage" \
@@ -585,41 +805,60 @@ cycle "modes: a PR that gains the label starts a fresh session, not a resumed on
 # Three in a row that are not limits means the provider is unhealthy, not that
 # these particular pairs are cursed. Walking the rest of the list into it costs
 # one duplicate-comment burst per pair, since each failure drops its session.
+# The count is taken at each barrier rather than per pass, so this is three
+# whole groups that reviewed nothing.
 cycle "failures: a run of non-limit failures abandons the cycle at the ordinary interval" \
-  PR_IDS=1,2 PERSONAS=red_team,sage,sme STUB_FAIL_ON=2,3,4 STUB_FAIL_MODE=other STUB_MAX_CYCLES=1 \
-  -- CALLS:4 \
+  PR_IDS=1,2,3,4 PERSONAS=red_team STUB_FAIL_ON=1,2,3 STUB_FAIL_MODE=other MAX_CYCLES=1 \
+  -- CALLS:3 \
      LOG:"3 passes in a row failed for reasons other than a limit" \
-     LOG:"Not reviewed this cycle: 2:code:sage 2:code:sme" \
-     LOG:"The next cycle starts at 2:code:sage" \
+     LOG:"Not reviewed this cycle: #4 code/red_team" \
+     NOLOG:"Reviewing PR #4" \
      NOLOG:"Backing off"
 
-# ... and the counter is consecutive, not cumulative: two failures, a success,
-# another failure is an ordinary bad day, not a dead endpoint.
+# ... and the counter is consecutive, not cumulative: two failures, a group that
+# reviewed something, another failure is an ordinary bad day, not a dead
+# endpoint.
 cycle "failures: a success resets the run, so scattered failures do not abandon" \
-  PERSONAS=red_team,sage,sme,adversarial STUB_FAIL_ON=1,2,4 STUB_FAIL_MODE=other STUB_MAX_CYCLES=1 \
+  PR_IDS=1,2,3,4 PERSONAS=red_team STUB_FAIL_ON=1,2,4 STUB_FAIL_MODE=other MAX_CYCLES=1 \
   -- CALLS:4 \
      NOLOG:"Abandoning this cycle" \
      NOLOG:"Not reviewed this cycle"
+
+# Every failure in a group counts, not one per group: a PR whose whole persona
+# set failed is three strikes on its own, and the next PR is not walked into the
+# same wall.
+cycle "failures: a whole group failing is counted pass by pass" \
+  PR_IDS=1,2 PERSONAS=red_team,sage,sme STUB_FAIL_ON=1,2,3 STUB_FAIL_MODE=other MAX_CYCLES=1 \
+  -- CALLS:3 \
+     LOG:"3 passes in a row failed for reasons other than a limit" \
+     NOLOG:"Reviewing PR #2"
+
+# A group that reviewed something proves the provider is alive whatever its
+# siblings did, so the failures inside it do not feed the count.
+cycle "failures: one success in a group forgives its failing siblings" \
+  PR_IDS=1,2 PERSONAS=red_team,sage,sme STUB_FAIL_ON=1,2,4,5 STUB_FAIL_MODE=other MAX_CYCLES=1 \
+  -- CALLS:6 \
+     NOLOG:"Abandoning this cycle"
 
 # --- per-mode prompts --------------------------------------------------------
 # The test stanza asks the reviewer to mentally revert production lines a test
 # depends on. There are none in a plan, and a reviewer handed a design document
 # will otherwise report missing tests in code nobody has written.
 cycle "prompts: plan mode drops the test stanza and code mode keeps it" \
-  PR_IDS=1,2 PERSONAS=red_team PLAN_PERSONAS=red_team STUB_PLAN_PRS=2 STUB_MAX_CYCLES=1 \
+  PR_IDS=1,2 PERSONAS=red_team PLAN_PERSONAS=red_team STUB_PLAN_PRS=2 MAX_CYCLES=1 \
   -- CALLS:2 \
      ARGV:1:"Treat the tests in this PR as code under review" \
      NOARGV:2:"Treat the tests in this PR as code under review"
 
 cycle "prompts: the plan default says what a plan review is and is not" \
-  PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 STUB_MAX_CYCLES=1 \
+  PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 MAX_CYCLES=1 \
   -- ARGV:1:"proposes an approach rather than implementing one" \
      ARGV:1:"do not ask for tests, error handling, or input validation in code that does not exist yet"
 
 # The gh constraints are what the privilege-minimized token can actually do, and
 # they are identical in both modes.
 cycle "prompts: the plan default keeps the gh stanza" \
-  PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 STUB_MAX_CYCLES=1 \
+  PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 MAX_CYCLES=1 \
   -- ARGV:1:'do not use `gh pr checks`'
 
 # The code followup's own coverage: it lived as a bare scalar before this branch
@@ -647,13 +886,13 @@ cycle "prompts: a resumed plan pass repeats the plan stanza" \
      ARGV:2:"do not ask for tests, error handling, or input validation in code that does not exist yet"
 
 cycle "prompts: PLAN_REVIEW_PROMPT reaches Claude verbatim, with no stanzas" \
-  PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 PLAN_REVIEW_PROMPT='just read the plan in 1' STUB_MAX_CYCLES=1 \
+  PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 PLAN_REVIEW_PROMPT='just read the plan in 1' MAX_CYCLES=1 \
   -- ARGV:1:"just read the plan in 1" \
      NOARGV:1:'do not use `gh pr checks`' \
      NOARGV:1:"proposes an approach rather than implementing one"
 
 cycle "prompts: PLAN_REVIEW_PROMPT_SUFFIX appends to the plan default" \
-  PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 PLAN_REVIEW_PROMPT_SUFFIX='And mention the ticket.' STUB_MAX_CYCLES=1 \
+  PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 PLAN_REVIEW_PROMPT_SUFFIX='And mention the ticket.' MAX_CYCLES=1 \
   -- ARGV:1:"proposes an approach rather than implementing one" \
      ARGV:1:"And mention the ticket."
 
@@ -692,7 +931,7 @@ cycle "prompts: PLAN_FOLLOWUP_PROMPT_SUFFIX appends to the plan followup default
 # their code prompt would silently get it on plan PRs too.
 cycle "prompts: a code override does not reach plan mode" \
   PR_IDS=1,2 PERSONAS=red_team PLAN_PERSONAS=red_team STUB_PLAN_PRS=2 \
-  REVIEW_PROMPT='code only 1' STUB_MAX_CYCLES=1 \
+  REVIEW_PROMPT='code only 1' MAX_CYCLES=1 \
   -- CALLS:2 \
      ARGV:1:"code only 1" \
      NOARGV:2:"code only 1" \
@@ -702,10 +941,166 @@ cycle "prompts: a code override does not reach plan mode" \
 # The asymmetry is the kind of thing that hides a one-directional bug.
 cycle "prompts: a plan override does not reach code mode" \
   PR_IDS=1,2 PERSONAS=red_team PLAN_PERSONAS=red_team STUB_PLAN_PRS=2 \
-  PLAN_REVIEW_PROMPT='plan only 2' STUB_MAX_CYCLES=1 \
+  PLAN_REVIEW_PROMPT='plan only 2' MAX_CYCLES=1 \
   -- CALLS:2 \
      NOARGV:1:"plan only 2" \
      ARGV:2:"plan only 2"
+
+# --- MCP flags --------------------------------------------------------------
+# The reviewed repo is untrusted, so --strict-mcp-config is a security boundary,
+# not a preference: without it a repo shipping its own .mcp.json gets MCP servers
+# of its choosing loaded into a --dangerously-skip-permissions session. The
+# supervisor builds these flags itself now, from MCP_CONFIG_FILE, so this asserts
+# the end of that wire rather than the shell array that used to carry it -- on
+# the RESUMED invocation too, since that is the one a per-session flag could be
+# lost on.
+cycle "mcp: every invocation is strict, resumed ones included" \
+  PERSONAS=red_team \
+  -- CALLS:2 \
+     ARGV:1:"--strict-mcp-config" \
+     ARGV:2:"--strict-mcp-config" \
+     NOARGV:1:"--mcp-config"
+
+# ... and with a Linear key the generated config is spliced in behind it, which
+# is what proves MCP_CONFIG_FILE still crosses the exec into the supervisor.
+cycle "mcp: a Linear key adds the generated config to every invocation" \
+  PERSONAS=red_team LINEAR_API_KEY=lin_api_x \
+  -- CALLS:2 \
+     LOG:"Linear MCP enabled" \
+     ARGV:1:"--strict-mcp-config --mcp-config" \
+     ARGV:2:"--strict-mcp-config --mcp-config"
+
+# --- parallel dispatch -------------------------------------------------------
+# Everything above runs at MAX_CONCURRENT_PASSES=1 so its ordinal assertions
+# mean something. These cases unset the cap, which is production's default, and
+# address dumps by content instead. PR 12 rather than PR 1 throughout, so that
+# "#12" in a prompt is a selector that cannot also match "#1".
+
+# The floor: a group's personas each get their own pass, on both cycles.
+cycle "parallel: every code persona of a group gets its own pass, both cycles" \
+  PR_IDS=12 MAX_CONCURRENT_PASSES= \
+  -- CALLS:8 \
+     MATCHCOUNT:"You are a Red Team security reviewer":2 \
+     MATCHCOUNT:"You are an Adversarial reviewer":2 \
+     MATCHCOUNT:"You are a Subject Matter Expert":2 \
+     MATCHCOUNT:"You are a Sage":2
+
+# ... and they really do overlap. This is the assertion CALLS:8 cannot make: a
+# supervisor that ran the four one after another satisfies every count above.
+# STUB_HOLD keeps each pass alive long enough that the peak is a property of the
+# dispatch rather than of how fast a process starts.
+cycle "parallel: the personas of a group are in flight at the same time" \
+  PR_IDS=12 MAX_CONCURRENT_PASSES= STUB_HOLD=0.3 MAX_CYCLES=1 \
+  -- CALLS:4 MAXINFLIGHT:4
+
+# The control for the case above, and the guarantee the whole inherited suite
+# rests on: at a cap of one the group is strictly sequential, so the ordinal
+# assertions up there are not a race that happens to be winning.
+cycle "parallel: a cap of one runs the group one pass at a time" \
+  PR_IDS=12 STUB_HOLD=0.3 MAX_CYCLES=1 \
+  -- CALLS:4 MAXINFLIGHT:1
+
+# ... and a cap between the two is honoured rather than rounded to either end.
+cycle "parallel: MAX_CONCURRENT_PASSES caps the peak without dropping a pass" \
+  PR_IDS=12 MAX_CONCURRENT_PASSES=2 STUB_HOLD=0.3 MAX_CYCLES=1 \
+  -- CALLS:4 MAXINFLIGHT:2
+
+# The property the persona design rests on, now under concurrency:
+# --append-system-prompt does not survive --resume, so cycle two has to re-pass
+# it. Four resumed passes, and each carries its OWN persona -- the part that a
+# session map keyed on something coarser than the pair would break, and that
+# MATCHCOUNT:--resume:4 on its own would not notice.
+cycle "parallel: a resumed pass still carries its own persona" \
+  PR_IDS=12 MAX_CONCURRENT_PASSES= \
+  -- CALLS:8 \
+     MATCHCOUNT:"--resume":4 \
+     MATCHCOUNT:"--resume&&--append-system-prompt&&You are a Red Team security reviewer":1 \
+     MATCHCOUNT:"--resume&&--append-system-prompt&&You are an Adversarial reviewer":1 \
+     MATCHCOUNT:"--resume&&--append-system-prompt&&You are a Subject Matter Expert":1 \
+     MATCHCOUNT:"--resume&&--append-system-prompt&&You are a Sage":1
+
+# --- the shared working copy -------------------------------------------------
+# The stanza is the half of the shared-clone defense the model can act on, and
+# every pass needs it: a persona that checks out a branch corrupts what its
+# siblings are reading, and a resumed pass is as able to do that as a new one.
+cycle "worktree: the shared-copy stanza reaches every pass, resumed ones included" \
+  PR_IDS=12 MAX_CONCURRENT_PASSES= \
+  -- CALLS:8 \
+     MATCHCOUNT:"One more constraint":8 \
+     LOG:"Shared-worktree constraint active for: code plan"
+
+# Nothing runs beside a pass at a cap of one, so the constraint is not true and
+# is not asserted. Both modes have to be narrowed for real -- one clone serves
+# both, and a plan PR can arrive on any cycle -- which the cap does by making
+# each mode's effective concurrency one.
+cycle "worktree: no shared-copy stanza when nothing runs beside the pass" \
+  PR_IDS=12 \
+  -- CALLS:8 \
+     MATCHCOUNT:"One more constraint":0 \
+     NOLOG:"Shared-worktree constraint active"
+
+# The one place the verbatim-operator-prompt guarantee gives way. An operator
+# who replaces REVIEW_PROMPT is not the person who pays for a persona writing to
+# the shared tree, so the stanza is appended to the override too -- while the
+# stanzas that are defaults-only stay away, which is what the two zero counts
+# say.
+cycle "worktree: the stanza is appended even to an operator prompt override" \
+  PR_IDS=12 MAX_CONCURRENT_PASSES= REVIEW_PROMPT='look at #{{PR}}' MAX_CYCLES=1 \
+  -- CALLS:4 \
+     MATCHCOUNT:"look at #12":4 \
+     MATCHCOUNT:"You are a Red Team security reviewer&&look at #12&&One more constraint":1 \
+     MATCHCOUNT:"Perform a thorough review of pull request":0 \
+     MATCHCOUNT:"Treat the tests in this PR as code under review":0
+
+# --- limits and failures inside a group --------------------------------------
+# A limit cannot recall the siblings already in flight, and killing them would
+# leave a pass that posted some findings and not the rest, so the group finishes
+# and the cycle stops at the barrier. What the cut owes is that persona alone:
+# the next cycle re-runs Red Team and nobody else, and re-runs it RESUMED,
+# because a limit is not a broken session.
+cycle "parallel: a limit owes only the persona it cut, and its siblings finish" \
+  PR_IDS=12 MAX_CONCURRENT_PASSES= STUB_FAIL_PERSONA="Red Team" STUB_FAIL_MODE=limit \
+  -- CALLS:5 \
+     MATCHCOUNT:"You are an Adversarial reviewer":1 \
+     MATCHCOUNT:"You are a Subject Matter Expert":1 \
+     MATCHCOUNT:"You are a Sage":1 \
+     MATCHCOUNT:"You are a Red Team security reviewer":2 \
+     MATCHCOUNT:"--resume":1 \
+     MATCHCOUNT:"--resume&&You are a Red Team security reviewer":1 \
+     LOG:"Owed next cycle: #12 code/red_team." \
+     LOG:"Resuming with #12 code/red_team." \
+     LOG:"Backing off" \
+     NOLOG:"Not reviewed this cycle"
+
+# The groups after the cut are abandoned whole -- walking them into the same
+# wall spends more of the resource that just ran out -- and the next cycle
+# starts PAST the cut rather than at the debt. Serving the debt first reads as
+# the obvious thing and starves everything else: Red Team reports a limit on
+# every attempt here, so a cycle that returned to #12 first would review #13
+# never.
+cycle "parallel: the cut abandons the groups after it and the next cycle starts past it" \
+  PR_IDS=12,13 MAX_CONCURRENT_PASSES= STUB_FAIL_PERSONA="Red Team" STUB_FAIL_MODE=limit \
+  -- CALLS:8 \
+     MATCHCOUNT:"request #12":4 \
+     MATCHCOUNT:"request #13":4 \
+     MATCHCOUNT:"--resume":0 \
+     LOG:"Not reviewed this cycle: #13 code/red_team #13 code/adversarial #13 code/sme #13 code/sage." \
+     LOG:"Resuming with #13 code/red_team #13 code/adversarial #13 code/sme #13 code/sage #12 code/red_team." \
+     LOG:"Not reviewed this cycle: #12 code/red_team #12 code/adversarial #12 code/sme #12 code/sage."
+
+# A non-limit failure is not a cut: the group finishes, the cycle carries on to
+# the next group, and the three siblings keep the sessions they opened. Red Team
+# has none to keep -- it has never completed a pass -- which is why the compound
+# count is zero rather than one.
+cycle "parallel: a non-limit failure neither cuts the cycle nor costs its siblings their sessions" \
+  PR_IDS=12 MAX_CONCURRENT_PASSES= STUB_FAIL_PERSONA="Red Team" STUB_FAIL_MODE=other \
+  -- CALLS:8 \
+     MATCHCOUNT:"--resume":3 \
+     MATCHCOUNT:"--resume&&You are a Red Team security reviewer":0 \
+     MATCHCOUNT:"You are a Red Team security reviewer":2 \
+     LOG:"starting a fresh session for it next cycle" \
+     NOLOG:"Not reviewed this cycle" \
+     NOLOG:"Backing off"
 
 printf '\n%d passed, %d failed' "$PASS" "$FAIL"
 [ "$SKIP" -gt 0 ] && printf ', %d skipped' "$SKIP"
