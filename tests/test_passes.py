@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -271,6 +273,39 @@ class RunPassTest(unittest.TestCase):
         got = self._run(script)
         self.assertIsNone(got.session_id)
         self.assertTrue(got.limited)
+
+    def test_a_failed_passs_stderr_tail_is_truncated(self):
+        # The neighbouring stderr paths -- usage_limit_line here and
+        # gh._stderr_tail -- both cut at 400 characters, because claude's
+        # stderr is not a stream that can be assumed credential-free and one
+        # very long line is the shape that carries a token past a reader. This
+        # path logs the last few lines of the same stream and has to match.
+        script = self._fake_claude(
+            """
+            import sys
+            sys.stderr.write("E " + "x" * 5000 + "\\n")
+            sys.exit(1)
+            """
+        )
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self._run(script)
+        logged = max(out.getvalue().splitlines(), key=len)
+        self.assertLess(len(logged), 500, logged[:120])
+        self.assertIn("xxxx", logged)
+
+    def test_blank_stderr_lines_do_not_crowd_out_the_real_ones(self):
+        # Tailing the raw split means a stderr padded with blank lines logs
+        # nothing readable at all.
+        script = self._fake_claude(
+            """
+            import sys
+            sys.stderr.write("the actual error\\n" + "\\n" * 20)
+            sys.exit(1)
+            """
+        )
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self._run(script)
+        self.assertIn("the actual error", out.getvalue())
 
     def test_non_limit_failure_is_not_classified_as_one(self):
         script = self._fake_claude(

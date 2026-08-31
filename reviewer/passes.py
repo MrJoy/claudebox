@@ -209,8 +209,13 @@ def run_pass(
         limited = is_usage_limit(stderr)
         line = usage_limit_line(stderr) if limited else ""
         log(f"WARN: claude exited {rc}:", pair=pair)
-        for tail in stderr.splitlines()[-5:]:
-            log(f"  {tail}", pair=pair)
+        # Truncated at the same 400 characters as usage_limit_line above and
+        # gh._stderr_tail, and for the same reason: claude's stderr is not a
+        # stream that can be assumed credential-free, and one very long line
+        # is the shape that carries a token past a reader's eye. Blank lines
+        # dropped so a stderr padded with them still shows five real ones.
+        for tail in [ln for ln in stderr.splitlines() if ln.strip()][-5:]:
+            log(f"  {tail[:400]}", pair=pair)
         return PassResult(rc=rc, session_id=recovered, limited=limited, limit_line=line)
 
     return PassResult(rc=0, session_id=recovered, limited=False, limit_line="")
