@@ -107,7 +107,8 @@ OPTIONS
   --persona LIST    Review with these adversarial personas only (comma list, or
                     'all'). Default: red_team,adversarial,sme,sage. Also
                     available: user, good_friend. One session per PR per persona,
-                    so a cycle is (PRs x personas) sequential reviews.
+                    so a cycle is (PRs x personas) reviews, a PR's personas
+                    running together -- see --max-concurrent-passes.
   --max-concurrent-passes N
                     How many of a PR's personas review it at the same time.
                     Default (unset or 0): all of them. Lower it if you hit

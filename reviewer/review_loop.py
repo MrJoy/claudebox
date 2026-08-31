@@ -193,10 +193,13 @@ def unlock_git_dir(work_repo: str) -> None:
     A path with nothing recorded falls back to adding the owner bit to what it
     finds. That is the case main leans on at startup to repair a clone a
     previous container left locked, since the modes that lock recorded died
-    with that process. The fallback only ever adds, so it cannot loosen a
-    directory an operator deliberately tightened -- at the cost of not being
-    able to put back what it never saw: a 775 .git comes back 755 after a
-    restart and stays there. Harmless in the container, which is single-user
+    with that process. Note what that fallback is: it ADDS the owner write bit
+    to whatever it finds, so a .git this process never locked comes back
+    writable whether or not somebody meant it to be read-only. That is the
+    point -- an inherited lock is exactly such a directory, and repairing it is
+    the whole reason main calls this at startup -- but it is a loosening, not a
+    restoration, and it cannot put back what it never saw: a 775 .git comes
+    back 755 after a restart and stays there. Harmless in the container, which is single-user
     under umask 022, and 755 is what that umask would have produced anyway.
     """
     for path in _locked_dirs(work_repo):
@@ -722,7 +725,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # it has no lock of its own to repair it. A no-op on a clone nobody
         # locked, and on a WORK_REPO with no .git at all -- the refusal for
         # that case belongs to lock_git_dir, below.
-        unlock_git_dir(work_repo)
+        try:
+            unlock_git_dir(work_repo)
+        except OSError as exc:
+            # chmod can fail on its own -- a clone owned by another uid, a
+            # read-only mount. Without this the traceback exits PID 1 in place
+            # of the ERROR: line every other startup failure produces, and
+            # under --restart unless-stopped that reads as a silent crash loop.
+            raise ConfigError(
+                f"cannot repair the working clone's .git permissions: {exc}"
+            )
 
         # The enforcement half of the shared-worktree constraint the stanza
         # states. Tied to the same set, so a run whose personas do not overlap
@@ -731,8 +743,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         enforce_lock = bool(worktree_modes)
         if enforce_lock:
             lock_git_dir(work_repo)
-            log("The working clone's .git is read-only between cycles "
-                "(shared-worktree enforcement).")
+            log("The working clone's .git is read-only except during the "
+                "cycle's own fetch (shared-worktree enforcement).")
     except ConfigError as exc:
         die(str(exc))
 

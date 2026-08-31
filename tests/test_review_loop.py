@@ -1694,6 +1694,28 @@ class GitDirLockWiringTest(unittest.TestCase):
         self._main()
         self.assertFalse(self._can_write())
 
+    def test_a_chmod_that_fails_at_startup_dies_rather_than_tracebacks(self):
+        # The startup repair calls chmod on a clone it did not lock, so the
+        # failures are environmental: another uid's clone, a read-only mount.
+        # An OSError there escapes main's `except ConfigError` and exits PID 1
+        # with a traceback, which under --restart unless-stopped reads as a
+        # silent crash loop rather than a configuration error.
+        original = review_loop.unlock_git_dir
+
+        def boom(_work_repo):
+            raise PermissionError(13, "Permission denied")
+
+        review_loop.unlock_git_dir = boom
+        self.addCleanup(setattr, review_loop, "unlock_git_dir", original)
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit) as caught:
+                self._main()
+        self.assertEqual(caught.exception.code, 1)
+        self.assertIn("cannot repair the working clone", err.getvalue())
+        self.assertTrue(err.getvalue().startswith("ERROR:"))
+
     def test_the_cycles_own_fetch_still_runs(self):
         # A real remote, so the fetch has something to succeed at. Locking the
         # clone and not lifting it around the fetch leaves the working copy
