@@ -174,8 +174,20 @@ wrong-mode review posts real comments that cannot be taken back. Here the
 mode already came from stage one, so the worst case is a redundant pass.
 
 To keep a persistent `gh` outage from re-reviewing everything on every
-poll, a failed stage two still records `polled[pr]`. The PR then fails
-open once per `updatedAt` change rather than once per cycle.
+poll, a failed stage two still records `polled[pr]`. That bounds the API
+cost, not the review cost: `Tracker` returns `None` either way, and `None`
+reaching the gate means "run the whole group" on every poll it recurs.
+When the snapshot's `updatedAt` is non-empty, the caller replaces that
+`None` with a degraded fingerprint (`signals.degraded`) carrying
+`head_oid` and `mode` from the snapshot and, in place of the comment
+timestamp, a value derived from `updatedAt` that cannot collide with a
+real one. The PR then fails open once per `updatedAt` change rather than
+once per cycle: a push moves `head_oid` and reviews, a human comment
+mid-outage moves `updatedAt` and reviews, and a frozen failing PR reviews
+once and stops. An empty `updatedAt` has nothing to key that on, so it
+keeps failing open every poll, same as `Tracker` refusing to cache
+against one. A transition into or out of a degraded fingerprint is not
+comment activity and must not be logged as one -- see Logging.
 
 ## Logging
 
@@ -184,7 +196,11 @@ The `Candidate PRs` line keeps its shape. Three companions join it:
 * what was skipped as unchanged,
 * what is settling and how long it has left,
 * for each PR that runs, the reason: `new head 3f2a1b0`, `new comment
-  activity`, `mode changed to plan`, `first review`, `no session`.
+  activity`, `mode changed to plan`, `first review`, `no session`, and,
+  when a degraded fingerprint is on either side of the comparison,
+  `stage-two lookup failed`, `stage-two lookup recovered`, or `updatedAt
+  changed during a failed lookup` in place of `new comment activity` --
+  no comment was actually observed in any of those three.
 
 A count of new comments is deliberately not reported, because carrying one
 would mean putting it in the fingerprint, and a count in the fingerprint makes
@@ -205,7 +221,13 @@ New cases under `tests/`, run by `test-python.sh`:
 * an owed pair running while its fingerprint is unchanged
 * a pair with no session running while its fingerprint is unchanged
 * stage two not called when `updatedAt` is unchanged
-* stage-two failure failing open exactly once per `updatedAt` change
+* stage-two failure failing open exactly once per `updatedAt` change,
+  including `updatedAt` or `head_oid` moving during a sustained failure,
+  and an empty `updatedAt` failing open every poll
+* a degraded fingerprint never comparing equal to a real one for the same
+  PR, so recovery from an outage reviews once
+* `change_reason` across a degraded/real transition not reporting comment
+  activity
 
 `test-personas.sh` needs a change to its `gh` stub. The suite runs two
 cycles specifically to produce a resumed invocation, and under the gate

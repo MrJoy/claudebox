@@ -526,8 +526,12 @@ class Supervisor:
         on the visit after.
 
         A group that owes nothing is then filtered by the change gate. `signal`
-        is None when the gate is off, and when stage two failed and we chose to
-        fail open; both mean "run it". A pair with no session always runs, which
+        is None when the gate is off, and when stage two failed against an
+        empty updatedAt (nothing to key a degraded fingerprint on); both mean
+        "run it". A failed lookup against a non-empty updatedAt arrives here as
+        a degraded Signal instead, so it's gated like a real one and stops
+        re-running once it's been served -- see signals.degraded. A pair with
+        no session always runs, which
         is what makes first sight, a session dropped by _record_failure, and
         MAX_PASSES_PER_SESSION rotation work without knowing about the gate. A
         mode flip needs no case of its own either: it makes a different Pair,
@@ -920,7 +924,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 if sig is None:
                     log(f"WARN: could not read PR #{snap.number}'s comment "
                         "activity; reviewing it rather than skipping it.")
-                else:
+                    # Tracker only remembers a real lookup's outcome, so a
+                    # repeated failure against the same updatedAt lands here
+                    # every poll. Synthesizing the degraded fingerprint here,
+                    # from the snapshot in hand, gives the same answer each
+                    # time without Tracker needing to know it exists -- that's
+                    # what turns "fail open" into "fail open once per change"
+                    # instead of "fail open forever".
+                    sig = signals_mod.degraded(snap)
+                if sig is not None:
                     signals_by_pr[snap.number] = sig
 
         groups = supervisor.build_groups([(s.number, s.mode) for s in snapshots])

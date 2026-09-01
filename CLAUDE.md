@@ -183,11 +183,22 @@ PR is reviewed in full rather than skipped, unlike the `ids` selector's mode
 lookup, which skips on failure because a wrong-mode review posts comments
 nobody can take back — here the mode is already known from stage one, so the
 worst a redundant pass costs is noise. `Tracker` still records the failed
-lookup against that `updatedAt` (`self._cache[number] = None`), which is what
-keeps a persistent `gh` outage from repeating the stage-two call every poll;
-it does not, on its own, stop the PR from being reviewed again on the next
-poll, since a missing fingerprint reads as "run it" until either the outage
-clears or `updatedAt` moves and gives the lookup something new to try.
+lookup against that `updatedAt` (`self._cache[number] = None`), which bounds
+the API cost of a persistent `gh` outage to one request per `updatedAt`
+change. The review cost is bounded the same way, not just the lookup: `main`
+does not put `Tracker`'s `None` straight into `signals_by_pr`. When the
+snapshot's `updatedAt` is non-empty, `signals.degraded` turns it into a
+fingerprint carrying `head_oid` and `mode` from the snapshot and, in place of
+`newest_human`, a value derived from `updatedAt` that can never collide with
+a real comment timestamp. That fingerprint gates the group exactly like a
+real one, so a frozen failing PR reviews once and goes quiet; a push or a
+human comment mid-outage still moves `updatedAt` and still gets reviewed. An
+**empty** `updatedAt` has nothing to key a degraded fingerprint on, so
+`signals.degraded` returns `None` there and the PR keeps failing open on
+every poll — the same as `Tracker` refusing to cache against an empty stamp.
+`signals.change_reason` gives a degraded-to-real transition (or the reverse)
+its own wording rather than "new comment activity", since no comment was
+actually observed in either direction.
 
 A PR whose newest change is younger than `SETTLE_SECONDS` (default 30, `0`
 disables it) is left off this cycle's list entirely, with nothing recorded

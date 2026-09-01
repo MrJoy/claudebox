@@ -1354,6 +1354,88 @@ class CycleGateTest(unittest.TestCase):
         self.assertIn("Settling (3600s)", log)
 
 
+class DegradedSignalGateTest(unittest.TestCase):
+    """A stage-two lookup that fails durably must still bound the review to
+    once per updatedAt change (task 11) -- gh.pr_signal returning None on
+    every call must not mean signals_by_pr never gets an entry for that PR.
+
+    Two polls happen inside one main() call, via MAX_CYCLES=2, so the same
+    Tracker instance sees both -- exactly how two 60s ticks of the real loop
+    would share it.
+    """
+
+    def _stamp(self, age=3600.0):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - age))
+
+    def _run(self, snapshot_sequence, **env):
+        original = os.environ.copy()
+        os.environ.clear()
+        os.environ.update(preflight_env(
+            WORK_REPO=scratch_repo(self), REVIEW_MODEL="m",
+            MAX_CYCLES=str(len(snapshot_sequence)),
+            PERSONAS="red_team", PLAN_PERSONAS="red_team",
+            REVIEW_INTERVAL_SECONDS="0", **env
+        ))
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(original)))
+
+        reviewed = []
+
+        class Recorder(review_loop.Supervisor):
+            def _run_one(inner, pair, prompt, session_id):
+                reviewed.append(pair.pr)
+                return ok()
+
+        review_loop.Supervisor, original_sup = Recorder, review_loop.Supervisor
+        self.addCleanup(setattr, review_loop, "Supervisor", original_sup)
+
+        calls = iter(snapshot_sequence)
+        original_enum = review_loop.gh.enumerate_candidate_prs
+        review_loop.gh.enumerate_candidate_prs = lambda *a, **k: list(next(calls))
+        self.addCleanup(setattr, review_loop.gh, "enumerate_candidate_prs", original_enum)
+
+        # A durable outage: stage two never answers, whatever PR it's asked about.
+        original_signal = review_loop.gh.pr_signal
+        review_loop.gh.pr_signal = lambda snap, env, **kwargs: None
+        self.addCleanup(setattr, review_loop.gh, "pr_signal", original_signal)
+
+        original_run = review_loop.subprocess.run
+        review_loop.subprocess.run = lambda *a, **k: subprocess.CompletedProcess(a[0], 0, "", "")
+        self.addCleanup(setattr, review_loop.subprocess, "run", original_run)
+
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            review_loop.main([])
+        return reviewed, out.getvalue()
+
+    def test_unchanged_updated_at_reviews_once_not_every_poll(self):
+        stamp = self._stamp()
+        snap = gh.PRSnapshot(12, "code", "abc", stamp)
+        reviewed, _ = self._run([[snap], [snap]])
+        self.assertEqual(reviewed, [12])
+
+    def test_updated_at_moving_during_the_outage_reviews_each_time(self):
+        # A human comment (or anything else that bumps updatedAt) arriving
+        # mid-outage must still get a review -- the degraded fingerprint keys
+        # on updatedAt for exactly this reason.
+        snap1 = gh.PRSnapshot(12, "code", "abc", self._stamp(age=3600.0))
+        snap2 = gh.PRSnapshot(12, "code", "abc", self._stamp(age=60.0))
+        reviewed, _ = self._run([[snap1], [snap2]])
+        self.assertEqual(reviewed, [12, 12])
+
+    def test_head_oid_moving_with_updated_at_fixed_still_reviews_each_time(self):
+        stamp = self._stamp()
+        snap1 = gh.PRSnapshot(12, "code", "aaaaaaa", stamp)
+        snap2 = gh.PRSnapshot(12, "code", "bbbbbbb", stamp)
+        reviewed, _ = self._run([[snap1], [snap2]])
+        self.assertEqual(reviewed, [12, 12])
+
+    def test_an_empty_updated_at_reviews_every_poll(self):
+        # Nothing to key a degraded fingerprint on, so this must keep failing
+        # open exactly like the pre-task-11 behavior -- forever, not once.
+        snap = gh.PRSnapshot(12, "code", "abc", "")
+        reviewed, _ = self._run([[snap], [snap]])
+        self.assertEqual(reviewed, [12, 12])
+
+
 class McpArgsTest(unittest.TestCase):
     """--strict-mcp-config is a security boundary, not a preference: the
     reviewed repo is untrusted, and without it a repo shipping its own

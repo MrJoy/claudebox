@@ -87,6 +87,45 @@ class EnabledTest(unittest.TestCase):
             self.assertTrue(signals.enabled({"REVIEW_ON_CHANGE": v}), v)
 
 
+class Snap:
+    """Stands in for gh.PRSnapshot so this module's tests do not import gh."""
+
+    def __init__(self, number=12, mode="code", head_oid="abc", updated_at="t1"):
+        self.number = number
+        self.mode = mode
+        self.head_oid = head_oid
+        self.updated_at = updated_at
+
+
+class DegradedTest(unittest.TestCase):
+    def test_carries_head_oid_and_mode_from_the_snapshot(self):
+        sig = signals.degraded(Snap(head_oid="deadbeef", mode="plan", updated_at="t1"))
+        self.assertEqual(sig.head_oid, "deadbeef")
+        self.assertEqual(sig.mode, "plan")
+
+    def test_empty_updated_at_yields_none(self):
+        # Nothing to key a review-once-per-change on, so the caller must keep
+        # failing open on every poll rather than caching a review it can never
+        # re-trigger -- same reasoning as Tracker refusing to cache "".
+        self.assertIsNone(signals.degraded(Snap(updated_at="")))
+
+    def test_never_collides_with_a_real_fingerprint_for_the_same_pr(self):
+        # Recovery from an outage must review once: a degraded and a real
+        # Signal built from the same snapshot have to compare unequal.
+        snap = Snap(head_oid="abc", mode="code", updated_at="2026-08-31T12:00:00Z")
+        deg = signals.degraded(snap)
+        real = signals.Signal(
+            head_oid=snap.head_oid, mode=snap.mode, newest_human="2026-08-31T12:00:00Z"
+        )
+        self.assertNotEqual(deg, real)
+
+    def test_is_degraded(self):
+        deg = signals.degraded(Snap(updated_at="t1"))
+        real = signals.Signal(head_oid="abc", mode="code", newest_human="")
+        self.assertTrue(signals.is_degraded(deg))
+        self.assertFalse(signals.is_degraded(real))
+
+
 class ChangeReasonTest(unittest.TestCase):
     NEW = signals.Signal(head_oid="3f2a1b0deadbeef", mode="code", newest_human="")
 
@@ -122,15 +161,29 @@ class ChangeReasonTest(unittest.TestCase):
             "new head 3f2a1b0, new comment activity, mode changed to plan",
         )
 
+    def test_recovering_from_a_failed_lookup_does_not_claim_comment_activity(self):
+        # The degraded newest_human and the real one almost always differ, so
+        # naively comparing them would report "new comment activity" for a
+        # transition where no comment was ever observed -- the lookup just
+        # started working again.
+        old = signals.degraded(Snap(head_oid="abc", mode="code", updated_at="t1"))
+        new = signals.Signal(head_oid="abc", mode="code", newest_human="2026-08-31T12:00:00Z")
+        reason = signals.change_reason(old, new)
+        self.assertNotIn("new comment activity", reason)
+        self.assertIn("recovered", reason)
 
-class Snap:
-    """Stands in for gh.PRSnapshot so this module's tests do not import gh."""
+    def test_failing_from_a_real_signal_does_not_claim_comment_activity(self):
+        old = signals.Signal(head_oid="abc", mode="code", newest_human="2026-08-31T12:00:00Z")
+        new = signals.degraded(Snap(head_oid="abc", mode="code", updated_at="t2"))
+        reason = signals.change_reason(old, new)
+        self.assertNotIn("new comment activity", reason)
+        self.assertIn("failed", reason)
 
-    def __init__(self, number=12, mode="code", head_oid="abc", updated_at="t1"):
-        self.number = number
-        self.mode = mode
-        self.head_oid = head_oid
-        self.updated_at = updated_at
+    def test_updated_at_moving_during_a_sustained_failure_is_not_comment_activity(self):
+        old = signals.degraded(Snap(head_oid="abc", mode="code", updated_at="t1"))
+        new = signals.degraded(Snap(head_oid="abc", mode="code", updated_at="t2"))
+        reason = signals.change_reason(old, new)
+        self.assertNotIn("new comment activity", reason)
 
 
 class TrackerTest(unittest.TestCase):

@@ -99,6 +99,42 @@ def enabled(env: Mapping[str, str]) -> bool:
     return (env.get("REVIEW_ON_CHANGE", "") or "").strip().lower() not in _OFF
 
 
+# Prefix that marks a degraded newest_human as fabricated rather than observed.
+# A real value here is an RFC-3339 comment timestamp, which never starts with
+# a letter, so no real Signal can collide with one this module synthesizes --
+# recovery from an outage is guaranteed to look like a change.
+_DEGRADED_PREFIX = "degraded:"
+
+
+def is_degraded(sig: Signal) -> bool:
+    """True when this fingerprint's comment field was fabricated, not observed."""
+    return sig.newest_human.startswith(_DEGRADED_PREFIX)
+
+
+def degraded(snapshot) -> Optional[Signal]:
+    """The fingerprint to use when stage two fails but updatedAt is known.
+
+    head_oid and mode come from the snapshot, exactly as a real Signal's do --
+    a push or a mode flip must still be noticed while the lookup that would
+    have confirmed it is down. newest_human is updatedAt itself, marked so it
+    can never be mistaken for a comment timestamp. Keying on updatedAt is what
+    bounds a durable failure to one review per change: the PR reviews once and
+    then goes quiet until updatedAt moves again, whether that's a human
+    comment, a push, or the reviewer's own comment on the pass this produced.
+
+    An empty updatedAt returns None, same as a real lookup would have nothing
+    to report: there is nothing to key on, so the caller must fail open on
+    every poll rather than caching a review it can never re-trigger.
+    """
+    if not snapshot.updated_at:
+        return None
+    return Signal(
+        head_oid=snapshot.head_oid,
+        mode=snapshot.mode,
+        newest_human=_DEGRADED_PREFIX + snapshot.updated_at,
+    )
+
+
 def change_reason(old: Optional[Signal], new: Signal) -> str:
     """Why this PR is being reviewed, for the log. Empty when nothing changed."""
     if old is None:
@@ -107,7 +143,17 @@ def change_reason(old: Optional[Signal], new: Signal) -> str:
     if old.head_oid != new.head_oid:
         reasons.append(f"new head {new.head_oid[:7]}")
     if old.newest_human != new.newest_human:
-        reasons.append("new comment activity")
+        old_deg, new_deg = is_degraded(old), is_degraded(new)
+        if old_deg and new_deg:
+            # Both sides are fabricated: the lookup is still failing and only
+            # updatedAt moved underneath it. No comment was seen either time.
+            reasons.append("updatedAt changed during a failed lookup")
+        elif new_deg:
+            reasons.append("stage-two lookup failed")
+        elif old_deg:
+            reasons.append("stage-two lookup recovered")
+        else:
+            reasons.append("new comment activity")
     if old.mode != new.mode:
         reasons.append(f"mode changed to {new.mode}")
     return ", ".join(reasons)
