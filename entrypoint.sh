@@ -79,7 +79,7 @@ strip_surrounding_quotes \
   GITHUB_TOKEN GITHUB_REPOSITORY LINEAR_API_KEY \
   PR_ASSIGNEE PR_IDS PR_SEARCH \
   PERSONAS PLAN_PERSONAS PERSONA_DIR PLAN_LABEL LIMIT_BACKOFF_SECONDS MAX_CYCLES \
-  MAX_CONCURRENT_PASSES REPO_PATH
+  MAX_CONCURRENT_PASSES REPO_PATH SETTLE_SECONDS REVIEW_ON_CHANGE
 # The prompt vars (REVIEW_PROMPT, FOLLOWUP_PROMPT, their _SUFFIX forms, and the
 # PLAN_-prefixed counterparts of all four) are deliberately absent from that
 # list. Everything else on it is a URL, an id, a credential, or a name or number
@@ -214,7 +214,12 @@ else
   WORK_DIR="${WORK_DIR:-$HOME/work}"
   WORK_REPO="$WORK_DIR/repo"
 fi
-REVIEW_INTERVAL_SECONDS="${REVIEW_INTERVAL_SECONDS:-300}"
+# How long to wait between polls. This is a POLL interval, not a review
+# interval: a cycle that finds nothing changed costs one `gh pr list`, so
+# polling often is cheap and the setting is what bounds the delay between
+# somebody pushing and the first review of that push. Validation lives in the
+# supervisor, with SETTLE_SECONDS and the rest of the numeric settings.
+REVIEW_INTERVAL_SECONDS="${REVIEW_INTERVAL_SECONDS:-60}"
 # How long to wait after a pass fails on a usage or rate limit, instead of the
 # normal interval. Long by default: the limit that stopped us is measured in
 # hours on most plans, and retrying into it costs the same allowance twice.
