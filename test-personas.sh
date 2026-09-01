@@ -840,13 +840,16 @@ cycle "modes: a PR that gains the label starts a fresh session, not a resumed on
 # one duplicate-comment burst per pair, since each failure drops its session.
 # The count is taken at each barrier rather than per pass, so this is three
 # whole groups that reviewed nothing.
-cycle "failures: a run of non-limit failures abandons the cycle at the ordinary interval" \
+# It then waits the backoff rather than the poll interval: the provider looks
+# dead, every session it touched was dropped, and the retry is a fresh full
+# review that the change gate cannot narrow. The wait is what test-python.sh
+# pins; here the case runs one cycle and exits before the sleep.
+cycle "failures: a run of non-limit failures abandons the cycle" \
   PR_IDS=1,2,3,4 PERSONAS=red_team STUB_FAIL_ON=1,2,3 STUB_FAIL_MODE=other MAX_CYCLES=1 \
   -- CALLS:3 \
      LOG:"3 passes in a row failed for reasons other than a limit" \
      LOG:"Not reviewed this cycle: #4 code/red_team" \
-     NOLOG:"Reviewing PR #4" \
-     NOLOG:"Backing off"
+     NOLOG:"Reviewing PR #4"
 
 # ... and the counter is consecutive, not cumulative: two failures, a group that
 # reviewed something, another failure is an ordinary bad day, not a dead
