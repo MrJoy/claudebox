@@ -526,6 +526,29 @@ class Supervisor:
             if self.sessions.get(p) is None or self.reviewed.get(p) != signal
         ]
 
+    def unreached_debt(
+        self, group: Group, signal: Optional["signals_mod.Signal"] = None
+    ) -> List[Pair]:
+        """What a group the cycle never reached owes the next one.
+
+        Not `pairs_to_run`: that narrows a group to what it already owes, which
+        is right for a group about to run and wrong here, since a group the
+        cycle never reached ran none of itself and the narrowing was justified
+        by a cut two cycles back. So the whole persona set is owed, minus the
+        pairs the change gate would have withheld had the cycle got that far --
+        otherwise a limit owes the entire tail of an unchanged PR list and the
+        next cycle spends the budget that just ran out re-reviewing it. A pair
+        already owed keeps its debt whatever the gate says: it has no result to
+        preserve.
+        """
+        return [
+            p for p in group.pairs
+            if p in self.owed
+            or signal is None
+            or self.sessions.get(p) is None
+            or self.reviewed.get(p) != signal
+        ]
+
     def order_groups(self, groups: List[Group]) -> List[Group]:
         """This cycle's groups, rotated to start after the last cut.
 
@@ -580,10 +603,11 @@ class Supervisor:
             signal = signals_by_pr.get(group.pr)
             to_run = self.pairs_to_run(group, signal)
             if not to_run:
-                # Nothing to review here. Skipped before run_group, so the cut
-                # accounting below never reasons about an empty result set. The
-                # rotation is unaffected: order_groups keys off the group list,
-                # not off what ran.
+                # Nothing to review here. This is a cost and noise guard, not a
+                # correctness one: run_group already short-circuits an empty
+                # pair list, and the cut accounting below is rebuilt per group.
+                # Skipping keeps a per-cycle log line out of the log for a PR
+                # nobody touched and does not build a pool for no work.
                 continue
             if signal is not None:
                 prior = next(
@@ -651,10 +675,16 @@ class Supervisor:
         # The cut group's own debt, plus every pair of every group the cycle
         # never reached. Their whole persona set is owed, narrowed or not: none
         # of them ran.
+        # cut_owes is taken as it stands: those pairs were selected to run this
+        # cycle and were prevented, so the gate has no say over them. The groups
+        # the cycle never reached go through unreached_debt, which puts them
+        # through the gate they would have faced. self.owed still holds last
+        # cycle's debt at this point, which is what keeps a group that was
+        # already owed and was never reached owed.
         new_owed = set(cut_owes)
         skipped: List[Pair] = []
         for group in ordered[cut_index + 1:]:
-            for pair in group.pairs:
+            for pair in self.unreached_debt(group, signals_by_pr.get(group.pr)):
                 new_owed.add(pair)
                 skipped.append(pair)
         self.owed = new_owed

@@ -1886,5 +1886,72 @@ class ChangeGateTest(unittest.TestCase):
         self.assertEqual(sorted(s.attempted), [self.RT, self.SG])
 
 
+    # -- multi-group cycles: the gate's interaction with the cut accounting --
+
+    OTHER_RT = Pair(34, "code", "red_team")
+    OTHER_SG = Pair(34, "code", "sage")
+    OTHER_GROUP = review_loop.Group(34, "code", (OTHER_RT, OTHER_SG))
+    SIG_OTHER = signals.Signal(head_oid="ccccccc", mode="code", newest_human="")
+
+    def test_a_skipped_group_before_a_cut_owes_nothing(self):
+        s = self.reviewed_and_sessioned(supervisor([limited(), limited()]))
+        with contextlib.redirect_stdout(io.StringIO()):
+            was_limited = s.run_cycle(
+                [self.GROUP, self.OTHER_GROUP], {12: self.SIG_A}
+            )
+        self.assertTrue(was_limited)
+        self.assertEqual(sorted(s.attempted), [self.OTHER_RT, self.OTHER_SG])
+        self.assertEqual(s.owed, {self.OTHER_RT, self.OTHER_SG})
+        self.assertEqual(s.cut_group, (34, "code"))
+
+    def test_a_skipped_group_does_not_reset_the_failure_counter(self):
+        # Guards the placement of the `continue`: below the any_success handling
+        # it would reset consecutive_failures, and a dead provider would never
+        # trip MAX_CONSECUTIVE_FAILURES on any list holding one unchanged PR.
+        third = Pair(56, "code", "red_team")
+        groups = [
+            review_loop.Group(56, "code", (third,)),
+            self.GROUP,
+            self.OTHER_GROUP,
+        ]
+        s = self.reviewed_and_sessioned(
+            supervisor([failed(), failed(), failed()], max_concurrent=1)
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            s.run_cycle(groups, {12: self.SIG_A})
+        # PR 12 is skipped between them, so the three failures are consecutive.
+        self.assertEqual(
+            sorted(s.attempted), sorted([third, self.OTHER_RT, self.OTHER_SG])
+        )
+        self.assertEqual(s.cut_group, (34, "code"))
+
+    def test_an_unchanged_group_the_cut_never_reached_is_not_owed(self):
+        # PR 34 has never been reviewed, so it runs and reports a limit; PR 12
+        # is unchanged and the cycle never reaches it.
+        s = self.reviewed_and_sessioned(supervisor([limited(), limited()]))
+        with contextlib.redirect_stdout(io.StringIO()):
+            s.run_cycle(
+                [self.OTHER_GROUP, self.GROUP],
+                {12: self.SIG_A, 34: self.SIG_OTHER},
+            )
+        # The cut group's own debt stands; PR 12, which the cycle never reached
+        # and which has not changed, owes nothing.
+        self.assertEqual(s.owed, {self.OTHER_RT, self.OTHER_SG})
+        self.assertEqual(s.cut_group, (34, "code"))
+
+    def test_an_owed_group_the_cut_never_reached_stays_owed(self):
+        # self.owed still holds last cycle's debt while new_owed is built, and
+        # pairs_to_run consults it before the gate, so an unchanged PR that was
+        # already owed and was never reached keeps its debt.
+        s = self.reviewed_and_sessioned(supervisor([limited(), limited()]))
+        s.owed = {self.RT}
+        with contextlib.redirect_stdout(io.StringIO()):
+            s.run_cycle(
+                [self.OTHER_GROUP, self.GROUP],
+                {12: self.SIG_A, 34: self.SIG_OTHER},
+            )
+        self.assertEqual(s.owed, {self.OTHER_RT, self.OTHER_SG, self.RT})
+
+
 if __name__ == "__main__":
     unittest.main()
