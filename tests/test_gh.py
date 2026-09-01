@@ -7,6 +7,7 @@ import unittest
 import _path  # noqa: F401
 
 import gh
+import signals
 from common import ConfigError
 
 
@@ -350,6 +351,82 @@ class SpawnFailureTest(unittest.TestCase):
         got, out = enumerate_log("ids", dict(self.ENV, PR_IDS="12"), self._raising)
         self.assertEqual(got, [])
         self.assertIn("could not read labels for PR #12", out)
+
+
+class PRSignalTest(unittest.TestCase):
+    ENV = {"GITHUB_REPOSITORY": "o/r"}
+    SNAP = None  # set in setUp, because gh.PRSnapshot arrives in Task 2
+
+    def setUp(self):
+        self.SNAP = gh.PRSnapshot(
+            number=12, mode="code", head_oid="abc123",
+            updated_at="2026-08-31T12:00:00Z")
+
+    def test_unsigned_conversation_comment_sets_newest_human(self):
+        view = json.dumps({
+            "comments": [
+                {"createdAt": "2026-08-31T09:00:00Z", "body": "-claudebox (sage)"},
+                {"createdAt": "2026-08-31T10:00:00Z", "body": "I disagree."},
+            ],
+            "reviews": [],
+        })
+        run = runner(Result(0, view), Result(0, "[]"))
+        got = gh.pr_signal(self.SNAP, self.ENV, run=run)
+        self.assertEqual(got.newest_human, "2026-08-31T10:00:00Z")
+        self.assertEqual(got.head_oid, "abc123")
+        self.assertEqual(got.mode, "code")
+
+    def test_only_signed_comments_leave_newest_human_empty(self):
+        view = json.dumps({
+            "comments": [{"createdAt": "2026-08-31T10:00:00Z",
+                          "body": "Nit here.\n\n-claudebox (red_team)"}],
+            "reviews": [],
+        })
+        run = runner(Result(0, view), Result(0, "[]"))
+        self.assertEqual(gh.pr_signal(self.SNAP, self.ENV, run=run).newest_human, "")
+
+    def test_a_review_with_an_empty_body_counts_as_a_human_event(self):
+        view = json.dumps({
+            "comments": [],
+            "reviews": [{"submittedAt": "2026-08-31T11:00:00Z", "body": ""}],
+        })
+        run = runner(Result(0, view), Result(0, "[]"))
+        self.assertEqual(
+            gh.pr_signal(self.SNAP, self.ENV, run=run).newest_human,
+            "2026-08-31T11:00:00Z",
+        )
+
+    def test_inline_review_comments_are_read_over_the_rest_api(self):
+        view = json.dumps({"comments": [], "reviews": []})
+        inline = json.dumps([
+            {"created_at": "2026-08-31T13:00:00Z", "body": "this line is wrong"},
+        ])
+        run = runner(Result(0, view), Result(0, inline))
+        got = gh.pr_signal(self.SNAP, self.ENV, run=run)
+        self.assertEqual(got.newest_human, "2026-08-31T13:00:00Z")
+        self.assertEqual(run.calls[1], [
+            "gh", "api", "repos/o/r/pulls/12/comments", "--paginate",
+        ])
+
+    def test_stage_two_never_asks_for_status_checks(self):
+        run = runner(Result(0, json.dumps({"comments": [], "reviews": []})),
+                     Result(0, "[]"))
+        gh.pr_signal(self.SNAP, self.ENV, run=run)
+        self.assertNotIn("statusCheckRollup", " ".join(run.calls[0]))
+
+    def test_a_failed_view_returns_none(self):
+        run = runner(Result(1, "", "gh: HTTP 502"), Result(0, "[]"))
+        self.assertIsNone(gh.pr_signal(self.SNAP, self.ENV, run=run))
+
+    def test_a_failed_inline_lookup_returns_none(self):
+        view = json.dumps({"comments": [], "reviews": []})
+        run = runner(Result(0, view), Result(1, "", "gh: HTTP 502"))
+        self.assertIsNone(gh.pr_signal(self.SNAP, self.ENV, run=run))
+
+    def test_a_gh_that_cannot_be_spawned_returns_none(self):
+        def run(argv, **kwargs):
+            raise OSError("no such file")
+        self.assertIsNone(gh.pr_signal(self.SNAP, self.ENV, run=run))
 
 
 if __name__ == "__main__":

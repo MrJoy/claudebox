@@ -15,6 +15,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any, Callable, List, Mapping
 
+import signals
 from common import ConfigError, log
 
 
@@ -209,3 +210,57 @@ def enumerate_candidate_prs(
             log(line)
         return []
     return pr_modes(payload, plan_label)
+
+
+def pr_signal(snapshot: PRSnapshot, env: Mapping[str, str],
+              run: Callable[..., Any] = subprocess.run):
+    """This PR's fingerprint, or None when GitHub could not be read.
+
+    Two calls, made only for a PR whose updatedAt moved. `gh pr view` carries
+    conversation comments and review submissions; inline diff comments are not
+    in the reviews field, so they come from the REST endpoint. Neither asks for
+    statusCheckRollup, which the privilege-minimized token cannot fetch.
+
+    None is the fail-open value and the caller reviews the PR on it. That is
+    the opposite of the ids selector's mode lookup, which skips on failure --
+    there a wrong mode posts comments that cannot be taken back, and here the
+    mode is already known from stage one, so the worst case is one redundant
+    pass.
+    """
+    repo = env["GITHUB_REPOSITORY"]
+
+    def gh_run(argv):
+        try:
+            return run(argv, capture_output=True, text=True, check=False)
+        except OSError as exc:
+            return subprocess.CompletedProcess(argv, 1, "", f"could not run gh: {exc}")
+
+    view = _read_json(gh_run([
+        "gh", "pr", "view", str(snapshot.number), "-R", repo,
+        "--json", "comments,reviews",
+    ]))
+    if not isinstance(view, dict):
+        return None
+
+    inline = _read_json(gh_run([
+        "gh", "api", f"repos/{repo}/pulls/{snapshot.number}/comments", "--paginate",
+    ]))
+    if not isinstance(inline, list):
+        return None
+
+    entries = []
+    for c in view.get("comments") or []:
+        if isinstance(c, dict):
+            entries.append((c.get("createdAt"), c.get("body")))
+    for r in view.get("reviews") or []:
+        if isinstance(r, dict):
+            entries.append((r.get("submittedAt"), r.get("body")))
+    for c in inline:
+        if isinstance(c, dict):
+            entries.append((c.get("created_at"), c.get("body")))
+
+    return signals.Signal(
+        head_oid=snapshot.head_oid,
+        mode=snapshot.mode,
+        newest_human=signals.newest_unsigned(entries),
+    )
