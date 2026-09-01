@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 import _path  # noqa: F401
@@ -695,11 +696,12 @@ class RequiredEnvTest(unittest.TestCase):
 
 
 class TunableDefaultsTest(unittest.TestCase):
-    """The three intervals default to what entrypoint.sh defaults to.
+    """The three intervals, pinned where a silent regression would burn quota.
 
-    A regression here would be silent and would burn the quota the backoff
-    exists to protect. The poll interval is 60 since the change gate landed:
-    the loop wakes often and reviews only what moved.
+    Two of them still match entrypoint.sh's own defaults. The poll interval is
+    60 here because the change gate landed: the loop wakes often and reviews
+    only what moved. entrypoint.sh still defaults it to 300 and exports it;
+    Task 7 brings the two back into sync.
     """
 
     def test_review_interval(self):
@@ -1177,6 +1179,14 @@ class PreflightTest(unittest.TestCase):
         with self.assertRaises(ConfigError):
             review_loop.preflight(preflight_env(PR_IDS=""))
 
+    def test_a_typod_settle_seconds_is_a_config_error(self):
+        # Validated here as well as in main because --check returns before
+        # main's config block, and entrypoint.sh runs --check ahead of the
+        # network clone and up to 120s of LiteLLM startup. Without this the
+        # typo costs both on every restart under --restart unless-stopped.
+        with self.assertRaises(ConfigError):
+            review_loop.preflight(preflight_env(SETTLE_SECONDS="thirty"))
+
 
 class CheckModeTest(unittest.TestCase):
     def _run(self, args, env):
@@ -1258,6 +1268,90 @@ class GitFetchFailureTest(unittest.TestCase):
         rc, out = self._one_cycle(run)
         self.assertEqual(rc, 0)
         self.assertIn("git fetch failed", out)
+
+
+class CycleGateTest(unittest.TestCase):
+    """What the cycle body does with the change gate, driven through main().
+
+    Both properties here are ordering properties, and reading the code is the
+    only other thing that pins them: the gate has to skip the stage-two lookup
+    entirely rather than make it and ignore the answer, and the settle filter
+    has to run before the tracker rather than after it.
+    """
+
+    def _cycle(self, snapshots, **env):
+        original = os.environ.copy()
+        os.environ.clear()
+        os.environ.update(preflight_env(
+            WORK_REPO=scratch_repo(self), REVIEW_MODEL="m", MAX_CYCLES="1",
+            PERSONAS="red_team", PLAN_PERSONAS="red_team",
+            REVIEW_INTERVAL_SECONDS="0", **env
+        ))
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(original)))
+
+        looked_up, reviewed = [], []
+
+        class Recorder(review_loop.Supervisor):
+            def _run_one(inner, pair, prompt, session_id):
+                reviewed.append(pair.pr)
+                return ok()
+
+        review_loop.Supervisor, original_sup = Recorder, review_loop.Supervisor
+        self.addCleanup(setattr, review_loop, "Supervisor", original_sup)
+
+        original_enum = review_loop.gh.enumerate_candidate_prs
+        review_loop.gh.enumerate_candidate_prs = lambda *a, **k: list(snapshots)
+        self.addCleanup(setattr, review_loop.gh, "enumerate_candidate_prs", original_enum)
+
+        def pr_signal(snap, env, **kwargs):
+            looked_up.append(snap.number)
+            return signals.Signal(head_oid=snap.head_oid, mode=snap.mode, newest_human="")
+
+        original_signal = review_loop.gh.pr_signal
+        review_loop.gh.pr_signal = pr_signal
+        self.addCleanup(setattr, review_loop.gh, "pr_signal", original_signal)
+
+        original_run = review_loop.subprocess.run
+        review_loop.subprocess.run = lambda *a, **k: subprocess.CompletedProcess(a[0], 0, "", "")
+        self.addCleanup(setattr, review_loop.subprocess, "run", original_run)
+
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            review_loop.main([])
+        return looked_up, reviewed, out.getvalue()
+
+    def _snap(self, number=12, age=3600.0):
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - age))
+        return gh.PRSnapshot(number, "code", "abc", stamp)
+
+    def test_the_gate_off_makes_no_stage_two_lookup(self):
+        # An operator who turns the gate off stops paying for the extra
+        # requests too. Consulting the tracker and discarding the answer would
+        # cost two GitHub calls per PR per cycle for nothing.
+        looked_up, reviewed, _ = self._cycle(
+            [self._snap()], REVIEW_ON_CHANGE="0")
+        self.assertEqual(looked_up, [])
+        self.assertEqual(reviewed, [12])
+
+    def test_the_gate_on_looks_a_settled_pr_up(self):
+        # The control for the case above: with the gate on, the same PR is
+        # looked up, so an assertion of "no lookup" means the gate and not a
+        # stub that never fires.
+        looked_up, reviewed, _ = self._cycle(
+            [self._snap()], SETTLE_SECONDS="30")
+        self.assertEqual(looked_up, [12])
+        self.assertEqual(reviewed, [12])
+
+    def test_a_settling_pr_is_dropped_before_the_tracker_sees_it(self):
+        # Nothing is recorded for a settling PR, which is what makes the next
+        # poll reconsider it from scratch. The tracker caches on updatedAt, so
+        # a lookup here would leave that cache holding a fingerprint taken
+        # mid-burst. The filter therefore runs BEFORE the tracker loop, and the
+        # absence of a lookup is how that ordering is observable.
+        looked_up, reviewed, log = self._cycle(
+            [self._snap(age=5.0)], SETTLE_SECONDS="3600")
+        self.assertEqual(looked_up, [])
+        self.assertEqual(reviewed, [])
+        self.assertIn("Settling (3600s)", log)
 
 
 class McpArgsTest(unittest.TestCase):
