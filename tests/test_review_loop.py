@@ -2181,6 +2181,40 @@ class ChangeGateTest(unittest.TestCase):
         self.assertEqual(s.owed, {self.OTHER_RT, self.OTHER_SG})
         self.assertEqual(s.cut_group, (34, "code"))
 
+    def test_the_reason_line_is_taken_from_the_pairs_that_are_running(self):
+        # A mixed group: sage is held by the gate, and red_team was rotated by
+        # MAX_PASSES_PER_SESSION so it runs with no session. red_team last read
+        # the PR at SIG_B, so the head really did move for it, and the reason
+        # line has to say so. sage sits ahead of it in the group, so reading the
+        # fingerprint off the whole group finds the pair that is NOT running and
+        # reports "no session" for a push that happened.
+        group = review_loop.Group(12, "code", (self.SG, self.RT))
+        s = supervisor([])
+        s.sessions[self.SG] = "S1"
+        s.reviewed[self.SG] = self.SIG_A
+        s.reviewed[self.RT] = self.SIG_B  # rotated: no session, stale reading
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            s.run_cycle([group], {12: self.SIG_A})
+        self.assertEqual(s.attempted, [self.RT])
+        self.assertIn("PR #12 [code]: new head aaaaaaa.", buf.getvalue())
+
+    def test_the_reason_line_does_not_invent_a_push_for_a_narrowed_group(self):
+        # The other direction, and the one M5 named: a group narrowed by `owed`
+        # runs sage, which has already read SIG_A, while red_team's stale SIG_B
+        # sits ahead of it in the group. Reading the whole group reports a head
+        # change that did not happen and sends an operator after a phantom push.
+        s = supervisor([])
+        s.sessions[self.RT] = s.sessions[self.SG] = "S1"
+        s.reviewed[self.RT] = self.SIG_B
+        s.reviewed[self.SG] = self.SIG_A
+        s.owed = {self.SG}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            s.run_cycle([self.GROUP], {12: self.SIG_A})
+        self.assertEqual(s.attempted, [self.SG])
+        self.assertNotIn("new head", buf.getvalue())
+
     def test_a_limit_does_not_owe_the_personas_the_gate_excused(self):
         # sage's fingerprint is the current one, so the gate withholds it and
         # only red_team runs; red_team then reports a limit. Owing sage spends

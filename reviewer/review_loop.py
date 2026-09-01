@@ -528,9 +528,11 @@ class Supervisor:
         not run last cycle, and the rest of the group did. A group that owes
         nothing runs in full. The narrowing lasts until the group is served
         without being cut again, which is one cycle in the ordinary case and
-        longer while a pair keeps reporting a limit -- the siblings a narrowed
-        group leaves out are owed by the cut that stopped it, so they come back
-        on the visit after.
+        longer while a pair keeps reporting a limit -- the siblings the OWED
+        narrowing leaves out are owed by the cut that stopped it, so they come
+        back on the visit after. The gate narrowing below is not like that: the
+        pairs it leaves out are excused rather than deferred, and debt_for
+        keeps them out of the debt for the same reason.
 
         A group that owes nothing is then filtered by the change gate, whose
         one definition of "unchanged" lives in _gate_holds. A failed lookup

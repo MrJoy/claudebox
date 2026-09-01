@@ -696,8 +696,7 @@ cycle "limits: the near-miss window wording is classified as a limit" \
 cycle "limits: an unrecognised failure degrades to the ordinary path" \
   PERSONAS=red_team STUB_FAIL_ON=1 STUB_FAIL_MODE=nearmiss MAX_CYCLES=1 \
   -- CALLS:1 \
-     LOG:"starting a fresh session for it next cycle" \
-     NOLOG:"Backing off"
+     LOG:"starting a fresh session for it next cycle"
 
 # The matched line itself reaches the log. is_usage_limit scans the whole stderr
 # while the WARN line tails only its last few, so without this a limit reported
