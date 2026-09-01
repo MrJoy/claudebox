@@ -700,10 +700,11 @@ class RequiredEnvTest(unittest.TestCase):
 class TunableDefaultsTest(unittest.TestCase):
     """The three intervals, pinned where a silent regression would burn quota.
 
-    Two of them still match entrypoint.sh's own defaults. The poll interval is
-    60 here because the change gate landed: the loop wakes often and reviews
-    only what moved. entrypoint.sh still defaults it to 300 and exports it;
-    Task 7 brings the two back into sync.
+    All three match entrypoint.sh's own defaults. The poll interval is 60
+    because the change gate landed: the loop wakes often and reviews only what
+    moved, so entrypoint.sh:222 defaults it to 60 too and exports it. A
+    disagreement between the two would only surface for someone running the
+    supervisor without the entrypoint.
     """
 
     def test_review_interval(self):
@@ -1181,7 +1182,7 @@ class PreflightTest(unittest.TestCase):
         with self.assertRaises(ConfigError):
             review_loop.preflight(preflight_env(PR_IDS=""))
 
-    def test_a_typod_settle_seconds_is_a_config_error(self):
+    def test_an_unparsable_settle_seconds_is_a_config_error(self):
         # Validated here as well as in main because --check returns before
         # main's config block, and entrypoint.sh runs --check ahead of the
         # network clone and up to 120s of LiteLLM startup. Without this the
