@@ -96,6 +96,12 @@ empty string when there are none. `updatedAt` is deliberately not part of
 the fingerprint. It moves for edits the design decided to ignore, and
 including it would make a typo fix in a PR body cost a persona fan-out.
 
+The one exception is `signals.degraded`, used only when stage two has
+failed: it builds a `Signal` from `head_oid`/`mode` plus `updatedAt`
+itself (marked so it cannot collide with a real comment timestamp), since
+there is nothing else to key a bounded retry on while the real fingerprint
+is unreadable. See "Failure behavior" below.
+
 Neither dict is persisted. That is not a deferral, it is required:
 `sessions` lives only in memory, so a persisted fingerprint would survive
 a restart into a process whose sessions did not, leaving a fresh session
@@ -142,6 +148,19 @@ A negative age, which means the container clock is behind GitHub's, is
 clamped to zero and the PR runs. Skew costs the batching and never the
 review.
 
+The settle window also closes a race the fingerprint alone cannot: `newest_human`
+is a whole-second RFC-3339 string, so a comment landing in the same second as
+the `updatedAt` a fingerprint was already recorded against is indistinguishable
+from it -- same second, same string, no change detected. The default window
+closes this because a snapshot only clears settling once it is already
+`SETTLE_SECONDS` old, so a comment arriving after that point necessarily
+stamps a strictly later second. The race is open at `SETTLE_SECONDS=0`, and
+it is open under the *other* clock skew direction too: a container clock
+running ahead of GitHub's inflates the computed age and lets a fresh PR clear
+settling before a real `SETTLE_SECONDS` has passed. This is the only place in
+this design where clock skew changes a decision instead of only costing
+batching.
+
 ## Cadence and configuration
 
 `REVIEW_INTERVAL_SECONDS` becomes a poll interval. Its default drops from
@@ -168,10 +187,13 @@ New variables, both read by the supervisor and both added to
 A stage-one failure degrades to an empty candidate list, which is the
 existing path and is unchanged.
 
-A stage-two failure fails open: the PR is reviewed, with a WARN naming
-it. The `ids` selector's mode lookup skips on failure because a
-wrong-mode review posts real comments that cannot be taken back. Here the
-mode already came from stage one, so the worst case is a redundant pass.
+A stage-two failure fails open once per `updatedAt` change: the first poll
+after a failure reviews the PR in full, with a WARN naming it; a later poll
+against the same `updatedAt` is gated on the degraded fingerprint instead,
+and the WARN says so. The `ids` selector's mode lookup skips on failure
+because a wrong-mode review posts real comments that cannot be taken back.
+Here the mode already came from stage one, so the worst case is a redundant
+pass.
 
 To keep a persistent `gh` outage from re-reviewing everything on every
 poll, a failed stage two still records `polled[pr]`. That bounds the API

@@ -178,8 +178,10 @@ sight, a session `_record_failure` dropped, and a `MAX_PASSES_PER_SESSION`
 rotation all look like "no session" to the gate and none of them needed to
 know it exists.
 
-**A stage-two failure fails open**, and the WARN says which PR it named. The
-PR is reviewed in full rather than skipped, unlike the `ids` selector's mode
+**A stage-two failure fails open once per `updatedAt` change**, and the WARN
+says which PR it named and, from the second poll on, that it is gated on
+`updatedAt` rather than reviewed unconditionally. The first poll after a
+failure is reviewed in full, unlike the `ids` selector's mode
 lookup, which skips on failure because a wrong-mode review posts comments
 nobody can take back — here the mode is already known from stage one, so the
 worst a redundant pass costs is noise. `Tracker` still records the failed
@@ -208,10 +210,26 @@ one review instead of one per push. A negative age — the container clock
 behind GitHub's — is clamped to zero and the PR runs; skew costs the
 batching, never the review.
 
+`SETTLE_SECONDS` also closes a race the fingerprint alone could not: `newest_human`
+resolves to whole-second RFC-3339 timestamps, so a comment landing in the same
+second as the `updatedAt` a fingerprint was already recorded against would be
+invisible to `change_reason` — same second, same string. The default settle
+window is what prevents that from mattering: a snapshot only clears settling
+once it is already `SETTLE_SECONDS` old, so any comment arriving after that
+point necessarily stamps a later second. The race reopens at `SETTLE_SECONDS=0`,
+and it reopens under skew too — a container clock running *ahead* of GitHub's
+inflates the computed age and lets a fresh PR clear settling before a full
+window has actually passed. This is the one place in this design where clock
+skew changes a decision rather than merely costing batching; the paragraph
+above's "skew costs the batching, never the review" is about the *opposite*
+skew direction (clock behind) and does not cover this case.
+
 `REVIEW_ON_CHANGE=0` turns the whole gate off: `signals_by_pr` stays empty,
-every `signal` handed to `pairs_to_run` is `None`, and `None` means "run it,"
-the same value a lookup failure produces. Stage two is never called at all
-in that mode, so the extra `gh` requests disappear along with the gate.
+every `signal` handed to `pairs_to_run` is `None`, and `None` means "run it" —
+the same value a lookup failure against an **empty** `updatedAt` produces (a
+lookup failure against a non-empty one produces a degraded Signal instead,
+not `None`; see above). Stage two is never called at all in this mode, so the
+extra `gh` requests disappear along with the gate.
 
 ### Backend selection & the all-tiers-mapped-to-one-model trick
 

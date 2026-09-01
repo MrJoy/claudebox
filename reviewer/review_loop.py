@@ -528,14 +528,13 @@ class Supervisor:
         A group that owes nothing is then filtered by the change gate. `signal`
         is None when the gate is off, and when stage two failed against an
         empty updatedAt (nothing to key a degraded fingerprint on); both mean
-        "run it". A failed lookup against a non-empty updatedAt arrives here as
-        a degraded Signal instead, so it's gated like a real one and stops
+        "run it". A failed lookup against a non-empty updatedAt arrives here
+        as a degraded Signal instead, so it's gated like a real one and stops
         re-running once it's been served -- see signals.degraded. A pair with
-        no session always runs, which
-        is what makes first sight, a session dropped by _record_failure, and
-        MAX_PASSES_PER_SESSION rotation work without knowing about the gate. A
-        mode flip needs no case of its own either: it makes a different Pair,
-        and that Pair has no session.
+        no session always runs, which is what makes first sight, a session
+        dropped by _record_failure, and MAX_PASSES_PER_SESSION rotation work
+        without knowing about the gate. A mode flip needs no case of its own
+        either: it makes a different Pair, and that Pair has no session.
         """
         owed_here = [p for p in group.pairs if p in self.owed]
         if owed_here:
@@ -720,9 +719,10 @@ class Supervisor:
     def _record_success(
         self, pair: Pair, result, signal: Optional["signals_mod.Signal"] = None
     ) -> None:
-        # Only when one was supplied: None arrives both from the gate being off
-        # and from a lookup that failed, and recording it would claim knowledge
-        # we do not have.
+        # Only when one was supplied: None arrives from the gate being off and
+        # from a failed lookup against an empty updatedAt (a failed lookup
+        # against a non-empty one arrives as a degraded Signal, not None), and
+        # recording it would claim knowledge we do not have.
         if signal is not None:
             self.reviewed[pair] = signal
         if result.session_id:
@@ -922,16 +922,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 sig = tracker.signal_for(
                     snap, lambda s: gh.pr_signal(s, env))
                 if sig is None:
-                    log(f"WARN: could not read PR #{snap.number}'s comment "
-                        "activity; reviewing it rather than skipping it.")
                     # Tracker only remembers a real lookup's outcome, so a
                     # repeated failure against the same updatedAt lands here
-                    # every poll. Synthesizing the degraded fingerprint here,
-                    # from the snapshot in hand, gives the same answer each
-                    # time without Tracker needing to know it exists -- that's
-                    # what turns "fail open" into "fail open once per change"
+                    # every poll. Synthesizing the degraded fingerprint from
+                    # the snapshot in hand gives the same answer each time
+                    # without Tracker needing to know it exists -- that's what
+                    # turns "fail open" into "fail open once per change"
                     # instead of "fail open forever".
                     sig = signals_mod.degraded(snap)
+                    if sig is not None:
+                        log(f"WARN: could not read PR #{snap.number}'s "
+                            "comment activity; gating it on updatedAt until "
+                            "the lookup recovers.")
+                    else:
+                        # No updatedAt to key a degraded fingerprint on, so
+                        # this really does fail open on every poll -- the
+                        # wording below is true here and nowhere else.
+                        log(f"WARN: could not read PR #{snap.number}'s "
+                            "comment activity; reviewing it rather than "
+                            "skipping it.")
                 if sig is not None:
                     signals_by_pr[snap.number] = sig
 
