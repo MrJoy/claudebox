@@ -123,5 +123,72 @@ class ChangeReasonTest(unittest.TestCase):
         )
 
 
+class Snap:
+    """Stands in for gh.PRSnapshot so this module's tests do not import gh."""
+
+    def __init__(self, number=12, mode="code", head_oid="abc", updated_at="t1"):
+        self.number = number
+        self.mode = mode
+        self.head_oid = head_oid
+        self.updated_at = updated_at
+
+
+class TrackerTest(unittest.TestCase):
+    def setUp(self):
+        self.calls = []
+
+    def fetch(self, result):
+        def f(snapshot):
+            self.calls.append(snapshot.number)
+            return result
+        return f
+
+    def test_first_sight_fetches(self):
+        t = signals.Tracker()
+        sig = signals.Signal("abc", "code", "")
+        self.assertEqual(t.signal_for(Snap(), self.fetch(sig)), sig)
+        self.assertEqual(self.calls, [12])
+
+    def test_unchanged_update_time_does_not_fetch_again(self):
+        t = signals.Tracker()
+        sig = signals.Signal("abc", "code", "")
+        snap = Snap(updated_at="t1")
+        t.signal_for(snap, self.fetch(sig))
+        again = t.signal_for(snap, self.fetch(sig))
+        self.assertEqual(self.calls, [12])
+        self.assertEqual(again, sig)
+
+    def test_moved_update_time_fetches_again(self):
+        t = signals.Tracker()
+        sig = signals.Signal("abc", "code", "")
+        t.signal_for(Snap(updated_at="t1"), self.fetch(sig))
+        t.signal_for(Snap(updated_at="t2"), self.fetch(sig))
+        self.assertEqual(self.calls, [12, 12])
+
+    def test_a_failed_fetch_returns_none_and_still_records_the_poll(self):
+        # Fail open once per updatedAt change, not once per cycle: a persistent
+        # gh outage must not re-review every PR on every poll.
+        t = signals.Tracker()
+        snap = Snap(updated_at="t1")
+        self.assertIsNone(t.signal_for(snap, self.fetch(None)))
+        self.assertIsNone(t.signal_for(snap, self.fetch(None)))
+        self.assertEqual(self.calls, [12])
+
+    def test_a_failed_fetch_retries_once_the_update_time_moves(self):
+        t = signals.Tracker()
+        t.signal_for(Snap(updated_at="t1"), self.fetch(None))
+        sig = signals.Signal("abc", "code", "")
+        self.assertEqual(t.signal_for(Snap(updated_at="t2"), self.fetch(sig)), sig)
+        self.assertEqual(self.calls, [12, 12])
+
+    def test_a_snapshot_with_no_update_time_always_fetches(self):
+        # "" would otherwise cache as a legitimate value and pin a PR forever.
+        t = signals.Tracker()
+        sig = signals.Signal("abc", "code", "")
+        t.signal_for(Snap(updated_at=""), self.fetch(sig))
+        t.signal_for(Snap(updated_at=""), self.fetch(sig))
+        self.assertEqual(self.calls, [12, 12])
+
+
 if __name__ == "__main__":
     unittest.main()

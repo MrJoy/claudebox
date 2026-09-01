@@ -12,7 +12,7 @@ outlives a cycle lives on Supervisor.
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Iterable, Mapping, Optional, Tuple
+from typing import Dict, Iterable, Mapping, Optional, Tuple
 
 # Comments claudebox posts carry this, because personas/*/_shared.md tells every
 # persona to sign its findings with it. Author login is deliberately NOT
@@ -111,3 +111,48 @@ def change_reason(old: Optional[Signal], new: Signal) -> str:
     if old.mode != new.mode:
         reasons.append(f"mode changed to {new.mode}")
     return ", ".join(reasons)
+
+
+class Tracker:
+    """Decides when a second GitHub lookup is worth making.
+
+    `updatedAt` moves on a push, a comment, a review and a label change, so a
+    PR whose value has not moved cannot have changed in any way this design
+    cares about. That is what keeps a cycle in which nothing happened at the
+    cost it has today: one request.
+
+    In memory, like the session map. It must NOT be persisted: `sessions` is in
+    memory too, so a fingerprint that survived a restart would leave a fresh
+    session that has never read the PR believing it had already reviewed it.
+    """
+
+    def __init__(self):
+        # PR number -> the updatedAt its last lookup ran against.
+        self.polled: Dict[int, str] = {}
+        # PR number -> the fingerprint that lookup produced, or None when it
+        # failed. Cached either way, so a persistent gh outage fails open once
+        # per updatedAt change instead of once per cycle.
+        self._cache: Dict[int, Optional[Signal]] = {}
+
+    def signal_for(self, snapshot, fetch) -> Optional[Signal]:
+        number = snapshot.number
+        stamp = snapshot.updated_at
+        # An empty stamp is not a value to cache against: gh did not tell us
+        # when the PR last moved, so every poll has to look for itself.
+        if stamp and self.polled.get(number) == stamp:
+            cached = self._cache.get(number)
+            if cached is None:
+                return None
+            # The mode can change without updatedAt reaching us as a new value
+            # in the same cycle; keep the cached comment timestamp and take the
+            # rest from the snapshot we were just handed.
+            return Signal(
+                head_oid=snapshot.head_oid,
+                mode=snapshot.mode,
+                newest_human=cached.newest_human,
+            )
+        result = fetch(snapshot)
+        if stamp:
+            self.polled[number] = stamp
+        self._cache[number] = result
+        return result
