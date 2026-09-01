@@ -135,9 +135,16 @@ pair once.
 owed_here = [p for p in group.pairs if p in self.owed]
 if owed_here:
     return owed_here                      # unchanged narrowing
-return [p for p in group.pairs
-        if self.sessions.get(p) is None or self.reviewed.get(p) != signal]
+return [p for p in group.pairs if not self._gate_holds(p, signal)]
 ```
+
+**Amended after the whole-branch review.** The clause above was written
+inline here and in `debt_for` separately, and the two drifted, which is how a
+cut came to owe the personas the gate had just excused. `_gate_holds(pair,
+signal)` is now the single definition -- true when the pair has a live session
+and its recorded fingerprint equals the current one -- and its three callers
+are the group about to run, the group the cycle never reached, and the debt a
+cut leaves behind.
 
 The owed path is untouched, which is what exempts retries after an error.
 A pair with no session always runs, so first sight, a session dropped by
