@@ -242,8 +242,17 @@ def pr_signal(snapshot: PRSnapshot, env: Mapping[str, str],
     if not isinstance(view, dict):
         return None
 
+    # Capped, not paginated. All this extracts is one max(), and claudebox's
+    # own comment moves updatedAt, so every PR it reviews buys this lookup on
+    # the following poll -- at a 60s interval an uncapped walk of a long-lived
+    # PR's inline comments is several REST calls per PR per minute. Newest
+    # first, one page: enough to find the newest unsigned comment in any
+    # realistic case, and the failure it avoids is a rate limit, which degrades
+    # to an empty candidate list and a reviewer that reviews nothing at all.
     inline = _read_json(gh_run([
-        "gh", "api", f"repos/{repo}/pulls/{snapshot.number}/comments", "--paginate",
+        "gh", "api",
+        f"repos/{repo}/pulls/{snapshot.number}/comments"
+        "?sort=created&direction=desc&per_page=30",
     ]))
     if not isinstance(inline, list):
         return None

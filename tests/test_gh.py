@@ -405,8 +405,22 @@ class PRSignalTest(unittest.TestCase):
         got = gh.pr_signal(self.SNAP, self.ENV, run=run)
         self.assertEqual(got.newest_human, "2026-08-31T13:00:00Z")
         self.assertEqual(run.calls[1], [
-            "gh", "api", "repos/o/r/pulls/12/comments", "--paginate",
+            "gh", "api",
+            "repos/o/r/pulls/12/comments?sort=created&direction=desc&per_page=30",
         ])
+
+    def test_the_inline_lookup_is_capped_rather_than_paginated(self):
+        # One max() does not justify walking every inline comment a long-lived
+        # PR ever collected, once per poll, at a 60s poll interval. The newest
+        # page is enough to find the newest unsigned comment, and an
+        # unbounded walk fails into a rate limit, which degrades to an empty
+        # candidate list and a reviewer that silently reviews nothing.
+        run = runner(Result(0, json.dumps({"comments": [], "reviews": []})),
+                     Result(0, "[]"))
+        gh.pr_signal(self.SNAP, self.ENV, run=run)
+        self.assertNotIn("--paginate", run.calls[1])
+        self.assertIn("per_page=30", run.calls[1][-1])
+        self.assertIn("direction=desc", run.calls[1][-1])
 
     def test_stage_two_never_asks_for_status_checks(self):
         run = runner(Result(0, json.dumps({"comments": [], "reviews": []})),

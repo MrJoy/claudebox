@@ -42,8 +42,20 @@ class Signal:
 
 
 def is_own(body: Optional[str]) -> bool:
-    """True when this comment body is one claudebox posted."""
-    return MARKER in (body or "").lower()
+    """True when this comment body is one claudebox posted.
+
+    Quoted lines are dropped before the test. GitHub's Quote reply button
+    copies the comment being replied to verbatim into the new body behind
+    "> ", so a human disputing a finding carries the marker and would be read
+    as claudebox's own -- and that reply is precisely the input the followup
+    prompt exists to consume. Stripping quotes fails in the direction this
+    design prefers everywhere else: at worst one extra review round.
+    """
+    text = "\n".join(
+        line for line in (body or "").splitlines()
+        if not line.lstrip().startswith(">")
+    )
+    return MARKER in text.lower()
 
 
 def newest_unsigned(entries: Iterable[Tuple[Optional[str], Optional[str]]]) -> str:

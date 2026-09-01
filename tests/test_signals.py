@@ -15,6 +15,29 @@ class MarkerTest(unittest.TestCase):
     def test_unsigned_body_is_not_ours(self):
         self.assertFalse(signals.is_own("I disagree, see the ticket."))
 
+    def test_a_quoted_signature_is_a_human_reply(self):
+        # GitHub's Quote reply button copies the quoted comment verbatim into
+        # the new body behind "> ", so a human disputing a claudebox finding
+        # carries the marker. Replying to a finding is the single most likely
+        # human action on a reviewed PR, and it is exactly the input the
+        # followup prompt exists to consume.
+        body = (
+            "> Nit: this leaks a file descriptor.\n"
+            "> \n"
+            "> -claudebox (red_team)\n"
+            "\n"
+            "It does not; the context manager closes it."
+        )
+        self.assertFalse(signals.is_own(body))
+
+    def test_an_indented_quote_is_still_a_quote(self):
+        self.assertFalse(signals.is_own("   > -claudebox (sage)\n\nWrong."))
+
+    def test_a_quoting_reply_that_also_signs_is_still_ours(self):
+        # A persona quoting its own earlier finding still signs below the
+        # quote, so the unquoted half decides.
+        self.assertTrue(signals.is_own("> earlier\n\nStill stands.\n\n-claudebox (sage)"))
+
     def test_empty_and_missing_bodies_are_not_ours(self):
         # A review submitted with no prose is still somebody acting on the PR.
         self.assertFalse(signals.is_own(""))
@@ -233,6 +256,27 @@ class TrackerTest(unittest.TestCase):
         sig = signals.Signal("abc", "code", "")
         self.assertEqual(t.signal_for(Snap(updated_at="t2"), self.fetch(sig)), sig)
         self.assertEqual(self.calls, [12, 12])
+
+    def test_a_cache_hit_reports_the_snapshots_mode_not_the_cached_one(self):
+        # The most load-bearing line in this class: a label flip does not have
+        # to move updatedAt to reach us as a new value, so mode comes from the
+        # snapshot in hand and only the comment timestamp comes from the cache.
+        # Without it a PR relabelled mid-poll is gated against the mode it was
+        # last reviewed under.
+        t = signals.Tracker()
+        sig = signals.Signal("abc", "code", "2026-08-30T00:00:00Z")
+        t.signal_for(Snap(updated_at="t1"), self.fetch(sig))
+        again = t.signal_for(Snap(updated_at="t1", mode="plan"), self.fetch(sig))
+        self.assertEqual(self.calls, [12])
+        self.assertEqual(again.mode, "plan")
+        self.assertEqual(again.newest_human, "2026-08-30T00:00:00Z")
+
+    def test_a_cache_hit_reports_the_snapshots_head_not_the_cached_one(self):
+        t = signals.Tracker()
+        sig = signals.Signal("abc", "code", "")
+        t.signal_for(Snap(updated_at="t1"), self.fetch(sig))
+        again = t.signal_for(Snap(updated_at="t1", head_oid="def"), self.fetch(sig))
+        self.assertEqual(again.head_oid, "def")
 
     def test_a_snapshot_with_no_update_time_always_fetches(self):
         # "" would otherwise cache as a legitimate value and pin a PR forever.
