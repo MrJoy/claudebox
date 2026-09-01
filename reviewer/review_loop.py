@@ -29,6 +29,7 @@ import gh
 import passes
 import personas as personas_mod
 import prompts as prompts_mod
+import signals as signals_mod
 from common import ConfigError, Pair, die, log
 
 # Not operator-configurable: this is a guard against a dead provider, not a
@@ -392,6 +393,13 @@ class Supervisor:
         # reports a limit on every attempt re-cut the cycle at the head of the
         # list forever, and nothing else would ever be reviewed again.
         self.cut_group: Optional[Tuple[int, str]] = None
+        # The fingerprint each pair last successfully reviewed at. A pair whose
+        # PR still fingerprints the same has nothing new to read, so it does not
+        # run. In memory alongside the session map, and deliberately not
+        # persisted: sessions are in memory too, so a fingerprint that outlived
+        # a restart would leave a fresh session that has never read the PR
+        # believing it had already reviewed it.
+        self.reviewed: Dict[Pair, signals_mod.Signal] = {}
 
     def build_groups(self, candidates: Sequence[Tuple[int, str]]) -> List[Group]:
         return [
@@ -487,7 +495,9 @@ class Supervisor:
             log(f"WARN: could not run claude: {exc}", pair=pair)
             return passes.PassResult(rc=1, session_id=session_id, limited=False, limit_line="")
 
-    def pairs_to_run(self, group: Group) -> List[Pair]:
+    def pairs_to_run(
+        self, group: Group, signal: Optional["signals_mod.Signal"] = None
+    ) -> List[Pair]:
         """Which of this group's personas run this cycle.
 
         A group that owes something runs ONLY what it owes: those personas did
@@ -497,9 +507,24 @@ class Supervisor:
         longer while a pair keeps reporting a limit -- the siblings a narrowed
         group leaves out are owed by the cut that stopped it, so they come back
         on the visit after.
+
+        A group that owes nothing is then filtered by the change gate. `signal`
+        is None when the gate is off, and when stage two failed and we chose to
+        fail open; both mean "run it". A pair with no session always runs, which
+        is what makes first sight, a session dropped by _record_failure, and
+        MAX_PASSES_PER_SESSION rotation work without knowing about the gate. A
+        mode flip needs no case of its own either: it makes a different Pair,
+        and that Pair has no session.
         """
         owed_here = [p for p in group.pairs if p in self.owed]
-        return owed_here if owed_here else list(group.pairs)
+        if owed_here:
+            return owed_here
+        if signal is None:
+            return list(group.pairs)
+        return [
+            p for p in group.pairs
+            if self.sessions.get(p) is None or self.reviewed.get(p) != signal
+        ]
 
     def order_groups(self, groups: List[Group]) -> List[Group]:
         """This cycle's groups, rotated to start after the last cut.
@@ -523,8 +548,18 @@ class Supervisor:
             return list(groups)
         return list(groups[start:]) + list(groups[:start])
 
-    def run_cycle(self, groups: List[Group]) -> bool:
-        """Walk the groups. Returns True when a usage limit cut the cycle."""
+    def run_cycle(
+        self,
+        groups: List[Group],
+        signals_by_pr: Optional[Dict[int, "signals_mod.Signal"]] = None,
+    ) -> bool:
+        """Walk the groups. Returns True when a usage limit cut the cycle.
+
+        `signals_by_pr` is this cycle's fingerprints, keyed by PR number. A PR
+        missing from it -- and an empty map, which is what the gate switched off
+        looks like -- is reviewed unconditionally.
+        """
+        signals_by_pr = signals_by_pr or {}
         if not groups:
             # An empty list keeps what is owed rather than clearing it:
             # enumeration failures degrade to an empty candidate list, and that
@@ -542,7 +577,20 @@ class Supervisor:
         was_limited = False
 
         for index, group in enumerate(ordered):
-            to_run = self.pairs_to_run(group)
+            signal = signals_by_pr.get(group.pr)
+            to_run = self.pairs_to_run(group, signal)
+            if not to_run:
+                # Nothing to review here. Skipped before run_group, so the cut
+                # accounting below never reasons about an empty result set. The
+                # rotation is unaffected: order_groups keys off the group list,
+                # not off what ran.
+                continue
+            if signal is not None:
+                prior = next(
+                    (self.reviewed[p] for p in group.pairs if p in self.reviewed), None
+                )
+                reason = signals_mod.change_reason(prior, signal) or "no session"
+                log(f"PR #{group.pr} [{group.mode}]: {reason}.")
             results = self.run_group(group, to_run)
 
             any_success = False
@@ -558,7 +606,7 @@ class Supervisor:
                     continue
                 if result.rc == 0:
                     any_success = True
-                    self._record_success(pair, result)
+                    self._record_success(pair, result, signal)
                 elif result.limited:
                     limited_here.add(pair)
                     self._record_limit(pair, result)
@@ -618,7 +666,14 @@ class Supervisor:
             log("Owed next cycle: " + " ".join(str(p) for p in sorted(new_owed)) + ".")
         return was_limited
 
-    def _record_success(self, pair: Pair, result) -> None:
+    def _record_success(
+        self, pair: Pair, result, signal: Optional["signals_mod.Signal"] = None
+    ) -> None:
+        # Only when one was supplied: None arrives both from the gate being off
+        # and from a lookup that failed, and recording it would claim knowledge
+        # we do not have.
+        if signal is not None:
+            self.reviewed[pair] = signal
         if result.session_id:
             self.sessions[pair] = result.session_id
         self.passes_done[pair] = self.passes_done.get(pair, 0) + 1

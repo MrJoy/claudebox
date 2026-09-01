@@ -12,6 +12,7 @@ import unittest
 import _path  # noqa: F401
 
 import review_loop
+import signals
 from common import ConfigError, Pair
 from passes import PassResult
 
@@ -1803,6 +1804,86 @@ class GitDirLockWiringTest(unittest.TestCase):
         # arrive on any cycle. Narrowing only code mode must not disarm it.
         self._main(PERSONAS="red_team")
         self.assertFalse(self._can_write())
+
+
+class ChangeGateTest(unittest.TestCase):
+    SIG_A = signals.Signal(head_oid="aaaaaaa", mode="code", newest_human="")
+    SIG_B = signals.Signal(head_oid="bbbbbbb", mode="code", newest_human="")
+    RT = Pair(12, "code", "red_team")
+    SG = Pair(12, "code", "sage")
+    GROUP = review_loop.Group(12, "code", (RT, SG))
+
+    def reviewed_and_sessioned(self, s):
+        """A supervisor that has already reviewed both pairs at SIG_A."""
+        for pair in (self.RT, self.SG):
+            s.sessions[pair] = "S1"
+            s.reviewed[pair] = self.SIG_A
+        return s
+
+    def test_no_signal_runs_every_pair(self):
+        s = self.reviewed_and_sessioned(supervisor([]))
+        self.assertEqual(s.pairs_to_run(self.GROUP, None), [self.RT, self.SG])
+
+    def test_a_pair_with_no_session_runs_whatever_the_signal_says(self):
+        s = supervisor([])
+        s.reviewed[self.RT] = self.SIG_A
+        s.reviewed[self.SG] = self.SIG_A
+        self.assertEqual(s.pairs_to_run(self.GROUP, self.SIG_A), [self.RT, self.SG])
+
+    def test_an_unchanged_signal_runs_nothing(self):
+        s = self.reviewed_and_sessioned(supervisor([]))
+        self.assertEqual(s.pairs_to_run(self.GROUP, self.SIG_A), [])
+
+    def test_a_changed_signal_runs_every_pair(self):
+        s = self.reviewed_and_sessioned(supervisor([]))
+        self.assertEqual(s.pairs_to_run(self.GROUP, self.SIG_B), [self.RT, self.SG])
+
+    def test_an_owed_pair_runs_even_when_nothing_changed(self):
+        # The "barring retries due to errors" carve-out: an owed pair has no
+        # result to preserve, so the gate must not hold it back.
+        s = self.reviewed_and_sessioned(supervisor([]))
+        s.owed = {self.RT}
+        self.assertEqual(s.pairs_to_run(self.GROUP, self.SIG_A), [self.RT])
+
+    def test_a_failed_pair_runs_next_time_because_its_session_was_dropped(self):
+        s = self.reviewed_and_sessioned(supervisor([]))
+        with contextlib.redirect_stdout(io.StringIO()):
+            s._record_failure(self.RT)
+        self.assertEqual(s.pairs_to_run(self.GROUP, self.SIG_A), [self.RT])
+
+    def test_a_successful_pass_records_the_fingerprint(self):
+        s = supervisor([])
+        with contextlib.redirect_stdout(io.StringIO()):
+            s._record_success(self.RT, ok("S9"), self.SIG_A)
+        self.assertEqual(s.reviewed[self.RT], self.SIG_A)
+
+    def test_a_pass_with_no_fingerprint_records_nothing(self):
+        # Fail-open and gate-off both arrive here with signal=None. Recording
+        # anything would claim knowledge we do not have.
+        s = supervisor([])
+        with contextlib.redirect_stdout(io.StringIO()):
+            s._record_success(self.RT, ok("S9"), None)
+        self.assertNotIn(self.RT, s.reviewed)
+
+    def test_a_cycle_where_nothing_changed_runs_no_passes(self):
+        s = self.reviewed_and_sessioned(supervisor([]))
+        with contextlib.redirect_stdout(io.StringIO()):
+            limited = s.run_cycle([self.GROUP], {12: self.SIG_A})
+        self.assertEqual(s.attempted, [])
+        self.assertFalse(limited)
+
+    def test_a_cycle_where_the_head_moved_runs_both_pairs(self):
+        s = self.reviewed_and_sessioned(supervisor([]))
+        with contextlib.redirect_stdout(io.StringIO()):
+            s.run_cycle([self.GROUP], {12: self.SIG_B})
+        self.assertEqual(sorted(s.attempted), [self.RT, self.SG])
+
+    def test_a_gateless_cycle_runs_both_pairs(self):
+        # REVIEW_ON_CHANGE=0 reaches run_cycle as an empty signal map.
+        s = self.reviewed_and_sessioned(supervisor([]))
+        with contextlib.redirect_stdout(io.StringIO()):
+            s.run_cycle([self.GROUP], {})
+        self.assertEqual(sorted(s.attempted), [self.RT, self.SG])
 
 
 if __name__ == "__main__":
