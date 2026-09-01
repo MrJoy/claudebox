@@ -44,11 +44,27 @@ BIN="$WORK/bin"; mkdir -p "$BIN"
 
 # gh answers PR label queries (mode routing reads them) and otherwise only needs
 # to succeed. Every case here leaves its PR unlabeled, so every case is code mode.
+# The change gate adds a second question: stage one now also asks for the head
+# commit and the last-updated stamp, and a PR whose stamp moved gets a stage-two
+# lookup for its comments. This suite runs one cycle, so every PR is a first
+# sighting and the gate lets it through whatever the answers say -- but the
+# answers still have to parse, or the gate fails open with a WARN and the run
+# stops proving anything about it.
 cat >"$BIN/gh" <<'STUB'
 #!/bin/sh
+# Stage two's inline-comment call. First, so it cannot fall through below.
+if [ "$1" = "api" ]; then printf '[]\n'; exit 0; fi
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   n="$3"
-  printf '{"number":%s,"labels":[]}\n' "$n"
+  # Stage two asks for comments and reviews; stage one asks for labels and the
+  # head. Dispatch on the --json field list, which is the last argument.
+  for a in "$@"; do last="$a"; done
+  case "$last" in
+    *comments*) printf '{"comments":[],"reviews":[]}\n'; exit 0 ;;
+  esac
+  # The fixed 2020 stamp is deliberate: it is far older than any settle window,
+  # so no case here ever waits for a change to settle.
+  printf '{"number":%s,"labels":[],"headRefOid":"abc123","updatedAt":"2020-01-01T00:00:00Z"}\n' "$n"
   exit 0
 fi
 # `gh repo clone REPO DEST` is the seed-less fallback; like git clone above it

@@ -63,11 +63,42 @@ BIN="$WORK/bin"; mkdir -p "$BIN"
 #                         been made, then labeled. That is the same as "after
 #                         cycle N" only for the single-PR, single-persona-per-
 #                         mode case that uses it (see below)
+#   STUB_FREEZE_HEAD   -- the PR reports the same head and the same update time
+#                         in every cycle, i.e. nothing about it ever moves. The
+#                         change gate is what that is for: a frozen PR is
+#                         reviewed once and then skipped
 cat >"$BIN/gh" <<'STUB'
 #!/bin/sh
 printf '%s\n' "$*" >>"$HOME/gh-argv"
+# Stage two of change detection asks the REST endpoint for inline diff comments.
+# First, so it can never fall through into the `pr view` logic below.
+if [ "$1" = "api" ]; then printf '[]\n'; exit 0; fi
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   n="$3"
+  # Two different `pr view` calls arrive here now. Stage two asks for comments
+  # and reviews; stage one asks for labels and the head. Dispatch on the --json
+  # field list, which is the last argument of both.
+  for a in "$@"; do last="$a"; done
+  case "$last" in
+    *comments*) printf '{"comments":[],"reviews":[]}\n'; exit 0 ;;
+  esac
+  # The change gate reviews a PR only when it moved. Cycle one is a first
+  # sighting and always runs; cycle two needs a moved head, or the resumed
+  # invocation this whole suite exists to assert would never happen. "Which
+  # cycle is this" is read off the claude stub's counter -- $HOME/calls holds a
+  # single integer, the number of invocations so far -- which is nonzero from
+  # the first pass onward and so distinguishes cycle one from every cycle
+  # after it. Reading it unlocked is safe because gh only ever runs from the
+  # supervisor's own thread, between groups, when no claude stub is alive.
+  # STUB_FREEZE_HEAD=1 pins the answer instead, which is how a case asserts
+  # that the gate really does gate. Both stamps are far older than any settle
+  # window, so no case here waits for a change to settle.
+  oid=aaaaaaa; when=2020-01-01T00:00:00Z
+  if [ -z "${STUB_FREEZE_HEAD:-}" ]; then
+    c=$(cat "$HOME/calls" 2>/dev/null || echo 0)
+    if [ "$c" -gt 0 ]; then oid=bbbbbbb; when=2020-01-02T00:00:00Z; fi
+  fi
+  meta="\"headRefOid\":\"$oid\",\"updatedAt\":\"$when\""
   case ",${STUB_LABEL_FAIL:-}," in
     *",$n,"*) echo "gh: could not resolve to a PullRequest" >&2; exit 1 ;;
   esac
@@ -78,19 +109,21 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
     *",$n,"*) echo "null"; exit 0 ;;
   esac
   # STUB_PLAN_AFTER=N: the PR is unlabeled until cycle N has finished, then
-  # labeled. Cycles are counted by the claude stub, which writes one line to
-  # $HOME/calls per invocation -- so this reads "after N passes", which is the
-  # same thing for the single-PR, single-persona-per-mode case that uses it.
+  # labeled. Cycles are counted by the claude stub through the same $HOME/calls
+  # integer -- so this reads "after N passes", which is the same thing for the
+  # single-PR, single-persona-per-mode case that uses it.
   if [ -n "${STUB_PLAN_AFTER:-}" ]; then
     c=$(cat "$HOME/calls" 2>/dev/null || echo 0)
     if [ "$c" -ge "$STUB_PLAN_AFTER" ]; then
-      printf '{"number":%s,"labels":[{"name":"%s"}]}\n' "$n" "${STUB_PLAN_LABEL:-plan}"
+      printf '{"number":%s,"labels":[{"name":"%s"}],%s}\n' \
+        "$n" "${STUB_PLAN_LABEL:-plan}" "$meta"
       exit 0
     fi
   fi
   case ",${STUB_PLAN_PRS:-}," in
-    *",$n,"*) printf '{"number":%s,"labels":[{"name":"%s"}]}\n' "$n" "${STUB_PLAN_LABEL:-plan}" ;;
-    *)        printf '{"number":%s,"labels":[]}\n' "$n" ;;
+    *",$n,"*) printf '{"number":%s,"labels":[{"name":"%s"}],%s}\n' \
+                "$n" "${STUB_PLAN_LABEL:-plan}" "$meta" ;;
+    *)        printf '{"number":%s,"labels":[],%s}\n' "$n" "$meta" ;;
   esac
   exit 0
 fi
@@ -1101,6 +1134,23 @@ cycle "parallel: a non-limit failure neither cuts the cycle nor costs its siblin
      LOG:"starting a fresh session for it next cycle" \
      NOLOG:"Not reviewed this cycle" \
      NOLOG:"Backing off"
+
+# --- the change gate --------------------------------------------------------
+# The Python suite proves the decision; these two prove the wiring end to end,
+# and they are a matched pair. Same PR, frozen so that nothing about it ever
+# moves: with the gate on it is reviewed once, with the gate off it is reviewed
+# every cycle. The second is what turns red if the escape hatch stops working.
+cycle "gate: a PR that has not moved is reviewed once, not again" \
+  PR_IDS=12 PERSONAS=red_team STUB_FREEZE_HEAD=1 \
+  -- CALLS:1 \
+     NOARGV:1:"--resume" \
+     LOG:"Unchanged since their last review: #12."
+
+cycle "gate: REVIEW_ON_CHANGE=0 reviews the same frozen PR every cycle" \
+  PR_IDS=12 PERSONAS=red_team STUB_FREEZE_HEAD=1 REVIEW_ON_CHANGE=0 \
+  -- CALLS:2 \
+     ARGV:2:"--resume S1" \
+     NOLOG:"Unchanged since their last review"
 
 printf '\n%d passed, %d failed' "$PASS" "$FAIL"
 [ "$SKIP" -gt 0 ] && printf ', %d skipped' "$SKIP"
