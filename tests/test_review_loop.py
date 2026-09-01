@@ -11,6 +11,7 @@ import unittest
 
 import _path  # noqa: F401
 
+import gh
 import review_loop
 import signals
 from common import ConfigError, Pair
@@ -694,14 +695,15 @@ class RequiredEnvTest(unittest.TestCase):
 
 
 class TunableDefaultsTest(unittest.TestCase):
-    """The three intervals default to what entrypoint.sh defaulted to.
+    """The three intervals default to what entrypoint.sh defaults to.
 
-    A regression to a 30-second interval would be silent and would burn the
-    quota the backoff exists to protect.
+    A regression here would be silent and would burn the quota the backoff
+    exists to protect. The poll interval is 60 since the change gate landed:
+    the loop wakes often and reviews only what moved.
     """
 
     def test_review_interval(self):
-        self.assertEqual(review_loop._positive_int({}, "REVIEW_INTERVAL_SECONDS", 300), 300)
+        self.assertEqual(review_loop._positive_int({}, "REVIEW_INTERVAL_SECONDS", 60), 60)
 
     def test_limit_backoff(self):
         self.assertEqual(review_loop._positive_int({}, "LIMIT_BACKOFF_SECONDS", 1800), 1800)
@@ -711,8 +713,8 @@ class TunableDefaultsTest(unittest.TestCase):
 
     def test_an_explicit_value_wins(self):
         self.assertEqual(
-            review_loop._positive_int({"REVIEW_INTERVAL_SECONDS": "60"}, "REVIEW_INTERVAL_SECONDS", 300),
-            60,
+            review_loop._positive_int({"REVIEW_INTERVAL_SECONDS": "90"}, "REVIEW_INTERVAL_SECONDS", 60),
+            90,
         )
 
     def test_a_digit_int_refuses_is_a_config_error(self):
@@ -721,11 +723,53 @@ class TunableDefaultsTest(unittest.TestCase):
         # out of PID 1, which under --restart unless-stopped is a silent crash
         # loop.
         with self.assertRaises(ConfigError):
-            review_loop._positive_int({"REVIEW_INTERVAL_SECONDS": "\u00b2"}, "REVIEW_INTERVAL_SECONDS", 300)
+            review_loop._positive_int({"REVIEW_INTERVAL_SECONDS": "\u00b2"}, "REVIEW_INTERVAL_SECONDS", 60)
 
     def test_a_negative_value_is_refused(self):
         with self.assertRaises(ConfigError):
-            review_loop._positive_int({"REVIEW_INTERVAL_SECONDS": "-1"}, "REVIEW_INTERVAL_SECONDS", 300)
+            review_loop._positive_int({"REVIEW_INTERVAL_SECONDS": "-1"}, "REVIEW_INTERVAL_SECONDS", 60)
+
+
+class SettleFilterTest(unittest.TestCase):
+    STAMP = "2026-08-31T00:00:00Z"
+
+    def snaps(self):
+        return [gh.PRSnapshot(12, "code", "abc", self.STAMP)]
+
+    def test_a_young_change_is_held_back(self):
+        base = signals._epoch(self.STAMP)
+        ready, settling = review_loop.partition_settling(self.snaps(), 30, base + 5.0)
+        self.assertEqual(ready, [])
+        self.assertEqual([x.number for x in settling], [12])
+
+    def test_an_old_change_is_ready(self):
+        base = signals._epoch(self.STAMP)
+        ready, settling = review_loop.partition_settling(self.snaps(), 30, base + 60.0)
+        self.assertEqual([x.number for x in ready], [12])
+        self.assertEqual(settling, [])
+
+    def test_settle_zero_holds_nothing_back(self):
+        base = signals._epoch(self.STAMP)
+        ready, _ = review_loop.partition_settling(self.snaps(), 0, base)
+        self.assertEqual([x.number for x in ready], [12])
+
+    def test_an_unreadable_timestamp_is_ready(self):
+        # A gh that did not tell us when the PR moved must not pin it forever.
+        snaps = [gh.PRSnapshot(12, "code", "abc", "")]
+        ready, settling = review_loop.partition_settling(snaps, 30, 1000.0)
+        self.assertEqual([x.number for x in ready], [12])
+        self.assertEqual(settling, [])
+
+
+class IntervalDefaultTest(unittest.TestCase):
+    def test_the_poll_interval_defaults_to_sixty(self):
+        self.assertEqual(
+            review_loop._positive_int({}, "REVIEW_INTERVAL_SECONDS", 60), 60)
+
+    def test_settle_seconds_rejects_a_typo(self):
+        with self.assertRaises(ConfigError):
+            review_loop._positive_int({"SETTLE_SECONDS": "thirty"},
+                                      "SETTLE_SECONDS", 30)
 
 
 class SpawnFailureTest(unittest.TestCase):

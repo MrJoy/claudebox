@@ -304,6 +304,23 @@ def _positive_int(env: Mapping[str, str], name: str, default: int) -> int:
     return value
 
 
+def partition_settling(snapshots, settle_seconds: int, now: float):
+    """Split candidates into (ready, settling).
+
+    A PR whose newest change is younger than the setting is left for the next
+    poll, so a burst of pushes costs one review instead of one per push.
+    Nothing about it is recorded, which is what makes the next poll reconsider
+    it from scratch.
+    """
+    ready, settling = [], []
+    for snap in snapshots:
+        if signals_mod.is_settling(snap.updated_at, settle_seconds, now):
+            settling.append(snap)
+        else:
+            ready.append(snap)
+    return ready, settling
+
+
 def check_litellm(env: Mapping[str, str]) -> None:
     """Are the workersai translators still up?
 
@@ -758,6 +775,11 @@ def preflight(env: Mapping[str, str]) -> Tuple[str, Dict[str, List[personas_mod.
         mode: personas_mod.resolve(mode, persona_dir, env)
         for mode in personas_mod.REVIEW_MODES
     }
+    # Validated here as well as in main, because --check returns before main's
+    # config block and a typo should cost a startup error rather than a clone
+    # and a translator. Reads only the environment, which is what --check is
+    # allowed to touch.
+    _positive_int(env, "SETTLE_SECONDS", 30)
     return selector, resolved
 
 
@@ -791,7 +813,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for warning in prompt_token_warnings(built.review, built.followup):
             log(warning)
         max_cycles = parse_max_cycles(env)
-        interval = _positive_int(env, "REVIEW_INTERVAL_SECONDS", 300)
+        interval = _positive_int(env, "REVIEW_INTERVAL_SECONDS", 60)
+        settle = _positive_int(env, "SETTLE_SECONDS", 30)
+        gate_on = signals_mod.enabled(env)
         backoff = _positive_int(env, "LIMIT_BACKOFF_SECONDS", 1800)
         max_passes = _positive_int(env, "MAX_PASSES_PER_SESSION", 0)
         review_model = _required(env, "REVIEW_MODEL")
@@ -849,6 +873,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_passes_per_session=max_passes,
         max_concurrent=max_concurrent,
     )
+    tracker = signals_mod.Tracker()
 
     cycles = 0
     while True:
@@ -883,8 +908,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             log(f"Candidate PRs ({selector}): "
                 + " ".join(f"{s.number}:{s.mode}" for s in snapshots))
 
+        signals_by_pr = {}
+        if gate_on:
+            snapshots, settling = partition_settling(snapshots, settle, time.time())
+            if settling:
+                log(f"Settling ({settle}s), left for the next poll: "
+                    + " ".join(f"#{s.number}" for s in settling) + ".")
+            for snap in snapshots:
+                sig = tracker.signal_for(
+                    snap, lambda s: gh.pr_signal(s, env))
+                if sig is None:
+                    log(f"WARN: could not read PR #{snap.number}'s comment "
+                        "activity; reviewing it rather than skipping it.")
+                else:
+                    signals_by_pr[snap.number] = sig
+
         groups = supervisor.build_groups([(s.number, s.mode) for s in snapshots])
-        limited = supervisor.run_cycle(groups)
+        skipped = [
+            g for g in groups
+            if not supervisor.pairs_to_run(g, signals_by_pr.get(g.pr))
+        ]
+        if skipped:
+            log("Unchanged since their last review: "
+                + " ".join(f"#{g.pr}" for g in skipped) + ".")
+
+        limited = supervisor.run_cycle(groups, signals_by_pr)
 
         cycles += 1
         if max_cycles is not None and cycles >= max_cycles:
@@ -895,7 +943,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             log(f"Backing off {backoff}s after a usage limit...")
             time.sleep(backoff)
         else:
-            log(f"Sleeping {interval}s...")
+            log(f"Polling again in {interval}s...")
             time.sleep(interval)
 
 
