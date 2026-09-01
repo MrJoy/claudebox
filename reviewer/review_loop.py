@@ -788,17 +788,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             log(f"WARN: git fetch could not run ({exc}); continuing")
 
         try:
-            candidates = gh.enumerate_candidate_prs(selector, env)
+            snapshots = gh.enumerate_candidate_prs(selector, env)
         except ConfigError as exc:
             die(str(exc))
 
-        if not candidates:
+        if not snapshots:
             log(f"No candidate PRs for selector '{selector}'.")
         else:
             log(f"Candidate PRs ({selector}): "
-                + " ".join(f"{pr}:{mode}" for pr, mode in candidates))
+                + " ".join(f"{s.number}:{s.mode}" for s in snapshots))
 
-        limited = supervisor.run_cycle(supervisor.build_groups(candidates))
+        groups = supervisor.build_groups([(s.number, s.mode) for s in snapshots])
+        limited = supervisor.run_cycle(groups)
 
         cycles += 1
         if max_cycles is not None and cycles >= max_cycles:

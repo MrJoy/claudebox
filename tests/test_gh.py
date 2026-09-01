@@ -113,24 +113,28 @@ class SelectorTest(unittest.TestCase):
             gh.resolve_pr_selection({"PR_IDS": "12,abc"})
 
 
+def snap(number, mode, head_oid="", updated_at=""):
+    return gh.PRSnapshot(number=number, mode=mode, head_oid=head_oid, updated_at=updated_at)
+
+
 class PrModesTest(unittest.TestCase):
     def test_list_payload_routes_by_label(self):
         payload = [
             {"number": 12, "labels": [{"name": "plan"}]},
             {"number": 13, "labels": [{"name": "bug"}]},
         ]
-        self.assertEqual(gh.pr_modes(payload, "plan"), [(12, "plan"), (13, "code")])
+        self.assertEqual(gh.pr_modes(payload, "plan"), [snap(12, "plan"), snap(13, "code")])
 
     def test_single_object_payload(self):
         self.assertEqual(
-            gh.pr_modes({"number": 12, "labels": []}, "plan"), [(12, "code")]
+            gh.pr_modes({"number": 12, "labels": []}, "plan"), [snap(12, "code")]
         )
 
     def test_missing_labels_key_is_code_mode(self):
         # `.labels[]?` in the jq version read a missing key as no labels, so a PR
         # object arriving without one is code mode: the same answer an unlabeled
         # PR gets.
-        self.assertEqual(gh.pr_modes({"number": 12}, "plan"), [(12, "code")])
+        self.assertEqual(gh.pr_modes({"number": 12}, "plan"), [snap(12, "code")])
 
     def test_null_number_is_dropped(self):
         # An unguarded .number once produced a candidate PR literally named
@@ -145,11 +149,57 @@ class PrModesTest(unittest.TestCase):
 
     def test_custom_plan_label(self):
         payload = [{"number": 12, "labels": [{"name": "design"}]}]
-        self.assertEqual(gh.pr_modes(payload, "design"), [(12, "plan")])
+        self.assertEqual(gh.pr_modes(payload, "design"), [snap(12, "plan")])
 
     def test_label_without_a_name_key_does_not_crash(self):
         payload = [{"number": 12, "labels": [{"color": "f00"}]}]
-        self.assertEqual(gh.pr_modes(payload, "plan"), [(12, "code")])
+        self.assertEqual(gh.pr_modes(payload, "plan"), [snap(12, "code")])
+
+    def test_head_and_update_time_ride_along(self):
+        payload = [{"number": 12, "labels": [], "headRefOid": "abc123",
+                     "updatedAt": "2026-08-31T12:00:00Z"}]
+        self.assertEqual(
+            gh.pr_modes(payload, "plan"),
+            [snap(12, "code", head_oid="abc123", updated_at="2026-08-31T12:00:00Z")],
+        )
+
+
+class SnapshotTest(unittest.TestCase):
+    ENV = {"GITHUB_REPOSITORY": "o/r", "PLAN_LABEL": "plan"}
+
+    def test_list_payload_carries_head_and_update_time(self):
+        payload = json.dumps([
+            {"number": 12, "labels": [], "headRefOid": "abc123",
+             "updatedAt": "2026-08-31T12:00:00Z"},
+        ])
+        run = runner(Result(0, payload))
+        got = gh.enumerate_candidate_prs("all", dict(self.ENV, PR_ALL="1"), run=run)
+        self.assertEqual(
+            got,
+            [gh.PRSnapshot(number=12, mode="code", head_oid="abc123",
+                           updated_at="2026-08-31T12:00:00Z")],
+        )
+
+    def test_stage_one_asks_for_the_new_fields(self):
+        run = runner(Result(0, "[]"))
+        gh.enumerate_candidate_prs("all", dict(self.ENV, PR_ALL="1"), run=run)
+        self.assertIn("number,labels,headRefOid,updatedAt", run.calls[0])
+
+    def test_ids_selector_asks_for_the_new_fields(self):
+        run = runner(Result(0, json.dumps(
+            {"number": 12, "labels": [], "headRefOid": "abc123",
+             "updatedAt": "2026-08-31T12:00:00Z"})))
+        gh.enumerate_candidate_prs("ids", dict(self.ENV, PR_IDS="12"), run=run)
+        self.assertIn("number,labels,headRefOid,updatedAt", run.calls[0])
+
+    def test_missing_fields_become_empty_strings(self):
+        # A gh that answers without them must not crash the cycle; an empty
+        # head_oid simply never matches a recorded one, so the PR is reviewed.
+        payload = json.dumps([{"number": 12, "labels": []}])
+        run = runner(Result(0, payload))
+        got = gh.enumerate_candidate_prs("all", dict(self.ENV, PR_ALL="1"), run=run)
+        self.assertEqual(got[0].head_oid, "")
+        self.assertEqual(got[0].updated_at, "")
 
 
 class EnumerateTest(unittest.TestCase):
@@ -158,10 +208,10 @@ class EnumerateTest(unittest.TestCase):
     def test_all_selector_calls_gh_pr_list_once(self):
         run = runner(Result(0, json.dumps([{"number": 12, "labels": []}])))
         got = gh.enumerate_candidate_prs("all", dict(self.ENV, PR_ALL="1"), run=run)
-        self.assertEqual(got, [(12, "code")])
+        self.assertEqual(got, [snap(12, "code")])
         self.assertEqual(len(run.calls), 1)
         self.assertIn("--json", run.calls[0])
-        self.assertIn("number,labels", run.calls[0])
+        self.assertIn("number,labels,headRefOid,updatedAt", run.calls[0])
 
     def test_failed_list_yields_nothing(self):
         run = runner(Result(1, ""))
@@ -181,7 +231,7 @@ class EnumerateTest(unittest.TestCase):
             Result(0, json.dumps({"number": 13, "labels": []})),
         )
         got = gh.enumerate_candidate_prs("ids", dict(self.ENV, PR_IDS="12,13"), run=run)
-        self.assertEqual(got, [(12, "plan"), (13, "code")])
+        self.assertEqual(got, [snap(12, "plan"), snap(13, "code")])
         self.assertEqual(len(run.calls), 2)
 
     def test_ids_failed_lookup_skips_that_pr_only(self):
@@ -190,7 +240,7 @@ class EnumerateTest(unittest.TestCase):
         # log line and a retry next cycle.
         run = runner(Result(1, ""), Result(0, json.dumps({"number": 13, "labels": []})))
         got = gh.enumerate_candidate_prs("ids", dict(self.ENV, PR_IDS="12,13"), run=run)
-        self.assertEqual(got, [(13, "code")])
+        self.assertEqual(got, [snap(13, "code")])
 
     def test_ids_empty_but_successful_lookup_skips(self):
         # A gh that exits 0 with empty stdout must not drop the PR silently.

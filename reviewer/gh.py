@@ -12,11 +12,26 @@ an unguarded number field once produced a candidate PR literally named `null`.
 
 import json
 import subprocess
-from typing import Any, Callable, List, Mapping, Tuple
+from dataclasses import dataclass
+from typing import Any, Callable, List, Mapping
 
 from common import ConfigError, log
 
-Candidate = Tuple[int, str]
+
+@dataclass(frozen=True)
+class PRSnapshot:
+    """One candidate PR as stage one sees it.
+
+    head_oid and updated_at ride along in the call that was already being made
+    for labels, so change detection costs no request on a cycle where nothing
+    happened. A field gh did not return becomes "", which never matches a
+    recorded fingerprint and so reviews the PR: the safe direction.
+    """
+
+    number: int
+    mode: str
+    head_oid: str
+    updated_at: str
 
 
 def pr_truthy(value) -> bool:
@@ -74,15 +89,15 @@ def resolve_pr_selection(env: Mapping[str, str]) -> str:
     return selector
 
 
-def pr_modes(payload: Any, plan_label: str) -> List[Candidate]:
-    """Turn gh --json number,labels output into (number, mode) pairs.
+def pr_modes(payload: Any, plan_label: str) -> List[PRSnapshot]:
+    """Turn gh --json number,labels,headRefOid,updatedAt output into snapshots.
 
     Accepts an array (gh pr list) or a single object (gh pr view). A PR carrying
     plan_label is plan mode; everything else is code mode, so an operator who
     never labels anything sees exactly the pre-modes behavior.
     """
     entries = payload if isinstance(payload, list) else [payload]
-    out: List[Candidate] = []
+    out: List[PRSnapshot] = []
     for entry in entries:
         if not isinstance(entry, dict):
             continue
@@ -93,7 +108,12 @@ def pr_modes(payload: Any, plan_label: str) -> List[Candidate]:
         is_plan = any(
             isinstance(lbl, dict) and lbl.get("name") == plan_label for lbl in labels
         )
-        out.append((number, "plan" if is_plan else "code"))
+        out.append(PRSnapshot(
+            number=number,
+            mode="plan" if is_plan else "code",
+            head_oid=entry.get("headRefOid") or "",
+            updated_at=entry.get("updatedAt") or "",
+        ))
     return out
 
 
@@ -125,8 +145,8 @@ def enumerate_candidate_prs(
     selector: str,
     env: Mapping[str, str],
     run: Callable[..., Any] = subprocess.run,
-) -> List[Candidate]:
-    """One (number, mode) pair per candidate PR."""
+) -> List[PRSnapshot]:
+    """One PRSnapshot per candidate PR."""
     repo = env["GITHUB_REPOSITORY"]
     plan_label = env.get("PLAN_LABEL") or "plan"
 
@@ -144,10 +164,11 @@ def enumerate_candidate_prs(
             return subprocess.CompletedProcess(argv, 1, "", f"could not run gh: {exc}")
 
     if selector == "ids":
-        out: List[Candidate] = []
+        out: List[PRSnapshot] = []
         for number in parse_pr_ids(env.get("PR_IDS", "")):
             argv = [
-                "gh", "pr", "view", str(number), "-R", repo, "--json", "number,labels",
+                "gh", "pr", "view", str(number), "-R", repo, "--json",
+                "number,labels,headRefOid,updatedAt",
             ]
             result = gh_run(argv)
             got = pr_modes(_read_json(result) or [], plan_label)
@@ -161,15 +182,19 @@ def enumerate_candidate_prs(
 
     base = ["gh", "pr", "list", "-R", repo]
     if selector == "all":
-        argv = base + ["--state", "open", "--limit", "100", "--json", "number,labels"]
+        argv = base + [
+            "--state", "open", "--limit", "100", "--json",
+            "number,labels,headRefOid,updatedAt",
+        ]
     elif selector == "assignee":
         argv = base + [
             "--state", "open", "--assignee", env["PR_ASSIGNEE"],
-            "--limit", "100", "--json", "number,labels",
+            "--limit", "100", "--json", "number,labels,headRefOid,updatedAt",
         ]
     elif selector == "search":
         argv = base + [
-            "--search", env["PR_SEARCH"], "--limit", "100", "--json", "number,labels",
+            "--search", env["PR_SEARCH"], "--limit", "100", "--json",
+            "number,labels,headRefOid,updatedAt",
         ]
     else:
         raise ConfigError(f"unknown PR selector '{selector}'.")

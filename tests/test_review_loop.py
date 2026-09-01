@@ -1240,7 +1240,9 @@ class McpArgsTest(unittest.TestCase):
         self.addCleanup(setattr, review_loop, "Supervisor", original_sup)
 
         original_enum = review_loop.gh.enumerate_candidate_prs
-        review_loop.gh.enumerate_candidate_prs = lambda *a, **k: [(12, "code")]
+        review_loop.gh.enumerate_candidate_prs = lambda *a, **k: [
+            review_loop.gh.PRSnapshot(number=12, mode="code", head_oid="", updated_at="")
+        ]
         self.addCleanup(setattr, review_loop.gh, "enumerate_candidate_prs", original_enum)
 
         original_run = review_loop.subprocess.run
@@ -1355,7 +1357,9 @@ class WorktreeStanzaWiringTest(unittest.TestCase):
         self.addCleanup(setattr, review_loop, "Supervisor", original_sup)
 
         original_enum = review_loop.gh.enumerate_candidate_prs
-        review_loop.gh.enumerate_candidate_prs = lambda *a, **k: [(12, "code")]
+        review_loop.gh.enumerate_candidate_prs = lambda *a, **k: [
+            review_loop.gh.PRSnapshot(number=12, mode="code", head_oid="", updated_at="")
+        ]
         self.addCleanup(setattr, review_loop.gh, "enumerate_candidate_prs", original_enum)
 
         original_run = review_loop.subprocess.run
