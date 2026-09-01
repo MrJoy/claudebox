@@ -43,8 +43,15 @@ another review round.
 
 Two holes follow from the choice and are accepted:
 
-* A human who quotes a claudebox signature while replying is invisible to
-  the trigger, and that PR waits for its next real change.
+* ~~A human who quotes a claudebox signature while replying is invisible to
+  the trigger, and that PR waits for its next real change.~~ **Amendment
+  (post-implementation, final review pass):** closed rather than accepted.
+  A whole-branch review judged the frequency mis-scoped — replying to a bot
+  finding is the single most likely human action on a claudebox-reviewed
+  PR, and that reply is exactly the input the followup prompt exists to
+  consume. `signals.is_own` now drops any line starting with `>` before
+  testing for the marker, so a quoted signature no longer counts and a
+  reply that quotes a finding and adds prose reads as human.
 * A persona that forgets to sign buys one extra round of passes. This
   self-limits, because the followup prompt already tells a resumed
   persona to post only findings it has not already raised, so the round
@@ -89,6 +96,17 @@ Two dicts on `Supervisor`, in memory beside `sessions`:
   on correctness.
 * `reviewed: Dict[Pair, Signal]` maps a pair to the fingerprint it last
   successfully reviewed at.
+
+**Amendment (post-implementation, final review pass):** `polled` did not
+land on `Supervisor`. The implementation put it, plus a second cache
+(`_cache: Dict[int, Optional[Signal]]`, the cached lookup outcome, `None`
+on a failure) inside a new `signals.Tracker`, owned by `main` rather than
+by `Supervisor`. A whole-branch review judged this an improvement worth
+keeping rather than a drift to correct: it keeps the API-cost cache
+separate from `Supervisor`'s review-correctness state, and it is precisely
+why `main` can synthesize a degraded fingerprint (see "Failure behavior"
+below) from a snapshot in hand without `Tracker` needing to know
+degradation exists at all. `reviewed` landed on `Supervisor` as designed.
 
 `Signal` is a frozen dataclass holding `head_oid`, `mode`, and
 `newest_human`, the timestamp of the newest unsigned comment, or the
@@ -144,9 +162,13 @@ younger than the setting is dropped from this cycle's candidate list with
 one log line, and nothing is recorded as polled for it, so the next poll
 reconsiders it from scratch.
 
-A negative age, which means the container clock is behind GitHub's, is
-clamped to zero and the PR runs. Skew costs the batching and never the
-review.
+A negative age, which means the container clock is behind GitHub's, falls
+outside the `0 <= age < settle_seconds` range `is_settling` checks, so the
+PR runs rather than settles. Skew costs the batching and never the review.
+
+The gate has to be on for any of this to run: `partition_settling` sits
+inside the same `if gate_on:` branch as the rest of the gate, so
+`REVIEW_ON_CHANGE=0` makes `SETTLE_SECONDS` inert whatever it is set to.
 
 The settle window also closes a race the fingerprint alone cannot: `newest_human`
 is a whole-second RFC-3339 string, so a comment landing in the same second as

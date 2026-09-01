@@ -47,9 +47,13 @@ BIN="$WORK/bin"; mkdir -p "$BIN"
 # The change gate adds a second question: stage one now also asks for the head
 # commit and the last-updated stamp, and a PR whose stamp moved gets a stage-two
 # lookup for its comments. This suite runs one cycle, so every PR is a first
-# sighting and the gate lets it through whatever the answers say -- but the
-# answers still have to parse, or the gate fails open with a WARN and the run
-# stops proving anything about it.
+# sighting and the gate is open regardless of what stage two answers -- deleting
+# this stub's `api` arm still leaves all 75 cases green. It exists so the call
+# has somewhere to land, not to prove its answer is read correctly; that
+# coverage is test-personas.sh's "gate: a PR that has not moved is reviewed
+# once, not again" (around line 1142), which runs a second cycle against a
+# frozen PR and can tell a real stage-two failure from one the gate never
+# reached.
 cat >"$BIN/gh" <<'STUB'
 #!/bin/sh
 # Stage two's inline-comment call. First, so it cannot fall through below.

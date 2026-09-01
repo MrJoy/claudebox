@@ -951,10 +951,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         signals_by_pr = {}
         if gate_on:
-            snapshots, settling = partition_settling(snapshots, settle, time.time())
+            now = time.time()
+            snapshots, settling = partition_settling(snapshots, settle, now)
             if settling:
-                log(f"Settling ({settle}s), left for the next poll: "
-                    + " ".join(f"#{s.number}" for s in settling) + ".")
+                def _left(snap):
+                    age = signals_mod.age_seconds(snap.updated_at, now)
+                    return settle if age is None else max(0, round(settle - age))
+                log("Settling, left for the next poll: "
+                    + " ".join(f"#{s.number} ({_left(s)}s)" for s in settling) + ".")
             for snap in snapshots:
                 sig = tracker.signal_for(
                     snap, lambda s: gh.pr_signal(s, env))

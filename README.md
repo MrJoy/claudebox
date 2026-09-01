@@ -394,7 +394,7 @@ Optional:
 - `ANTHROPIC_CUSTOM_HEADERS` (optional on any provider; **required** for `GATEWAY_UPSTREAM=bedrock`/`vertex`) — extra request headers, `Name: value` per line
 - `REVIEW_INTERVAL_SECONDS` (default `60`) — how often the reviewer polls; a poll that finds nothing changed costs one `gh` call, not a review, so this is a poll interval and not the delay between reviews
 - `REVIEW_ON_CHANGE` (default on) — `0` reviews every candidate PR on every poll, the whole-cadence behavior from before change-driven re-review existed
-- `SETTLE_SECONDS` (default `30`, `0` disables it) — how young a PR's newest change has to be before this poll leaves it for the next one, so a burst of pushes costs one review instead of one per push
+- `SETTLE_SECONDS` (default `30`, `0` disables it) — how young a PR's newest change has to be before this poll leaves it for the next one, so a burst of pushes costs one review instead of one per push; only takes effect while `REVIEW_ON_CHANGE` is on, since `REVIEW_ON_CHANGE=0` has no settle window to wait out
 - `MAX_CYCLES` (how many review cycles to run before exiting; unset or `0` runs forever, `1` gives a one-shot run)
 - `REVIEW_PROMPT` (a (PR, persona) pair's first review, new session; uses the `{{PR}}` token)
 - `FOLLOWUP_PROMPT` (a pair's resumed review; uses the `{{PR}}` token)

@@ -1353,7 +1353,12 @@ class CycleGateTest(unittest.TestCase):
             [self._snap(age=5.0)], SETTLE_SECONDS="3600")
         self.assertEqual(looked_up, [])
         self.assertEqual(reviewed, [])
-        self.assertIn("Settling (3600s)", log)
+        # ~3595s: settle(3600) minus the ~5s age baked into the snapshot, minus
+        # whatever wall-clock slipped by before main() reads the clock again.
+        # A tight range pins "this is the remaining time" against the earlier
+        # bug (logging the configured window unchanged) without the assertion
+        # flaking on scheduler jitter.
+        self.assertRegex(log, r"Settling, left for the next poll: #12 \(359[0-9]s\)\.")
 
 
 class DegradedSignalGateTest(unittest.TestCase):
