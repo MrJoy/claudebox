@@ -58,11 +58,11 @@ The design is built entirely around one constraint: **the loop runs unattended i
 
 `entrypoint.sh` produces an environment and a filesystem state, a job shell handles well. The loop produces decisions carrying structured per-task results, and every defect ever recorded against this harness lived there: a `MODE_PERSONAS` expansion that word-split and glob-expanded once a bash array had been flattened into a space-joined string, a successful-but-empty `gh pr view --json labels` dropping a PR with no log line, an unguarded `.number` in a jq filter producing a candidate PR literally named `null`, `case "$mode"` dispatches with no `*)` arm. Shell cannot tell absence from emptiness, and deciding what a piece of missing input means is most of what the loop does.
 
-- **`entrypoint.sh` is startup.** Hardening checks, `gh`/`git` auth, the Claude-Code→provider env and the model-tier pinning, the working clone, the MCP config, and the LiteLLM translator with its normalizer. Before any of that it runs the supervisor once as `python3 "$SUPERVISOR_MAIN" --check`, which resolves the PR selector and both modes' persona sets and exits: the shell used to validate both immediately after its defaults block, and letting them wait for the exec meant a typo'd `PERSONAS` bought a network clone of the whole repo and up to 120 seconds of LiteLLM startup on every restart under `--restart unless-stopped`. `--check` may read only what the environment already holds at that point, so nothing exported further down the file can become a prerequisite of it. The file ends in `exec python3 "$SUPERVISOR_MAIN"`, so the supervisor takes over PID 1 rather than running as a child the shell would have to babysit and forward signals to. Being PID 1 does not make `docker stop` graceful: the kernel drops a default-disposition signal sent to PID 1 and the supervisor installs no `SIGTERM` handler, so a stop is a no-op followed by `SIGKILL`. Bash behaved the same way; a handler that ends the in-flight pass is deferred. Environment is the only thing that crosses the boundary. `WORK_REPO`, `REVIEW_MODEL`, `MCP_CONFIG_FILE`, `LITELLM_PID`, `SHIM_PID`, `REVIEW_INTERVAL_SECONDS`, `LIMIT_BACKOFF_SECONDS` and `MAX_PASSES_PER_SESSION` are exported for it at the bottom of the file; the operator-facing rest (the four selectors, `PLAN_LABEL`, the persona and prompt variables, `MAX_CYCLES`, `MAX_CONCURRENT_PASSES`) the supervisor reads for itself. Those were already in the environment; what the shell does to them on the way past is `strip_surrounding_quotes`, which re-`export`s the repaired value, so the supervisor sees the normalized one.
+- **`entrypoint.sh` is startup.** Hardening checks, `gh`/`git` auth, the Claude-Code→provider env and the model-tier pinning, the working clone, the MCP config, and the LiteLLM translator with its normalizer. Before any of that it runs the supervisor once as `python3 "$SUPERVISOR_MAIN" --check`, which resolves the PR selector and both modes' persona sets and exits: the shell used to validate both immediately after its defaults block, and letting them wait for the exec meant a typo'd `PERSONAS` bought a network clone of the whole repo and up to 120 seconds of LiteLLM startup on every restart under `--restart unless-stopped`. `--check` may read only what the environment already holds at that point, so nothing exported further down the file can become a prerequisite of it. The file ends in `exec python3 "$SUPERVISOR_MAIN"`, so the supervisor takes over PID 1 rather than running as a child the shell would have to babysit and forward signals to. Being PID 1 does not make `docker stop` graceful: the kernel drops a default-disposition signal sent to PID 1 and the supervisor installs no `SIGTERM` handler, so a stop is a no-op followed by `SIGKILL`. Bash behaved the same way; a handler that ends the in-flight pass is deferred. Environment is the only thing that crosses the boundary. `WORK_REPO`, `REVIEW_MODEL`, `MCP_CONFIG_FILE`, `LITELLM_PID`, `SHIM_PID`, `REVIEW_INTERVAL_SECONDS`, `LIMIT_BACKOFF_SECONDS` and `MAX_PASSES_PER_SESSION` are exported for it at the bottom of the file; the operator-facing rest (the four selectors, `PLAN_LABEL`, the persona and prompt variables, `MAX_CYCLES`, `MAX_CONCURRENT_PASSES`, `SETTLE_SECONDS`, `REVIEW_ON_CHANGE`) the supervisor reads for itself. Those were already in the environment; what the shell does to them on the way past is `strip_surrounding_quotes`, which re-`export`s the repaired value, so the supervisor sees the normalized one.
 
-- **`reviewer/` is the supervisor.** Six flat modules, imported by plain name rather than as a package, since `review_loop.py` runs as a script and its own directory is on `sys.path` already. `common.py` holds `ConfigError`, the `Pair(pr, mode, persona)` record, `log()` and `die()`. `prompts.py`, with `_stanzas.py` beside it, holds the four defaults and the gh, test, plan and Linear stanzas, and applies the override and suffix rules. `personas.py` resolves one mode's persona set out of `PERSONA_DIR`. `gh.py` owns selector resolution, PR id parsing, label-to-mode routing and `enumerate_candidate_prs`. `passes.py` runs a single `claude` invocation, formats its `stream-json`, and classifies a usage limit. `review_loop.py` holds `Supervisor` (the session map and the shape of a cycle), `check_litellm`, and `main`. Standard library only, matching `workersai-shim.py`: nothing in here may add a pip dependency, because the image installs no Python packages for it.
+- **`reviewer/` is the supervisor.** Seven flat modules, imported by plain name rather than as a package, since `review_loop.py` runs as a script and its own directory is on `sys.path` already. `common.py` holds `ConfigError`, the `Pair(pr, mode, persona)` record, `log()` and `die()`. `prompts.py`, with `_stanzas.py` beside it, holds the four defaults and the gh, test, plan and Linear stanzas, and applies the override and suffix rules. `personas.py` resolves one mode's persona set out of `PERSONA_DIR`. `gh.py` owns selector resolution, PR id parsing, label-to-mode routing and `enumerate_candidate_prs`. `signals.py` holds the per-PR fingerprint, the marker test that tells claudebox's own comments from everybody else's, the settle arithmetic, and the lookup cache that keeps a cycle in which nothing happened costing what it costs today. `passes.py` runs a single `claude` invocation, formats its `stream-json`, and classifies a usage limit. `review_loop.py` holds `Supervisor` (the session map and the shape of a cycle), `check_litellm`, and `main`. Standard library only, matching `workersai-shim.py`: nothing in here may add a pip dependency, because the image installs no Python packages for it.
 
-- **A cycle** is `check_litellm` → `git fetch` → enumerate candidate PRs, each tagged with its review mode → walk the PRs one at a time, running each PR's personas together behind a barrier → sleep. The supervisor controls cadence, PR selection, review mode, persona order, and crash-recovery; Claude reviews the one PR it's handed, as the one persona it's handed. `MAX_CYCLES` bounds how many cycles run before the process exits: unset or `0` means forever, which is what an unattended container wants, and it is how both bash suites terminate deterministically. `claudebox.sh` passes it to nothing, so a foreground `claudebox.sh test` still loops until interrupted unless the operator's env file carries `MAX_CYCLES=1`. See `.env.example` for what an unparsable value does.
+- **A cycle** is `check_litellm` → `git fetch` → enumerate candidate PRs, each tagged with its review mode → the change gate, which drops what hasn't moved and defers what moved too recently → walk the remaining PRs one at a time, running each PR's personas together behind a barrier → poll again. The supervisor controls cadence, PR selection, review mode, persona order, and crash-recovery; Claude reviews the one PR it's handed, as the one persona it's handed. `MAX_CYCLES` bounds how many cycles run before the process exits: unset or `0` means forever, which is what an unattended container wants, and it is how both bash suites terminate deterministically. `claudebox.sh` passes it to nothing, so a foreground `claudebox.sh test` still loops until interrupted unless the operator's env file carries `MAX_CYCLES=1`. See `.env.example` for what an unparsable value does. The sleep at the end is a poll interval now, not a review interval: see "Change-driven re-review" below for what makes that distinction hold.
 
 - **One Claude session per (PR, mode, persona) triple.** The supervisor enumerates candidate PRs from exactly one selector (`PR_ALL`/`PR_ASSIGNEE`/`PR_IDS`/`PR_SEARCH`; zero or multiple is a hard error) and reviews each PR with each persona enabled for that PR's mode in its own session, held in `Supervisor.sessions`, an in-memory dict keyed by `Pair`. A pair's first review starts a new `claude -p` session (recovering its `session_id` from the `stream-json` output); later cycles `--resume` that pair's id so that persona won't re-raise findings on that PR. Prompts are `{{PR}}`-templated and per-mode, built once at startup by `prompts.build` and held in `Supervisor.review_prompts`/`followup_prompts`, keyed by mode (code mode uses `REVIEW_PROMPT` on start and `FOLLOWUP_PROMPT` on resume; plan mode uses `PLAN_REVIEW_PROMPT` and `PLAN_FOLLOWUP_PROMPT`; what follows describes the code pair, and "Review modes and personas" below covers the plan pair). Both defaults carry `GH_STANZA`, spelling out what the privilege-minimized token can actually do: `gh pr view` must be given an explicit `--json` field list, and `gh pr checks` cannot be used at all. Both otherwise need a permission no fine-grained PAT can be granted — a bare `gh pr view` implicitly fetches `statusCheckRollup` — and the resulting failure reads like a misconfigured token, so a session that hits it tends to start guessing at the diff instead of reading it. The stanza is repeated in the followup rather than left to the session's own history, because a long-resumed session's earliest turns are the first thing a context summary drops. Like the Linear stanza it applies to the **defaults only**, so an operator override reaches Claude verbatim — except for `WORKTREE_STANZA`, the one stanza that goes onto an override too, and only when that mode's personas actually run concurrently (see "Personas in parallel"). Both defaults also carry `TEST_STANZA`, which turns "review the tests" into a procedure: for each test the PR adds, work out which lines of the non-test change it depends on, mentally revert them, and raise a finding if it would still pass — plus the neighbouring mutations and the as-implemented smells (assertions restating the implementation, recomputing the expected value the same way, asserting a mock's stubbed return, snapshotting current output). It exists because a real review missed a PR whose tests passed identically with the change reverted; a named procedure is checkable against a diff in a way that "is this a good test?" is not. It's repeated in the followup for the same context-summary reason as the gh stanza, and because tests added in response to earlier findings land on *resumed* passes. The two copies are one Python constant referenced twice, so they can no longer drift apart the way two shell heredocs could; `tests/fixtures/` pins all four assembled prompts byte-for-byte against what the shell used to emit, which is what would catch an edit that changed one of them by accident. A failed pass drops that pair's session id, so its next cycle starts fresh (and may re-comment once — accepted noise). `MAX_PASSES_PER_SESSION` optionally rotates a pair's session to bound context growth (per pair). The map is in-memory, so a container restart may re-review each PR once per persona.
 
@@ -110,13 +110,171 @@ Personas are blind to each other on purpose, in both modes. `_shared.md` tells t
 
 **Usage limits are a first-class failure.** `passes.is_usage_limit` inspects claude's stderr; a match keeps the pair's session, ends the cycle once the rest of its group has finished, and backs off `LIMIT_BACKOFF_SECONDS`. Without that, a limit makes the next cycle re-read every PR and re-post findings already posted, which spends more of the exhausted resource. The classifier matches provider error text, an upstream surface that can change, so a miss deliberately degrades to the ordinary drop-the-session path rather than to a crash. `passes.run_pass` recovers the session id **before** checking the exit code, taking it from the stream as each event arrives, because a pass that started a session and then hit a limit still has a resumable one. The classifier's pattern lives in `USAGE_LIMIT_RE`, and `usage_limit_line` re-scans line by line so the log can echo the line that matched: the classifier reads the whole stderr while the adjacent WARN tails only its last few lines, so without that echo a limit reported early in a long stderr is classified correctly and invisible. Only the single matched line is logged, truncated, because claude's stderr is not a stream that can be assumed credential-free.
 
-**A cycle cut short is remembered two ways: where it stopped, and what it owes.** `Supervisor.cut_group` holds the `(pr, mode)` of the group a cut stopped in, and `order_groups` rotates the next cycle to start at the group *after* it, wrapping around. `Supervisor.owed` holds the pairs that cut did not run — the personas the limit prevented, plus every pair of every group the cycle never reached — and `pairs_to_run` makes a group that owes something run **only** what it owes, since the rest of it already ran. Without the rotation, a limit that allows only a few passes per backoff window would review the leading groups forever and the trailing ones never, which the persona multiplier turns from unlucky into routine. Serving the debt first instead of rotating is the trap worth naming: a pair that reports a limit on every attempt would re-cut the cycle at the head of the list every time, and nothing else would ever be reviewed again. So the cut group goes last, keeps its debt, and is served when the rotation reaches it — and the siblings a narrowed group leaves out are themselves owed by the cut that stopped it, so they come back on the visit after. Both are rebuilt from the cycle's own groups at the end of it, which is what keeps a debt whose PR has closed from surviving. The pairs a cut skipped and the pairs owed are both named in the log, so an operator reads a stall rather than inferring one from missing comments. `cut_group` and `owed` are in memory alongside the session and pass dicts; surviving a container restart is deferred to phase 2. An empty group list leaves both alone rather than clearing them, because a failed enumeration degrades to an empty candidate list and must not quietly cancel the debt.
+**A cycle cut short is remembered two ways: where it stopped, and what it owes.** `Supervisor.cut_group` holds the `(pr, mode)` of the group a cut stopped in, and `order_groups` rotates the next cycle to start at the group *after* it, wrapping around. `Supervisor.owed` holds the pairs that cut did not run, and `pairs_to_run` makes a group that owes something run **only** what it owes, since the rest of it already ran. Without the rotation, a limit that allows only a few passes per backoff window would review the leading groups forever and the trailing ones never, which the persona multiplier turns from unlucky into routine. Serving the debt first instead of rotating is the trap worth naming: a pair that reports a limit on every attempt would re-cut the cycle at the head of the list every time, and nothing else would ever be reviewed again. So the cut group goes last, keeps its debt, and is served when the rotation reaches it — and the siblings the **owed** narrowing leaves out are themselves owed by the cut that stopped it, so they come back on the visit after. The change gate narrows a group too, and that narrowing works the other way: a pair the gate leaves out has nothing to review, so it is excused rather than deferred and `debt_for` keeps it out of the debt. Both are rebuilt from the cycle's own groups at the end of it, which is what keeps a debt whose PR has closed from surviving. The pairs a cut skipped and the pairs owed are both named in the log, so an operator reads a stall rather than inferring one from missing comments. `cut_group` and `owed` are in memory alongside the session and pass dicts; surviving a container restart is deferred to phase 2. An empty group list leaves both alone rather than clearing them, because a failed enumeration degrades to an empty candidate list and must not quietly cancel the debt.
+
+What a cut group owes is not simply "everything it didn't run." An earlier version of this bookkeeping said so, and a whole-branch review found the bug that phrasing hides: with the change gate on (see "Change-driven re-review" below), some of a group's untouched pairs had nothing to review in the first place, and owing them anyway spent a resumed session on an unchanged PR right when the provider budget had just run out. `Supervisor._gate_holds(pair, signal)` is the one predicate for "the gate has nothing here" — `signal is None` (gate off, or a failed lookup with no `updatedAt` to key a degraded fingerprint on) holds nothing, otherwise a pair is held when it has a live session and its recorded fingerprint still matches. `pairs_to_run` and `Supervisor.debt_for` (renamed from `unreached_debt`, since the old name went false the moment the cut group started calling it too) both call it and neither restates it. So what a cut group owes is the pairs a limit or the pool actually prevented from running, plus whatever `debt_for` says the gate still has something for — not the group's untouched pairs wholesale. A group the cycle never reached owes its whole persona set for the same reason, minus whatever the gate would have excused had the cycle got that far.
 
 A pair the pool refuses is neither a success nor a failure. `ThreadPoolExecutor.submit` raises `RuntimeError` on a container out of threads, on the *submitting* thread, where neither `_run_one`'s `OSError` guard nor `_dispatch`'s catch-all is anywhere near it; letting it out would discard the results the pool already holds, and those passes have posted their comments. `run_group` stops submitting instead, and the unstarted pairs keep their sessions and are owed to the next cycle.
 
-**Three non-limit failures in a row also abandon the cycle**, at the ordinary interval rather than the backoff (`MAX_CONSECUTIVE_FAILURES`, not operator-configurable — it is a guard against a dead provider, not a tuning knob). Connection refused, a dead LiteLLM translator, a gateway 502: none classify as a limit, and each failure drops its pair's session, so walking a whole list into a dead endpoint costs a duplicate-comment burst per pair. The count is evaluated at the barrier rather than per pass, and a success anywhere in the group resets it, because a success anywhere means the provider is alive. The abandonment sets the same cut group and debt a limit would.
+**Three non-limit failures in a row also abandon the cycle** (`MAX_CONSECUTIVE_FAILURES`, not operator-configurable — it is a guard against a dead provider, not a tuning knob). Connection refused, a dead LiteLLM translator, a gateway 502: none classify as a limit, and each failure drops its pair's session, so a retry at this abandonment is a fresh session rather than a resume, and the change gate cannot reach a pair with no session — walking a whole list into a dead endpoint every ordinary interval would therefore cost a full fan-out of fresh sessions once a minute, on the one failure path the gate cannot discount. `run_cycle` returns why it stopped rather than a bare bool — `CYCLE_OK` (falsy), `CYCLE_LIMITED`, or `CYCLE_UNHEALTHY` — and `main` waits `LIMIT_BACKOFF_SECONDS` for either non-`CYCLE_OK` outcome, so this abandonment now waits the same backoff a usage limit does rather than the ordinary poll interval. The count is evaluated at the barrier rather than per pass, and a success anywhere in the group resets it, because a success anywhere means the provider is alive. The abandonment sets the same cut group and debt a limit would.
 
 **A pass that fails to spawn is one of those failures, not a crash.** `subprocess.Popen` raises `OSError` for `EAGAIN` against `--pids-limit 512`, `ENOMEM` against `--memory 4g`, and a `claude` that is not on `PATH`; the shell read `PIPESTATUS[0]` and saw a non-zero rc for all three, so `Supervisor._run_one` catches `OSError` and returns an ordinary failed `PassResult`. Unguarded it exits PID 1, and the session map, the pass counts and the cut-and-owed bookkeeping live only in memory, so the restart makes every pair start a fresh session and re-post findings it already posted — where the shell's cost was one dropped session. `git fetch` in the cycle and the `gh` calls behind `enumerate_candidate_prs` carry the same guard, standing in for the `|| true` / `|| log WARN` they were ported from; a failed enumeration degrades to an empty candidate list, which the cycle already handles.
+
+### Change-driven re-review
+
+A cycle used to walk every candidate PR and review it, whether or not anything
+had happened since the last pass. With the persona multiplier that is
+(PRs × that PR's mode's personas) provider sessions spent per cycle to
+conclude that nothing had changed. The gate that avoids this sits between
+enumeration and the walk: a PR is reviewed only when something happened to
+it, and left alone otherwise.
+
+**Four things count as something happening**, decided per PR by
+`signals.Signal` and `signals.change_reason`: the head commit moved, a
+conversation comment or a submitted review arrived whose body does not carry
+the marker, an inline diff comment arrived without the marker, or the PR's
+mode flipped because `PLAN_LABEL` was added or removed. Editing the title,
+body, or base branch does neither — those moves `updatedAt` and stop there.
+
+**The marker, not the author login.** A comment is claudebox's own when its
+body contains `-claudebox` case-insensitively (`signals.is_own`), and
+`personas/code/_shared.md` and `personas/plan/_shared.md` both tell every
+persona to sign that way, so an unsigned comment reads as a human's. Author
+login was rejected as the test because claudebox is commonly run under the
+operator's own PAT — matching on login would classify the operator's own
+comments as claudebox's, and the comment trigger would never fire for the
+person most likely to use it. `is_own` drops any line starting with `>`
+before it tests for the marker, because GitHub's Quote reply button copies
+the quoted comment verbatim behind `> `, and a human disputing a finding
+would otherwise carry the marker they quoted and be read as claudebox's own —
+on exactly the reply the followup prompt exists to consume. A reply that
+quotes a finding and adds prose reads as human; a reply that quotes and then
+signs still reads as claudebox, because the unquoted half decides.
+
+**Two stages, one request on a quiet cycle.** Stage one is the
+`enumerate_candidate_prs` call every cycle already made, its `--json` field
+list widened to `number,labels,headRefOid,updatedAt`, returned as a
+`PRSnapshot` per candidate rather than a bare `(number, mode)` pair. Stage
+two, `gh.pr_signal`, is a `gh pr view --json comments,reviews` plus a `gh api
+.../pulls/N/comments?sort=created&direction=desc&per_page=30` for inline
+comments, and `signals.Tracker` runs it only for a PR whose `updatedAt` has
+moved since the last time it ran. So a cycle in which nothing happened costs
+exactly what it costs today: the one stage-one request, and no stage-two
+calls at all, because every candidate's `updatedAt` still matches what
+`Tracker.polled` has on file for it. The inline lookup is capped at the 30
+newest rather than paginated: claudebox's own comment moves `updatedAt`, so
+every PR it reviews buys this lookup again on the following poll, and an
+uncapped walk of a long-lived PR's inline comments at a 60s poll interval is
+several REST calls per PR per minute — the difference between "extracts one
+`max()`" and a rate limit that degrades to an empty candidate list and a
+reviewer that reviews nothing at all. Thirty newest is enough to find the
+newest unsigned comment in any realistic case; a PR carrying more than 30
+inline comments newer than the newest unsigned one could in principle hide
+it.
+
+**`updatedAt` gates the second lookup and is not part of the fingerprint.**
+It moves on an edit the design decided not to count — a typo fix in the body,
+a retitle — and putting it in `Signal` would turn each of those into a full
+persona fan-out. `Signal` instead carries `head_oid`, `mode`, and
+`newest_human`, the timestamp of the newest unmarked comment or the empty
+string when there is none; two fingerprints differ exactly when one of the
+four triggers actually fired.
+
+**Neither `Tracker`'s dicts nor `Supervisor.reviewed` survive a restart, and
+that is required rather than deferred.** `sessions` is in-memory only, so a
+persisted fingerprint would come back after a restart the session map did
+not, and a session that has never read the PR would believe, from the
+fingerprint alone, that it already had. A restart still re-reviews each pair
+once, exactly as it did before this existed.
+
+**`owed` runs ahead of the gate.** `pairs_to_run` checks what a group owes
+before it asks `signals_by_pr` anything, so a pair a limit or a failure cut
+short always runs again regardless of whether its PR's fingerprint moved — a
+retry has no result to preserve, and the gate has no business withholding
+one. A pair with no session runs unconditionally for the same reason: first
+sight, a session `_record_failure` dropped, and a `MAX_PASSES_PER_SESSION`
+rotation all look like "no session" to the gate and none of them needed to
+know it exists.
+
+`owed` is the first line of defense against a review going missing, not the
+guarantee — `Supervisor.reviewed` is. `reviewed` is written only on a
+successful pass, so whenever `owed` itself is lost (a settling PR reconsidered
+from scratch, a transient enumeration failure, a PR closed and reopened) the
+pair's fingerprint in `reviewed` is simply stale, and a stale fingerprint
+differs from the current one, so `_gate_holds` says no and the pair runs
+again. A limited pair, an unstarted pair, and a gate-narrowed pair all land
+back on the right side of that check without `owed` needing to have
+remembered them.
+
+**A stage-two failure fails open once per `updatedAt` change**, and the WARN
+says which PR it named and, when the snapshot's `updatedAt` is non-empty,
+that it is gated on `updatedAt` rather than reviewed unconditionally — the
+wording varies by whether there is an `updatedAt` to key on, not by which
+poll this is. The first poll after a
+failure is reviewed in full, unlike the `ids` selector's mode
+lookup, which skips on failure because a wrong-mode review posts comments
+nobody can take back — here the mode is already known from stage one, so the
+worst a redundant pass costs is noise. `Tracker` still records the failed
+lookup against that `updatedAt` (`self._cache[number] = None`), which bounds
+the API cost of a persistent `gh` outage to one request per `updatedAt`
+change. The review cost is bounded the same way, not just the lookup: `main`
+does not put `Tracker`'s `None` straight into `signals_by_pr`. When the
+snapshot's `updatedAt` is non-empty, `signals.degraded` turns it into a
+fingerprint carrying `head_oid` and `mode` from the snapshot and, in place of
+`newest_human`, a value derived from `updatedAt` that can never collide with
+a real comment timestamp. That fingerprint gates the group exactly like a
+real one, so a frozen failing PR reviews once and goes quiet; a push or a
+human comment mid-outage still moves `updatedAt` and still gets reviewed. An
+**empty** `updatedAt` has nothing to key a degraded fingerprint on, so
+`signals.degraded` returns `None` there and the PR keeps failing open on
+every poll — the same as `Tracker` refusing to cache against an empty stamp.
+`signals.change_reason` gives a degraded-to-real transition (or the reverse)
+its own wording rather than "new comment activity", since no comment was
+actually observed in either direction.
+
+A PR whose newest change is younger than `SETTLE_SECONDS` (default 30, `0`
+disables it) is left off this cycle's list entirely, with nothing recorded
+against it, so the next poll reconsiders it from scratch rather than treating
+the wait as a lookup already made. That is what turns a burst of pushes into
+one review instead of one per push. `SETTLE_SECONDS` only has anything to wait
+out while `REVIEW_ON_CHANGE` is on; with the gate off, `partition_settling`
+never runs, so `SETTLE_SECONDS` is inert regardless of what it's set to. A
+negative age — the container clock behind GitHub's — falls outside
+`is_settling`'s `0 <= age < settle` range, so the PR runs rather than settles;
+skew costs the batching, never the review.
+
+There is no starvation guard on the other side of this. A PR touched more
+often than `SETTLE_SECONDS` — a chatty CI bot pushing every few seconds — is
+still settling on every poll and is never reviewed, with nothing but a
+repeating "Settling" line to say so. claudebox's own comments do not cause
+this: at the 60s default poll interval and the 30s default window, its own
+comment has always aged out by the time the next poll looks.
+
+`SETTLE_SECONDS` also closes a race the fingerprint alone could not: `newest_human`
+resolves to whole-second RFC-3339 timestamps, so a comment landing in the same
+second as the `updatedAt` a fingerprint was already recorded against would
+never actually reach `change_reason` — `Tracker.signal_for`'s `polled` check
+sees the same `updatedAt` it already has on file and skips the lookup
+entirely, and even a lookup that did run would produce a `newest_human` equal
+to the one `Supervisor.reviewed` already holds for that pair, so `_gate_holds`
+would compare the fingerprints equal and hold anyway. Same second, same
+string, no visible change at either point. The default settle
+window is what prevents that from mattering: a snapshot only clears settling
+once it is already `SETTLE_SECONDS` old, so any comment arriving after that
+point necessarily stamps a later second. The race reopens at `SETTLE_SECONDS=0`,
+and it reopens under skew too — a container clock running *ahead* of GitHub's
+inflates the computed age and lets a fresh PR clear settling before a full
+window has actually passed. This is the one place in this design where clock
+skew changes a decision rather than merely costing batching; the paragraph
+above's "skew costs the batching, never the review" is about the *opposite*
+skew direction (clock behind) and does not cover this case.
+
+`REVIEW_ON_CHANGE=0` turns the whole gate off: `signals_by_pr` stays empty,
+every `signal` handed to `pairs_to_run` is `None`, and `None` means "run it" —
+the same value a lookup failure against an **empty** `updatedAt` produces (a
+lookup failure against a non-empty one produces a degraded Signal instead,
+not `None`; see above). Stage two is never called at all in this mode, so the
+extra `gh` requests disappear along with the gate.
 
 ### Backend selection & the all-tiers-mapped-to-one-model trick
 
@@ -187,7 +345,7 @@ Every line the supervisor writes is stamped `[HH:MM:SS]` in UTC, matching the sh
 
 ## Configuration
 
-All config is via environment variables (`.env.example` documents them). Always required: `GITHUB_TOKEN`, `GITHUB_REPOSITORY`, and exactly one PR selector (`PR_ALL`/`PR_ASSIGNEE`/`PR_IDS`/`PR_SEARCH`). Provider selection: `PROVIDER` (default `ollama`) plus that provider's credential — `OLLAMA_API_KEY` (ollama), `ANTHROPIC_API_KEY` (anthropic), `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_API_KEY` (custom), `GATEWAY_UPSTREAM` (optional, default `anthropic`) + that upstream's base URL/project/region and `ANTHROPIC_CUSTOM_HEADERS` (cloudflare), or `CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_API_TOKEN` (workersai); see "Backend selection" above. Optional for workersai: `LITELLM_PORT` (default 4000) and `SHIM_PORT` (default 4001) for the translator and the normalizer behind it, `SHIM_NORMALIZE` (default on) to remove that hop, and `LITELLM_DEBUG`. Optional: `REVIEW_MODEL` (provider-specific default, but required for `custom` and `cloudflare`), `ANTHROPIC_CUSTOM_HEADERS` (see below), `REVIEW_INTERVAL_SECONDS`, `MAX_PASSES_PER_SESSION`, `MAX_CYCLES` (how many cycles before the process exits; unset or `0` is forever, and an unparsable value is a startup error), `ALLOW_UNHARDENED`, `LINEAR_API_KEY` (see "Optional Linear context" above), `PLAN_LABEL` (default `plan`; a PR carrying it is reviewed in plan mode, everything else in code mode), `PERSONAS` (code mode, default `red_team,adversarial,sme,sage`), `PLAN_PERSONAS` (plan mode, default all six), `MAX_CONCURRENT_PASSES` (how many of a PR's personas run at once; unset or `0` is all of them, `1` is one at a time and disarms the shared-worktree stanza and the `.git` lock for every mode, and an unparsable value is a startup error), `PERSONA_DIR` (default `/opt/claudebox/personas`, a parent of `code/` and `plan/`; see "Review modes and personas" above), `LIMIT_BACKOFF_SECONDS` (default `1800`), and eight prompt overrides. Four are code mode: `REVIEW_PROMPT` (new session) / `FOLLOWUP_PROMPT` (resumed passes), and `REVIEW_PROMPT_SUFFIX` / `FOLLOWUP_PROMPT_SUFFIX` (append to whichever of those is in effect, default or override). The other four are their plan-mode counterparts, `PLAN_REVIEW_PROMPT` / `PLAN_FOLLOWUP_PROMPT` / `PLAN_REVIEW_PROMPT_SUFFIX` / `PLAN_FOLLOWUP_PROMPT_SUFFIX`. All eight defaults live in `reviewer/prompts.py`, with the stanzas they share in `reviewer/_stanzas.py`, and none of the eight vars is quote-stripped. The supervisor reads all eight straight from the environment: the entrypoint neither validates nor forwards them.
+All config is via environment variables (`.env.example` documents them). Always required: `GITHUB_TOKEN`, `GITHUB_REPOSITORY`, and exactly one PR selector (`PR_ALL`/`PR_ASSIGNEE`/`PR_IDS`/`PR_SEARCH`). Provider selection: `PROVIDER` (default `ollama`) plus that provider's credential — `OLLAMA_API_KEY` (ollama), `ANTHROPIC_API_KEY` (anthropic), `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_API_KEY` (custom), `GATEWAY_UPSTREAM` (optional, default `anthropic`) + that upstream's base URL/project/region and `ANTHROPIC_CUSTOM_HEADERS` (cloudflare), or `CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_API_TOKEN` (workersai); see "Backend selection" above. Optional for workersai: `LITELLM_PORT` (default 4000) and `SHIM_PORT` (default 4001) for the translator and the normalizer behind it, `SHIM_NORMALIZE` (default on) to remove that hop, and `LITELLM_DEBUG`. Optional: `REVIEW_MODEL` (provider-specific default, but required for `custom` and `cloudflare`), `ANTHROPIC_CUSTOM_HEADERS` (see below), `REVIEW_INTERVAL_SECONDS` (default `60`; a poll interval now, not a review interval — see "Change-driven re-review" above), `REVIEW_ON_CHANGE` (default on; `0` reviews every candidate on every poll, which was the whole behavior before this), `SETTLE_SECONDS` (default `30`, `0` disables it; how young a PR's newest change can be before this poll leaves it for the next one), `MAX_PASSES_PER_SESSION`, `MAX_CYCLES` (how many cycles before the process exits; unset or `0` is forever, and an unparsable value is a startup error), `ALLOW_UNHARDENED`, `LINEAR_API_KEY` (see "Optional Linear context" above), `PLAN_LABEL` (default `plan`; a PR carrying it is reviewed in plan mode, everything else in code mode), `PERSONAS` (code mode, default `red_team,adversarial,sme,sage`), `PLAN_PERSONAS` (plan mode, default all six), `MAX_CONCURRENT_PASSES` (how many of a PR's personas run at once; unset or `0` is all of them, `1` is one at a time and disarms the shared-worktree stanza and the `.git` lock for every mode, and an unparsable value is a startup error), `PERSONA_DIR` (default `/opt/claudebox/personas`, a parent of `code/` and `plan/`; see "Review modes and personas" above), `LIMIT_BACKOFF_SECONDS` (default `1800`), and eight prompt overrides. Four are code mode: `REVIEW_PROMPT` (new session) / `FOLLOWUP_PROMPT` (resumed passes), and `REVIEW_PROMPT_SUFFIX` / `FOLLOWUP_PROMPT_SUFFIX` (append to whichever of those is in effect, default or override). The other four are their plan-mode counterparts, `PLAN_REVIEW_PROMPT` / `PLAN_FOLLOWUP_PROMPT` / `PLAN_REVIEW_PROMPT_SUFFIX` / `PLAN_FOLLOWUP_PROMPT_SUFFIX`. All eight defaults live in `reviewer/prompts.py`, with the stanzas they share in `reviewer/_stanzas.py`, and none of the eight vars is quote-stripped. The supervisor reads all eight straight from the environment: the entrypoint neither validates nor forwards them.
 
 ## Gotchas when editing
 
@@ -206,3 +364,14 @@ All config is via environment variables (`.env.example` documents them). Always 
 - `MAX_CONCURRENT_PASSES=1` must stay on the same code path as any other value — a one-worker pool, not a sequential branch beside the concurrent one. A second path would drift, and it would silently invalidate every ordinal assertion in `test-personas.sh`.
 - `_locked_dirs` covers `.git` plus every directory under `.git/refs`, recursively, and never `.git/objects`. Both halves are load-bearing. The refs subtree is there because a lock covering `.git` alone leaves `git update-ref refs/remotes/origin/main HEAD` and `git notes add` both exiting 0 — the first empties `git log origin/main..HEAD` so a sibling sees a PR containing nothing, the second injects chosen text into every sibling's `git log` and `git show`. The object store is excluded because that walk is O(object count), which is what commit `fdd0ac1` exists to avoid; refs is O(ref count), and on this checkout `_locked_dirs` returns 7 paths where a full `.git` walk would touch a couple of hundred. Do not pin that second number in prose: it is the object store's fanout and it moves on every commit.
 - `entrypoint.sh` must `chmod u+w` the clone's `.git` before its own git setup, because a restart meets a clone the supervisor left locked.
+- The `-claudebox` signature in `personas/*/_shared.md` is load-bearing, not
+  cosmetic: it is the only thing distinguishing claudebox's own comments from a
+  human's, and an unsigned comment costs the PR another review round. Author
+  login is deliberately not consulted, because claudebox is commonly run under
+  the operator's own PAT.
+- `signals.Tracker` and `Supervisor.reviewed` must stay in memory. Persisting a
+  fingerprint without persisting the session map would leave a fresh session
+  that has never read the PR believing it had already reviewed it.
+- `test-personas.sh`'s `gh` stub advances `headRefOid` between its two cycles on
+  purpose. Freeze it and the suite's central assertion, that a resumed pass
+  still carries its persona, silently stops being reached.

@@ -1,9 +1,14 @@
 ## How to report what you find
 
-Post one comment per finding on the pull request with the GitHub CLI, and sign
-each one `-claudebox ({{PERSONA}})`. A finding is worth a comment when you can
-point at the specific part of the change that demonstrates it and say what to do
-about it.
+Post one comment per finding on the pull request with `gh pr comment`, not the
+inline review-comment API, and sign each one `-claudebox ({{PERSONA}})`. A
+finding is worth a comment when you can point at the specific part of the
+change that demonstrates it and say what to do about it.
+
+Signing is not a courtesy. claudebox decides whether a pull request needs
+another look by reading its comments, and a comment without that signature is
+read as a human's, which costs the pull request another full round of reviews.
+Sign every comment you post.
 
 If the change is solid and you have no findings, say so and post nothing. Do not
 manufacture findings to appear thorough. Silence from you is a strong signal.

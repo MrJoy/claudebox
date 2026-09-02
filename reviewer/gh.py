@@ -12,11 +12,27 @@ an unguarded number field once produced a candidate PR literally named `null`.
 
 import json
 import subprocess
-from typing import Any, Callable, List, Mapping, Tuple
+from dataclasses import dataclass
+from typing import Any, Callable, List, Mapping
 
+import signals
 from common import ConfigError, log
 
-Candidate = Tuple[int, str]
+
+@dataclass(frozen=True)
+class PRSnapshot:
+    """One candidate PR as stage one sees it.
+
+    head_oid and updated_at ride along in the call that was already being made
+    for labels, so change detection costs no request on a cycle where nothing
+    happened. A field gh did not return becomes "", which never matches a
+    recorded fingerprint and so reviews the PR: the safe direction.
+    """
+
+    number: int
+    mode: str
+    head_oid: str
+    updated_at: str
 
 
 def pr_truthy(value) -> bool:
@@ -74,15 +90,15 @@ def resolve_pr_selection(env: Mapping[str, str]) -> str:
     return selector
 
 
-def pr_modes(payload: Any, plan_label: str) -> List[Candidate]:
-    """Turn gh --json number,labels output into (number, mode) pairs.
+def pr_modes(payload: Any, plan_label: str) -> List[PRSnapshot]:
+    """Turn gh --json number,labels,headRefOid,updatedAt output into snapshots.
 
     Accepts an array (gh pr list) or a single object (gh pr view). A PR carrying
     plan_label is plan mode; everything else is code mode, so an operator who
     never labels anything sees exactly the pre-modes behavior.
     """
     entries = payload if isinstance(payload, list) else [payload]
-    out: List[Candidate] = []
+    out: List[PRSnapshot] = []
     for entry in entries:
         if not isinstance(entry, dict):
             continue
@@ -93,7 +109,12 @@ def pr_modes(payload: Any, plan_label: str) -> List[Candidate]:
         is_plan = any(
             isinstance(lbl, dict) and lbl.get("name") == plan_label for lbl in labels
         )
-        out.append((number, "plan" if is_plan else "code"))
+        out.append(PRSnapshot(
+            number=number,
+            mode="plan" if is_plan else "code",
+            head_oid=entry.get("headRefOid") or "",
+            updated_at=entry.get("updatedAt") or "",
+        ))
     return out
 
 
@@ -125,8 +146,8 @@ def enumerate_candidate_prs(
     selector: str,
     env: Mapping[str, str],
     run: Callable[..., Any] = subprocess.run,
-) -> List[Candidate]:
-    """One (number, mode) pair per candidate PR."""
+) -> List[PRSnapshot]:
+    """One PRSnapshot per candidate PR."""
     repo = env["GITHUB_REPOSITORY"]
     plan_label = env.get("PLAN_LABEL") or "plan"
 
@@ -144,10 +165,11 @@ def enumerate_candidate_prs(
             return subprocess.CompletedProcess(argv, 1, "", f"could not run gh: {exc}")
 
     if selector == "ids":
-        out: List[Candidate] = []
+        out: List[PRSnapshot] = []
         for number in parse_pr_ids(env.get("PR_IDS", "")):
             argv = [
-                "gh", "pr", "view", str(number), "-R", repo, "--json", "number,labels",
+                "gh", "pr", "view", str(number), "-R", repo, "--json",
+                "number,labels,headRefOid,updatedAt",
             ]
             result = gh_run(argv)
             got = pr_modes(_read_json(result) or [], plan_label)
@@ -161,15 +183,19 @@ def enumerate_candidate_prs(
 
     base = ["gh", "pr", "list", "-R", repo]
     if selector == "all":
-        argv = base + ["--state", "open", "--limit", "100", "--json", "number,labels"]
+        argv = base + [
+            "--state", "open", "--limit", "100", "--json",
+            "number,labels,headRefOid,updatedAt",
+        ]
     elif selector == "assignee":
         argv = base + [
             "--state", "open", "--assignee", env["PR_ASSIGNEE"],
-            "--limit", "100", "--json", "number,labels",
+            "--limit", "100", "--json", "number,labels,headRefOid,updatedAt",
         ]
     elif selector == "search":
         argv = base + [
-            "--search", env["PR_SEARCH"], "--limit", "100", "--json", "number,labels",
+            "--search", env["PR_SEARCH"], "--limit", "100", "--json",
+            "number,labels,headRefOid,updatedAt",
         ]
     else:
         raise ConfigError(f"unknown PR selector '{selector}'.")
@@ -184,3 +210,66 @@ def enumerate_candidate_prs(
             log(line)
         return []
     return pr_modes(payload, plan_label)
+
+
+def pr_signal(snapshot: PRSnapshot, env: Mapping[str, str],
+              run: Callable[..., Any] = subprocess.run):
+    """This PR's fingerprint, or None when GitHub could not be read.
+
+    Two calls, made only for a PR whose updatedAt moved. `gh pr view` carries
+    conversation comments and review submissions; inline diff comments are not
+    in the reviews field, so they come from the REST endpoint. Neither asks for
+    statusCheckRollup, which the privilege-minimized token cannot fetch.
+
+    None is the fail-open value and the caller reviews the PR on it. That is
+    the opposite of the ids selector's mode lookup, which skips on failure --
+    there a wrong mode posts comments that cannot be taken back, and here the
+    mode is already known from stage one, so the worst case is one redundant
+    pass.
+    """
+    repo = env["GITHUB_REPOSITORY"]
+
+    def gh_run(argv):
+        try:
+            return run(argv, capture_output=True, text=True, check=False)
+        except OSError as exc:
+            return subprocess.CompletedProcess(argv, 1, "", f"could not run gh: {exc}")
+
+    view = _read_json(gh_run([
+        "gh", "pr", "view", str(snapshot.number), "-R", repo,
+        "--json", "comments,reviews",
+    ]))
+    if not isinstance(view, dict):
+        return None
+
+    # Capped, not paginated. All this extracts is one max(), and claudebox's
+    # own comment moves updatedAt, so every PR it reviews buys this lookup on
+    # the following poll -- at a 60s interval an uncapped walk of a long-lived
+    # PR's inline comments is several REST calls per PR per minute. Newest
+    # first, one page: enough to find the newest unsigned comment in any
+    # realistic case, and the failure it avoids is a rate limit, which degrades
+    # to an empty candidate list and a reviewer that reviews nothing at all.
+    inline = _read_json(gh_run([
+        "gh", "api",
+        f"repos/{repo}/pulls/{snapshot.number}/comments"
+        "?sort=created&direction=desc&per_page=30",
+    ]))
+    if not isinstance(inline, list):
+        return None
+
+    entries = []
+    for c in view.get("comments") or []:
+        if isinstance(c, dict):
+            entries.append((c.get("createdAt"), c.get("body")))
+    for r in view.get("reviews") or []:
+        if isinstance(r, dict):
+            entries.append((r.get("submittedAt"), r.get("body")))
+    for c in inline:
+        if isinstance(c, dict):
+            entries.append((c.get("created_at"), c.get("body")))
+
+    return signals.Signal(
+        head_oid=snapshot.head_oid,
+        mode=snapshot.mode,
+        newest_human=signals.newest_unsigned(entries),
+    )

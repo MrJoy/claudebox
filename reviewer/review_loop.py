@@ -29,7 +29,15 @@ import gh
 import passes
 import personas as personas_mod
 import prompts as prompts_mod
+import signals as signals_mod
 from common import ConfigError, Pair, die, log
+
+# What a cycle stopped for, and whether the next poll waits the backoff.
+# CYCLE_OK is falsy and the other two are truthy, so "should we back off" is
+# the value's own truth.
+CYCLE_OK = ""
+CYCLE_LIMITED = "limit"
+CYCLE_UNHEALTHY = "unhealthy"
 
 # Not operator-configurable: this is a guard against a dead provider, not a
 # tuning knob. Connection refused, a dead LiteLLM translator, a gateway 502:
@@ -303,6 +311,23 @@ def _positive_int(env: Mapping[str, str], name: str, default: int) -> int:
     return value
 
 
+def partition_settling(snapshots, settle_seconds: int, now: float):
+    """Split candidates into (ready, settling).
+
+    A PR whose newest change is younger than the setting is left for the next
+    poll, so a burst of pushes costs one review instead of one per push.
+    Nothing about it is recorded, which is what makes the next poll reconsider
+    it from scratch.
+    """
+    ready, settling = [], []
+    for snap in snapshots:
+        if signals_mod.is_settling(snap.updated_at, settle_seconds, now):
+            settling.append(snap)
+        else:
+            ready.append(snap)
+    return ready, settling
+
+
 def check_litellm(env: Mapping[str, str]) -> None:
     """Are the workersai translators still up?
 
@@ -392,6 +417,13 @@ class Supervisor:
         # reports a limit on every attempt re-cut the cycle at the head of the
         # list forever, and nothing else would ever be reviewed again.
         self.cut_group: Optional[Tuple[int, str]] = None
+        # The fingerprint each pair last successfully reviewed at. A pair whose
+        # PR still fingerprints the same has nothing new to read, so it does not
+        # run. In memory alongside the session map, and deliberately not
+        # persisted: sessions are in memory too, so a fingerprint that outlived
+        # a restart would leave a fresh session that has never read the PR
+        # believing it had already reviewed it.
+        self.reviewed: Dict[Pair, signals_mod.Signal] = {}
 
     def build_groups(self, candidates: Sequence[Tuple[int, str]]) -> List[Group]:
         return [
@@ -487,19 +519,76 @@ class Supervisor:
             log(f"WARN: could not run claude: {exc}", pair=pair)
             return passes.PassResult(rc=1, session_id=session_id, limited=False, limit_line="")
 
-    def pairs_to_run(self, group: Group) -> List[Pair]:
+    def pairs_to_run(
+        self, group: Group, signal: Optional["signals_mod.Signal"] = None
+    ) -> List[Pair]:
         """Which of this group's personas run this cycle.
 
         A group that owes something runs ONLY what it owes: those personas did
         not run last cycle, and the rest of the group did. A group that owes
         nothing runs in full. The narrowing lasts until the group is served
         without being cut again, which is one cycle in the ordinary case and
-        longer while a pair keeps reporting a limit -- the siblings a narrowed
-        group leaves out are owed by the cut that stopped it, so they come back
-        on the visit after.
+        longer while a pair keeps reporting a limit -- the siblings the OWED
+        narrowing leaves out are owed by the cut that stopped it, so they come
+        back on the visit after. The gate narrowing below is not like that: the
+        pairs it leaves out are excused rather than deferred, and debt_for
+        keeps them out of the debt for the same reason.
+
+        A group that owes nothing is then filtered by the change gate, whose
+        one definition of "unchanged" lives in _gate_holds. A failed lookup
+        against a non-empty updatedAt arrives here as a degraded Signal rather
+        than as None, so it's gated like a real one and stops re-running once
+        it's been served -- see signals.degraded. A mode flip needs no case of
+        its own: it makes a different Pair, and that Pair has no session.
         """
         owed_here = [p for p in group.pairs if p in self.owed]
-        return owed_here if owed_here else list(group.pairs)
+        if owed_here:
+            return owed_here
+        return [p for p in group.pairs if not self._gate_holds(p, signal)]
+
+    def _gate_holds(
+        self, pair: Pair, signal: Optional["signals_mod.Signal"]
+    ) -> bool:
+        """True when the change gate has nothing for this pair to review.
+
+        One definition of "unchanged", three callers: the group about to run,
+        the group the cycle never reached, and the debt a cut leaves behind.
+        They were written in three sittings and disagreed, which is how a cut
+        came to owe personas the gate had just excused. Keep it that way -- a
+        change to what "unchanged" means belongs here and nowhere else.
+
+        `signal` is None when the gate is off, and when stage two failed
+        against an empty updatedAt (nothing to key a degraded fingerprint on);
+        both mean "run it". A pair with no session always runs, which is what
+        makes first sight, a session dropped by _record_failure, and
+        MAX_PASSES_PER_SESSION rotation work without knowing about the gate.
+        """
+        if signal is None:
+            return False
+        return self.sessions.get(pair) is not None and self.reviewed.get(pair) == signal
+
+    def debt_for(
+        self, group: Group, signal: Optional["signals_mod.Signal"] = None
+    ) -> List[Pair]:
+        """What a group owes the next cycle, before this cycle's results.
+
+        Two callers, and neither can use `pairs_to_run`: that narrows a group
+        to what it already owes, which is right for a group about to run and
+        wrong for one a cut left behind, since the narrowing was justified by a
+        cut two cycles back. So the whole persona set is owed, minus the pairs
+        the change gate would have withheld had the cycle got that far --
+        otherwise a limit owes the entire tail of an unchanged PR list and the
+        next cycle spends the budget that just ran out re-reviewing it. A pair
+        already owed keeps its debt whatever the gate says: it has no result to
+        preserve.
+
+        The cut group's own debt is this minus the pairs that did produce a
+        result; the groups the cycle never reached take it whole.
+        """
+        return [
+            p for p in group.pairs
+            if p in self.owed or not self._gate_holds(p, signal)
+        ]
 
     def order_groups(self, groups: List[Group]) -> List[Group]:
         """This cycle's groups, rotated to start after the last cut.
@@ -523,8 +612,21 @@ class Supervisor:
             return list(groups)
         return list(groups[start:]) + list(groups[:start])
 
-    def run_cycle(self, groups: List[Group]) -> bool:
-        """Walk the groups. Returns True when a usage limit cut the cycle."""
+    def run_cycle(
+        self,
+        groups: List[Group],
+        signals_by_pr: Optional[Dict[int, "signals_mod.Signal"]] = None,
+    ) -> str:
+        """Walk the groups. Returns why the cycle stopped early, or CYCLE_OK.
+
+        Truthy exactly when the next poll should wait the backoff rather than
+        the ordinary interval.
+
+        `signals_by_pr` is this cycle's fingerprints, keyed by PR number. A PR
+        missing from it -- and an empty map, which is what the gate switched off
+        looks like -- is reviewed unconditionally.
+        """
+        signals_by_pr = signals_by_pr or {}
         if not groups:
             # An empty list keeps what is owed rather than clearing it:
             # enumeration failures degrade to an empty candidate list, and that
@@ -539,10 +641,29 @@ class Supervisor:
         consecutive_failures = 0
         cut_index: Optional[int] = None
         cut_owes: Set[Pair] = set()
-        was_limited = False
+        outcome = CYCLE_OK
 
         for index, group in enumerate(ordered):
-            to_run = self.pairs_to_run(group)
+            signal = signals_by_pr.get(group.pr)
+            to_run = self.pairs_to_run(group, signal)
+            if not to_run:
+                # Nothing to review here. This is a cost and noise guard, not a
+                # correctness one: run_group already short-circuits an empty
+                # pair list, and the cut accounting below is rebuilt per group.
+                # Skipping keeps a per-cycle log line out of the log for a PR
+                # nobody touched and does not build a pool for no work.
+                continue
+            if signal is not None:
+                # From the pairs actually running, not from the whole group:
+                # a mixed group (one persona rotated by MAX_PASSES_PER_SESSION,
+                # another gated) would otherwise log a head change against a
+                # fingerprint belonging to a pair that is not running, sending
+                # an operator after a push that never happened.
+                prior = next(
+                    (self.reviewed[p] for p in to_run if p in self.reviewed), None
+                )
+                reason = signals_mod.change_reason(prior, signal) or "no session"
+                log(f"PR #{group.pr} [{group.mode}]: {reason}.")
             results = self.run_group(group, to_run)
 
             any_success = False
@@ -558,7 +679,7 @@ class Supervisor:
                     continue
                 if result.rc == 0:
                     any_success = True
-                    self._record_success(pair, result)
+                    self._record_success(pair, result, signal)
                 elif result.limited:
                     limited_here.add(pair)
                     self._record_limit(pair, result)
@@ -573,23 +694,34 @@ class Supervisor:
             else:
                 consecutive_failures += group_failures
 
-            # Everything in the group that did not run: the pairs the pool
-            # refused, and the siblings a narrowed group left out. A pair that
-            # ran and failed is not here -- it had its turn, and its session was
-            # dropped, so the next cycle to reach the group starts it fresh.
-            did_not_run = {p for p in group.pairs if p not in results}
+            # Everything in the group that did not run and is still owed one:
+            # the pairs the pool refused, and the siblings a narrowed group left
+            # out that the gate has something for. A pair that ran and failed is
+            # not here -- it had its turn, and its session was dropped, so the
+            # next cycle to reach the group starts it fresh. A pair the gate
+            # excused is not here either: it had nothing to review, and owing it
+            # spends a resumed session on an unchanged PR at exactly the moment
+            # the budget has run out.
+            still_owed = {
+                p for p in self.debt_for(group, signal) if p not in results
+            }
 
             if limited_here or unstarted:
-                was_limited = bool(limited_here)
+                # limited_here is unioned in rather than filtered: a pair that
+                # reported a limit ran, so it has a result and debt_for
+                # cannot see it. The pool's refusals need no such treatment --
+                # they were selected to run, so the gate does not hold them.
                 if unstarted and not limited_here:
                     log("WARN: the worker pool refused a pass; abandoning this cycle.")
-                cut_index, cut_owes = index, limited_here | did_not_run
+                outcome = CYCLE_LIMITED if limited_here else CYCLE_OK
+                cut_index, cut_owes = index, limited_here | still_owed
                 break
 
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                 log(f"WARN: {consecutive_failures} passes in a row failed for reasons "
                     "other than a limit; the provider looks unhealthy. Abandoning this cycle.")
-                cut_index, cut_owes = index, did_not_run
+                outcome = CYCLE_UNHEALTHY
+                cut_index, cut_owes = index, still_owed
                 break
 
         # Both exits rebuild `owed` from this cycle's own groups, which is what
@@ -598,15 +730,20 @@ class Supervisor:
         if cut_index is None:
             self.owed = set()
             self.cut_group = None
-            return was_limited
+            return outcome
 
         # The cut group's own debt, plus every pair of every group the cycle
-        # never reached. Their whole persona set is owed, narrowed or not: none
-        # of them ran.
+        # never reached -- their whole persona set, narrowed or not, since none
+        # of them ran. Both go through debt_for, which is the one place that
+        # decides what "unchanged" means, so a persona the gate excused is in
+        # neither; the pairs a limit or the pool prevented are, because they
+        # were selected to run and the gate has no say over them.
+        # self.owed still holds last cycle's debt at this point, which is what
+        # keeps a group that was already owed and was never reached owed.
         new_owed = set(cut_owes)
         skipped: List[Pair] = []
         for group in ordered[cut_index + 1:]:
-            for pair in group.pairs:
+            for pair in self.debt_for(group, signals_by_pr.get(group.pr)):
                 new_owed.add(pair)
                 skipped.append(pair)
         self.owed = new_owed
@@ -616,9 +753,17 @@ class Supervisor:
             log("Not reviewed this cycle: " + " ".join(str(p) for p in skipped) + ".")
         if new_owed:
             log("Owed next cycle: " + " ".join(str(p) for p in sorted(new_owed)) + ".")
-        return was_limited
+        return outcome
 
-    def _record_success(self, pair: Pair, result) -> None:
+    def _record_success(
+        self, pair: Pair, result, signal: Optional["signals_mod.Signal"] = None
+    ) -> None:
+        # Only when one was supplied: None arrives from the gate being off and
+        # from a failed lookup against an empty updatedAt (a failed lookup
+        # against a non-empty one arrives as a degraded Signal, not None), and
+        # recording it would claim knowledge we do not have.
+        if signal is not None:
+            self.reviewed[pair] = signal
         if result.session_id:
             self.sessions[pair] = result.session_id
         self.passes_done[pair] = self.passes_done.get(pair, 0) + 1
@@ -673,6 +818,11 @@ def preflight(env: Mapping[str, str]) -> Tuple[str, Dict[str, List[personas_mod.
         mode: personas_mod.resolve(mode, persona_dir, env)
         for mode in personas_mod.REVIEW_MODES
     }
+    # Validated here as well as in main, because --check returns before main's
+    # config block and a typo should cost a startup error rather than a clone
+    # and a translator. Reads only the environment, which is what --check is
+    # allowed to touch.
+    _positive_int(env, "SETTLE_SECONDS", 30)
     return selector, resolved
 
 
@@ -706,7 +856,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for warning in prompt_token_warnings(built.review, built.followup):
             log(warning)
         max_cycles = parse_max_cycles(env)
-        interval = _positive_int(env, "REVIEW_INTERVAL_SECONDS", 300)
+        interval = _positive_int(env, "REVIEW_INTERVAL_SECONDS", 60)
+        settle = _positive_int(env, "SETTLE_SECONDS", 30)
+        gate_on = signals_mod.enabled(env)
         backoff = _positive_int(env, "LIMIT_BACKOFF_SECONDS", 1800)
         max_passes = _positive_int(env, "MAX_PASSES_PER_SESSION", 0)
         review_model = _required(env, "REVIEW_MODEL")
@@ -764,6 +916,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_passes_per_session=max_passes,
         max_concurrent=max_concurrent,
     )
+    tracker = signals_mod.Tracker()
 
     cycles = 0
     while True:
@@ -788,28 +941,81 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             log(f"WARN: git fetch could not run ({exc}); continuing")
 
         try:
-            candidates = gh.enumerate_candidate_prs(selector, env)
+            snapshots = gh.enumerate_candidate_prs(selector, env)
         except ConfigError as exc:
             die(str(exc))
 
-        if not candidates:
+        if not snapshots:
             log(f"No candidate PRs for selector '{selector}'.")
         else:
             log(f"Candidate PRs ({selector}): "
-                + " ".join(f"{pr}:{mode}" for pr, mode in candidates))
+                + " ".join(f"{s.number}:{s.mode}" for s in snapshots))
 
-        limited = supervisor.run_cycle(supervisor.build_groups(candidates))
+        signals_by_pr = {}
+        if gate_on:
+            now = time.time()
+            snapshots, settling = partition_settling(snapshots, settle, now)
+            if settling:
+                def _left(snap):
+                    age = signals_mod.age_seconds(snap.updated_at, now)
+                    return settle if age is None else max(0, round(settle - age))
+                log("Settling, left for the next poll: "
+                    + " ".join(f"#{s.number} ({_left(s)}s)" for s in settling) + ".")
+            for snap in snapshots:
+                sig = tracker.signal_for(
+                    snap, lambda s: gh.pr_signal(s, env))
+                if sig is None:
+                    # Tracker only remembers a real lookup's outcome, so a
+                    # repeated failure against the same updatedAt lands here
+                    # every poll. Synthesizing the degraded fingerprint from
+                    # the snapshot in hand gives the same answer each time
+                    # without Tracker needing to know it exists -- that's what
+                    # turns "fail open" into "fail open once per change"
+                    # instead of "fail open forever".
+                    sig = signals_mod.degraded(snap)
+                    if sig is not None:
+                        log(f"WARN: could not read PR #{snap.number}'s "
+                            "comment activity; gating it on updatedAt until "
+                            "the lookup recovers.")
+                    else:
+                        # No updatedAt to key a degraded fingerprint on, so
+                        # this really does fail open on every poll -- the
+                        # wording below is true here and nowhere else.
+                        log(f"WARN: could not read PR #{snap.number}'s "
+                            "comment activity; reviewing it rather than "
+                            "skipping it.")
+                if sig is not None:
+                    signals_by_pr[snap.number] = sig
+
+        groups = supervisor.build_groups([(s.number, s.mode) for s in snapshots])
+        skipped = [
+            g for g in groups
+            if not supervisor.pairs_to_run(g, signals_by_pr.get(g.pr))
+        ]
+        if skipped:
+            log("Unchanged since their last review: "
+                + " ".join(f"#{g.pr}" for g in skipped) + ".")
+
+        outcome = supervisor.run_cycle(groups, signals_by_pr)
 
         cycles += 1
         if max_cycles is not None and cycles >= max_cycles:
             log(f"Reached MAX_CYCLES={max_cycles}; exiting.")
             return 0
 
-        if limited:
-            log(f"Backing off {backoff}s after a usage limit...")
+        if outcome:
+            # Three strikes gets the same wait as a limit. The provider looks
+            # dead, _record_failure dropped every session it touched, so each
+            # retry is a fresh full review rather than a resume -- and the
+            # change gate cannot reach a pair with no session. At the poll
+            # interval that is the most expensive thing this loop can do while
+            # achieving nothing.
+            reason = ("a usage limit" if outcome == CYCLE_LIMITED
+                      else "abandoning a cycle to repeated failures")
+            log(f"Backing off {backoff}s after {reason}...")
             time.sleep(backoff)
         else:
-            log(f"Sleeping {interval}s...")
+            log(f"Polling again in {interval}s...")
             time.sleep(interval)
 
 

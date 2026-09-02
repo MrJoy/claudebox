@@ -7,11 +7,14 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 import _path  # noqa: F401
 
+import gh
 import review_loop
+import signals
 from common import ConfigError, Pair
 from passes import PassResult
 
@@ -426,8 +429,10 @@ class ConsecutiveFailureTest(unittest.TestCase):
         s = supervisor([failed(), failed(), failed()])
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            was_limited = s.run_cycle(grouped(*self.PAIRS))
-        self.assertFalse(was_limited)
+            outcome = s.run_cycle(grouped(*self.PAIRS))
+        # The provider looks dead and every session it touched was dropped, so
+        # the next poll waits the backoff rather than the ordinary interval.
+        self.assertEqual(outcome, review_loop.CYCLE_UNHEALTHY)
         self.assertEqual(len(s.attempted), 3)
         # The pairs that failed are not owed: they ran. The ones the cycle never
         # reached are.
@@ -693,14 +698,17 @@ class RequiredEnvTest(unittest.TestCase):
 
 
 class TunableDefaultsTest(unittest.TestCase):
-    """The three intervals default to what entrypoint.sh defaulted to.
+    """The three intervals, pinned where a silent regression would burn quota.
 
-    A regression to a 30-second interval would be silent and would burn the
-    quota the backoff exists to protect.
+    All three match entrypoint.sh's own defaults. The poll interval is 60
+    because the change gate landed: the loop wakes often and reviews only what
+    moved, so entrypoint.sh:222 defaults it to 60 too and exports it. A
+    disagreement between the two would only surface for someone running the
+    supervisor without the entrypoint.
     """
 
     def test_review_interval(self):
-        self.assertEqual(review_loop._positive_int({}, "REVIEW_INTERVAL_SECONDS", 300), 300)
+        self.assertEqual(review_loop._positive_int({}, "REVIEW_INTERVAL_SECONDS", 60), 60)
 
     def test_limit_backoff(self):
         self.assertEqual(review_loop._positive_int({}, "LIMIT_BACKOFF_SECONDS", 1800), 1800)
@@ -710,8 +718,8 @@ class TunableDefaultsTest(unittest.TestCase):
 
     def test_an_explicit_value_wins(self):
         self.assertEqual(
-            review_loop._positive_int({"REVIEW_INTERVAL_SECONDS": "60"}, "REVIEW_INTERVAL_SECONDS", 300),
-            60,
+            review_loop._positive_int({"REVIEW_INTERVAL_SECONDS": "90"}, "REVIEW_INTERVAL_SECONDS", 60),
+            90,
         )
 
     def test_a_digit_int_refuses_is_a_config_error(self):
@@ -720,11 +728,53 @@ class TunableDefaultsTest(unittest.TestCase):
         # out of PID 1, which under --restart unless-stopped is a silent crash
         # loop.
         with self.assertRaises(ConfigError):
-            review_loop._positive_int({"REVIEW_INTERVAL_SECONDS": "\u00b2"}, "REVIEW_INTERVAL_SECONDS", 300)
+            review_loop._positive_int({"REVIEW_INTERVAL_SECONDS": "\u00b2"}, "REVIEW_INTERVAL_SECONDS", 60)
 
     def test_a_negative_value_is_refused(self):
         with self.assertRaises(ConfigError):
-            review_loop._positive_int({"REVIEW_INTERVAL_SECONDS": "-1"}, "REVIEW_INTERVAL_SECONDS", 300)
+            review_loop._positive_int({"REVIEW_INTERVAL_SECONDS": "-1"}, "REVIEW_INTERVAL_SECONDS", 60)
+
+
+class SettleFilterTest(unittest.TestCase):
+    STAMP = "2026-08-31T00:00:00Z"
+
+    def snaps(self):
+        return [gh.PRSnapshot(12, "code", "abc", self.STAMP)]
+
+    def test_a_young_change_is_held_back(self):
+        base = signals._epoch(self.STAMP)
+        ready, settling = review_loop.partition_settling(self.snaps(), 30, base + 5.0)
+        self.assertEqual(ready, [])
+        self.assertEqual([x.number for x in settling], [12])
+
+    def test_an_old_change_is_ready(self):
+        base = signals._epoch(self.STAMP)
+        ready, settling = review_loop.partition_settling(self.snaps(), 30, base + 60.0)
+        self.assertEqual([x.number for x in ready], [12])
+        self.assertEqual(settling, [])
+
+    def test_settle_zero_holds_nothing_back(self):
+        base = signals._epoch(self.STAMP)
+        ready, _ = review_loop.partition_settling(self.snaps(), 0, base)
+        self.assertEqual([x.number for x in ready], [12])
+
+    def test_an_unreadable_timestamp_is_ready(self):
+        # A gh that did not tell us when the PR moved must not pin it forever.
+        snaps = [gh.PRSnapshot(12, "code", "abc", "")]
+        ready, settling = review_loop.partition_settling(snaps, 30, 1000.0)
+        self.assertEqual([x.number for x in ready], [12])
+        self.assertEqual(settling, [])
+
+
+class IntervalDefaultTest(unittest.TestCase):
+    def test_the_poll_interval_defaults_to_sixty(self):
+        self.assertEqual(
+            review_loop._positive_int({}, "REVIEW_INTERVAL_SECONDS", 60), 60)
+
+    def test_settle_seconds_rejects_a_typo(self):
+        with self.assertRaises(ConfigError):
+            review_loop._positive_int({"SETTLE_SECONDS": "thirty"},
+                                      "SETTLE_SECONDS", 30)
 
 
 class SpawnFailureTest(unittest.TestCase):
@@ -1132,6 +1182,14 @@ class PreflightTest(unittest.TestCase):
         with self.assertRaises(ConfigError):
             review_loop.preflight(preflight_env(PR_IDS=""))
 
+    def test_an_unparsable_settle_seconds_is_a_config_error(self):
+        # Validated here as well as in main because --check returns before
+        # main's config block, and entrypoint.sh runs --check ahead of the
+        # network clone and up to 120s of LiteLLM startup. Without this the
+        # typo costs both on every restart under --restart unless-stopped.
+        with self.assertRaises(ConfigError):
+            review_loop.preflight(preflight_env(SETTLE_SECONDS="thirty"))
+
 
 class CheckModeTest(unittest.TestCase):
     def _run(self, args, env):
@@ -1215,6 +1273,192 @@ class GitFetchFailureTest(unittest.TestCase):
         self.assertIn("git fetch failed", out)
 
 
+class CycleGateTest(unittest.TestCase):
+    """What the cycle body does with the change gate, driven through main().
+
+    Both properties here are ordering properties, and reading the code is the
+    only other thing that pins them: the gate has to skip the stage-two lookup
+    entirely rather than make it and ignore the answer, and the settle filter
+    has to run before the tracker rather than after it.
+    """
+
+    def _cycle(self, snapshots, **env):
+        original = os.environ.copy()
+        os.environ.clear()
+        os.environ.update(preflight_env(
+            WORK_REPO=scratch_repo(self), REVIEW_MODEL="m", MAX_CYCLES="1",
+            PERSONAS="red_team", PLAN_PERSONAS="red_team",
+            REVIEW_INTERVAL_SECONDS="0", **env
+        ))
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(original)))
+
+        looked_up, reviewed = [], []
+
+        class Recorder(review_loop.Supervisor):
+            def _run_one(inner, pair, prompt, session_id):
+                reviewed.append(pair.pr)
+                return ok()
+
+        review_loop.Supervisor, original_sup = Recorder, review_loop.Supervisor
+        self.addCleanup(setattr, review_loop, "Supervisor", original_sup)
+
+        original_enum = review_loop.gh.enumerate_candidate_prs
+        review_loop.gh.enumerate_candidate_prs = lambda *a, **k: list(snapshots)
+        self.addCleanup(setattr, review_loop.gh, "enumerate_candidate_prs", original_enum)
+
+        def pr_signal(snap, env, **kwargs):
+            looked_up.append(snap.number)
+            return signals.Signal(head_oid=snap.head_oid, mode=snap.mode, newest_human="")
+
+        original_signal = review_loop.gh.pr_signal
+        review_loop.gh.pr_signal = pr_signal
+        self.addCleanup(setattr, review_loop.gh, "pr_signal", original_signal)
+
+        original_run = review_loop.subprocess.run
+        review_loop.subprocess.run = lambda *a, **k: subprocess.CompletedProcess(a[0], 0, "", "")
+        self.addCleanup(setattr, review_loop.subprocess, "run", original_run)
+
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            review_loop.main([])
+        return looked_up, reviewed, out.getvalue()
+
+    def _snap(self, number=12, age=3600.0):
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - age))
+        return gh.PRSnapshot(number, "code", "abc", stamp)
+
+    def test_the_gate_off_makes_no_stage_two_lookup(self):
+        # An operator who turns the gate off stops paying for the extra
+        # requests too. Consulting the tracker and discarding the answer would
+        # cost two GitHub calls per PR per cycle for nothing.
+        looked_up, reviewed, _ = self._cycle(
+            [self._snap()], REVIEW_ON_CHANGE="0")
+        self.assertEqual(looked_up, [])
+        self.assertEqual(reviewed, [12])
+
+    def test_the_gate_on_looks_a_settled_pr_up(self):
+        # The control for the case above: with the gate on, the same PR is
+        # looked up, so an assertion of "no lookup" means the gate and not a
+        # stub that never fires.
+        looked_up, reviewed, _ = self._cycle(
+            [self._snap()], SETTLE_SECONDS="30")
+        self.assertEqual(looked_up, [12])
+        self.assertEqual(reviewed, [12])
+
+    def test_a_settling_pr_is_dropped_before_the_tracker_sees_it(self):
+        # Nothing is recorded for a settling PR, which is what makes the next
+        # poll reconsider it from scratch. The tracker caches on updatedAt, so
+        # a lookup here would leave that cache holding a fingerprint taken
+        # mid-burst. The filter therefore runs BEFORE the tracker loop, and the
+        # absence of a lookup is how that ordering is observable.
+        looked_up, reviewed, log = self._cycle(
+            [self._snap(age=5.0)], SETTLE_SECONDS="3600")
+        self.assertEqual(looked_up, [])
+        self.assertEqual(reviewed, [])
+        # ~3595s: settle(3600) minus the ~5s age baked into the snapshot, minus
+        # whatever wall-clock slipped by before main() reads the clock again.
+        # A tight range pins "this is the remaining time" against the earlier
+        # bug (logging the configured window unchanged) without the assertion
+        # flaking on scheduler jitter.
+        self.assertRegex(log, r"Settling, left for the next poll: #12 \(359[0-9]s\)\.")
+
+
+class DegradedSignalGateTest(unittest.TestCase):
+    """A stage-two lookup that fails durably must still bound the review to
+    once per updatedAt change (task 11) -- gh.pr_signal returning None on
+    every call must not mean signals_by_pr never gets an entry for that PR.
+
+    Two polls happen inside one main() call, via MAX_CYCLES=2, so the same
+    Tracker instance sees both -- exactly how two 60s ticks of the real loop
+    would share it.
+    """
+
+    def _stamp(self, age=3600.0):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - age))
+
+    def _run(self, snapshot_sequence, **env):
+        original = os.environ.copy()
+        os.environ.clear()
+        os.environ.update(preflight_env(
+            WORK_REPO=scratch_repo(self), REVIEW_MODEL="m",
+            MAX_CYCLES=str(len(snapshot_sequence)),
+            PERSONAS="red_team", PLAN_PERSONAS="red_team",
+            REVIEW_INTERVAL_SECONDS="0", **env
+        ))
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(original)))
+
+        reviewed = []
+
+        class Recorder(review_loop.Supervisor):
+            def _run_one(inner, pair, prompt, session_id):
+                reviewed.append(pair.pr)
+                return ok()
+
+        review_loop.Supervisor, original_sup = Recorder, review_loop.Supervisor
+        self.addCleanup(setattr, review_loop, "Supervisor", original_sup)
+
+        calls = iter(snapshot_sequence)
+        original_enum = review_loop.gh.enumerate_candidate_prs
+        review_loop.gh.enumerate_candidate_prs = lambda *a, **k: list(next(calls))
+        self.addCleanup(setattr, review_loop.gh, "enumerate_candidate_prs", original_enum)
+
+        # A durable outage: stage two never answers, whatever PR it's asked about.
+        original_signal = review_loop.gh.pr_signal
+        review_loop.gh.pr_signal = lambda snap, env, **kwargs: None
+        self.addCleanup(setattr, review_loop.gh, "pr_signal", original_signal)
+
+        original_run = review_loop.subprocess.run
+        review_loop.subprocess.run = lambda *a, **k: subprocess.CompletedProcess(a[0], 0, "", "")
+        self.addCleanup(setattr, review_loop.subprocess, "run", original_run)
+
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            review_loop.main([])
+        return reviewed, out.getvalue()
+
+    def test_unchanged_updated_at_reviews_once_not_every_poll(self):
+        stamp = self._stamp()
+        snap = gh.PRSnapshot(12, "code", "abc", stamp)
+        reviewed, _ = self._run([[snap], [snap]])
+        self.assertEqual(reviewed, [12])
+
+    def test_updated_at_moving_during_the_outage_reviews_each_time(self):
+        # A human comment (or anything else that bumps updatedAt) arriving
+        # mid-outage must still get a review -- the degraded fingerprint keys
+        # on updatedAt for exactly this reason.
+        snap1 = gh.PRSnapshot(12, "code", "abc", self._stamp(age=3600.0))
+        snap2 = gh.PRSnapshot(12, "code", "abc", self._stamp(age=60.0))
+        reviewed, _ = self._run([[snap1], [snap2]])
+        self.assertEqual(reviewed, [12, 12])
+
+    def test_head_oid_moving_with_updated_at_fixed_still_reviews_each_time(self):
+        stamp = self._stamp()
+        snap1 = gh.PRSnapshot(12, "code", "aaaaaaa", stamp)
+        snap2 = gh.PRSnapshot(12, "code", "bbbbbbb", stamp)
+        reviewed, _ = self._run([[snap1], [snap2]])
+        self.assertEqual(reviewed, [12, 12])
+
+    def test_the_two_degraded_warnings_say_different_things(self):
+        # Two branches, two wordings, and swapping them would leave the suite
+        # green while telling an operator the opposite of the truth: a PR with
+        # an updatedAt is gated on it and reviews once, and one without really
+        # does fail open on every poll.
+        with_stamp = gh.PRSnapshot(12, "code", "abc", self._stamp())
+        _, log = self._run([[with_stamp]])
+        self.assertIn("gating it on updatedAt until the lookup recovers", log)
+        self.assertNotIn("reviewing it rather than skipping it", log)
+
+        without = gh.PRSnapshot(13, "code", "abc", "")
+        _, log = self._run([[without]])
+        self.assertIn("reviewing it rather than skipping it", log)
+        self.assertNotIn("gating it on updatedAt", log)
+
+    def test_an_empty_updated_at_reviews_every_poll(self):
+        # Nothing to key a degraded fingerprint on, so this must keep failing
+        # open exactly like the pre-task-11 behavior -- forever, not once.
+        snap = gh.PRSnapshot(12, "code", "abc", "")
+        reviewed, _ = self._run([[snap], [snap]])
+        self.assertEqual(reviewed, [12, 12])
+
+
 class McpArgsTest(unittest.TestCase):
     """--strict-mcp-config is a security boundary, not a preference: the
     reviewed repo is untrusted, and without it a repo shipping its own
@@ -1240,7 +1484,9 @@ class McpArgsTest(unittest.TestCase):
         self.addCleanup(setattr, review_loop, "Supervisor", original_sup)
 
         original_enum = review_loop.gh.enumerate_candidate_prs
-        review_loop.gh.enumerate_candidate_prs = lambda *a, **k: [(12, "code")]
+        review_loop.gh.enumerate_candidate_prs = lambda *a, **k: [
+            review_loop.gh.PRSnapshot(number=12, mode="code", head_oid="", updated_at="")
+        ]
         self.addCleanup(setattr, review_loop.gh, "enumerate_candidate_prs", original_enum)
 
         original_run = review_loop.subprocess.run
@@ -1355,7 +1601,9 @@ class WorktreeStanzaWiringTest(unittest.TestCase):
         self.addCleanup(setattr, review_loop, "Supervisor", original_sup)
 
         original_enum = review_loop.gh.enumerate_candidate_prs
-        review_loop.gh.enumerate_candidate_prs = lambda *a, **k: [(12, "code")]
+        review_loop.gh.enumerate_candidate_prs = lambda *a, **k: [
+            review_loop.gh.PRSnapshot(number=12, mode="code", head_oid="", updated_at="")
+        ]
         self.addCleanup(setattr, review_loop.gh, "enumerate_candidate_prs", original_enum)
 
         original_run = review_loop.subprocess.run
@@ -1799,6 +2047,410 @@ class GitDirLockWiringTest(unittest.TestCase):
         # arrive on any cycle. Narrowing only code mode must not disarm it.
         self._main(PERSONAS="red_team")
         self.assertFalse(self._can_write())
+
+
+class ChangeGateTest(unittest.TestCase):
+    SIG_A = signals.Signal(head_oid="aaaaaaa", mode="code", newest_human="")
+    SIG_B = signals.Signal(head_oid="bbbbbbb", mode="code", newest_human="")
+    RT = Pair(12, "code", "red_team")
+    SG = Pair(12, "code", "sage")
+    GROUP = review_loop.Group(12, "code", (RT, SG))
+
+    def reviewed_and_sessioned(self, s):
+        """A supervisor that has already reviewed both pairs at SIG_A."""
+        for pair in (self.RT, self.SG):
+            s.sessions[pair] = "S1"
+            s.reviewed[pair] = self.SIG_A
+        return s
+
+    def test_no_signal_runs_every_pair(self):
+        s = self.reviewed_and_sessioned(supervisor([]))
+        self.assertEqual(s.pairs_to_run(self.GROUP, None), [self.RT, self.SG])
+
+    def test_a_pair_with_no_session_runs_whatever_the_signal_says(self):
+        s = supervisor([])
+        s.reviewed[self.RT] = self.SIG_A
+        s.reviewed[self.SG] = self.SIG_A
+        self.assertEqual(s.pairs_to_run(self.GROUP, self.SIG_A), [self.RT, self.SG])
+
+    def test_an_unchanged_signal_runs_nothing(self):
+        s = self.reviewed_and_sessioned(supervisor([]))
+        self.assertEqual(s.pairs_to_run(self.GROUP, self.SIG_A), [])
+
+    def test_a_changed_signal_runs_every_pair(self):
+        s = self.reviewed_and_sessioned(supervisor([]))
+        self.assertEqual(s.pairs_to_run(self.GROUP, self.SIG_B), [self.RT, self.SG])
+
+    def test_an_owed_pair_runs_even_when_nothing_changed(self):
+        # The "barring retries due to errors" carve-out: an owed pair has no
+        # result to preserve, so the gate must not hold it back.
+        s = self.reviewed_and_sessioned(supervisor([]))
+        s.owed = {self.RT}
+        self.assertEqual(s.pairs_to_run(self.GROUP, self.SIG_A), [self.RT])
+
+    def test_a_failed_pair_runs_next_time_because_its_session_was_dropped(self):
+        s = self.reviewed_and_sessioned(supervisor([]))
+        with contextlib.redirect_stdout(io.StringIO()):
+            s._record_failure(self.RT)
+        self.assertEqual(s.pairs_to_run(self.GROUP, self.SIG_A), [self.RT])
+
+    def test_a_successful_pass_records_the_fingerprint(self):
+        s = supervisor([])
+        with contextlib.redirect_stdout(io.StringIO()):
+            s._record_success(self.RT, ok("S9"), self.SIG_A)
+        self.assertEqual(s.reviewed[self.RT], self.SIG_A)
+
+    def test_a_pass_with_no_fingerprint_records_nothing(self):
+        # Fail-open and gate-off both arrive here with signal=None. Recording
+        # anything would claim knowledge we do not have.
+        s = supervisor([])
+        with contextlib.redirect_stdout(io.StringIO()):
+            s._record_success(self.RT, ok("S9"), None)
+        self.assertNotIn(self.RT, s.reviewed)
+
+    def test_a_cycle_where_nothing_changed_runs_no_passes(self):
+        s = self.reviewed_and_sessioned(supervisor([]))
+        with contextlib.redirect_stdout(io.StringIO()):
+            limited = s.run_cycle([self.GROUP], {12: self.SIG_A})
+        self.assertEqual(s.attempted, [])
+        self.assertFalse(limited)
+
+    def test_a_cycle_where_the_head_moved_runs_both_pairs(self):
+        s = self.reviewed_and_sessioned(supervisor([]))
+        with contextlib.redirect_stdout(io.StringIO()):
+            s.run_cycle([self.GROUP], {12: self.SIG_B})
+        self.assertEqual(sorted(s.attempted), [self.RT, self.SG])
+
+    def test_a_gateless_cycle_runs_both_pairs(self):
+        # REVIEW_ON_CHANGE=0 reaches run_cycle as an empty signal map.
+        s = self.reviewed_and_sessioned(supervisor([]))
+        with contextlib.redirect_stdout(io.StringIO()):
+            s.run_cycle([self.GROUP], {})
+        self.assertEqual(sorted(s.attempted), [self.RT, self.SG])
+
+
+    # -- multi-group cycles: the gate's interaction with the cut accounting --
+
+    OTHER_RT = Pair(34, "code", "red_team")
+    OTHER_SG = Pair(34, "code", "sage")
+    OTHER_GROUP = review_loop.Group(34, "code", (OTHER_RT, OTHER_SG))
+    SIG_OTHER = signals.Signal(head_oid="ccccccc", mode="code", newest_human="")
+
+    def test_a_skipped_group_before_a_cut_owes_nothing(self):
+        s = self.reviewed_and_sessioned(supervisor([limited(), limited()]))
+        with contextlib.redirect_stdout(io.StringIO()):
+            was_limited = s.run_cycle(
+                [self.GROUP, self.OTHER_GROUP], {12: self.SIG_A}
+            )
+        self.assertTrue(was_limited)
+        self.assertEqual(sorted(s.attempted), [self.OTHER_RT, self.OTHER_SG])
+        self.assertEqual(s.owed, {self.OTHER_RT, self.OTHER_SG})
+        self.assertEqual(s.cut_group, (34, "code"))
+
+    def test_a_skipped_group_does_not_reset_the_failure_counter(self):
+        # Guards the placement of the `continue`: below the any_success handling
+        # it would reset consecutive_failures, and a dead provider would never
+        # trip MAX_CONSECUTIVE_FAILURES on any list holding one unchanged PR.
+        third = Pair(56, "code", "red_team")
+        groups = [
+            review_loop.Group(56, "code", (third,)),
+            self.GROUP,
+            self.OTHER_GROUP,
+        ]
+        s = self.reviewed_and_sessioned(
+            supervisor([failed(), failed(), failed()], max_concurrent=1)
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            s.run_cycle(groups, {12: self.SIG_A})
+        # PR 12 is skipped between them, so the three failures are consecutive.
+        self.assertEqual(
+            sorted(s.attempted), sorted([third, self.OTHER_RT, self.OTHER_SG])
+        )
+        self.assertEqual(s.cut_group, (34, "code"))
+
+    def test_an_unchanged_group_the_cut_never_reached_is_not_owed(self):
+        # PR 34 has never been reviewed, so it runs and reports a limit; PR 12
+        # is unchanged and the cycle never reaches it.
+        s = self.reviewed_and_sessioned(supervisor([limited(), limited()]))
+        with contextlib.redirect_stdout(io.StringIO()):
+            s.run_cycle(
+                [self.OTHER_GROUP, self.GROUP],
+                {12: self.SIG_A, 34: self.SIG_OTHER},
+            )
+        # The cut group's own debt stands; PR 12, which the cycle never reached
+        # and which has not changed, owes nothing.
+        self.assertEqual(s.owed, {self.OTHER_RT, self.OTHER_SG})
+        self.assertEqual(s.cut_group, (34, "code"))
+
+    def test_the_reason_line_is_taken_from_the_pairs_that_are_running(self):
+        # A mixed group: sage is held by the gate, and red_team was rotated by
+        # MAX_PASSES_PER_SESSION so it runs with no session. red_team last read
+        # the PR at SIG_B, so the head really did move for it, and the reason
+        # line has to say so. sage sits ahead of it in the group, so reading the
+        # fingerprint off the whole group finds the pair that is NOT running and
+        # reports "no session" for a push that happened.
+        group = review_loop.Group(12, "code", (self.SG, self.RT))
+        s = supervisor([])
+        s.sessions[self.SG] = "S1"
+        s.reviewed[self.SG] = self.SIG_A
+        s.reviewed[self.RT] = self.SIG_B  # rotated: no session, stale reading
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            s.run_cycle([group], {12: self.SIG_A})
+        self.assertEqual(s.attempted, [self.RT])
+        self.assertIn("PR #12 [code]: new head aaaaaaa.", buf.getvalue())
+
+    def test_the_reason_line_does_not_invent_a_push_for_a_narrowed_group(self):
+        # The other direction, and the one M5 named: a group narrowed by `owed`
+        # runs sage, which has already read SIG_A, while red_team's stale SIG_B
+        # sits ahead of it in the group. Reading the whole group reports a head
+        # change that did not happen and sends an operator after a phantom push.
+        s = supervisor([])
+        s.sessions[self.RT] = s.sessions[self.SG] = "S1"
+        s.reviewed[self.RT] = self.SIG_B
+        s.reviewed[self.SG] = self.SIG_A
+        s.owed = {self.SG}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            s.run_cycle([self.GROUP], {12: self.SIG_A})
+        self.assertEqual(s.attempted, [self.SG])
+        self.assertNotIn("new head", buf.getvalue())
+
+    def test_a_limit_does_not_owe_the_personas_the_gate_excused(self):
+        # sage's fingerprint is the current one, so the gate withholds it and
+        # only red_team runs; red_team then reports a limit. Owing sage spends
+        # a resumed session on a PR it has nothing new to read, fired exactly
+        # when the provider budget has run out.
+        s = supervisor([limited()])
+        s.sessions[self.RT] = s.sessions[self.SG] = "S1"
+        s.reviewed[self.RT] = self.SIG_B
+        s.reviewed[self.SG] = self.SIG_A
+        with contextlib.redirect_stdout(io.StringIO()):
+            was_limited = s.run_cycle([self.GROUP], {12: self.SIG_A})
+        self.assertTrue(was_limited)
+        self.assertEqual(s.attempted, [self.RT])
+        self.assertEqual(s.owed, {self.RT})
+
+    def test_the_three_strikes_exit_does_not_owe_the_gate_excused_either(self):
+        # The same question, asked at the other exit: a provider outage must
+        # not re-owe a persona that had nothing to review.
+        third = Pair(56, "code", "red_team")
+        fourth = Pair(78, "code", "red_team")
+        groups = [
+            review_loop.Group(56, "code", (third,)),
+            review_loop.Group(78, "code", (fourth,)),
+            self.GROUP,
+        ]
+        s = supervisor([failed(), failed(), failed()])
+        s.sessions[self.RT] = s.sessions[self.SG] = "S1"
+        s.reviewed[self.RT] = self.SIG_B
+        s.reviewed[self.SG] = self.SIG_A
+        with contextlib.redirect_stdout(io.StringIO()):
+            s.run_cycle(groups, {12: self.SIG_A})
+        # red_team ran and failed, so it is not owed -- it had its turn and its
+        # session was dropped. sage never ran, and must not be owed either: the
+        # gate had nothing for it.
+        self.assertEqual(s.attempted, [third, fourth, self.RT])
+        self.assertEqual(s.owed, set())
+
+    def test_a_cut_still_owes_the_pairs_the_pool_never_started(self):
+        # The other half of the fix: a pair the pool refused was selected to
+        # run and was prevented, so it stays owed. Only the gate-excused
+        # sibling drops out.
+        personas = ["red_team", "sage", "sme"]
+        rt = Pair(12, "code", "red_team")
+        sg = Pair(12, "code", "sage")
+        sme = Pair(12, "code", "sme")
+        group = review_loop.Group(12, "code", (rt, sg, sme))
+        s = supervisor(
+            [ok("S9")], max_concurrent=1,
+            personas={"code": personas},
+            persona_prompts={("code", p): p for p in personas},
+        )
+        for pair in (rt, sg, sme):
+            s.sessions[pair] = "S1"
+            s.reviewed[pair] = self.SIG_B
+        s.reviewed[sme] = self.SIG_A  # the gate withholds sme
+
+        real = review_loop.ThreadPoolExecutor
+
+        class Exhausted(real):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._accepted = 0
+
+            def submit(self, *args, **kwargs):
+                if self._accepted >= 1:
+                    raise RuntimeError("can't start new thread")
+                self._accepted += 1
+                return super().submit(*args, **kwargs)
+
+        review_loop.ThreadPoolExecutor = Exhausted
+        self.addCleanup(setattr, review_loop, "ThreadPoolExecutor", real)
+        with contextlib.redirect_stdout(io.StringIO()):
+            s.run_cycle([group], {12: self.SIG_A})
+        self.assertEqual(s.owed, {sg})
+
+    def test_an_owed_group_the_cut_never_reached_stays_owed(self):
+        # self.owed still holds last cycle's debt while new_owed is built, and
+        # pairs_to_run consults it before the gate, so an unchanged PR that was
+        # already owed and was never reached keeps its debt.
+        s = self.reviewed_and_sessioned(supervisor([limited(), limited()]))
+        s.owed = {self.RT}
+        with contextlib.redirect_stdout(io.StringIO()):
+            s.run_cycle(
+                [self.OTHER_GROUP, self.GROUP],
+                {12: self.SIG_A, 34: self.SIG_OTHER},
+            )
+        self.assertEqual(s.owed, {self.OTHER_RT, self.OTHER_SG, self.RT})
+
+
+class AbandonBackoffTest(unittest.TestCase):
+    """A cycle abandoned to repeated failures waits like a limited one.
+
+    The three-strikes exit means the provider looks dead, and every pair it
+    touched had its session dropped, so the retry is a fresh full review rather
+    than a resume. At the 60s poll interval that is five times the cost of the
+    behavior it replaced, on the one path the change gate cannot reach.
+    """
+
+    PAIRS = [Pair(n, "code", "red_team") for n in (12, 13, 14, 15)]
+
+    def test_the_exit_reports_an_unhealthy_cycle(self):
+        s = supervisor([failed(), failed(), failed()])
+        with contextlib.redirect_stdout(io.StringIO()):
+            outcome = s.run_cycle(grouped(*self.PAIRS))
+        self.assertEqual(outcome, review_loop.CYCLE_UNHEALTHY)
+
+    def test_a_limited_cycle_still_reports_a_limit(self):
+        s = supervisor([limited()])
+        with contextlib.redirect_stdout(io.StringIO()):
+            outcome = s.run_cycle(grouped(*self.PAIRS))
+        self.assertEqual(outcome, review_loop.CYCLE_LIMITED)
+
+    def test_a_clean_cycle_reports_nothing(self):
+        s = supervisor([])
+        with contextlib.redirect_stdout(io.StringIO()):
+            outcome = s.run_cycle(grouped(*self.PAIRS))
+        self.assertEqual(outcome, review_loop.CYCLE_OK)
+
+    def test_main_sleeps_the_backoff_after_an_abandoned_cycle(self):
+        slept = self._main_with_failures()
+        self.assertEqual(slept, [900])
+
+    def _main_with_failures(self):
+        original = os.environ.copy()
+        os.environ.clear()
+        os.environ.update(preflight_env(
+            WORK_REPO=scratch_repo(self), REVIEW_MODEL="m", MAX_CYCLES="2",
+            PERSONAS="red_team", PLAN_PERSONAS="red_team",
+            REVIEW_INTERVAL_SECONDS="7", LIMIT_BACKOFF_SECONDS="900",
+            REVIEW_ON_CHANGE="0",
+        ))
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(original)))
+
+        class Recorder(review_loop.Supervisor):
+            def _run_one(inner, pair, prompt, session_id):
+                return failed()
+
+        review_loop.Supervisor, original_sup = Recorder, review_loop.Supervisor
+        self.addCleanup(setattr, review_loop, "Supervisor", original_sup)
+
+        snaps = [gh.PRSnapshot(n, "code", "abc", "") for n in (12, 13, 14, 15)]
+        original_enum = review_loop.gh.enumerate_candidate_prs
+        review_loop.gh.enumerate_candidate_prs = lambda *a, **k: list(snaps)
+        self.addCleanup(setattr, review_loop.gh, "enumerate_candidate_prs", original_enum)
+
+        original_run = review_loop.subprocess.run
+        review_loop.subprocess.run = lambda *a, **k: subprocess.CompletedProcess(a[0], 0, "", "")
+        self.addCleanup(setattr, review_loop.subprocess, "run", original_run)
+
+        slept = []
+        original_sleep = review_loop.time.sleep
+        review_loop.time.sleep = lambda n: slept.append(n)
+        self.addCleanup(setattr, review_loop.time, "sleep", original_sleep)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            review_loop.main([])
+        return slept
+
+
+class OutageRecoveryTest(unittest.TestCase):
+    """The whole degraded-fingerprint story, end to end through main().
+
+    Stage two goes down, stays down for a second poll, and then answers again.
+    The PR is reviewed exactly once while it is down -- the degraded
+    fingerprint keys on updatedAt, and Tracker caches the failure against the
+    same value, so the second poll asks nothing and reviews nothing. Recovery
+    arrives with the next updatedAt change, which is the only thing that
+    retries the lookup, and a real fingerprint can never equal a fabricated
+    one, so the PR is reviewed once more and then goes quiet again.
+    """
+
+    def _stamp(self, age):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - age))
+
+    def _run(self, snapshot_per_cycle, signal_per_cycle):
+        original = os.environ.copy()
+        os.environ.clear()
+        os.environ.update(preflight_env(
+            WORK_REPO=scratch_repo(self), REVIEW_MODEL="m",
+            MAX_CYCLES=str(len(snapshot_per_cycle)),
+            PERSONAS="red_team", PLAN_PERSONAS="red_team",
+            REVIEW_INTERVAL_SECONDS="0",
+        ))
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(original)))
+
+        reviewed = []
+
+        class Recorder(review_loop.Supervisor):
+            def _run_one(inner, pair, prompt, session_id):
+                reviewed.append(pair.pr)
+                return ok()
+
+        review_loop.Supervisor, original_sup = Recorder, review_loop.Supervisor
+        self.addCleanup(setattr, review_loop, "Supervisor", original_sup)
+
+        counter = {"n": 0}
+
+        def enumerate_prs(*a, **k):
+            counter["n"] += 1
+            return [snapshot_per_cycle[counter["n"] - 1]]
+
+        original_enum = review_loop.gh.enumerate_candidate_prs
+        review_loop.gh.enumerate_candidate_prs = enumerate_prs
+        self.addCleanup(setattr, review_loop.gh, "enumerate_candidate_prs", original_enum)
+
+        original_signal = review_loop.gh.pr_signal
+        review_loop.gh.pr_signal = lambda s, env, **kw: signal_per_cycle(counter["n"], s)
+        self.addCleanup(setattr, review_loop.gh, "pr_signal", original_signal)
+
+        original_run = review_loop.subprocess.run
+        review_loop.subprocess.run = lambda *a, **k: subprocess.CompletedProcess(a[0], 0, "", "")
+        self.addCleanup(setattr, review_loop.subprocess, "run", original_run)
+
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            review_loop.main([])
+        return reviewed, out.getvalue()
+
+    def test_an_outage_reviews_once_and_recovery_reviews_once_more(self):
+        down = gh.PRSnapshot(12, "code", "abc", self._stamp(3600))
+        # The comment claudebox posted on the first poll is itself an updatedAt
+        # change, which is what retries the lookup once the outage lifts.
+        up = gh.PRSnapshot(12, "code", "abc", self._stamp(600))
+        snapshots = [down, down, up, up]
+
+        def signal_per_cycle(n, snap):
+            if n <= 2:
+                return None
+            return signals.Signal(head_oid=snap.head_oid, mode=snap.mode,
+                                  newest_human="2026-08-30T00:00:00Z")
+
+        reviewed, log = self._run(snapshots, signal_per_cycle)
+        self.assertEqual(reviewed, [12, 12])
+        self.assertIn("gating it on updatedAt until the lookup recovers", log)
+        self.assertIn("stage-two lookup recovered", log)
+        self.assertIn("Unchanged since their last review: #12", log)
 
 
 if __name__ == "__main__":

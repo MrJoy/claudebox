@@ -44,11 +44,31 @@ BIN="$WORK/bin"; mkdir -p "$BIN"
 
 # gh answers PR label queries (mode routing reads them) and otherwise only needs
 # to succeed. Every case here leaves its PR unlabeled, so every case is code mode.
+# The change gate adds a second question: stage one now also asks for the head
+# commit and the last-updated stamp, and a PR whose stamp moved gets a stage-two
+# lookup for its comments. This suite runs one cycle, so every PR is a first
+# sighting and the gate is open regardless of what stage two answers -- deleting
+# this stub's `api` arm still leaves all 75 cases green. It exists so the call
+# has somewhere to land, not to prove its answer is read correctly; that
+# coverage is test-personas.sh's "gate: a PR that has not moved is reviewed
+# once, not again" (around line 1142), which runs a second cycle against a
+# frozen PR and can tell a real stage-two failure from one the gate never
+# reached.
 cat >"$BIN/gh" <<'STUB'
 #!/bin/sh
+# Stage two's inline-comment call. First, so it cannot fall through below.
+if [ "$1" = "api" ]; then printf '[]\n'; exit 0; fi
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   n="$3"
-  printf '{"number":%s,"labels":[]}\n' "$n"
+  # Stage two asks for comments and reviews; stage one asks for labels and the
+  # head. Dispatch on the --json field list, which is the last argument.
+  for a in "$@"; do last="$a"; done
+  case "$last" in
+    *comments*) printf '{"comments":[],"reviews":[]}\n'; exit 0 ;;
+  esac
+  # The fixed 2020 stamp is deliberate: it is far older than any settle window,
+  # so no case here ever waits for a change to settle.
+  printf '{"number":%s,"labels":[],"headRefOid":"abc123","updatedAt":"2020-01-01T00:00:00Z"}\n' "$n"
   exit 0
 fi
 # `gh repo clone REPO DEST` is the seed-less fallback; like git clone above it
