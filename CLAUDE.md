@@ -120,6 +120,54 @@ A pair the pool refuses is neither a success nor a failure. `ThreadPoolExecutor.
 
 **A pass that fails to spawn is one of those failures, not a crash.** `subprocess.Popen` raises `OSError` for `EAGAIN` against `--pids-limit 512`, `ENOMEM` against `--memory 4g`, and a `claude` that is not on `PATH`; the shell read `PIPESTATUS[0]` and saw a non-zero rc for all three, so `Supervisor._run_one` catches `OSError` and returns an ordinary failed `PassResult`. Unguarded it exits PID 1, and the session map, the pass counts and the cut-and-owed bookkeeping live only in memory, so the restart makes every pair start a fresh session and re-post findings it already posted — where the shell's cost was one dropped session. `git fetch` in the cycle and the `gh` calls behind `enumerate_candidate_prs` carry the same guard, standing in for the `|| true` / `|| log WARN` they were ported from; a failed enumeration degrades to an empty candidate list, which the cycle already handles.
 
+### Priced findings, the round ladder, and phases
+
+A code-mode finding has a price the persona pays before it posts, and the
+price lives in `personas/code/_shared.md` rather than in a task-prompt
+stanza. The contract rides in `--append-system-prompt` on every pass, so it
+reaches an operator who overrode `REVIEW_PROMPT` and survives `--resume`,
+which a stanza on the defaults would do neither of. Four rules: demonstrate
+the defect against this diff, try to refute it and say what was tried, tag
+the comment `blocking`/`should-fix`/`nit` with nits never posted, and a
+named list of non-findings (defences against callers or changes that do
+not exist, speculative abstractions, style). Sage's own "if it exists for
+a hypothetical future, it's a finding" is the same failure seen from the
+other side: Sage flags over-guarding code, the contract stops reviewers
+demanding it. Plan mode has none of this; its contract already says a gap
+in code the plan has not written is not a finding.
+
+`Supervisor.rounds` counts completed passes per pair, whatever session
+they ran in, and `prompts.round_stanza(mode, round)` turns it into a line
+`Supervisor.system_prompt_for` appends after the persona on every
+invocation. Round 1 is the whole PR at a `should-fix` floor, round 2 is
+the commits since the persona's last review at the same floor, round 3
+and later are `blocking` only with the PR presumed sound. "Since your last
+review" is a procedure the persona runs from its own signed comments and
+`gh pr view --json commits`, not a head the loop hands over, so a fresh
+session at round 3 follows the same procedure as a resumed one and the
+gate can be off. The counter is not touched by `_record_failure`, by
+`MAX_PASSES_PER_SESSION` rotation, or by a limit, and it is in memory for
+the same reason `reviewed` is. The rungs are constants; an operator who
+wants a different ladder overrides the prompts. Plan mode's round line is
+the empty string, so its system prompt is byte-identical to before.
+
+Sage has a second job in the code tree: read sibling comments posted
+since the head commit and rebut one that asks for a defence against a
+change nobody has made. It cannot read what has not been posted, and a
+sibling's signed comment deliberately does not re-trigger the gate, so a
+persona has a **phase** from a `phase:` frontmatter key (1 default, 2 the
+only other value, anything else a startup `ConfigError`). `run_group`
+runs each phase under its own pool and waits between them; it is still
+one group with one cut and one debt, and `run_cycle`'s evaluation at the
+barrier is untouched. A usage limit in phase 1 withholds phase 2, whose
+pairs then have no result and are owed exactly as a pool refusal's are;
+a sibling that limits on every attempt therefore keeps Sage withheld
+until the limit clears, which is the right order of priorities when the
+provider is refusing work. `MAX_CONCURRENT_PASSES=1` is still one code
+path: one worker per phase, Sage last. The selector's order still decides
+the log line and the pair list; phase decides run order only, which is
+why `test-personas.sh`'s default-set peak is three in flight, not four.
+
 ### Change-driven re-review
 
 A cycle used to walk every candidate PR and review it, whether or not anything
@@ -375,3 +423,10 @@ All config is via environment variables (`.env.example` documents them). Always 
 - `test-personas.sh`'s `gh` stub advances `headRefOid` between its two cycles on
   purpose. Freeze it and the suite's central assertion, that a resumed pass
   still carries its persona, silently stops being reached.
+- `personas/code/sage.md` carries `phase: 2`, and `tools/import-advocate-personas.py`
+  writes only `label:` and `success:`. A re-run drops the key and demotes Sage
+  to phase 1 with no error anywhere; `tests/test_personas.py`'s shipped-phases
+  test is what fails instead. Keep the key when reviewing an importer diff.
+- The round line goes in the system prompt beside the persona, never in the
+  task prompt, and for the same reasons: `--append-system-prompt` is re-passed
+  on `--resume`, and an operator override must not be edited.

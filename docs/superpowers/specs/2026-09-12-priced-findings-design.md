@@ -1,7 +1,7 @@
 # Priced findings
 
 Date: 2026-09-12
-Status: approved, ready for an implementation plan
+Status: implemented on feat/change-driven-review
 
 ## Problem
 
