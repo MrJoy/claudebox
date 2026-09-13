@@ -406,6 +406,14 @@ class Supervisor:
 
         self.sessions: Dict[Pair, str] = {}
         self.passes_done: Dict[Pair, int] = {}
+        # Completed passes per pair, whatever session they ran in. Drives the
+        # round ladder in the system prompt. Not reset by rotation or by a
+        # failed pass: those are about the session, the round is about the
+        # PR's history with this persona. In memory for the same reason
+        # `reviewed` is -- a persisted round beside an unpersisted session map
+        # would tell a session that has never read the PR that the PR has
+        # survived three of its reviews.
+        self.rounds: Dict[Pair, int] = {}
         # Pairs the last cycle owed but did not run: the personas a limit cut,
         # plus everything in the groups it never reached. Normally empty.
         # Without it, a limit that allows only a few passes per backoff window
@@ -504,7 +512,7 @@ class Supervisor:
                 pair=pair,
                 prompt=prompt,
                 session_id=session_id,
-                persona_prompt=self.persona_prompts[(pair.mode, pair.persona)],
+                persona_prompt=self.system_prompt_for(pair),
                 model=self.model,
                 mcp_args=self.mcp_args,
                 cwd=self.cwd,
@@ -518,6 +526,20 @@ class Supervisor:
             # makes every pair re-post findings it already posted.
             log(f"WARN: could not run claude: {exc}", pair=pair)
             return passes.PassResult(rc=1, session_id=session_id, limited=False, limit_line="")
+
+    def round_for(self, pair: Pair) -> int:
+        """The round the pair's next pass runs at."""
+        return self.rounds.get(pair, 0) + 1
+
+    def system_prompt_for(self, pair: Pair) -> str:
+        """Persona, then the round line. Composed per pass, since the round moves.
+
+        This is the whole --append-system-prompt value. The task prompt is
+        not touched, which keeps the verbatim-operator-prompt guarantee.
+        """
+        base = self.persona_prompts[(pair.mode, pair.persona)]
+        line = prompts_mod.round_stanza(pair.mode, self.round_for(pair))
+        return f"{base}\n{line}" if line else base
 
     def pairs_to_run(
         self, group: Group, signal: Optional["signals_mod.Signal"] = None
@@ -767,8 +789,9 @@ class Supervisor:
         if result.session_id:
             self.sessions[pair] = result.session_id
         self.passes_done[pair] = self.passes_done.get(pair, 0) + 1
+        self.rounds[pair] = self.rounds.get(pair, 0) + 1
         log(f"review complete (session {self.sessions.get(pair)}, "
-            f"pass {self.passes_done[pair]}).", pair=pair)
+            f"pass {self.passes_done[pair]}, round {self.rounds[pair]}).", pair=pair)
         if (
             self.max_passes_per_session > 0
             and self.passes_done[pair] >= self.max_passes_per_session

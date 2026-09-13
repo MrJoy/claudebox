@@ -2455,3 +2455,106 @@ class OutageRecoveryTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RoundsTest(unittest.TestCase):
+    """A round is a completed pass. Nothing about the session moves it."""
+
+    RT = Pair(12, "code", "red_team")
+
+    def cycle(self, s):
+        with contextlib.redirect_stdout(io.StringIO()):
+            s.run_cycle(s.build_groups([(12, "code")]))
+
+    def test_first_pass_is_round_one(self):
+        s = supervisor([], personas={"code": ["red_team"]})
+        self.assertEqual(s.round_for(self.RT), 1)
+
+    def test_success_advances_the_round(self):
+        s = supervisor([ok("S1"), ok("S1")], personas={"code": ["red_team"]})
+        self.cycle(s)
+        self.assertEqual(s.round_for(self.RT), 2)
+        self.cycle(s)
+        self.assertEqual(s.round_for(self.RT), 3)
+
+    def test_failure_does_not_advance_the_round(self):
+        s = supervisor([ok("S1"), failed()], personas={"code": ["red_team"]})
+        self.cycle(s)
+        self.cycle(s)
+        self.assertEqual(s.round_for(self.RT), 2)
+        self.assertNotIn(self.RT, s.sessions)
+
+    def test_limit_does_not_advance_the_round(self):
+        s = supervisor([ok("S1"), limited("S1")], personas={"code": ["red_team"]})
+        self.cycle(s)
+        self.cycle(s)
+        self.assertEqual(s.round_for(self.RT), 2)
+
+    def test_rotation_keeps_the_round(self):
+        # MAX_PASSES_PER_SESSION=1 drops the session after every pass, and
+        # passes_done goes back to 0. The round is about the PR's history with
+        # this persona, not about the session, so it keeps counting.
+        s = supervisor([ok("S1"), ok("S2")], personas={"code": ["red_team"]},
+                       max_passes_per_session=1)
+        self.cycle(s)
+        self.assertEqual(s.passes_done[self.RT], 0)
+        self.assertEqual(s.round_for(self.RT), 2)
+        self.cycle(s)
+        self.assertEqual(s.round_for(self.RT), 3)
+
+    def test_the_log_line_names_the_round(self):
+        s = supervisor([ok("S1")], personas={"code": ["red_team"]})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            s.run_cycle(s.build_groups([(12, "code")]))
+        self.assertIn("review complete (session S1, pass 1, round 1).", buf.getvalue())
+
+
+class SystemPromptTest(unittest.TestCase):
+    """The round line rides beside the persona, in the system prompt."""
+
+    def test_round_line_follows_the_persona(self):
+        s = supervisor([], personas={"code": ["red_team"]})
+        got = s.system_prompt_for(Pair(12, "code", "red_team"))
+        self.assertTrue(got.startswith("rt\n"))
+        self.assertIn("This is round 1 of your review", got)
+
+    def test_round_two_after_one_success(self):
+        s = supervisor([ok("S1")], personas={"code": ["red_team"]})
+        with contextlib.redirect_stdout(io.StringIO()):
+            s.run_cycle(s.build_groups([(12, "code")]))
+        self.assertIn("This is round 2 of your review",
+                      s.system_prompt_for(Pair(12, "code", "red_team")))
+
+    def test_plan_mode_is_the_bare_persona(self):
+        s = supervisor([], personas={"plan": ["red_team"]})
+        self.assertEqual(s.system_prompt_for(Pair(12, "plan", "red_team")), "rt")
+
+    def test_run_one_hands_the_composed_prompt_to_run_pass(self):
+        # Through the real _run_one, with run_pass stubbed at the seam, so this
+        # proves the composition reaches the claude invocation rather than
+        # only existing as a method.
+        seen = {}
+
+        def fake_run_pass(**kw):
+            seen.update(kw)
+            return ok("S1")
+
+        s = review_loop.Supervisor(
+            personas={"code": ["red_team"]},
+            persona_prompts={("code", "red_team"): "rt"},
+            review_prompts={"code": "review #{{PR}}"},
+            followup_prompts={"code": "recheck #{{PR}}"},
+            model="m", mcp_args=[], cwd=".", max_passes_per_session=0, max_concurrent=1,
+        )
+        s.rounds[Pair(12, "code", "red_team")] = 2
+        original = review_loop.passes.run_pass
+        review_loop.passes.run_pass = fake_run_pass
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                s._run_one(Pair(12, "code", "red_team"), "recheck #12", "S1")
+        finally:
+            review_loop.passes.run_pass = original
+        self.assertIn("This is round 3 of your review", seen["persona_prompt"])
+        self.assertTrue(seen["persona_prompt"].startswith("rt\n"))
+        self.assertEqual(seen["prompt"], "recheck #12")
