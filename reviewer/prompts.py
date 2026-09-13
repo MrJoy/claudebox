@@ -85,6 +85,53 @@ WORKTREE_STANZA = (
 )
 
 
+# The round ladder. A round is one completed pass of one (pr, mode, persona)
+# pair, whatever session it ran in, so it survives rotation and failure. The
+# rungs are constants rather than an env var: an operator who wants a different
+# ladder overrides the prompts and writes their own. The line goes in the
+# SYSTEM prompt beside the persona, for the same two reasons the persona does:
+# it must be re-passed on --resume, and it must reach an operator override
+# without editing it. Plan mode has no ladder; its personas review a document,
+# and the failure modes the ladder exists for are code-shaped.
+_ROUND_DELTA = (
+    "Read closely only the commits since your last review: find your own most "
+    "recent comment on this pull request, the newest one signed with your label, "
+    "and read the commits `gh pr view` lists with a date after it. If you have no "
+    "earlier comment, read the whole change."
+)
+
+_ROUND_FIRST = (
+    "This is round 1 of your review of this pull request. Review the whole change. "
+    "Post nothing tagged below `should-fix`."
+)
+
+_ROUND_SECOND = (
+    "This is round 2 of your review of this pull request. " + _ROUND_DELTA
+    + " Post nothing tagged below `should-fix`."
+)
+
+_ROUND_LATER = (
+    "This is round {n} of your review of this pull request, which has already "
+    "survived {k} rounds of it. " + _ROUND_DELTA + " Post only `blocking` findings: "
+    "a `should-fix` in the new commits is not posted this round. Presume that what "
+    "you have already reviewed is sound. Finding nothing new is the expected "
+    "outcome, and saying so is the right report."
+)
+
+
+def round_stanza(mode: str, round: int) -> str:
+    """The round line for the system prompt, or "" for a mode with no ladder."""
+    if round < 1:
+        raise ValueError(f"round must be >= 1, got {round}")
+    if mode != "code":
+        return ""
+    if round == 1:
+        return _ROUND_FIRST
+    if round == 2:
+        return _ROUND_SECOND
+    return _ROUND_LATER.format(n=round, k=round - 1)
+
+
 @dataclass(frozen=True)
 class Prompts:
     review: Dict[str, str]
