@@ -76,6 +76,26 @@ class ShippedPersonasTest(unittest.TestCase):
         self.assertIn("another engineer might make", code)
         self.assertIn("does not exist in the repository", code)
 
+    def test_shipped_phases(self):
+        # tools/import-advocate-personas.py writes label and success and a body,
+        # and nothing else. A re-run drops `phase: 2` from code/sage.md, which
+        # would silently demote Sage to phase 1 and disarm its rebuttal with no
+        # error anywhere. This is the check that turns that into a failed
+        # suite rather than a quiet regression.
+        code = {p.id: p.phase for p in personas.resolve("code", SHIPPED, {"PERSONAS": "all"})}
+        plan = {p.id: p.phase for p in personas.resolve("plan", SHIPPED, {"PLAN_PERSONAS": "all"})}
+        self.assertEqual(code["sage"], 2)
+        self.assertEqual({k: v for k, v in code.items() if k != "sage"},
+                         {k: 1 for k in code if k != "sage"})
+        self.assertEqual(plan, {k: 1 for k in plan})
+
+    def test_sage_code_body_carries_the_rebuttal_mandate(self):
+        sage = personas.resolve("code", SHIPPED, {"PERSONAS": "sage"})[0].prompt
+        self.assertIn("## Your second job", sage)
+        self.assertIn("-claudebox (", sage)
+        plan_sage = personas.resolve("plan", SHIPPED, {"PLAN_PERSONAS": "sage"})[0].prompt
+        self.assertNotIn("## Your second job", plan_sage)
+
     def test_unterminated_frontmatter_yields_no_body(self):
         # What the awk it replaced did: it never set body without a closing
         # ---. Returning the rest of the file instead would ship the frontmatter
