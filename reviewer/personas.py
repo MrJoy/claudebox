@@ -39,11 +39,20 @@ RESERVED = frozenset({"aggregate"})
 _LABEL_OK = re.compile(r"^[A-Za-z0-9 ._-]+$")
 
 
+# A persona's phase within its PR's group. Phase 1 runs together behind the
+# group's barrier; phase 2 runs after every phase-1 pass has finished, which is
+# what lets a persona read what its siblings posted THIS round. Sage's code-tree
+# body is the one that sets it. Only 1 and 2 exist, and there is deliberately
+# no third: a phase is a barrier the whole PR waits on.
+PHASES = (1, 2)
+
+
 @dataclass(frozen=True)
 class Persona:
     id: str
     label: str
     prompt: str
+    phase: int = 1
 
 
 def _split_frontmatter(text: str) -> Tuple[Dict[str, str], str]:
@@ -154,7 +163,18 @@ def resolve(mode: str, persona_dir: str, env: Mapping[str, str]) -> List[Persona
         if not body.strip():
             raise ConfigError(f"persona '{mode}/{pid}' has an empty prompt body.")
 
+        raw_phase = meta.get("phase", "1").strip()
+        try:
+            phase = int(raw_phase)
+        except ValueError:
+            phase = 0
+        if phase not in PHASES:
+            raise ConfigError(
+                f"persona '{mode}/{pid}' has phase: '{raw_phase}'; "
+                f"expected one of {', '.join(str(p) for p in PHASES)}."
+            )
+
         prompt = (body + "\n" + shared).replace("{{PERSONA}}", label)
-        out.append(Persona(id=pid, label=label, prompt=prompt))
+        out.append(Persona(id=pid, label=label, prompt=prompt, phase=phase))
 
     return out

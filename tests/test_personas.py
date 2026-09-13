@@ -30,8 +30,11 @@ class TreeBuilder:
             write(os.path.join(self.root, mode, "_shared.md"), shared)
         return self
 
-    def persona(self, mode, pid, label="Red Team", body="Attack the change."):
-        fm = f"---\nlabel: {label}\nsuccess: Finds real holes.\n---\n"
+    def persona(self, mode, pid, label="Red Team", body="Attack the change.", phase=None):
+        fm = f"---\nlabel: {label}\nsuccess: Finds real holes.\n"
+        if phase is not None:
+            fm += f"phase: {phase}\n"
+        fm += "---\n"
         write(os.path.join(self.root, mode, f"{pid}.md"), fm + body)
         return self
 
@@ -206,3 +209,31 @@ class RefusalTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PhaseTest(unittest.TestCase):
+    """A persona's phase decides whether it runs with its siblings or after them."""
+
+    def setUp(self):
+        self.b = TreeBuilder().tree("code")
+        self.addCleanup(self.b.cleanup)
+
+    def resolve(self, env):
+        return personas.resolve("code", self.b.root, env)
+
+    def test_absent_is_phase_one(self):
+        self.b.persona("code", "rt")
+        self.assertEqual(self.resolve({"PERSONAS": "rt"})[0].phase, 1)
+
+    def test_two_is_accepted(self):
+        self.b.persona("code", "sg", label="Sage", phase="2")
+        self.assertEqual(self.resolve({"PERSONAS": "sg"})[0].phase, 2)
+
+    def test_other_values_are_refused_naming_the_file(self):
+        for bad in ("3", "0", "two", ""):
+            with self.subTest(bad=bad):
+                self.b.persona("code", "sg", label="Sage", phase=bad)
+                with self.assertRaises(ConfigError) as cm:
+                    self.resolve({"PERSONAS": "sg"})
+                self.assertIn("code/sg", str(cm.exception))
+                self.assertIn("phase", str(cm.exception))
