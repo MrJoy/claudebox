@@ -393,6 +393,7 @@ class Supervisor:
         cwd: str,
         max_passes_per_session: int,
         max_concurrent: int = 0,
+        persona_phases: Optional[Dict[Tuple[str, str], int]] = None,
     ):
         self.personas = personas
         self.persona_prompts = persona_prompts
@@ -403,6 +404,10 @@ class Supervisor:
         self.cwd = cwd
         self.max_passes_per_session = max_passes_per_session
         self.max_concurrent = max_concurrent
+        # (mode, persona) -> 1 or 2. Absent means 1. Phase 2 runs after every
+        # phase-1 pass in the group has finished, which is what lets Sage read
+        # what its siblings posted this round.
+        self.persona_phases: Dict[Tuple[str, str], int] = dict(persona_phases or {})
 
         self.sessions: Dict[Pair, str] = {}
         self.passes_done: Dict[Pair, int] = {}
@@ -449,20 +454,51 @@ class Supervisor:
             return max(1, min(self.max_concurrent, len(to_run)))
         return max(1, len(to_run))
 
-    def run_group(self, group: Group, to_run: Sequence[Pair]) -> Dict[Pair, "passes.PassResult"]:
-        """Run to_run concurrently and wait for all of them.
+    def phase_of(self, pair: Pair) -> int:
+        return self.persona_phases.get((pair.mode, pair.persona), 1)
 
-        Nothing is killed. A limit reported by one persona leaves its siblings
-        running, because a killed pass may have posted some findings and not
-        others, and its session-id recovery is unreliable.
+    def run_group(self, group: Group, to_run: Sequence[Pair]) -> Dict[Pair, "passes.PassResult"]:
+        """Run to_run in phases, each phase concurrent, and wait for all of them.
+
+        Still one group: one result dict, one cut, one debt, and the limit and
+        failure evaluation happens once in run_cycle after every phase. A
+        phase is a barrier the whole PR waits on, so phase 2 sees what phase 1
+        posted. Nothing is killed. A limit reported by one persona leaves its
+        in-flight siblings running, because a killed pass may have posted some
+        findings and not others, and its session-id recovery is unreliable.
+
+        A limit in phase 1 keeps phase 2 from starting: the provider has just
+        refused this PR's siblings, and the rebuttal pass exists to read
+        findings that were never posted. The unstarted pairs have no result,
+        which is the state a pool refusal leaves a pair in, and run_cycle owes
+        them the same way.
         """
         results: Dict[Pair, passes.PassResult] = {}
         if not to_run:
             return results
 
-        with ThreadPoolExecutor(max_workers=self.workers_for(group, to_run)) as pool:
+        for phase in sorted({self.phase_of(p) for p in to_run}):
+            batch = [p for p in to_run if self.phase_of(p) == phase]
+            if results and any(r.limited for r in results.values()):
+                log(f"phase {phase} of PR #{group.pr} [{group.mode}] not started: an "
+                    "earlier phase hit a limit; leaving it for the next cycle.")
+                break
+            if not self._run_phase(group, batch, results):
+                break
+        return results
+
+    def _run_phase(
+        self, group: Group, batch: Sequence[Pair], results: Dict[Pair, "passes.PassResult"]
+    ) -> bool:
+        """One phase under its own pool. False when the pool refused a pass.
+
+        A refusal stops every later phase too: the next submit would hit the
+        same wall, and a pass that did not run is owed, not failed.
+        """
+        submitted_all = True
+        with ThreadPoolExecutor(max_workers=self.workers_for(group, batch)) as pool:
             futures: Dict[Future, Pair] = {}
-            for pair in to_run:
+            for pair in batch:
                 try:
                     futures[pool.submit(self._dispatch, pair)] = pair
                 except RuntimeError as exc:
@@ -472,14 +508,15 @@ class Supervisor:
                     # would discard the results the pool already holds, and
                     # those passes have posted their comments. Stop submitting
                     # instead: the caller sees a pair with no result and owes it
-                    # to the next cycle. The rest of to_run goes unsubmitted
+                    # to the next cycle. The rest of the batch goes unsubmitted
                     # because the next submit would hit the same wall.
                     log(f"WARN: could not start a worker for {pair} ({exc}); "
                         "leaving it and the rest of its group for the next cycle.")
+                    submitted_all = False
                     break
             for future, pair in futures.items():
                 results[pair] = future.result()
-        return results
+        return submitted_all
 
     def _dispatch(self, pair: Pair) -> "passes.PassResult":
         """One pass, chosen prompt and all, on a worker thread.

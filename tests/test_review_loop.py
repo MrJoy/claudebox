@@ -2558,3 +2558,120 @@ class SystemPromptTest(unittest.TestCase):
         self.assertIn("This is round 3 of your review", seen["persona_prompt"])
         self.assertTrue(seen["persona_prompt"].startswith("rt\n"))
         self.assertEqual(seen["prompt"], "recheck #12")
+
+
+FOUR = ("red_team", "adversarial", "sme", "sage")
+
+
+def phased(results, cap, **kwargs):
+    """Four code personas, Sage in phase 2."""
+    defaults = dict(
+        personas={"code": list(FOUR)},
+        persona_prompts={("code", p): p for p in FOUR},
+        persona_phases={("code", "sage"): 2},
+        max_concurrent=cap,
+    )
+    defaults.update(kwargs)
+    return supervisor(results, **defaults)
+
+
+class PhaseTest(unittest.TestCase):
+    """Phase 1 finishes before phase 2 starts, at every cap."""
+
+    def _ordering(self, cap):
+        lock = threading.Lock()
+        started, finished = [], set()
+        violations = []
+
+        class Recorder(FakeSupervisor):
+            def _run_one(self, pair, prompt, session_id):
+                with lock:
+                    started.append(pair.persona)
+                    if pair.persona == "sage" and finished != set(FOUR) - {"sage"}:
+                        violations.append(sorted(finished))
+                time.sleep(0.01)
+                with lock:
+                    finished.add(pair.persona)
+                return ok("S1")
+
+        s = phased([], cap)
+        s.__class__ = Recorder
+        group = s.build_groups([(12, "code")])[0]
+        with contextlib.redirect_stdout(io.StringIO()):
+            results = s.run_group(group, list(group.pairs))
+        self.assertEqual(violations, [])
+        self.assertEqual(started[-1], "sage")
+        self.assertEqual(set(results), set(group.pairs))
+
+    def test_unlimited(self):
+        self._ordering(0)
+
+    def test_cap_of_one(self):
+        self._ordering(1)
+
+    def test_cap_of_two(self):
+        self._ordering(2)
+
+    def test_phase_of_defaults_to_one(self):
+        s = supervisor([])
+        self.assertEqual(s.phase_of(Pair(12, "code", "red_team")), 1)
+        self.assertEqual(s.phase_of(Pair(12, "code", "sage")), 1)
+
+    def test_phase_one_still_runs_concurrently(self):
+        # Three phase-1 personas cross a barrier of three: the first phase is
+        # the same pool it was before phases existed.
+        barrier = threading.Barrier(3, timeout=2)
+
+        class Concurrent(FakeSupervisor):
+            def _run_one(self, pair, prompt, session_id):
+                if pair.persona != "sage":
+                    barrier.wait()
+                return ok("S1")
+
+        s = phased([], 0)
+        s.__class__ = Concurrent
+        group = s.build_groups([(12, "code")])[0]
+        with contextlib.redirect_stdout(io.StringIO()):
+            results = s.run_group(group, list(group.pairs))
+        self.assertEqual([r.rc for r in results.values()], [0, 0, 0, 0])
+
+    def test_a_phase_one_limit_leaves_phase_two_unstarted_and_owed(self):
+        s = phased([limited("S1"), ok("S2"), ok("S3")], 1)
+        s.sessions[Pair(12, "code", "sage")] = "S8"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            outcome = s.run_cycle(s.build_groups([(12, "code")]))
+        self.assertEqual(outcome, review_loop.CYCLE_LIMITED)
+        self.assertNotIn("sage", [p.persona for p in s.attempted])
+        self.assertIn(Pair(12, "code", "sage"), s.owed)
+        self.assertEqual(s.sessions[Pair(12, "code", "sage")], "S8")
+        self.assertIn("phase 2", buf.getvalue())
+
+    def test_a_phase_one_failure_does_not_skip_phase_two(self):
+        # Only a limit withholds phase 2. An ordinary failure is one persona's
+        # problem, and Sage may still have siblings' comments to read.
+        s = phased([failed(), ok("S2"), ok("S3"), ok("S4")], 1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            s.run_cycle(s.build_groups([(12, "code")]))
+        self.assertIn("sage", [p.persona for p in s.attempted])
+
+    def test_phase_two_alone(self):
+        s = phased([ok("S1")], 1)
+        group = s.build_groups([(12, "code")])[0]
+        with contextlib.redirect_stdout(io.StringIO()):
+            results = s.run_group(group, [Pair(12, "code", "sage")])
+        self.assertEqual(list(results), [Pair(12, "code", "sage")])
+
+    def test_phase_one_alone(self):
+        s = phased([ok("S1")], 1)
+        group = s.build_groups([(12, "code")])[0]
+        with contextlib.redirect_stdout(io.StringIO()):
+            results = s.run_group(group, [Pair(12, "code", "red_team")])
+        self.assertEqual(list(results), [Pair(12, "code", "red_team")])
+
+    def test_workers_are_sized_per_phase(self):
+        s = phased([], 0)
+        group = s.build_groups([(12, "code")])[0]
+        phase_one = [p for p in group.pairs if p.persona != "sage"]
+        self.assertEqual(s.workers_for(group, phase_one), 3)
+        self.assertEqual(s.workers_for(group, [Pair(12, "code", "sage")]), 1)
