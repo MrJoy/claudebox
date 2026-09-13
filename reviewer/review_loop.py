@@ -975,6 +975,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cwd=work_repo,
         max_passes_per_session=max_passes,
         max_concurrent=max_concurrent,
+        persona_phases={(m, p.id): p.phase for m, ps in resolved.items() for p in ps},
     )
     tracker = signals_mod.Tracker()
 
