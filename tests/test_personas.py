@@ -59,6 +59,20 @@ class ShippedPersonasTest(unittest.TestCase):
         got = personas.resolve("code", SHIPPED, {"PERSONAS": "red_team"})
         self.assertNotIn("success:", got[0].prompt)
 
+    def test_the_code_contract_prices_a_finding(self):
+        # The price rides in the system prompt of every code pass. The plan
+        # tree does not carry it: a plan has no diff to demonstrate against.
+        code = personas.resolve("code", SHIPPED, {"PERSONAS": "red_team"})[0].prompt
+        plan = personas.resolve("plan", SHIPPED, {"PLAN_PERSONAS": "red_team"})[0].prompt
+        for needle in ("## What a finding costs", "`blocking`", "`should-fix`", "`nit`"):
+            self.assertIn(needle, code)
+            self.assertNotIn(needle, plan)
+
+    def test_the_code_contract_names_the_speculative_non_findings(self):
+        code = personas.resolve("code", SHIPPED, {"PERSONAS": "red_team"})[0].prompt
+        self.assertIn("another engineer might make", code)
+        self.assertIn("does not exist in the repository", code)
+
     def test_unterminated_frontmatter_yields_no_body(self):
         # What the awk it replaced did: it never set body without a closing
         # ---. Returning the rest of the file instead would ship the frontmatter
