@@ -424,6 +424,8 @@ Set **exactly one** of these (or pass the matching launcher flag). Zero or more 
 | `PR_SEARCH=is:open label:x` | `--search "…"` | PRs matching a gh search query (you control state) |
 | `PR_NEW=1` | `--new` | open PRs created after this container started (cutoff captured once at startup, reset on restart) |
 
+> **`PR_SEARCH` and `PR_NEW` need a token that can search.** Both are backed by GitHub's issue/PR search, which returns nothing for a fine-grained PAT — so on a privilege-minimized token they silently find no PRs. `PR_ALL`, `PR_ASSIGNEE`, and `PR_IDS` avoid search (`PR_ASSIGNEE` lists open PRs and matches the login itself), so they work with a PR-read-only token. Use a classic PAT with `repo` scope if you need the search-backed selectors.
+
 All eight prompt variables use a `{{PR}}` token (substituted with the PR number), and `MAX_PASSES_PER_SESSION` applies per (PR, mode, persona) pair.
 
 ### Personas

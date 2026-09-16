@@ -281,11 +281,48 @@ class EnumerateTest(unittest.TestCase):
             gh.enumerate_candidate_prs("ids", dict(self.ENV, PR_IDS="12"), run=run), []
         )
 
-    def test_assignee_selector_passes_the_assignee(self):
-        run = runner(Result(0, "[]"))
-        gh.enumerate_candidate_prs("assignee", dict(self.ENV, PR_ASSIGNEE="me"), run=run)
-        self.assertIn("--assignee", run.calls[0])
-        self.assertIn("me", run.calls[0])
+    def test_assignee_selector_lists_open_prs_and_filters_client_side(self):
+        # gh pr list --assignee is search-backed, and GitHub's issue/PR search
+        # returns nothing for a fine-grained / privilege-minimized token, so the
+        # selector once silently saw no PRs. Enumerate open PRs the non-search
+        # way and match the assignee ourselves.
+        payload = json.dumps([
+            {"number": 12, "labels": [], "assignees": [{"login": "MrJoy"}]},
+            {"number": 13, "labels": [], "assignees": [{"login": "alice"}]},
+        ])
+        run = runner(Result(0, payload))
+        got = gh.enumerate_candidate_prs("assignee", dict(self.ENV, PR_ASSIGNEE="MrJoy"), run=run)
+        self.assertEqual(got, [snap(12, "code")])
+        argv = run.calls[0]
+        self.assertNotIn("--assignee", argv)
+        self.assertIn("--state", argv)
+        self.assertIn("assignees", " ".join(argv))
+        self.assertEqual(len(run.calls), 1)
+
+    def test_assignee_match_is_case_insensitive(self):
+        # GitHub logins are case-insensitive, and the search-backed --assignee
+        # matched that way, so preserve it.
+        payload = json.dumps([{"number": 12, "labels": [],
+                               "assignees": [{"login": "MrJoy"}]}])
+        run = runner(Result(0, payload))
+        got = gh.enumerate_candidate_prs("assignee", dict(self.ENV, PR_ASSIGNEE="mrjoy"), run=run)
+        self.assertEqual(got, [snap(12, "code")])
+
+    def test_assignee_pr_with_no_assignees_is_excluded(self):
+        payload = json.dumps([{"number": 12, "labels": []}])
+        run = runner(Result(0, payload))
+        self.assertEqual(
+            gh.enumerate_candidate_prs("assignee", dict(self.ENV, PR_ASSIGNEE="MrJoy"), run=run), []
+        )
+
+    def test_assignee_one_of_several_assignees_matches(self):
+        payload = json.dumps([{"number": 12, "labels": [],
+                               "assignees": [{"login": "alice"}, {"login": "MrJoy"}]}])
+        run = runner(Result(0, payload))
+        self.assertEqual(
+            gh.enumerate_candidate_prs("assignee", dict(self.ENV, PR_ASSIGNEE="MrJoy"), run=run),
+            [snap(12, "code")],
+        )
 
     def test_search_selector_passes_the_query(self):
         run = runner(Result(0, "[]"))

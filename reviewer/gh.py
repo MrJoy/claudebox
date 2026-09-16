@@ -133,6 +133,19 @@ def _stderr_tail(result) -> List[str]:
     return [f"  {line[:400]}" for line in text.splitlines()[-5:] if line.strip()]
 
 
+def _assigned_to(entry: dict, login: str) -> bool:
+    """True when this PR object lists `login` among its assignees.
+
+    Case-insensitive, because GitHub logins are and the search-backed
+    --assignee this replaced matched that way.
+    """
+    target = (login or "").lower()
+    for a in entry.get("assignees") or []:
+        if isinstance(a, dict) and (a.get("login") or "").lower() == target:
+            return True
+    return False
+
+
 def _read_json(result) -> Any:
     if result.returncode != 0:
         return None
@@ -198,9 +211,13 @@ def enumerate_candidate_prs(
             "number,labels,headRefOid,updatedAt",
         ]
     elif selector == "assignee":
+        # Deliberately NOT `--assignee`: that filter is search-backed, and
+        # GitHub's issue/PR search returns nothing for a fine-grained /
+        # privilege-minimized token, so the selector silently saw no PRs. List
+        # open PRs the non-search way and match the assignee below.
         argv = base + [
-            "--state", "open", "--assignee", env["PR_ASSIGNEE"],
-            "--limit", "100", "--json", "number,labels,headRefOid,updatedAt",
+            "--state", "open", "--limit", "100", "--json",
+            "number,labels,headRefOid,updatedAt,assignees",
         ]
     elif selector == "search":
         argv = base + [
@@ -223,6 +240,9 @@ def enumerate_candidate_prs(
 
     result = gh_run(argv)
     payload = _read_json(result)
+    if selector == "assignee" and isinstance(payload, list):
+        payload = [e for e in payload
+                   if isinstance(e, dict) and _assigned_to(e, env["PR_ASSIGNEE"])]
     if payload is None:
         # Deliberate departure from the shell, which logged the same
         # "No candidate PRs" line whether gh failed or there simply were none.
