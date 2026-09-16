@@ -104,10 +104,26 @@ class SelectorTest(unittest.TestCase):
         self.assertEqual(gh.resolve_pr_selection({"PR_ASSIGNEE": "me"}), "assignee")
         self.assertEqual(gh.resolve_pr_selection({"PR_IDS": "3"}), "ids")
         self.assertEqual(gh.resolve_pr_selection({"PR_SEARCH": "is:open"}), "search")
+        self.assertEqual(gh.resolve_pr_selection({"PR_NEW": "1"}), "new")
 
     def test_falsy_pr_all_does_not_count_as_a_selector(self):
         with self.assertRaises(ConfigError):
             gh.resolve_pr_selection({"PR_ALL": "0"})
+
+    def test_falsy_pr_new_does_not_count_as_a_selector(self):
+        # A boolean flag like PR_ALL, so the same falsy-does-not-count rule.
+        with self.assertRaises(ConfigError):
+            gh.resolve_pr_selection({"PR_NEW": "0"})
+
+    def test_pr_new_collides_with_another_selector(self):
+        with self.assertRaises(ConfigError) as cm:
+            gh.resolve_pr_selection({"PR_NEW": "1", "PR_ALL": "1"})
+        self.assertIn("multiple PR selectors", str(cm.exception))
+
+    def test_pr_new_is_named_in_the_no_selector_message(self):
+        with self.assertRaises(ConfigError) as cm:
+            gh.resolve_pr_selection({})
+        self.assertIn("PR_NEW", str(cm.exception))
 
     def test_bad_ids_fail_at_startup_not_every_cycle(self):
         with self.assertRaises(ConfigError):
@@ -276,6 +292,26 @@ class EnumerateTest(unittest.TestCase):
         gh.enumerate_candidate_prs("search", dict(self.ENV, PR_SEARCH="is:open"), run=run)
         self.assertIn("--search", run.calls[0])
         self.assertIn("is:open", run.calls[0])
+
+    def test_new_selector_searches_for_prs_created_after_the_baseline(self):
+        run = runner(Result(0, json.dumps([{"number": 12, "labels": []}])))
+        got = gh.enumerate_candidate_prs(
+            "new", dict(self.ENV, PR_NEW="1"), run=run,
+            since="2026-09-16T10:00:00Z",
+        )
+        self.assertEqual(got, [snap(12, "code")])
+        self.assertEqual(len(run.calls), 1)
+        self.assertIn("--search", run.calls[0])
+        self.assertIn("is:open created:>2026-09-16T10:00:00Z", run.calls[0])
+        self.assertIn("number,labels,headRefOid,updatedAt", run.calls[0])
+
+    def test_new_selector_without_a_baseline_is_a_config_error(self):
+        # main captures the baseline once at process start and always passes it;
+        # a "new" arm with no since is a wiring bug, not a malformed gh query to
+        # send blindly (created:> with nothing after it matches every PR).
+        run = runner(Result(0, "[]"))
+        with self.assertRaises(ConfigError):
+            gh.enumerate_candidate_prs("new", dict(self.ENV, PR_NEW="1"), run=run)
 
 
 def enumerate_log(selector, env, run):

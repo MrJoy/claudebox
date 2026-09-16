@@ -979,6 +979,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     tracker = signals_mod.Tracker()
 
+    # The "new" selector's cutoff: captured once here, at supervisor start, and
+    # held fixed so the window does not slide forward each cycle. It resets to
+    # now on a container restart, matching the in-memory stance of the session
+    # map, reviewed, and Tracker. Ignored by every other selector.
+    started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if selector == "new":
+        log(f"Selecting PRs created after {started_at}.")
+
     cycles = 0
     while True:
         check_litellm(env)
@@ -1002,7 +1010,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             log(f"WARN: git fetch could not run ({exc}); continuing")
 
         try:
-            snapshots = gh.enumerate_candidate_prs(selector, env)
+            snapshots = gh.enumerate_candidate_prs(selector, env, since=started_at)
         except ConfigError as exc:
             die(str(exc))
 

@@ -130,7 +130,7 @@ Labeling a PR is a review-weakening control, not just a routing switch: plan mod
 
 Put a plan in a PR the same way you put code in one. Write the design document on a branch, open the PR, add the label, and the reviewer reads the diff as the proposal. When you revise the plan in response to a comment, push the revision to the same branch: each persona resumes its own session, reads the new revision knowing what it already said about the old one, and drops the points your revision settles.
 
-With `PR_IDS`, where each PR's labels are looked up one at a time, a lookup that fails skips that PR for the cycle with a warning in the log and retries it next cycle. It is never guessed into the wrong mode, because a wrong-mode review posts real comments you would have to go and delete. The other three selectors read their labels from the `gh pr list` call that finds the PRs in the first place, so there is no per-PR lookup to fail: a failed listing simply yields no candidates that cycle, and the log says so.
+With `PR_IDS`, where each PR's labels are looked up one at a time, a lookup that fails skips that PR for the cycle with a warning in the log and retries it next cycle. It is never guessed into the wrong mode, because a wrong-mode review posts real comments you would have to go and delete. The other four selectors read their labels from the `gh pr list` call that finds the PRs in the first place, so there is no per-PR lookup to fail: a failed listing simply yields no candidates that cycle, and the log says so.
 
 A persona is an angle of attack, borrowed from [advocate](https://github.com/jmcentire/advocate): Red Team wants the change to survive assault, Adversarial wants its logic to hold under challenge, Sage wants it simplified, Subject Matter Expert wants a peer to sign off, User wants a stranger to navigate it, Good Friend applies the 3am test. These are **plan-review** personas on loan. advocate wrote them to interrogate a proposal before the work happens, which is why plan mode runs all six and code mode runs the four that survive contact with a diff: `user` and `good_friend` were written against designs and whole projects, so on a narrow diff they reach for material that is not in it. Both sets ship in both modes, so you can opt either one into code review with `PERSONAS` if you want it.
 
@@ -422,6 +422,7 @@ Set **exactly one** of these (or pass the matching launcher flag). Zero or more 
 | `PR_ASSIGNEE=login` | `--assignee login` | open PRs assigned to that user |
 | `PR_IDS=12,15,20` | `--prs 12,15,20` | exactly those PR numbers |
 | `PR_SEARCH=is:open label:x` | `--search "…"` | PRs matching a gh search query (you control state) |
+| `PR_NEW=1` | `--new` | open PRs created after this container started (cutoff captured once at startup, reset on restart) |
 
 All eight prompt variables use a `{{PR}}` token (substituted with the PR number), and `MAX_PASSES_PER_SESSION` applies per (PR, mode, persona) pair.
 

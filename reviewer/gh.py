@@ -72,16 +72,19 @@ def resolve_pr_selection(env: Mapping[str, str]) -> str:
         active.append("ids")
     if env.get("PR_SEARCH"):
         active.append("search")
+    if pr_truthy(env.get("PR_NEW")):
+        active.append("new")
 
     if not active:
         raise ConfigError(
             "no PR selector set; provide exactly one of PR_ALL, PR_ASSIGNEE, "
-            "PR_IDS, PR_SEARCH (launcher: --all / --assignee / --prs / --search)."
+            "PR_IDS, PR_SEARCH, PR_NEW (launcher: --all / --assignee / --prs "
+            "/ --search / --new)."
         )
     if len(active) > 1:
         raise ConfigError(
             "multiple PR selectors set; provide exactly one of PR_ALL, "
-            "PR_ASSIGNEE, PR_IDS, PR_SEARCH."
+            "PR_ASSIGNEE, PR_IDS, PR_SEARCH, PR_NEW."
         )
     selector = active[0]
     # Validate the ID list up front so a bad value fails fast, not every cycle.
@@ -146,8 +149,15 @@ def enumerate_candidate_prs(
     selector: str,
     env: Mapping[str, str],
     run: Callable[..., Any] = subprocess.run,
+    since: str = "",
 ) -> List[PRSnapshot]:
-    """One PRSnapshot per candidate PR."""
+    """One PRSnapshot per candidate PR.
+
+    since is the "new" selector's baseline: the moment the supervisor started,
+    as an ISO-8601 UTC string. It is captured once by main and held fixed, so
+    the window does not slide forward each cycle. Ignored by every other
+    selector.
+    """
     repo = env["GITHUB_REPOSITORY"]
     plan_label = env.get("PLAN_LABEL") or "plan"
 
@@ -196,6 +206,17 @@ def enumerate_candidate_prs(
         argv = base + [
             "--search", env["PR_SEARCH"], "--limit", "100", "--json",
             "number,labels,headRefOid,updatedAt",
+        ]
+    elif selector == "new":
+        # A search arm with a fixed query. main always passes since; an empty
+        # one is a wiring bug, and `created:>` with nothing after it matches
+        # every open PR -- the opposite of what "new" means -- so refuse it
+        # rather than send it.
+        if not since:
+            raise ConfigError("the 'new' selector needs a baseline timestamp.")
+        argv = base + [
+            "--search", f"is:open created:>{since}", "--limit", "100",
+            "--json", "number,labels,headRefOid,updatedAt",
         ]
     else:
         raise ConfigError(f"unknown PR selector '{selector}'.")
