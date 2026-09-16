@@ -2455,3 +2455,223 @@ class OutageRecoveryTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RoundsTest(unittest.TestCase):
+    """A round is a completed pass. Nothing about the session moves it."""
+
+    RT = Pair(12, "code", "red_team")
+
+    def cycle(self, s):
+        with contextlib.redirect_stdout(io.StringIO()):
+            s.run_cycle(s.build_groups([(12, "code")]))
+
+    def test_first_pass_is_round_one(self):
+        s = supervisor([], personas={"code": ["red_team"]})
+        self.assertEqual(s.round_for(self.RT), 1)
+
+    def test_success_advances_the_round(self):
+        s = supervisor([ok("S1"), ok("S1")], personas={"code": ["red_team"]})
+        self.cycle(s)
+        self.assertEqual(s.round_for(self.RT), 2)
+        self.cycle(s)
+        self.assertEqual(s.round_for(self.RT), 3)
+
+    def test_failure_does_not_advance_the_round(self):
+        s = supervisor([ok("S1"), failed()], personas={"code": ["red_team"]})
+        self.cycle(s)
+        self.cycle(s)
+        self.assertEqual(s.round_for(self.RT), 2)
+        self.assertNotIn(self.RT, s.sessions)
+
+    def test_limit_does_not_advance_the_round(self):
+        s = supervisor([ok("S1"), limited("S1")], personas={"code": ["red_team"]})
+        self.cycle(s)
+        self.cycle(s)
+        self.assertEqual(s.round_for(self.RT), 2)
+
+    def test_rotation_keeps_the_round(self):
+        # MAX_PASSES_PER_SESSION=1 drops the session after every pass, and
+        # passes_done goes back to 0. The round is about the PR's history with
+        # this persona, not about the session, so it keeps counting.
+        s = supervisor([ok("S1"), ok("S2")], personas={"code": ["red_team"]},
+                       max_passes_per_session=1)
+        self.cycle(s)
+        self.assertEqual(s.passes_done[self.RT], 0)
+        self.assertEqual(s.round_for(self.RT), 2)
+        self.cycle(s)
+        self.assertEqual(s.round_for(self.RT), 3)
+
+    def test_the_log_line_names_the_round(self):
+        s = supervisor([ok("S1")], personas={"code": ["red_team"]})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            s.run_cycle(s.build_groups([(12, "code")]))
+        self.assertIn("review complete (session S1, pass 1, round 1).", buf.getvalue())
+
+
+class SystemPromptTest(unittest.TestCase):
+    """The round line rides beside the persona, in the system prompt."""
+
+    def test_round_line_follows_the_persona(self):
+        s = supervisor([], personas={"code": ["red_team"]})
+        got = s.system_prompt_for(Pair(12, "code", "red_team"))
+        self.assertTrue(got.startswith("rt\n"))
+        self.assertIn("This is round 1 of your review", got)
+
+    def test_round_two_after_one_success(self):
+        s = supervisor([ok("S1")], personas={"code": ["red_team"]})
+        with contextlib.redirect_stdout(io.StringIO()):
+            s.run_cycle(s.build_groups([(12, "code")]))
+        self.assertIn("This is round 2 of your review",
+                      s.system_prompt_for(Pair(12, "code", "red_team")))
+
+    def test_plan_mode_is_the_bare_persona(self):
+        s = supervisor([], personas={"plan": ["red_team"]})
+        self.assertEqual(s.system_prompt_for(Pair(12, "plan", "red_team")), "rt")
+
+    def test_run_one_hands_the_composed_prompt_to_run_pass(self):
+        # Through the real _run_one, with run_pass stubbed at the seam, so this
+        # proves the composition reaches the claude invocation rather than
+        # only existing as a method.
+        seen = {}
+
+        def fake_run_pass(**kw):
+            seen.update(kw)
+            return ok("S1")
+
+        s = review_loop.Supervisor(
+            personas={"code": ["red_team"]},
+            persona_prompts={("code", "red_team"): "rt"},
+            review_prompts={"code": "review #{{PR}}"},
+            followup_prompts={"code": "recheck #{{PR}}"},
+            model="m", mcp_args=[], cwd=".", max_passes_per_session=0, max_concurrent=1,
+        )
+        s.rounds[Pair(12, "code", "red_team")] = 2
+        original = review_loop.passes.run_pass
+        review_loop.passes.run_pass = fake_run_pass
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                s._run_one(Pair(12, "code", "red_team"), "recheck #12", "S1")
+        finally:
+            review_loop.passes.run_pass = original
+        self.assertIn("This is round 3 of your review", seen["persona_prompt"])
+        self.assertTrue(seen["persona_prompt"].startswith("rt\n"))
+        self.assertEqual(seen["prompt"], "recheck #12")
+
+
+FOUR = ("red_team", "adversarial", "sme", "sage")
+
+
+def phased(results, cap, **kwargs):
+    """Four code personas, Sage in phase 2."""
+    defaults = dict(
+        personas={"code": list(FOUR)},
+        persona_prompts={("code", p): p for p in FOUR},
+        persona_phases={("code", "sage"): 2},
+        max_concurrent=cap,
+    )
+    defaults.update(kwargs)
+    return supervisor(results, **defaults)
+
+
+class PhaseTest(unittest.TestCase):
+    """Phase 1 finishes before phase 2 starts, at every cap."""
+
+    def _ordering(self, cap):
+        lock = threading.Lock()
+        started, finished = [], set()
+        violations = []
+
+        class Recorder(FakeSupervisor):
+            def _run_one(self, pair, prompt, session_id):
+                with lock:
+                    started.append(pair.persona)
+                    if pair.persona == "sage" and finished != set(FOUR) - {"sage"}:
+                        violations.append(sorted(finished))
+                time.sleep(0.01)
+                with lock:
+                    finished.add(pair.persona)
+                return ok("S1")
+
+        s = phased([], cap)
+        s.__class__ = Recorder
+        group = s.build_groups([(12, "code")])[0]
+        with contextlib.redirect_stdout(io.StringIO()):
+            results = s.run_group(group, list(group.pairs))
+        self.assertEqual(violations, [])
+        self.assertEqual(started[-1], "sage")
+        self.assertEqual(set(results), set(group.pairs))
+
+    def test_unlimited(self):
+        self._ordering(0)
+
+    def test_cap_of_one(self):
+        self._ordering(1)
+
+    def test_cap_of_two(self):
+        self._ordering(2)
+
+    def test_phase_of_defaults_to_one(self):
+        s = supervisor([])
+        self.assertEqual(s.phase_of(Pair(12, "code", "red_team")), 1)
+        self.assertEqual(s.phase_of(Pair(12, "code", "sage")), 1)
+
+    def test_phase_one_still_runs_concurrently(self):
+        # Three phase-1 personas cross a barrier of three: the first phase is
+        # the same pool it was before phases existed.
+        barrier = threading.Barrier(3, timeout=2)
+
+        class Concurrent(FakeSupervisor):
+            def _run_one(self, pair, prompt, session_id):
+                if pair.persona != "sage":
+                    barrier.wait()
+                return ok("S1")
+
+        s = phased([], 0)
+        s.__class__ = Concurrent
+        group = s.build_groups([(12, "code")])[0]
+        with contextlib.redirect_stdout(io.StringIO()):
+            results = s.run_group(group, list(group.pairs))
+        self.assertEqual([r.rc for r in results.values()], [0, 0, 0, 0])
+
+    def test_a_phase_one_limit_leaves_phase_two_unstarted_and_owed(self):
+        s = phased([limited("S1"), ok("S2"), ok("S3")], 1)
+        s.sessions[Pair(12, "code", "sage")] = "S8"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            outcome = s.run_cycle(s.build_groups([(12, "code")]))
+        self.assertEqual(outcome, review_loop.CYCLE_LIMITED)
+        self.assertNotIn("sage", [p.persona for p in s.attempted])
+        self.assertIn(Pair(12, "code", "sage"), s.owed)
+        self.assertEqual(s.sessions[Pair(12, "code", "sage")], "S8")
+        self.assertIn("phase 2", buf.getvalue())
+
+    def test_a_phase_one_failure_does_not_skip_phase_two(self):
+        # Only a limit withholds phase 2. An ordinary failure is one persona's
+        # problem, and Sage may still have siblings' comments to read.
+        s = phased([failed(), ok("S2"), ok("S3"), ok("S4")], 1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            s.run_cycle(s.build_groups([(12, "code")]))
+        self.assertIn("sage", [p.persona for p in s.attempted])
+
+    def test_phase_two_alone(self):
+        s = phased([ok("S1")], 1)
+        group = s.build_groups([(12, "code")])[0]
+        with contextlib.redirect_stdout(io.StringIO()):
+            results = s.run_group(group, [Pair(12, "code", "sage")])
+        self.assertEqual(list(results), [Pair(12, "code", "sage")])
+
+    def test_phase_one_alone(self):
+        s = phased([ok("S1")], 1)
+        group = s.build_groups([(12, "code")])[0]
+        with contextlib.redirect_stdout(io.StringIO()):
+            results = s.run_group(group, [Pair(12, "code", "red_team")])
+        self.assertEqual(list(results), [Pair(12, "code", "red_team")])
+
+    def test_workers_are_sized_per_phase(self):
+        s = phased([], 0)
+        group = s.build_groups([(12, "code")])[0]
+        phase_one = [p for p in group.pairs if p.persona != "sage"]
+        self.assertEqual(s.workers_for(group, phase_one), 3)
+        self.assertEqual(s.workers_for(group, [Pair(12, "code", "sage")]), 1)

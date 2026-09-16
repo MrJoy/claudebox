@@ -578,13 +578,40 @@ if selected "$L"; then
 fi
 
 # --- per-persona passes -----------------------------------------------------
-cycle "passes: each persona gets its own pass, in the selected order" \
+cycle "passes: each persona gets its own pass, phase 1 in selected order" \
   PERSONAS=red_team,sage \
   -- CALLS:4 \
      ARGV:1:"You are a Red Team security reviewer" \
      ARGV:2:"You are a Sage" \
      ARGV:3:"You are a Red Team security reviewer" \
      ARGV:4:"You are a Sage"
+
+# Phase, not selector order, decides run order. The log line keeps selector
+# order, which is what the earlier "code personas:" LOG assertion pins, and the
+# ordinals here pin the other half. Sage runs last in BOTH cycles: a phase is
+# a per-group barrier, not a one-time startup sort.
+cycle "phases: Sage runs after its siblings whatever the selector order" \
+  PERSONAS=sage,red_team \
+  -- CALLS:4 \
+     LOG:"code personas: sage red_team" \
+     ARGV:1:"You are a Red Team security reviewer" \
+     ARGV:2:"You are a Sage" \
+     ARGV:3:"You are a Red Team security reviewer" \
+     ARGV:4:"You are a Sage"
+
+# The round line rides in --append-system-prompt beside the persona. Round 2 on
+# the resumed pass is the assertion that matters: like the persona, the line
+# has to be re-passed, because the flag does not survive --resume. The task
+# prompt is pinned byte-for-byte by tests/fixtures, so "not in the task prompt"
+# is already proven there.
+cycle "rounds: the resumed pass carries round 2 beside its persona" \
+  PERSONAS=red_team \
+  -- CALLS:2 \
+     ARGV:1:"This is round 1 of your review" \
+     NOARGV:1:"This is round 2 of your review" \
+     ARGV:2:"--resume S1" \
+     ARGV:2:"You are a Red Team security reviewer" \
+     ARGV:2:"This is round 2 of your review"
 
 # Both assertions are adjacency assertions, the same technique the --resume ones
 # use. Asserting the two strings separately would pass just as happily with the
@@ -664,9 +691,20 @@ cycle "limits: an ordinary failure still drops the session" \
 # leave a pass that posted some of its findings and not the rest. So the group
 # finishes and the cycle stops at the barrier.
 cycle "limits: the limited persona's siblings still finish their pass" \
-  PERSONAS=red_team,sage,sme STUB_FAIL_ON=2 STUB_FAIL_MODE=limit MAX_CYCLES=1 \
+  PERSONAS=red_team,adversarial,sme STUB_FAIL_ON=2 STUB_FAIL_MODE=limit MAX_CYCLES=1 \
   -- CALLS:3 \
      LOG:"ending this cycle after the group finishes"
+
+# Sage is phase 2, and a limit in phase 1 keeps phase 2 from starting: the
+# provider has just refused this PR's siblings, and the rebuttal pass exists to
+# read findings that were never posted. Sage is owed, not failed, alongside the
+# persona the limit cut.
+cycle "phases: a phase-1 limit withholds Sage and owes it" \
+  PERSONAS=red_team,sage,sme STUB_FAIL_ON=2 STUB_FAIL_MODE=limit MAX_CYCLES=1 \
+  -- CALLS:2 \
+     MATCHCOUNT:"You are a Sage":0 \
+     LOG:"phase 2 of PR #1 [code] not started" \
+     LOG:"Owed next cycle: #1 code/sage #1 code/sme."
 
 # What the cut does abandon is every group after it: walking the remaining PRs
 # into the same wall spends more of the resource that just ran out.
@@ -717,14 +755,25 @@ cycle "limits: a limit before any session does not claim to keep one" \
 # allows a few passes per backoff window, review the leading pairs forever and
 # the trailing ones never.
 cycle "resume: the next cycle re-runs only the persona the limit cut" \
-  PERSONAS=red_team,sage,sme STUB_FAIL_ON=2 STUB_FAIL_MODE=limit \
+  PERSONAS=red_team,adversarial,sme STUB_FAIL_ON=2 STUB_FAIL_MODE=limit \
   -- CALLS:4 \
-     LOG:"Resuming with #1 code/sage." \
+     LOG:"Resuming with #1 code/adversarial." \
      NOLOG:"Not reviewed this cycle" \
      ARGV:3:"You are a Subject Matter Expert" \
      NOARGV:3:"--resume" \
-     ARGV:4:"You are a Sage" \
+     ARGV:4:"You are an Adversarial reviewer" \
      ARGV:4:"--resume S2"
+
+# A withheld Sage is served on the next cycle, after the limited persona has
+# been retried, and it starts a fresh session because it never had one.
+cycle "phases: a withheld Sage is owed and runs after the retry" \
+  PERSONAS=red_team,sage,sme STUB_FAIL_ON=2 STUB_FAIL_MODE=limit \
+  -- CALLS:4 \
+     LOG:"Resuming with #1 code/sage #1 code/sme." \
+     ARGV:3:"You are a Subject Matter Expert" \
+     ARGV:3:"--resume S2" \
+     ARGV:4:"You are a Sage" \
+     NOARGV:4:"--resume"
 
 # --- mode routing ------------------------------------------------------------
 # Mode is decided once per PR, inside enumerate_candidate_prs, from its labels.
@@ -1024,8 +1073,15 @@ cycle "parallel: every code persona of a group gets its own pass, both cycles" \
 # supervisor that ran the four one after another satisfies every count above.
 # STUB_HOLD keeps each pass alive long enough that the peak is a property of the
 # dispatch rather than of how fast a process starts.
+# The default set peaks at three, not four: Sage is phase 2 and waits for the
+# other three to finish. The second case is the same claim with four phase-1
+# personas, so "unlimited means all of them" is still pinned directly.
 cycle "parallel: the personas of a group are in flight at the same time" \
   PR_IDS=12 MAX_CONCURRENT_PASSES= STUB_HOLD=0.3 MAX_CYCLES=1 \
+  -- CALLS:4 MAXINFLIGHT:3
+
+cycle "parallel: four phase-1 personas are all in flight at once" \
+  PR_IDS=12 PERSONAS=red_team,adversarial,sme,good_friend MAX_CONCURRENT_PASSES= STUB_HOLD=0.3 MAX_CYCLES=1 \
   -- CALLS:4 MAXINFLIGHT:4
 
 # The control for the case above, and the guarantee the whole inherited suite
@@ -1093,17 +1149,21 @@ cycle "worktree: the stanza is appended even to an operator prompt override" \
 # and the cycle stops at the barrier. What the cut owes is that persona alone:
 # the next cycle re-runs Red Team and nobody else, and re-runs it RESUMED,
 # because a limit is not a broken session.
-cycle "parallel: a limit owes only the persona it cut, and its siblings finish" \
+# Red Team limits on EVERY attempt here, so Sage, withheld behind that limit
+# in cycle 1, is withheld again on the retry: phase 2 waits for a phase 1 that
+# clears, and a provider that keeps refusing never clears. Once it does, Sage
+# runs -- the case above this one's "phases:" sibling pins that.
+cycle "parallel: a limit owes the persona it cut and the withheld Sage; the phase-1 siblings finish" \
   PR_IDS=12 MAX_CONCURRENT_PASSES= STUB_FAIL_PERSONA="Red Team" STUB_FAIL_MODE=limit \
-  -- CALLS:5 \
+  -- CALLS:4 \
      MATCHCOUNT:"You are an Adversarial reviewer":1 \
      MATCHCOUNT:"You are a Subject Matter Expert":1 \
-     MATCHCOUNT:"You are a Sage":1 \
+     MATCHCOUNT:"You are a Sage":0 \
      MATCHCOUNT:"You are a Red Team security reviewer":2 \
      MATCHCOUNT:"--resume":1 \
      MATCHCOUNT:"--resume&&You are a Red Team security reviewer":1 \
-     LOG:"Owed next cycle: #12 code/red_team." \
-     LOG:"Resuming with #12 code/red_team." \
+     LOG:"Owed next cycle: #12 code/red_team #12 code/sage." \
+     LOG:"Resuming with #12 code/red_team #12 code/sage." \
      LOG:"Backing off" \
      NOLOG:"Not reviewed this cycle"
 
@@ -1115,12 +1175,12 @@ cycle "parallel: a limit owes only the persona it cut, and its siblings finish" 
 # never.
 cycle "parallel: the cut abandons the groups after it and the next cycle starts past it" \
   PR_IDS=12,13 MAX_CONCURRENT_PASSES= STUB_FAIL_PERSONA="Red Team" STUB_FAIL_MODE=limit \
-  -- CALLS:8 \
-     MATCHCOUNT:"request #12":4 \
-     MATCHCOUNT:"request #13":4 \
+  -- CALLS:6 \
+     MATCHCOUNT:"request #12":3 \
+     MATCHCOUNT:"request #13":3 \
      MATCHCOUNT:"--resume":0 \
      LOG:"Not reviewed this cycle: #13 code/red_team #13 code/adversarial #13 code/sme #13 code/sage." \
-     LOG:"Resuming with #13 code/red_team #13 code/adversarial #13 code/sme #13 code/sage #12 code/red_team." \
+     LOG:"Resuming with #13 code/red_team #13 code/adversarial #13 code/sme #13 code/sage #12 code/red_team #12 code/sage." \
      LOG:"Not reviewed this cycle: #12 code/red_team #12 code/adversarial #12 code/sme #12 code/sage."
 
 # A non-limit failure is not a cut: the group finishes, the cycle carries on to

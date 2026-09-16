@@ -207,3 +207,47 @@ class RenderTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RoundStanzaTest(unittest.TestCase):
+    """The ladder. Three rungs, constants, code mode only."""
+
+    def test_round_one_reviews_the_whole_pr_at_should_fix(self):
+        s = prompts.round_stanza("code", 1)
+        self.assertIn("This is round 1 of your review", s)
+        self.assertIn("whole change", s)
+        self.assertIn("`should-fix`", s)
+        self.assertNotIn("since your last review", s)
+
+    def test_round_two_narrows_to_the_delta_at_should_fix(self):
+        s = prompts.round_stanza("code", 2)
+        self.assertIn("This is round 2 of your review", s)
+        self.assertIn("since your last review", s)
+        self.assertIn("`should-fix`", s)
+        self.assertNotIn("presume", s.lower())
+
+    def test_round_three_and_later_are_blocking_only(self):
+        s3 = prompts.round_stanza("code", 3)
+        s7 = prompts.round_stanza("code", 7)
+        for s, n in ((s3, 3), (s7, 7)):
+            self.assertIn(f"This is round {n} of your review", s)
+            self.assertIn("since your last review", s)
+            self.assertIn("only `blocking`", s)
+            self.assertIn("survived", s)
+        self.assertEqual(s3.replace("round 3", "round N").replace("survived 2", "survived K"),
+                         s7.replace("round 7", "round N").replace("survived 6", "survived K"))
+
+    def test_the_delta_is_a_procedure_the_persona_runs(self):
+        # No last-reviewed head is handed over. The persona finds its own
+        # newest signed comment and reads the commits dated after it.
+        s = prompts.round_stanza("code", 2)
+        self.assertIn("your own most recent comment", s)
+        self.assertIn("gh pr view", s)
+
+    def test_plan_mode_has_no_ladder(self):
+        for n in (1, 2, 3, 9):
+            self.assertEqual(prompts.round_stanza("plan", n), "")
+
+    def test_round_below_one_is_a_bug(self):
+        with self.assertRaises(ValueError):
+            prompts.round_stanza("code", 0)
