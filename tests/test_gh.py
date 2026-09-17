@@ -104,10 +104,26 @@ class SelectorTest(unittest.TestCase):
         self.assertEqual(gh.resolve_pr_selection({"PR_ASSIGNEE": "me"}), "assignee")
         self.assertEqual(gh.resolve_pr_selection({"PR_IDS": "3"}), "ids")
         self.assertEqual(gh.resolve_pr_selection({"PR_SEARCH": "is:open"}), "search")
+        self.assertEqual(gh.resolve_pr_selection({"PR_NEW": "1"}), "new")
 
     def test_falsy_pr_all_does_not_count_as_a_selector(self):
         with self.assertRaises(ConfigError):
             gh.resolve_pr_selection({"PR_ALL": "0"})
+
+    def test_falsy_pr_new_does_not_count_as_a_selector(self):
+        # A boolean flag like PR_ALL, so the same falsy-does-not-count rule.
+        with self.assertRaises(ConfigError):
+            gh.resolve_pr_selection({"PR_NEW": "0"})
+
+    def test_pr_new_collides_with_another_selector(self):
+        with self.assertRaises(ConfigError) as cm:
+            gh.resolve_pr_selection({"PR_NEW": "1", "PR_ALL": "1"})
+        self.assertIn("multiple PR selectors", str(cm.exception))
+
+    def test_pr_new_is_named_in_the_no_selector_message(self):
+        with self.assertRaises(ConfigError) as cm:
+            gh.resolve_pr_selection({})
+        self.assertIn("PR_NEW", str(cm.exception))
 
     def test_bad_ids_fail_at_startup_not_every_cycle(self):
         with self.assertRaises(ConfigError):
@@ -265,17 +281,74 @@ class EnumerateTest(unittest.TestCase):
             gh.enumerate_candidate_prs("ids", dict(self.ENV, PR_IDS="12"), run=run), []
         )
 
-    def test_assignee_selector_passes_the_assignee(self):
-        run = runner(Result(0, "[]"))
-        gh.enumerate_candidate_prs("assignee", dict(self.ENV, PR_ASSIGNEE="me"), run=run)
-        self.assertIn("--assignee", run.calls[0])
-        self.assertIn("me", run.calls[0])
+    def test_assignee_selector_lists_open_prs_and_filters_client_side(self):
+        # gh pr list --assignee is search-backed, and GitHub's issue/PR search
+        # returns nothing for a fine-grained / privilege-minimized token, so the
+        # selector once silently saw no PRs. Enumerate open PRs the non-search
+        # way and match the assignee ourselves.
+        payload = json.dumps([
+            {"number": 12, "labels": [], "assignees": [{"login": "MrJoy"}]},
+            {"number": 13, "labels": [], "assignees": [{"login": "alice"}]},
+        ])
+        run = runner(Result(0, payload))
+        got = gh.enumerate_candidate_prs("assignee", dict(self.ENV, PR_ASSIGNEE="MrJoy"), run=run)
+        self.assertEqual(got, [snap(12, "code")])
+        argv = run.calls[0]
+        self.assertNotIn("--assignee", argv)
+        self.assertIn("--state", argv)
+        self.assertIn("assignees", " ".join(argv))
+        self.assertEqual(len(run.calls), 1)
+
+    def test_assignee_match_is_case_insensitive(self):
+        # GitHub logins are case-insensitive, and the search-backed --assignee
+        # matched that way, so preserve it.
+        payload = json.dumps([{"number": 12, "labels": [],
+                               "assignees": [{"login": "MrJoy"}]}])
+        run = runner(Result(0, payload))
+        got = gh.enumerate_candidate_prs("assignee", dict(self.ENV, PR_ASSIGNEE="mrjoy"), run=run)
+        self.assertEqual(got, [snap(12, "code")])
+
+    def test_assignee_pr_with_no_assignees_is_excluded(self):
+        payload = json.dumps([{"number": 12, "labels": []}])
+        run = runner(Result(0, payload))
+        self.assertEqual(
+            gh.enumerate_candidate_prs("assignee", dict(self.ENV, PR_ASSIGNEE="MrJoy"), run=run), []
+        )
+
+    def test_assignee_one_of_several_assignees_matches(self):
+        payload = json.dumps([{"number": 12, "labels": [],
+                               "assignees": [{"login": "alice"}, {"login": "MrJoy"}]}])
+        run = runner(Result(0, payload))
+        self.assertEqual(
+            gh.enumerate_candidate_prs("assignee", dict(self.ENV, PR_ASSIGNEE="MrJoy"), run=run),
+            [snap(12, "code")],
+        )
 
     def test_search_selector_passes_the_query(self):
         run = runner(Result(0, "[]"))
         gh.enumerate_candidate_prs("search", dict(self.ENV, PR_SEARCH="is:open"), run=run)
         self.assertIn("--search", run.calls[0])
         self.assertIn("is:open", run.calls[0])
+
+    def test_new_selector_searches_for_prs_created_after_the_baseline(self):
+        run = runner(Result(0, json.dumps([{"number": 12, "labels": []}])))
+        got = gh.enumerate_candidate_prs(
+            "new", dict(self.ENV, PR_NEW="1"), run=run,
+            since="2026-09-16T10:00:00Z",
+        )
+        self.assertEqual(got, [snap(12, "code")])
+        self.assertEqual(len(run.calls), 1)
+        self.assertIn("--search", run.calls[0])
+        self.assertIn("is:open created:>2026-09-16T10:00:00Z", run.calls[0])
+        self.assertIn("number,labels,headRefOid,updatedAt", run.calls[0])
+
+    def test_new_selector_without_a_baseline_is_a_config_error(self):
+        # main captures the baseline once at process start and always passes it;
+        # a "new" arm with no since is a wiring bug, not a malformed gh query to
+        # send blindly (created:> with nothing after it matches every PR).
+        run = runner(Result(0, "[]"))
+        with self.assertRaises(ConfigError):
+            gh.enumerate_candidate_prs("new", dict(self.ENV, PR_NEW="1"), run=run)
 
 
 def enumerate_log(selector, env, run):

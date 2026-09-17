@@ -72,16 +72,19 @@ def resolve_pr_selection(env: Mapping[str, str]) -> str:
         active.append("ids")
     if env.get("PR_SEARCH"):
         active.append("search")
+    if pr_truthy(env.get("PR_NEW")):
+        active.append("new")
 
     if not active:
         raise ConfigError(
             "no PR selector set; provide exactly one of PR_ALL, PR_ASSIGNEE, "
-            "PR_IDS, PR_SEARCH (launcher: --all / --assignee / --prs / --search)."
+            "PR_IDS, PR_SEARCH, PR_NEW (launcher: --all / --assignee / --prs "
+            "/ --search / --new)."
         )
     if len(active) > 1:
         raise ConfigError(
             "multiple PR selectors set; provide exactly one of PR_ALL, "
-            "PR_ASSIGNEE, PR_IDS, PR_SEARCH."
+            "PR_ASSIGNEE, PR_IDS, PR_SEARCH, PR_NEW."
         )
     selector = active[0]
     # Validate the ID list up front so a bad value fails fast, not every cycle.
@@ -130,6 +133,19 @@ def _stderr_tail(result) -> List[str]:
     return [f"  {line[:400]}" for line in text.splitlines()[-5:] if line.strip()]
 
 
+def _assigned_to(entry: dict, login: str) -> bool:
+    """True when this PR object lists `login` among its assignees.
+
+    Case-insensitive, because GitHub logins are and the search-backed
+    --assignee this replaced matched that way.
+    """
+    target = (login or "").lower()
+    for a in entry.get("assignees") or []:
+        if isinstance(a, dict) and (a.get("login") or "").lower() == target:
+            return True
+    return False
+
+
 def _read_json(result) -> Any:
     if result.returncode != 0:
         return None
@@ -146,8 +162,15 @@ def enumerate_candidate_prs(
     selector: str,
     env: Mapping[str, str],
     run: Callable[..., Any] = subprocess.run,
+    since: str = "",
 ) -> List[PRSnapshot]:
-    """One PRSnapshot per candidate PR."""
+    """One PRSnapshot per candidate PR.
+
+    since is the "new" selector's baseline: the moment the supervisor started,
+    as an ISO-8601 UTC string. It is captured once by main and held fixed, so
+    the window does not slide forward each cycle. Ignored by every other
+    selector.
+    """
     repo = env["GITHUB_REPOSITORY"]
     plan_label = env.get("PLAN_LABEL") or "plan"
 
@@ -188,20 +211,38 @@ def enumerate_candidate_prs(
             "number,labels,headRefOid,updatedAt",
         ]
     elif selector == "assignee":
+        # Deliberately NOT `--assignee`: that filter is search-backed, and
+        # GitHub's issue/PR search returns nothing for a fine-grained /
+        # privilege-minimized token, so the selector silently saw no PRs. List
+        # open PRs the non-search way and match the assignee below.
         argv = base + [
-            "--state", "open", "--assignee", env["PR_ASSIGNEE"],
-            "--limit", "100", "--json", "number,labels,headRefOid,updatedAt",
+            "--state", "open", "--limit", "100", "--json",
+            "number,labels,headRefOid,updatedAt,assignees",
         ]
     elif selector == "search":
         argv = base + [
             "--search", env["PR_SEARCH"], "--limit", "100", "--json",
             "number,labels,headRefOid,updatedAt",
         ]
+    elif selector == "new":
+        # A search arm with a fixed query. main always passes since; an empty
+        # one is a wiring bug, and `created:>` with nothing after it matches
+        # every open PR -- the opposite of what "new" means -- so refuse it
+        # rather than send it.
+        if not since:
+            raise ConfigError("the 'new' selector needs a baseline timestamp.")
+        argv = base + [
+            "--search", f"is:open created:>{since}", "--limit", "100",
+            "--json", "number,labels,headRefOid,updatedAt",
+        ]
     else:
         raise ConfigError(f"unknown PR selector '{selector}'.")
 
     result = gh_run(argv)
     payload = _read_json(result)
+    if selector == "assignee" and isinstance(payload, list):
+        payload = [e for e in payload
+                   if isinstance(e, dict) and _assigned_to(e, env["PR_ASSIGNEE"])]
     if payload is None:
         # Deliberate departure from the shell, which logged the same
         # "No candidate PRs" line whether gh failed or there simply were none.

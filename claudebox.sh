@@ -35,6 +35,7 @@ PR_ALL=0
 PR_ASSIGNEE=""
 PR_IDS=""
 PR_SEARCH=""
+PR_NEW=0
 PR_SEL_COUNT=0
 PR_SEL_NAMES=""
 
@@ -102,8 +103,12 @@ OPTIONS
                     12,15,20).
   --search QUERY    Review PRs matching this gh search query (e.g.
                     "is:open label:needs-review"). You control state via the
-                    query. Provide exactly ONE of --all/--assignee/--prs/--search
-                    (here or via PR_* in the env file).
+                    query.
+  --new             Review open PRs created after this container started. The
+                    cutoff is captured once at startup and resets on restart.
+                    Provide exactly ONE of
+                    --all/--assignee/--prs/--search/--new (here or via PR_* in
+                    the env file).
   --persona LIST    Review with these adversarial personas only (comma list, or
                     'all'). Default: red_team,adversarial,sme,sage. Also
                     available: user, good_friend. One session per PR per persona,
@@ -132,6 +137,7 @@ EXAMPLES
   claudebox run --all --tail                                 # review every open PR
   claudebox run --assignee alice                             # PRs assigned to alice
   claudebox run --prs 12,15,20                               # just these PRs
+  claudebox run --new                                        # only PRs opened after startup
   ./claudebox.sh test --repo ~/src/myrepo                    # one-off foreground run
   ./claudebox.sh logs
   ./claudebox.sh stop
@@ -161,6 +167,7 @@ while [ $# -gt 0 ]; do
     --assignee)    PR_ASSIGNEE="${2:?--assignee requires a LOGIN}"; PR_SEL_COUNT=$((PR_SEL_COUNT + 1)); PR_SEL_NAMES="$PR_SEL_NAMES --assignee"; shift ;;
     --prs)         PR_IDS="${2:?--prs requires a comma/space list of PR numbers}"; PR_SEL_COUNT=$((PR_SEL_COUNT + 1)); PR_SEL_NAMES="$PR_SEL_NAMES --prs"; shift ;;
     --search)      PR_SEARCH="${2:?--search requires a gh search query}"; PR_SEL_COUNT=$((PR_SEL_COUNT + 1)); PR_SEL_NAMES="$PR_SEL_NAMES --search"; shift ;;
+    --new)         PR_NEW=1;      PR_SEL_COUNT=$((PR_SEL_COUNT + 1)); PR_SEL_NAMES="$PR_SEL_NAMES --new" ;;
     --persona)     PERSONAS="${2:?--persona requires a comma-separated list of persona names}"; shift ;;
     --max-concurrent-passes)
                    MAX_CONCURRENT_PASSES="${2:?--max-concurrent-passes requires a non-negative integer}"; shift ;;
@@ -178,7 +185,7 @@ done
 # Selector flags are mutually exclusive (the entrypoint is authoritative and
 # also errors when none/multiple are set via the env file; this is the friendly
 # early check for CLI flags). Zero flags is fine here — the env file may set one.
-[ "$PR_SEL_COUNT" -le 1 ] || die "multiple PR selector flags given ($(echo "$PR_SEL_NAMES" | xargs)); provide exactly one of --all, --assignee, --prs, --search."
+[ "$PR_SEL_COUNT" -le 1 ] || die "multiple PR selector flags given ($(echo "$PR_SEL_NAMES" | xargs)); provide exactly one of --all, --assignee, --prs, --search, --new."
 
 # --- Inference pipeline (announced loudly) ---------------------------------
 # Print a visually distinct banner for each value we INFER (never for values
@@ -320,6 +327,7 @@ build_run_flags() {
   [ -n "$PR_ASSIGNEE" ] && RUN_FLAGS+=(-e "PR_ASSIGNEE=$PR_ASSIGNEE")
   [ -n "$PR_IDS" ]      && RUN_FLAGS+=(-e "PR_IDS=$PR_IDS")
   [ -n "$PR_SEARCH" ]   && RUN_FLAGS+=(-e "PR_SEARCH=$PR_SEARCH")
+  [ "$PR_NEW" = 1 ]     && RUN_FLAGS+=(-e "PR_NEW=1")
   [ -n "$PERSONAS" ]    && RUN_FLAGS+=(-e "PERSONAS=$PERSONAS")
   [ -n "$MAX_CONCURRENT_PASSES" ] && RUN_FLAGS+=(-e "MAX_CONCURRENT_PASSES=$MAX_CONCURRENT_PASSES")
   true  # keep the function's exit status 0: the last `[ ... ] && ...` above
