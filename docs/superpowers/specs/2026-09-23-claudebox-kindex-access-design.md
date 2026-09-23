@@ -242,7 +242,7 @@ exactly what plan review exists to catch.
 
 - **Vector search.** The container has no `VOYAGE_API_KEY`, so kindex's hybrid
   search runs on FTS and the graph without embeddings. Passing the key through
-  would send PR-derived query text to Voyage. Tracked as a follow-up issue.
+  would send PR-derived query text to Voyage. Tracked in issue #4.
 - **Writing back to the host graph.** Findings stay on the PR.
 - **Surviving a restart.** The snapshot is rebuilt at boot like the working
   clone.
