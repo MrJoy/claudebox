@@ -47,9 +47,9 @@ class ShippedPersonasTest(unittest.TestCase):
         got = personas.resolve("code", SHIPPED, {})
         self.assertEqual([p.id for p in got], ["red_team", "adversarial", "sme", "sage"])
 
-    def test_plan_default_resolves_to_six(self):
+    def test_plan_default_resolves_to_seven(self):
         got = personas.resolve("plan", SHIPPED, {})
-        self.assertEqual(len(got), 6)
+        self.assertEqual(len(got), 7)
 
     def test_prompt_is_body_then_shared_contract(self):
         got = personas.resolve("code", SHIPPED, {"PERSONAS": "red_team"})
@@ -107,11 +107,11 @@ class ShippedPersonasTest(unittest.TestCase):
 
     def test_all_selects_every_persona_in_the_tree(self):
         got = personas.resolve("code", SHIPPED, {"PERSONAS": "all"})
-        self.assertEqual(len(got), 6)
+        self.assertEqual(len(got), 7)
 
     def test_all_is_case_insensitive(self):
         self.assertEqual(
-            len(personas.resolve("code", SHIPPED, {"PERSONAS": "ALL"})), 6
+            len(personas.resolve("code", SHIPPED, {"PERSONAS": "ALL"})), 7
         )
 
     def test_selector_order_is_preserved(self):
@@ -124,7 +124,7 @@ class ShippedPersonasTest(unittest.TestCase):
 
     def test_plan_selector_var_is_separate(self):
         got = personas.resolve("plan", SHIPPED, {"PERSONAS": "sage"})
-        self.assertEqual(len(got), 6)
+        self.assertEqual(len(got), 7)
 
 
 class RefusalTest(unittest.TestCase):

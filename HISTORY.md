@@ -1,5 +1,9 @@
 # History
 
+## Unreleased
+
+* **A seventh persona, Pat Helland (`helland`), imported from advocate.** advocate added it after claudebox's first import, so it was missing rather than excluded. It asks who owns each fact, who may mutate it, and what the business does when a guess turns out wrong. Plan mode runs it by default, since ownership and reconciliation questions cost least to act on before code exists. Code mode leaves it opt-in through `PERSONAS`, because most diffs never cross a system boundary. Only `helland.md` was copied from the importer's output; a full re-run would have dropped Sage's `phase: 2` and its rebuttal section.
+
 ## 0.7.0 - 2026-09-16
 
 * **A fifth PR selector, `PR_NEW` (launcher `--new`), reviews open PRs created after the supervisor started.** It sits alongside `PR_ALL`/`PR_ASSIGNEE`/`PR_IDS`/`PR_SEARCH` and is mutually exclusive with them: a `gh pr list --search "is:open created:>TS"` arm whose cutoff is captured once in `main()` as an ISO-8601 UTC string and threaded through `since=` so the window does not slide forward each cycle. The baseline resets on a container restart, matching the in-memory stance of the session map, `reviewed`, and `Tracker`, so a run that crash-loops under `--restart unless-stopped` advances its own cutoff and skips PRs created during the downtime — no persisted state. `entrypoint.sh` is untouched: `PR_NEW` is a boolean like `PR_ALL` (not quote-stripped) and resolves through the existing `--check` preflight.
