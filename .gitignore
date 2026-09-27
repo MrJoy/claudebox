@@ -3,3 +3,4 @@
 !.env.example
 __pycache__/
 .superpowers/
+.claude/worktrees
