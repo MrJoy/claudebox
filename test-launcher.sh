@@ -169,6 +169,31 @@ if selected "$L"; then
   expect "$L" 1 -- "ERROR:"
 fi
 
+L="--no-repo skips automatic kindex resolution and never asks kin"
+if selected "$L"; then
+  launch "$L" 1 -- -- run --no-repo --name cb --env-file "$ENVF" --no-restart
+  expect "$L" 0 -- "!/kindex-src" "kindex is not resolved without a mounted repo"
+  [ ! -s "$WORK/kin.log" ] || bad "$L (kin was called)" "$(cat "$WORK/kin.log")"
+fi
+
+L="--no-repo --kindex-dir still mounts that dir"
+if selected "$L"; then
+  launch "$L" 1 -- -- run --no-repo --name cb --env-file "$ENVF" --no-restart --kindex-dir "$STORE"
+  expect "$L" 0 -- "$STORE:/kindex-src:ro"
+fi
+
+L="--no-repo --kindex-profile still resolves, from PWD"
+if selected "$L"; then
+  : >"$WORK/kin.log"
+  ( cd "$REPO" && env -i PWD="$REPO" PATH="$STUBS:$BASE_PATH" HOME="$WORK" STUB_KIN_LOG="$WORK/kin.log" STUB_KIN_DIR="$STORE" \
+      STUB_KIN_PROFILE=hoo3 STUB_KIN_SOURCE=flag \
+      /bin/bash "$LAUNCHER" --dry-run run --no-repo --name cb --env-file "$ENVF" --no-restart --kindex-profile hoo3 \
+      >"$WORK/out" 2>&1 )
+  RC=$?
+  expect "$L" 0 -- "$STORE:/kindex-src:ro" "profile hoo3 via flag"
+  if grep -q "^$(cd "$REPO" && pwd)|config get data_dir --profile hoo3" "$WORK/kin.log"; then ok "$L (cwd)"; else bad "$L (cwd)" "kin config ran from: $(cut -d'|' -f1 "$WORK/kin.log" | head -1)"; fi
+fi
+
 L="test: mounts the store the same way"
 if selected "$L"; then
   launch "$L" 1 -- -- test --repo "$REPO" --env-file "$ENVF"
@@ -191,6 +216,24 @@ L="build: a kin whose --version fails falls back to the Dockerfile default"
 if selected "$L"; then
   launch "$L" 1 -- STUB_KIN_FAIL=1 -- build
   expect "$L" 0 -- "docker build" "!KINDEX_VERSION"
+fi
+
+L="build: a passthrough --build-arg KINDEX_VERSION lands after the launcher's own"
+if selected "$L"; then
+  # docker gives the LAST --build-arg for a key the win, so the passthrough
+  # coming after the launcher's own on the printed command line already
+  # overrides it; this pins that ordering against a regression.
+  launch "$L" 1 -- -- build -- --build-arg KINDEX_VERSION=1.2.3
+  line="$(grep -- '+ docker build' "$WORK/out")"
+  second="${line#*KINDEX_VERSION=9.8.7}"
+  if [ "$RC" = 0 ] && [ "$line" != "$second" ]; then
+    case "$second" in
+      *"KINDEX_VERSION=1.2.3"*) ok "$L" ;;
+      *) bad "$L" "passthrough --build-arg did not land after the launcher's own: $line" ;;
+    esac
+  else
+    bad "$L" "unexpected output: $line"
+  fi
 fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

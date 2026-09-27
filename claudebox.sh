@@ -63,7 +63,12 @@ USAGE
   ./claudebox.sh [options] <command> [-- extra docker/claude args]
 
 COMMANDS
-  build     Build the image from this directory.
+  build     Build the image from this directory. Pins the image's kindex to
+            the host's own `kin --version`, when `kin` is on PATH, so the
+            image opens the schema the host writes. Override with
+            `-- --build-arg KINDEX_VERSION=X.Y.Z` (a later --build-arg for the
+            same key wins over the launcher's own) -- useful for a source or
+            git install of kin whose version string isn't on PyPI.
   run       Start the reviewer detached and hardened (the normal way to run it).
   test      Run once in the FOREGROUND (--rm -it) for a quick, ephemeral check.
   logs      Follow the running container's logs (docker logs -f).
@@ -79,6 +84,9 @@ OPTIONS
                     exposed to it. Must be a primary repo, not a git worktree.
                     Omit with --no-repo to network-clone GITHUB_REPOSITORY.
   --no-repo         Don't mount a repo; the reviewer clones over the network.
+                    Also skips automatic kindex resolution, since there is no
+                    repo to resolve a store against -- pass --kindex-profile
+                    or --kindex-dir to give the reviewer one anyway.
   --env-file PATH   Env file passed to the container. Default: auto-select from
                     the cwd, preferring .env.claudebox over .env (so a repo can
                     carry its own claudebox creds without touching its .env).
@@ -136,8 +144,10 @@ OPTIONS
                     can post what it reads onto a PR.
   --kindex-profile NAME
                     Use this kindex profile instead of the one kindex resolves.
+                    Works under --no-repo: resolution runs from the current
+                    directory instead of a repo.
   --kindex-dir DIR  Mount this kindex data dir (it must hold kindex.db) instead
-                    of asking kindex.
+                    of asking kindex. Works under --no-repo.
   --dry-run         Print the docker command instead of executing it.
   -h, --help        Show this help.
 
@@ -310,13 +320,21 @@ resolve_kindex() {
     announce "kindex: store $KINDEX_MOUNT (from --kindex-dir), mounted read-only; reviewers can read all of it"
     return 0
   fi
+  if [ "$MOUNT_REPO" = 0 ] && [ -z "$KINDEX_PROFILE" ]; then
+    log "NOTE: kindex is not resolved without a mounted repo (--no-repo); pass --kindex-profile or --kindex-dir to give one anyway."
+    return 0
+  fi
   if ! command -v kin >/dev/null 2>&1; then
     [ -z "$KINDEX_PROFILE" ] || die "--kindex-profile given, but kin is not on PATH."
     return 0
   fi
   # From inside the repo: kindex matches profile roots against the cwd, and
-  # reads the repo's tracked .kin/config from there.
+  # reads the repo's tracked .kin/config from there. With --no-repo there is
+  # no repo to stand in, so a named --kindex-profile resolves from $PWD
+  # instead -- the operator named the profile, and cwd only matters for
+  # kindex's own lookup.
   local from="$REPO" dir="" which="" profile="" source=""
+  [ "$MOUNT_REPO" = 1 ] || from="$PWD"
   [ -d "$from" ] || from="$PWD"
   local -a pargs
   pargs=()
