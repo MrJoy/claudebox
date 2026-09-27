@@ -48,6 +48,8 @@ def _stat(path: str) -> Stat:
         st = os.stat(path)
     except FileNotFoundError:
         return None
+    except OSError as exc:
+        raise SnapshotError(f"could not stat {path}: {exc}")
     return (st.st_size, st.st_mtime_ns)
 
 

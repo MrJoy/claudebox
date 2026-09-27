@@ -1,8 +1,10 @@
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
 import unittest
+import unittest.mock
 
 import _path  # noqa: F401
 
@@ -201,6 +203,31 @@ class RefreshTest(unittest.TestCase):
         h = Harness(self, tempfile.mkdtemp())
         with self.assertRaisesRegex(SnapshotError, "kindex.db"):
             h.snap.refresh()
+
+    def test_a_stat_permission_error_is_a_snapshot_error_and_dst_is_untouched(self):
+        # Review fix: a PermissionError/EIO/ESTALE from os.stat used to escape
+        # _stat uncaught, which review_loop.py's SnapshotError handlers can't
+        # catch, killing PID 1. os.stat is monkeypatched rather than chmod'd,
+        # since chmod is unreliable as root (the reviewer container runs
+        # unprivileged, but a test run as root would not see the denial).
+        src, _ = make_store(self)
+        h = Harness(self, src)
+        h.snap.refresh()
+        before_dst = titles(h.dst)
+
+        real_stat = os.stat
+        db_path = os.path.join(src, "kindex.db")
+
+        def failing_stat(path, *a, **kw):
+            if path == db_path:
+                raise PermissionError(13, "Permission denied")
+            return real_stat(path, *a, **kw)
+
+        with unittest.mock.patch("os.stat", side_effect=failing_stat):
+            with self.assertRaisesRegex(SnapshotError, re.escape(db_path)):
+                h.snap.refresh()
+        self.assertEqual(titles(h.dst), before_dst)
+        self.assertFalse(os.path.exists(h.dst + ".staging"))
 
 
 class WarmUpTest(unittest.TestCase):
