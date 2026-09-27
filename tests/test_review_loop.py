@@ -620,18 +620,42 @@ class CheckLitellmTest(unittest.TestCase):
     def _exited_child(self):
         """A child that has exited but has not been waited on: a zombie.
 
-        The pipe is the synchronization. It has no reader but this process and
-        no writer but the child, so EOF means the child is gone -- and reaching
-        it costs no wait(), which would reap the very state under test.
+        EOF on the pipe says the child closed its end. The kernel marks it a
+        zombie a moment later, and under load this process can read the EOF
+        inside that gap, where check_litellm's WNOHANG reap finds a live
+        child and passes it. So after the EOF we poll `ps` until the child
+        shows state `Z`, which reaches the state under test without a wait()
+        that would reap it.
         """
         proc = subprocess.Popen([sys.executable, "-c", ""], stdout=subprocess.PIPE)
         self.assertEqual(proc.stdout.read(), b"")
         proc.stdout.close()
+        self._wait_for_zombie(proc.pid)
         # check_litellm reaps this pid, so Popen never learns the child is gone
         # and __del__ warns that it is "still running". Record the status we
         # already know, or the suite's output stops being pristine.
         self.addCleanup(self._mark_reaped, proc)
         return proc
+
+    @staticmethod
+    def _wait_for_zombie(pid, timeout=2.0):
+        """Block until `pid` is actually a zombie, or fail loudly.
+
+        os.waitid with WNOWAIT would ask this directly, and Python has no
+        os.waitid on Darwin, where this suite also runs. `ps -o stat=` answers
+        on both platforms and reaps nothing.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            result = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(pid)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            if result.stdout.strip().startswith(b"Z"):
+                return
+            time.sleep(0.01)
+        raise AssertionError(f"pid {pid} did not become a zombie within {timeout}s")
 
     @staticmethod
     def _mark_reaped(proc):
