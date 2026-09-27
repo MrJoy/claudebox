@@ -22,10 +22,12 @@ REVIEW_MODES: Tuple[str, ...] = ("code", "plan")
 # The code default is the subset: advocate's `user` and `good_friend` were
 # written against designs and whole projects, so on a narrow diff they reach for
 # material that isn't in it. Plan mode is where they finally have something to
-# bite on, which is why the plan default is everything.
+# bite on, which is why the plan default is everything. `helland` is plan-only
+# by default for a narrower reason: it hunts ownership and reconciliation
+# defects across system boundaries, and most diffs never cross one.
 DEFAULTS: Dict[str, str] = {
     "code": "red_team,adversarial,sme,sage",
-    "plan": "adversarial,good_friend,red_team,sage,sme,user",
+    "plan": "adversarial,good_friend,helland,red_team,sage,sme,user",
 }
 
 # The selector env var per mode. The bare name means code mode.

@@ -517,7 +517,7 @@ cycle "selection: an explicit list is honoured, in the order given" \
 
 cycle "selection: all expands to every shipped persona" \
   PERSONAS=all \
-  -- CALLS:12 LOG:"code personas: adversarial good_friend red_team sage sme user"
+  -- CALLS:14 LOG:"code personas: adversarial good_friend helland red_team sage sme user"
 
 refuses "selection: an unknown persona name refuses at startup" \
   "unknown persona 'red-team'" \
@@ -834,9 +834,9 @@ cycle "mode: a null label response skips the PR rather than reviewing PR #null" 
      NOLOG:"PR #null"
 
 # --- per-mode persona sets ---------------------------------------------------
-cycle "modes: plan mode runs all six personas by default" \
+cycle "modes: plan mode runs all seven personas by default" \
   STUB_PLAN_PRS=1 MAX_CYCLES=1 \
-  -- CALLS:6 LOG:"plan personas: adversarial good_friend red_team sage sme user"
+  -- CALLS:7 LOG:"plan personas: adversarial good_friend helland red_team sage sme user"
 
 cycle "modes: code mode still runs the four code-facing personas by default" \
   MAX_CYCLES=1 \
