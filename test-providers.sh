@@ -233,7 +233,9 @@ run_entrypoint() {
   # ONE `claude` invocation: the stub below overwrites its dump per call, and
   # what this suite asserts (credentials, endpoints, model tiers) is identical
   # for every persona. Multi-persona behaviour lives in test-personas.sh, which
-  # captures per invocation.
+  # captures per invocation. KINDEX_SRC names a path that never exists, so a
+  # host with a store at the default /kindex-src cannot switch kindex on for
+  # a case that did not ask for it; the kindex cases pass their own.
   env -i PATH="$BIN:$PATH" HOME="$HOME_DIR" \
     ALLOW_UNHARDENED=1 \
     GITHUB_TOKEN=x GITHUB_REPOSITORY=owner/repo PR_IDS=1 \
@@ -241,6 +243,7 @@ run_entrypoint() {
     LITELLM_BIN="$BIN/litellm" SHIM_BIN="$SCRIPT_DIR/workersai-shim.py" \
     REAL_PYTHON3="$REAL_PYTHON3" REVIEWER_MAIN="$SCRIPT_DIR/reviewer/review_loop.py" \
     PERSONA_DIR="$SCRIPT_DIR/personas" PERSONAS=red_team \
+    KINDEX_SRC="$HOME_DIR/nonexistent" \
     "$@" "$BASH_BIN" "$ENTRYPOINT" >"$OUT" 2>&1 &
   watchdog_wait $!
 }
@@ -686,7 +689,7 @@ wires "kindex: a mounted store wires the server, the profile, and the deny list"
      ARGV:'kindex knowledge graph' \
      LOG:'kindex MCP enabled'
 wires "kindex: no store means no server, no flag, no stanza" \
-  PROVIDER=ollama OLLAMA_API_KEY=k KINDEX_SRC="$WORK/nonexistent" \
+  PROVIDER=ollama OLLAMA_API_KEY=k \
   -- 'NOMCP:"kindex"' NOARGV:'--disallowedTools' NOARGV:'kindex knowledge graph'
 wires "kindex: an env-file KINDEX_ENABLED without a store does nothing" \
   PROVIDER=ollama OLLAMA_API_KEY=k KINDEX_ENABLED=1 KINDEX_SRC="$WORK/nonexistent" \
