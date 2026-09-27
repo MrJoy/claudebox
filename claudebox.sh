@@ -47,6 +47,14 @@ PERSONAS=""
 # not here, for the same reason PERSONAS isn't).
 MAX_CONCURRENT_PASSES=""
 
+# kindex: on by default whenever `kin` is on PATH (--no-kindex opts out). The
+# store is resolved by kindex itself, from inside the repo, and mounted
+# read-only; the container works from a copy. See CLAUDE.md.
+KINDEX=1
+KINDEX_PROFILE=""
+KINDEX_DIR=""
+KINDEX_MOUNT=""
+
 usage() {
   cat <<'EOF'
 claudebox — launcher for the unattended PR-reviewer container.
@@ -119,6 +127,17 @@ OPTIONS
                     Default (unset or 0): all of them. Lower it if you hit
                     provider rate limits or the container's memory ceiling; 1
                     reviews one persona at a time.
+  --no-kindex       Don't give reviewers your kindex graph. By default, when
+                    `kin` is on PATH, the launcher asks kindex which store
+                    serves --repo (`kin config get data_dir`, run from inside
+                    the repo), mounts that store read-only, and reviewers read
+                    a private copy of it through the kindex MCP tools, read
+                    tools only. They can see ALL of that store, and a reviewer
+                    can post what it reads onto a PR.
+  --kindex-profile NAME
+                    Use this kindex profile instead of the one kindex resolves.
+  --kindex-dir DIR  Mount this kindex data dir (it must hold kindex.db) instead
+                    of asking kindex.
   --dry-run         Print the docker command instead of executing it.
   -h, --help        Show this help.
 
@@ -171,6 +190,9 @@ while [ $# -gt 0 ]; do
     --persona)     PERSONAS="${2:?--persona requires a comma-separated list of persona names}"; shift ;;
     --max-concurrent-passes)
                    MAX_CONCURRENT_PASSES="${2:?--max-concurrent-passes requires a non-negative integer}"; shift ;;
+    --no-kindex)   KINDEX=0 ;;
+    --kindex-profile) KINDEX_PROFILE="${2:?--kindex-profile requires a profile NAME}"; shift ;;
+    --kindex-dir)  KINDEX_DIR="${2:?--kindex-dir requires a PATH}"; shift ;;
     --dry-run)     DRY_RUN=1 ;;
     -h|--help)     usage; exit 0 ;;
     --)            shift; EXTRA=("$@"); break ;;
@@ -186,6 +208,13 @@ done
 # also errors when none/multiple are set via the env file; this is the friendly
 # early check for CLI flags). Zero flags is fine here — the env file may set one.
 [ "$PR_SEL_COUNT" -le 1 ] || die "multiple PR selector flags given ($(echo "$PR_SEL_NAMES" | xargs)); provide exactly one of --all, --assignee, --prs, --search, --new."
+
+if [ "$KINDEX" = 0 ] && { [ -n "$KINDEX_PROFILE" ] || [ -n "$KINDEX_DIR" ]; }; then
+  die "--no-kindex contradicts --kindex-profile/--kindex-dir; give one or the other."
+fi
+if [ -n "$KINDEX_PROFILE" ] && [ -n "$KINDEX_DIR" ]; then
+  die "give --kindex-profile or --kindex-dir, not both."
+fi
 
 # --- Inference pipeline (announced loudly) ---------------------------------
 # Print a visually distinct banner for each value we INFER (never for values
@@ -262,6 +291,48 @@ show_and_run() {
   "$@"
 }
 
+# Automatic kindex resolution warns and carries on: a kin that misbehaves on
+# the host should not block a review launch. A store the operator named with
+# --kindex-profile/--kindex-dir dies instead, because they asked for it.
+kindex_fail() {
+  if [ -n "$KINDEX_PROFILE" ] || [ -n "$KINDEX_DIR" ]; then die "$1"; fi
+  log "WARN: $1; running without kindex."
+}
+
+# Sets KINDEX_MOUNT to the host data dir to mount, or leaves it empty. Not
+# called inside $(...): it may die, and a die in a subshell exits only that.
+resolve_kindex() {
+  KINDEX_MOUNT=""
+  [ "$KINDEX" = 1 ] || return 0
+  if [ -n "$KINDEX_DIR" ]; then
+    [ -f "$KINDEX_DIR/kindex.db" ] || { kindex_fail "--kindex-dir '$KINDEX_DIR' holds no kindex.db"; return 0; }
+    KINDEX_MOUNT="$(cd "$KINDEX_DIR" && pwd)"
+    announce "kindex: store $KINDEX_MOUNT (from --kindex-dir), mounted read-only; reviewers can read all of it"
+    return 0
+  fi
+  if ! command -v kin >/dev/null 2>&1; then
+    [ -z "$KINDEX_PROFILE" ] || die "--kindex-profile given, but kin is not on PATH."
+    return 0
+  fi
+  # From inside the repo: kindex matches profile roots against the cwd, and
+  # reads the repo's tracked .kin/config from there.
+  local from="$REPO" dir="" which="" profile="" source=""
+  [ -d "$from" ] || from="$PWD"
+  local -a pargs
+  pargs=()
+  [ -z "$KINDEX_PROFILE" ] || pargs=(--profile "$KINDEX_PROFILE")
+  if ! dir="$(cd "$from" && kin config get data_dir ${pargs[@]+"${pargs[@]}"} 2>/dev/null)" || [ -z "$dir" ]; then
+    kindex_fail "kin could not resolve a kindex store for '$from' (run 'kin config get data_dir' there to see why)"
+    return 0
+  fi
+  [ -f "$dir/kindex.db" ] || { kindex_fail "kindex resolved '$dir' for '$from', which holds no kindex.db"; return 0; }
+  which="$(cd "$from" && kin profile which --json ${pargs[@]+"${pargs[@]}"} 2>/dev/null || true)"
+  profile="$(printf '%s' "$which" | sed -n 's/.*"profile": *"\([^"]*\)".*/\1/p')"
+  source="$(printf '%s' "$which" | sed -n 's/.*"source": *"\([^"]*\)".*/\1/p')"
+  KINDEX_MOUNT="$dir"
+  announce "kindex: profile ${profile:-(none)} via ${source:-legacy}, store $dir, mounted read-only; reviewers can read all of it (--no-kindex to opt out)"
+}
+
 # Assemble the shared `docker run` flags (mounts + hardening) for run/test.
 build_run_flags() {
   RUN_FLAGS=(--env-file "$ENV_FILE")
@@ -288,6 +359,9 @@ build_run_flags() {
     fi
     RUN_FLAGS+=(-v "$repo_abs/.git:/repo/.git:ro")
   fi
+
+  resolve_kindex
+  [ -z "$KINDEX_MOUNT" ] || RUN_FLAGS+=(-v "$KINDEX_MOUNT:/kindex-src:ro")
 
   if [ "$MOUNT_CLAUDE" = 1 ]; then
     [ -d "$HOME/.claude" ] || die "--mount-claude: '$HOME/.claude' does not exist (log in with 'claude' first, or use a token)."
@@ -338,7 +412,18 @@ build_run_flags() {
 
 case "$COMMAND" in
   build)
-    show_and_run docker build -t "$IMAGE" ${EXTRA[@]+"${EXTRA[@]}"} "$SCRIPT_DIR"
+    # Match the image's kindex to the host's, so the image opens the schema the
+    # host writes. No kin, or a version string we don't recognise, leaves the
+    # Dockerfile's pinned default.
+    build_args=()
+    if command -v kin >/dev/null 2>&1; then
+      kv="$(kin --version 2>/dev/null | awk '{print $2}')"
+      if printf '%s' "$kv" | grep -qE '^[0-9]+(\.[0-9]+)+$'; then
+        build_args=(--build-arg "KINDEX_VERSION=$kv")
+        announce "kindex version: $kv (matching the host's kin)"
+      fi
+    fi
+    show_and_run docker build -t "$IMAGE" ${build_args[@]+"${build_args[@]}"} ${EXTRA[@]+"${EXTRA[@]}"} "$SCRIPT_DIR"
     ;;
   run)
     build_run_flags

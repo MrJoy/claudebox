@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+#
+# Launcher tests for claudebox.sh's kindex resolution. No Docker: every case
+# runs with --dry-run and asserts on the docker command the launcher prints. A
+# `kin` stub stands in for the host's kindex. The launcher runs under
+# /bin/bash on purpose, which is 3.2 on macOS, the shell it has to survive.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LAUNCHER="$SCRIPT_DIR/claudebox.sh"
+FILTER="${1:-}"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+STUBS="$WORK/stubs"; mkdir -p "$STUBS"
+cat >"$STUBS/kin" <<'STUB'
+#!/bin/sh
+printf '%s|%s\n' "$(pwd)" "$*" >>"$STUB_KIN_LOG"
+if [ -n "${STUB_KIN_FAIL:-}" ]; then
+  echo "Error: Unknown kindex profile 'hoo3' (from kin); known profiles: personal" >&2
+  exit 2
+fi
+case "$1" in
+  --version) echo "kin 9.8.7 (Kindex)" ;;
+  config) printf '%s\n' "$STUB_KIN_DIR" ;;
+  profile) printf '{"profile": "%s", "source": "%s"}\n' "${STUB_KIN_PROFILE:-personal}" "${STUB_KIN_SOURCE:-default}" ;;
+esac
+STUB
+chmod +x "$STUBS/kin"
+
+REPO="$WORK/repo"; mkdir -p "$REPO/.git"
+STORE="$WORK/store"; mkdir -p "$STORE"; : >"$STORE/kindex.db"
+SPACED="$WORK/Application Support/kindex"; mkdir -p "$SPACED"; : >"$SPACED/kindex.db"
+EMPTY="$WORK/empty-store"; mkdir -p "$EMPTY"
+ENVF="$WORK/env"; : >"$ENVF"
+BASE_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+
+PASS=0; FAIL=0; FAILED=""
+ok()  { PASS=$((PASS + 1)); printf 'ok   %s\n' "$1"; }
+bad() { FAIL=$((FAIL + 1)); FAILED="$FAILED
+  - $1"; printf 'FAIL %s\n       %s\n' "$1" "$2"; sed 's/^/       | /' "$WORK/out"; }
+selected() { [ -z "$FILTER" ] && return 0; case "$1" in *"$FILTER"*) return 0 ;; esac; return 1; }
+
+# launch LABEL WITH_KIN(1|0) -- VAR=VALUE... -- launcher args...
+# Leaves combined output in $WORK/out and the exit status in $RC.
+launch() {
+  local label="$1" with_kin="$2"; shift 2
+  [ "${1:-}" = "--" ] && shift
+  local -a envs=()
+  while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
+  [ "${1:-}" = "--" ] && shift
+  local path="$BASE_PATH"; [ "$with_kin" = 1 ] && path="$STUBS:$BASE_PATH"
+  : >"$WORK/kin.log"
+  env -i PATH="$path" HOME="$WORK" STUB_KIN_LOG="$WORK/kin.log" STUB_KIN_DIR="$STORE" \
+    ${envs[@]+"${envs[@]}"} /bin/bash "$LAUNCHER" --dry-run "$@" >"$WORK/out" 2>&1
+  RC=$?
+}
+
+# expect LABEL RC-WANT -- substrings... ; a leading ! negates a substring.
+expect() {
+  local label="$1" want="$2"; shift 2
+  [ "${1:-}" = "--" ] && shift
+  local s missing=""
+  [ "$RC" = "$want" ] || missing="$missing [exit $RC, wanted $want]"
+  for s in "$@"; do
+    case "$s" in
+      !*) grep -qF -- "${s#!}" "$WORK/out" && missing="$missing [should not have: ${s#!}]" ;;
+      *)  grep -qF -- "$s" "$WORK/out" || missing="$missing [missing: $s]" ;;
+    esac
+  done
+  if [ -n "$missing" ]; then bad "$label" "$missing"; else ok "$label"; fi
+}
+
+RUN=(run --repo "$REPO" --name cb --env-file "$ENVF" --no-restart)
+
+L="auto: the resolved store is mounted read-only"
+if selected "$L"; then
+  launch "$L" 1 -- -- "${RUN[@]}"
+  expect "$L" 0 -- "$STORE:/kindex-src:ro" "profile personal via default"
+fi
+
+L="auto: resolution runs from inside the repo (roots match on cwd)"
+if selected "$L"; then
+  launch "$L" 1 -- -- "${RUN[@]}"
+  if grep -q "^$(cd "$REPO" && pwd)|config get data_dir" "$WORK/kin.log"; then ok "$L"; else bad "$L" "kin config ran from: $(cut -d'|' -f1 "$WORK/kin.log" | head -1)"; fi
+fi
+
+L="auto: no kin on PATH means no mount and no error"
+if selected "$L"; then
+  launch "$L" 0 -- -- "${RUN[@]}"
+  expect "$L" 0 -- "!/kindex-src"
+fi
+
+L="auto: an unknown profile warns and launches without kindex"
+if selected "$L"; then
+  launch "$L" 1 -- STUB_KIN_FAIL=1 -- "${RUN[@]}"
+  expect "$L" 0 -- "WARN:" "running without kindex" "!/kindex-src"
+fi
+
+L="auto: a resolved dir with no kindex.db warns and launches without kindex"
+if selected "$L"; then
+  launch "$L" 1 -- STUB_KIN_DIR="$EMPTY" -- "${RUN[@]}"
+  expect "$L" 0 -- "holds no kindex.db" "!/kindex-src"
+fi
+
+L="auto: a store path with a space stays one argument"
+if selected "$L"; then
+  launch "$L" 1 -- STUB_KIN_DIR="$SPACED" -- "${RUN[@]}"
+  # show_and_run prints with printf %q, which escapes the space.
+  expect "$L" 0 -- 'Application\ Support/kindex:/kindex-src:ro'
+fi
+
+L="--no-kindex mounts nothing and never asks kin"
+if selected "$L"; then
+  launch "$L" 1 -- -- "${RUN[@]}" --no-kindex
+  expect "$L" 0 -- "!/kindex-src"
+  [ ! -s "$WORK/kin.log" ] || bad "$L (kin was called)" "$(cat "$WORK/kin.log")"
+fi
+
+L="--kindex-profile passes --profile to both kin calls"
+if selected "$L"; then
+  launch "$L" 1 -- STUB_KIN_PROFILE=hoo3 STUB_KIN_SOURCE=flag -- "${RUN[@]}" --kindex-profile hoo3
+  expect "$L" 0 -- "$STORE:/kindex-src:ro" "profile hoo3 via flag"
+  [ "$(grep -c -- '--profile hoo3' "$WORK/kin.log")" = 2 ] || bad "$L (calls)" "$(cat "$WORK/kin.log")"
+fi
+
+L="--kindex-profile that kin rejects is fatal"
+if selected "$L"; then
+  launch "$L" 1 -- STUB_KIN_FAIL=1 -- "${RUN[@]}" --kindex-profile hoo3
+  expect "$L" 1 -- "ERROR:"
+fi
+
+L="--kindex-dir mounts that dir without asking kin"
+if selected "$L"; then
+  launch "$L" 1 -- -- "${RUN[@]}" --kindex-dir "$SPACED"
+  expect "$L" 0 -- 'Application\ Support/kindex:/kindex-src:ro'
+  [ ! -s "$WORK/kin.log" ] || bad "$L (kin was called)" "$(cat "$WORK/kin.log")"
+fi
+
+L="--kindex-dir without a kindex.db is fatal"
+if selected "$L"; then
+  launch "$L" 1 -- -- "${RUN[@]}" --kindex-dir "$EMPTY"
+  expect "$L" 1 -- "ERROR:" "holds no kindex.db"
+fi
+
+L="--no-kindex with an override is fatal"
+if selected "$L"; then
+  launch "$L" 1 -- -- "${RUN[@]}" --no-kindex --kindex-dir "$STORE"
+  expect "$L" 1 -- "ERROR:"
+fi
+
+L="--kindex-profile with --kindex-dir is fatal"
+if selected "$L"; then
+  launch "$L" 1 -- -- "${RUN[@]}" --kindex-profile hoo3 --kindex-dir "$STORE"
+  expect "$L" 1 -- "ERROR:"
+fi
+
+L="test: mounts the store the same way"
+if selected "$L"; then
+  launch "$L" 1 -- -- test --repo "$REPO" --env-file "$ENVF"
+  expect "$L" 0 -- "$STORE:/kindex-src:ro"
+fi
+
+L="build: pins the image's kindex to the host's version"
+if selected "$L"; then
+  launch "$L" 1 -- -- build
+  expect "$L" 0 -- "KINDEX_VERSION=9.8.7"
+fi
+
+L="build: no kin means the Dockerfile default"
+if selected "$L"; then
+  launch "$L" 0 -- -- build
+  expect "$L" 0 -- "!KINDEX_VERSION"
+fi
+
+printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+[ "$FAIL" = 0 ] || { printf 'Failed:%s\n' "$FAILED"; exit 1; }
