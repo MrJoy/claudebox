@@ -99,6 +99,12 @@ if selected "$L"; then
   expect "$L" 1 -- "ERROR:" "kin is not on PATH"
 fi
 
+L="--kindex-dir with no kin on PATH still mounts that dir"
+if selected "$L"; then
+  launch "$L" 0 -- -- "${RUN[@]}" --kindex-dir "$SPACED"
+  expect "$L" 0 -- 'Application\ Support/kindex:/kindex-src:ro' "from --kindex-dir"
+fi
+
 L="auto: an unknown profile warns and launches without kindex"
 if selected "$L"; then
   launch "$L" 1 -- STUB_KIN_FAIL=1 -- "${RUN[@]}"
