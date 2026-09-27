@@ -623,9 +623,9 @@ class CheckLitellmTest(unittest.TestCase):
         EOF on the pipe says the child closed its end. The kernel marks it a
         zombie a moment later, and under load this process can read the EOF
         inside that gap, where check_litellm's WNOHANG reap finds a live
-        child and passes it. So after the EOF we poll `ps` until the child
-        shows state `Z`, which reaches the state under test without a wait()
-        that would reap it.
+        child and passes it. So after the EOF we poll until the child is a
+        zombie, which reaches the state under test without a wait() that
+        would reap it.
         """
         proc = subprocess.Popen([sys.executable, "-c", ""], stdout=subprocess.PIPE)
         self.assertEqual(proc.stdout.read(), b"")
@@ -638,21 +638,31 @@ class CheckLitellmTest(unittest.TestCase):
         return proc
 
     @staticmethod
-    def _wait_for_zombie(pid, timeout=2.0):
-        """Block until `pid` is actually a zombie, or fail loudly.
+    def _is_zombie(pid):
+        """Has `pid` exited? Answers without reaping it.
 
-        os.waitid with WNOWAIT would ask this directly, and Python has no
-        os.waitid on Darwin, where this suite also runs. `ps -o stat=` answers
-        on both platforms and reaps nothing.
+        os.waitid with WNOWAIT asks the kernel directly, and Linux has it,
+        including the claudebox image, which ships no `ps`. Python has no
+        os.waitid on Darwin, where `ps -o stat=` answers instead. With
+        neither there is nothing to ask, so the test skips.
         """
+        if hasattr(os, "waitid"):
+            flags = os.WEXITED | os.WNOHANG | os.WNOWAIT
+            return os.waitid(os.P_PID, pid, flags) is not None
+        if shutil.which("ps") is None:
+            raise unittest.SkipTest("no os.waitid and no ps to ask whether a child has exited")
+        result = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        return result.stdout.strip().startswith(b"Z")
+
+    def _wait_for_zombie(self, pid, timeout=2.0):
+        """Block until `pid` is a zombie, or fail."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            result = subprocess.run(
-                ["ps", "-o", "stat=", "-p", str(pid)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-            )
-            if result.stdout.strip().startswith(b"Z"):
+            if self._is_zombie(pid):
                 return
             time.sleep(0.01)
         raise AssertionError(f"pid {pid} did not become a zombie within {timeout}s")
@@ -681,6 +691,10 @@ class CheckLitellmTest(unittest.TestCase):
     def test_a_live_child_passes(self):
         proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
         try:
+            # The zombie wait must turn on the child's state. A live child
+            # never gets there, so the wait has to run out.
+            with self.assertRaises(AssertionError):
+                self._wait_for_zombie(proc.pid, timeout=0.05)
             review_loop.check_litellm({"LITELLM_PID": str(proc.pid), "HOME": "/nonexistent"})
         finally:
             proc.kill()
