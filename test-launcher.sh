@@ -32,6 +32,8 @@ REPO="$WORK/repo"; mkdir -p "$REPO/.git"
 STORE="$WORK/store"; mkdir -p "$STORE"; : >"$STORE/kindex.db"
 SPACED="$WORK/Application Support/kindex"; mkdir -p "$SPACED"; : >"$SPACED/kindex.db"
 EMPTY="$WORK/empty-store"; mkdir -p "$EMPTY"
+RELSTORE="relstore"; mkdir -p "$REPO/$RELSTORE"; : >"$REPO/$RELSTORE/kindex.db"
+HOMESTORE="$WORK/homekindex"; mkdir -p "$HOMESTORE"; : >"$HOMESTORE/kindex.db"
 ENVF="$WORK/env"; : >"$ENVF"
 BASE_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 
@@ -110,6 +112,18 @@ if selected "$L"; then
   expect "$L" 0 -- 'Application\ Support/kindex:/kindex-src:ro'
 fi
 
+L="auto: a relative data_dir canonicalizes against the repo"
+if selected "$L"; then
+  launch "$L" 1 -- STUB_KIN_DIR="$RELSTORE" -- "${RUN[@]}"
+  expect "$L" 0 -- "$REPO/$RELSTORE:/kindex-src:ro"
+fi
+
+L="auto: a ~/-prefixed data_dir expands to HOME"
+if selected "$L"; then
+  launch "$L" 1 -- STUB_KIN_DIR="~/homekindex" -- "${RUN[@]}"
+  expect "$L" 0 -- "$HOMESTORE:/kindex-src:ro"
+fi
+
 L="--no-kindex mounts nothing and never asks kin"
 if selected "$L"; then
   launch "$L" 1 -- -- "${RUN[@]}" --no-kindex
@@ -171,6 +185,12 @@ L="build: no kin means the Dockerfile default"
 if selected "$L"; then
   launch "$L" 0 -- -- build
   expect "$L" 0 -- "!KINDEX_VERSION"
+fi
+
+L="build: a kin whose --version fails falls back to the Dockerfile default"
+if selected "$L"; then
+  launch "$L" 1 -- STUB_KIN_FAIL=1 -- build
+  expect "$L" 0 -- "docker build" "!KINDEX_VERSION"
 fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

@@ -325,12 +325,28 @@ resolve_kindex() {
     kindex_fail "kin could not resolve a kindex store for '$from' (run 'kin config get data_dir' there to see why)"
     return 0
   fi
-  [ -f "$dir/kindex.db" ] || { kindex_fail "kindex resolved '$dir' for '$from', which holds no kindex.db"; return 0; }
+  # kin prints data_dir verbatim, unexpanded: a leading '~' or a relative path
+  # both come through as-is. Expand '~' ourselves, then canonicalize a
+  # relative path against $from (the same directory kin resolved it from),
+  # so both the kindex.db check and the eventual `-v` flag see an absolute
+  # path -- a bare relative path reaching `docker run -v` is read as a NAMED
+  # VOLUME, not a bind mount, and docker creates it empty and silent.
+  case "$dir" in
+    "~") dir="$HOME" ;;
+    "~/"*) dir="$HOME/${dir#"~/"}" ;;
+  esac
+  local abs=""
+  abs="$(CDPATH= cd "$from" 2>/dev/null && CDPATH= cd "$dir" 2>/dev/null && pwd)" || abs=""
+  if [ -z "$abs" ]; then
+    kindex_fail "kindex resolved '$dir' for '$from', which does not exist"
+    return 0
+  fi
+  [ -f "$abs/kindex.db" ] || { kindex_fail "kindex resolved '$abs' for '$from', which holds no kindex.db"; return 0; }
   which="$(cd "$from" && kin profile which --json ${pargs[@]+"${pargs[@]}"} 2>/dev/null || true)"
   profile="$(printf '%s' "$which" | sed -n 's/.*"profile": *"\([^"]*\)".*/\1/p')"
   source="$(printf '%s' "$which" | sed -n 's/.*"source": *"\([^"]*\)".*/\1/p')"
-  KINDEX_MOUNT="$dir"
-  announce "kindex: profile ${profile:-(none)} via ${source:-legacy}, store $dir, mounted read-only; reviewers can read all of it (--no-kindex to opt out)"
+  KINDEX_MOUNT="$abs"
+  announce "kindex: profile ${profile:-(none)} via ${source:-legacy}, store $abs, mounted read-only; reviewers can read all of it (--no-kindex to opt out)"
 }
 
 # Assemble the shared `docker run` flags (mounts + hardening) for run/test.
@@ -417,7 +433,7 @@ case "$COMMAND" in
     # Dockerfile's pinned default.
     build_args=()
     if command -v kin >/dev/null 2>&1; then
-      kv="$(kin --version 2>/dev/null | awk '{print $2}')"
+      kv="$(kin --version 2>/dev/null | awk '{print $2}')" || kv=""
       if printf '%s' "$kv" | grep -qE '^[0-9]+(\.[0-9]+)+$'; then
         build_args=(--build-arg "KINDEX_VERSION=$kv")
         announce "kindex version: $kv (matching the host's kin)"
