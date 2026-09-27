@@ -379,6 +379,20 @@ class ArgvTest(unittest.TestCase):
         )
         self.assertEqual(argv[-2:], ["--", "the prompt"])
 
+    def test_double_dash_precedes_the_prompt_with_both_variadic_flags(self):
+        # --disallowedTools is variadic too, and a denied-tool list left
+        # unterminated would swallow the prompt as another tool name.
+        argv = passes.build_argv(
+            session_id=None,
+            model="m",
+            persona_prompt="p",
+            mcp_args=["--strict-mcp-config", "--mcp-config", "/home/r/mcp.json",
+                      "--disallowedTools", "mcp__kindex__add"],
+            prompt="the prompt",
+        )
+        self.assertEqual(argv[-2:], ["--", "the prompt"])
+        self.assertLess(argv.index("--disallowedTools"), argv.index("--"))
+
 
 if __name__ == "__main__":
     unittest.main()

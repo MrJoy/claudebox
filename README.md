@@ -410,6 +410,7 @@ Optional:
 - `MAX_PASSES_PER_SESSION` (rotate a session to a fresh one every N passes, per (PR, mode, persona) pair; `0` = never)
 - `MAX_CONCURRENT_PASSES` / `--max-concurrent-passes` (how many of a PR's personas review it at the same time; unset or `0` is all of them, `1` reviews one at a time — see [Personas](#personas))
 - `LINEAR_API_KEY` (optional Linear ticket context; use a **read-only** key — see [Linear ticket context](#linear-ticket-context))
+- `--no-kindex` / `--kindex-profile NAME` / `--kindex-dir DIR` (launcher flags, not env vars) control the reviewer's read-only kindex graph access, on by default when `kin` is on your `PATH`; see [kindex knowledge graph](#kindex-knowledge-graph)
 - `--export-sessions` (launcher flag, not an env var) — export review transcripts to the host and align the session folder; see [Exporting review sessions to your host](#exporting-review-sessions-to-your-host)
 
 ### PR selection
@@ -458,6 +459,24 @@ Get a key from **Settings → Security & access → Personal API keys**. Linear'
 Read-only bounds what the reviewer can change, not what it can see: a personal API key is scoped to your whole Linear workspace, not to the one ticket a PR claims to reference. The reviewer already treats PR titles, bodies, and diffs as untrusted input, and it can post PR comments — so Linear ticket content becomes a second untrusted input channel into a permission-skipped session, and a hostile or careless PR body can in principle steer it into reading unrelated tickets and pasting their contents into a comment on a possibly-public PR. Don't enable `LINEAR_API_KEY` on repos that take PRs from untrusted contributors, and prefer a key from an account with minimal Linear visibility over your main one.
 
 The entrypoint writes the key into a generated MCP config at `$HOME/mcp.json` (mode `600`), and the review loop passes that file to Claude Code with `--mcp-config`. Every review pass also runs with `--strict-mcp-config`, whether or not Linear is configured: the reviewed repo is untrusted input, and strict mode means a repository that ships its own `.mcp.json` can't get MCP servers of its choosing loaded into a permission-skipped session.
+
+### kindex knowledge graph
+
+If the reviewed repo has a [kindex](https://github.com/jmcentire/kindex) knowledge graph on the host, the reviewer gets a read-only copy of it: recorded decisions, constraints, open questions, prior findings, searchable through the kindex MCP tools alongside Linear. It's on **by default** whenever `kin` is on your `PATH` and you're mounting a repo: `claudebox.sh` resolves the store the same way kindex itself would for that repo, mounts the store itself read-only, and the container makes its own private copy before it refreshes each review cycle. `--no-repo` skips this resolution, since there's no repo to resolve it against; give `--kindex-profile` or `--kindex-dir` to name a store anyway.
+
+**The exposure: reviewers can read the whole resolved store, and can post anything they read there onto a PR.** kindex has no per-PR or per-persona scoping, and nothing here adds one. The reviewer's write channel is `gh pr comment`, so whatever's in the graph can end up in a comment on a possibly-public PR. How well that's contained comes down to how you've partitioned kindex profiles on your host; a repo that falls back to your default profile exposes everything in it.
+
+Three launcher flags control it:
+
+- `--no-kindex`: don't give the reviewer a kindex graph at all.
+- `--kindex-profile NAME`: use this named profile instead of whatever kindex would otherwise resolve.
+- `--kindex-dir DIR`: mount this data directory directly (it must hold a `kindex.db`), skipping resolution entirely.
+
+Both overrides work under `--no-repo` too. `--kindex-profile` then resolves from your current directory rather than the repo, since there isn't one; `--kindex-dir` never asked kindex anything to begin with.
+
+The container never opens your live store: it's mounted read-only as a source, and the loop copies it into the container before anything queries it, verifying the copy before use. Nothing the reviewer does can write back to your host graph.
+
+Rebuild after upgrading kindex on the host. `claudebox.sh build` pins the image's kindex to your host's `kin --version`, so an image older than the schema your store was written with fails the first snapshot at startup with a message telling you to rebuild; an older host schema is migrated into the copy instead of refused. Upgrading kindex on the host while a container is already running shows up later instead, at the next cycle's refresh, as a WARN that keeps the last good snapshot until you rebuild.
 
 ## Notes & caveats
 

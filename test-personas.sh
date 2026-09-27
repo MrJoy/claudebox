@@ -326,6 +326,9 @@ run_entrypoint() {
   local label="$1"; shift
   HOME_DIR="$WORK/home"; OUT="$WORK/out"
   rm -rf "$HOME_DIR"; mkdir -p "$HOME_DIR/work/repo/.git" "$HOME_DIR/seed"
+  # KINDEX_SRC is pinned to a path that never exists, so a host with a store
+  # at the entrypoint's default /kindex-src still runs these cases without
+  # kindex's MCP server.
   # Both waits are real time.sleep() calls inside the supervisor now, so both
   # are pinned to a second: the backoff is 1800s by default, and one limit case
   # running two cycles would otherwise stall the suite for half an hour.
@@ -336,7 +339,7 @@ run_entrypoint() {
     MAX_CYCLES=2 MAX_CONCURRENT_PASSES=1 \
     REAL_PYTHON3="$REAL_PYTHON3" REVIEWER_MAIN="$SCRIPT_DIR/reviewer/review_loop.py" \
     PERSONA_DIR="$SCRIPT_DIR/personas" \
-    PROVIDER=ollama OLLAMA_API_KEY=k \
+    PROVIDER=ollama OLLAMA_API_KEY=k KINDEX_SRC="$HOME_DIR/nonexistent" \
     "$@" "$BASH_BIN" "$ENTRYPOINT" >"$OUT" 2>&1 &
   watchdog_wait $!
 }

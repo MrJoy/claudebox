@@ -75,6 +75,29 @@ RUN apt-get update \
 ENV LITELLM_BIN=/opt/litellm/bin/litellm \
     LITELLM_LOCAL_MODEL_COST_MAP=True
 
+# kindex, for read-only access to the host's knowledge graph (see CLAUDE.md,
+# "Read-only kindex access"). Its own venv, root-owned like /opt/litellm and
+# for the same reason: the reviewer runs this code and must not be able to edit
+# it. `claudebox.sh build` passes the host's `kin --version` here, so the image
+# opens the schema the host writes; this default is for builds with no host kin.
+#
+# tools.txt is every MCP tool this version registers. reviewer/kindex_tools.py
+# denies all of them except a hand-classified read set, so a tool a bump adds
+# is denied until someone classifies it. The dump runs with a throwaway HOME:
+# importing the server must not touch a real store, and there is none here.
+ARG KINDEX_VERSION=0.44.0
+RUN python3 -m venv /opt/kindex \
+ && /opt/kindex/bin/pip install --no-cache-dir "kindex[mcp]==${KINDEX_VERSION}" \
+ && HOME=/tmp/kindex-build /opt/kindex/bin/python -c \
+      'import asyncio; from kindex.mcp_server import mcp; print("\n".join(sorted(t.name for t in asyncio.run(mcp.list_tools()))))' \
+      >/opt/kindex/tools.txt \
+ && test -s /opt/kindex/tools.txt \
+ && rm -rf /tmp/kindex-build \
+ && find /opt/kindex -name '__pycache__' -type d -prune -exec rm -rf {} +
+ENV KINDEX_PYTHON=/opt/kindex/bin/python \
+    KINDEX_MCP_BIN=/opt/kindex/bin/kin-mcp \
+    KINDEX_TOOLS_FILE=/opt/kindex/tools.txt
+
 # --- Non-root user ---------------------------------------------------------
 # Claude Code refuses --dangerously-skip-permissions when running as root, so
 # the loop must run unprivileged. This is also a defense-in-depth boundary.
@@ -112,6 +135,9 @@ COPY --chown=reviewer:reviewer personas/ /opt/claudebox/personas/
 # --dangerously-skip-permissions, and under --restart unless-stopped a writable
 # supervisor would be a persistence vector across restarts.
 COPY reviewer/ /opt/claudebox/reviewer/
+# Every tool the allowlist names must still exist in the pinned kindex. A read
+# tool renamed by a bump would otherwise be denied by omission, silently.
+RUN python3 -c 'import sys; sys.path.insert(0, "/opt/claudebox/reviewer"); import kindex_tools; have = set(open("/opt/kindex/tools.txt").read().split()); gone = sorted(kindex_tools.READ_TOOLS - have); sys.exit("kindex_tools.READ_TOOLS names tools this kindex lacks: " + ", ".join(gone) if gone else 0)'
 # The Workers AI normalizer, which entrypoint.sh runs between LiteLLM and
 # Cloudflare for PROVIDER=workersai. Stdlib-only, so it runs on the python3
 # installed above with no venv of its own. See the file header for why it exists.

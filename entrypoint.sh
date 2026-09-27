@@ -146,22 +146,33 @@ check_resource_limit() {
 # scope can't be checked from in here, so it's on the operator.
 
 # Write the MCP server config to $1 and return 0, or return 1 when there's
-# nothing to configure. The key is passed via env.LINEAR_API_KEY (not --arg)
-# so it never appears in the jq argv/`ps` output; jq's JSON string handling
-# still does the escaping, so a key containing a quote or backslash can't
-# produce a broken file. umask in a subshell makes the file 600 at creation,
-# so the key is never briefly world-readable.
+# nothing to configure: no Linear key and no kindex store. The key is passed via
+# env.LINEAR_API_KEY (not --arg) so it never appears in the jq argv/`ps` output;
+# jq's JSON string handling still does the escaping, so a key containing a quote
+# or backslash can't produce a broken file. umask in a subshell makes the file
+# 600 at creation, so the key is never briefly world-readable.
 write_mcp_config() {
-  [ -n "${LINEAR_API_KEY:-}" ] || return 1
+  [ -n "${LINEAR_API_KEY:-}" ] || [ "${KINDEX_ENABLED:-}" = 1 ] || return 1
   ( umask 077
-    LINEAR_API_KEY="$LINEAR_API_KEY" jq -n '{
-      mcpServers: {
-        linear: {
-          type: "http",
-          url: "https://mcp.linear.app/mcp",
-          headers: { Authorization: ("Bearer " + env.LINEAR_API_KEY) }
-        }
-      }
+    LINEAR_API_KEY="${LINEAR_API_KEY:-}" KINDEX_ENABLED="${KINDEX_ENABLED:-}" \
+    KINDEX_MCP_BIN="$KINDEX_MCP_BIN" jq -n '{
+      mcpServers: (
+        (if env.LINEAR_API_KEY != "" then {
+          linear: {
+            type: "http",
+            url: "https://mcp.linear.app/mcp",
+            headers: { Authorization: ("Bearer " + env.LINEAR_API_KEY) }
+          }
+        } else {} end)
+        + (if env.KINDEX_ENABLED == "1" then {
+          kindex: {
+            type: "stdio",
+            command: env.KINDEX_MCP_BIN,
+            args: [],
+            env: { KIN_PROFILE: "claudebox" }
+          }
+        } else {} end)
+      )
     }' >"$1" )
 }
 
@@ -736,6 +747,30 @@ export ANTHROPIC_DEFAULT_HAIKU_MODEL="$REVIEW_MODEL"
 # Deprecated alias for the small/fast model; set too for older code paths.
 export ANTHROPIC_SMALL_FAST_MODEL="$REVIEW_MODEL"
 
+# --- Optional kindex knowledge graph ----------------------------------------
+# claudebox.sh mounts the data dir kindex resolves for the reviewed repo at
+# $KINDEX_SRC, read-only. It is never opened in place: the supervisor copies it
+# to $KINDEX_DATA_DIR and refreshes the copy between cycles (reviewer/
+# graph_snapshot.py), and kin-mcp serves the copy. The container has one kindex
+# profile, `claudebox`, whatever the host's was called; the snapshot restamps
+# its copy to match, and KIN_PROFILE in the server's env outranks the
+# `profile:` key a reviewed repo's tracked .kin/config may carry.
+#
+# KINDEX_ENABLED is ours alone: unset first, so an env-file value cannot make
+# the prompts promise tools nobody wired.
+KINDEX_SRC="${KINDEX_SRC:-/kindex-src}"
+KINDEX_MCP_BIN="${KINDEX_MCP_BIN:-/opt/kindex/bin/kin-mcp}"
+KINDEX_DATA_DIR="$HOME/kindex"
+unset KINDEX_ENABLED
+if [ -f "$KINDEX_SRC/kindex.db" ]; then
+  KINDEX_ENABLED=1
+  mkdir -p "$HOME/.config/kindex"
+  # JSON is YAML; jq quotes the path.
+  jq -n --arg d "$KINDEX_DATA_DIR" \
+    '{profiles: {claudebox: {data_dir: $d}}, default_profile: "claudebox"}' \
+    >"$HOME/.config/kindex/kin.yaml"
+fi
+
 # --- MCP servers -----------------------------------------------------------
 # We generate the config; the supervisor builds the flags. It passes
 # --strict-mcp-config ALWAYS, and adds --mcp-config only when this file exists
@@ -747,14 +782,17 @@ export ANTHROPIC_SMALL_FAST_MODEL="$REVIEW_MODEL"
 MCP_CONFIG_FILE="$HOME/mcp.json"
 rm -f "$MCP_CONFIG_FILE"
 if write_mcp_config "$MCP_CONFIG_FILE"; then
-  log "Linear MCP enabled (expects a READ-ONLY Linear API key)."
+  [ -z "${LINEAR_API_KEY:-}" ] || log "Linear MCP enabled (expects a READ-ONLY Linear API key)."
+  [ "${KINDEX_ENABLED:-}" != 1 ] || log "kindex MCP enabled (a read-only snapshot of $KINDEX_SRC; read tools only)."
 else
   # A write that created the file and then failed partway (jq killed, the disk
   # full after the open) would otherwise hand claude truncated JSON on every
   # pass, because the supervisor keys the flag off the file existing. Deleting
   # it degrades that to "no MCP servers", which is what the shell did when it
-  # keyed the flag off the write succeeding.
+  # keyed the flag off the write succeeding. kindex goes with it, or the prompt
+  # would promise a server that is not there.
   rm -f "$MCP_CONFIG_FILE"
+  unset KINDEX_ENABLED
 fi
 
 # --- Prepare a writable working copy ---------------------------------------
@@ -828,6 +866,9 @@ git -C "$WORK_REPO" remote set-url origin "https://github.com/${GITHUB_REPOSITOR
 export WORK_REPO
 export REVIEW_MODEL
 export MCP_CONFIG_FILE
+if [ "${KINDEX_ENABLED:-}" = 1 ]; then
+  export KINDEX_ENABLED KINDEX_SRC KINDEX_DATA_DIR
+fi
 export LITELLM_PID="${LITELLM_PID:-}"
 export SHIM_PID="${SHIM_PID:-}"
 # Exported even though Python defaults them identically, so the value this
