@@ -2,6 +2,7 @@ import contextlib
 import io
 import os
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -1522,6 +1523,122 @@ class McpArgsTest(unittest.TestCase):
             MCP_CONFIG_FILE="/nonexistent/mcp.json",
         ))
         self.assertEqual(argv, ["--strict-mcp-config"])
+
+
+class KindexWiringTest(unittest.TestCase):
+    """main() takes the first snapshot before any cycle, denies the write tools,
+    and refreshes between cycles without letting a failed refresh stop reviews."""
+
+    def _env(self, **extra):
+        src = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, src, ignore_errors=True)
+        conn = sqlite3.connect(os.path.join(src, "kindex.db"))
+        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+        conn.commit()
+        conn.close()
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        tools = os.path.join(home, "tools.txt")
+        with open(tools, "w") as fh:
+            fh.write("add\nsearch\n")
+        mcp = os.path.join(home, "mcp.json")
+        with open(mcp, "w") as fh:
+            fh.write("{}")
+        self.mcp = mcp
+        self.data_dir = os.path.join(home, "kindex")
+        env = preflight_env(
+            WORK_REPO=scratch_repo(self), REVIEW_MODEL="m", MAX_CYCLES="1",
+            PERSONAS="red_team", MCP_CONFIG_FILE=mcp,
+            KINDEX_ENABLED="1", KINDEX_SRC=src, KINDEX_DATA_DIR=self.data_dir,
+            KINDEX_PYTHON="/usr/bin/true", KINDEX_TOOLS_FILE=tools,
+        )
+        env.update(extra)
+        return env
+
+    def _main(self, env, refresh=None):
+        original = os.environ.copy()
+        os.environ.clear()
+        os.environ.update(env)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(original)))
+
+        captured = {"mcp_args": None, "prompts": []}
+
+        class Recorder(review_loop.Supervisor):
+            def _run_one(inner, pair, prompt, session_id):
+                captured["mcp_args"] = list(inner.mcp_args)
+                captured["prompts"].append(prompt)
+                return ok()
+
+        for obj, name, value in (
+            (review_loop, "Supervisor", Recorder),
+            (review_loop.gh, "enumerate_candidate_prs", lambda *a, **k: [
+                review_loop.gh.PRSnapshot(number=12, mode="code", head_oid="", updated_at="")]),
+            (review_loop.subprocess, "run",
+             lambda *a, **k: subprocess.CompletedProcess(a[0], 0, "", "")),
+            (review_loop.time, "sleep", lambda n: None),
+        ):
+            self.addCleanup(setattr, obj, name, getattr(obj, name))
+            setattr(obj, name, value)
+        if refresh is not None:
+            cls = review_loop.graph_snapshot.Snapshotter
+            self.addCleanup(setattr, cls, "refresh", cls.refresh)
+            cls.refresh = refresh
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                rc = review_loop.main([])
+            except SystemExit as exc:
+                rc = exc.code
+        return rc, out.getvalue(), err.getvalue(), captured
+
+    def test_the_write_tools_are_denied_behind_the_config(self):
+        _, _, _, captured = self._main(self._env())
+        self.assertEqual(captured["mcp_args"], [
+            "--strict-mcp-config", "--mcp-config", self.mcp,
+            "--disallowedTools", "mcp__kindex__add",
+        ])
+
+    def test_the_first_snapshot_exists_before_the_first_pass(self):
+        self._main(self._env())
+        self.assertTrue(os.path.isfile(os.path.join(self.data_dir, "kindex.db")))
+
+    def test_the_stanza_reaches_the_prompt(self):
+        _, _, _, captured = self._main(self._env())
+        self.assertIn("kindex knowledge graph", captured["prompts"][0])
+
+    def test_a_failed_first_snapshot_stops_the_container(self):
+        def fail(self_):
+            raise review_loop.graph_snapshot.SnapshotError("kindex refused the copy: x")
+        rc, _, err, captured = self._main(self._env(), refresh=fail)
+        self.assertEqual(rc, 1)
+        self.assertIn("kindex snapshot failed: kindex refused the copy: x", err)
+        self.assertIn("claudebox.sh build", err)
+        self.assertIsNone(captured["mcp_args"])
+
+    def test_a_failed_refresh_mid_life_warns_and_keeps_reviewing(self):
+        # Review Focus 5: the host upgraded kindex while the container ran.
+        calls = []
+
+        def first_ok_then_fail(self_):
+            calls.append(1)
+            if len(calls) > 1:
+                raise review_loop.graph_snapshot.SnapshotError("kindex refused the copy: newer")
+            return True
+
+        rc, out, _, captured = self._main(self._env(MAX_CYCLES="2"), refresh=first_ok_then_fail)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls), 3)  # startup, then once per cycle
+        self.assertIn("WARN: kindex snapshot refresh failed (kindex refused the copy: newer); "
+                      "keeping the previous one.", out)
+        self.assertEqual(len(captured["prompts"]), 2)
+
+    def test_disabled_means_no_snapshot_and_no_flag(self):
+        env = self._env()
+        env.pop("KINDEX_ENABLED")
+        _, _, _, captured = self._main(env)
+        self.assertEqual(captured["mcp_args"], ["--strict-mcp-config", "--mcp-config", self.mcp])
+        self.assertFalse(os.path.exists(self.data_dir))
 
 
 class SharedWorktreeModesTest(unittest.TestCase):

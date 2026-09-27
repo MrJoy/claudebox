@@ -26,6 +26,8 @@ from dataclasses import dataclass
 from typing import Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
 
 import gh
+import graph_snapshot
+import kindex_tools
 import passes
 import personas as personas_mod
 import prompts as prompts_mod
@@ -957,6 +959,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             lock_git_dir(work_repo)
             log("The working clone's .git is read-only except during the "
                 "cycle's own fetch (shared-worktree enforcement).")
+
+        # The kindex snapshot, taken before the first pass so no persona ever
+        # sees a server with nothing behind it. KINDEX_ENABLED is set only by
+        # entrypoint.sh, and only once it has written the server into mcp.json.
+        # A first snapshot that fails is a startup failure: the stanza already
+        # promised the tools. The usual cause is a host kindex newer than the
+        # image's, which a rebuild fixes.
+        snapshotter = None
+        kindex_deny: List[str] = []
+        if env.get("KINDEX_ENABLED") == "1":
+            snapshotter = graph_snapshot.Snapshotter(
+                src=_required(env, "KINDEX_SRC"),
+                dst=_required(env, "KINDEX_DATA_DIR"),
+                python=env.get("KINDEX_PYTHON") or "/opt/kindex/bin/python",
+            )
+            try:
+                snapshotter.refresh()
+            except graph_snapshot.SnapshotError as exc:
+                raise ConfigError(
+                    f"kindex snapshot failed: {exc}. If the host's kindex is newer "
+                    "than the image's, rebuild with `claudebox.sh build`, which pins "
+                    "the image to the host's version; or run with --no-kindex."
+                )
+            kindex_deny = kindex_tools.deny_args(
+                env.get("KINDEX_TOOLS_FILE") or "/opt/kindex/tools.txt")
+            log("kindex: read-only snapshot of the host store ready; "
+                f"{len(kindex_tools.READ_TOOLS)} read tools allowed.")
     except ConfigError as exc:
         die(str(exc))
 
@@ -964,6 +993,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     mcp_config = env.get("MCP_CONFIG_FILE", "")
     if mcp_config and os.path.isfile(mcp_config):
         mcp_args += ["--mcp-config", mcp_config]
+        # Only behind a config that exists: the deny list names kindex's tools,
+        # and there is no kindex server without the file.
+        mcp_args += kindex_deny
 
     supervisor = Supervisor(
         personas=persona_ids,
@@ -990,6 +1022,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     cycles = 0
     while True:
         check_litellm(env)
+
+        # Between cycles, before the fetch: groups are strictly serialized, so
+        # no pass has the snapshot open. A refresh that fails keeps the last
+        # good one, the same degrade-and-continue the fetch below gets.
+        if snapshotter is not None:
+            try:
+                if snapshotter.refresh():
+                    log("kindex: refreshed the snapshot from the host store.")
+            except graph_snapshot.SnapshotError as exc:
+                log(f"WARN: kindex snapshot refresh failed ({exc}); keeping the previous one.")
 
         log("Fetching latest refs...")
         try:
