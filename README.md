@@ -462,7 +462,7 @@ The entrypoint writes the key into a generated MCP config at `$HOME/mcp.json` (m
 
 ### kindex knowledge graph
 
-If the reviewed repo has a [kindex](https://github.com/jmcentire/kindex) knowledge graph on the host, the reviewer gets a read-only copy of it: recorded decisions, constraints, open questions, prior findings, searchable through the kindex MCP tools alongside Linear. It's on **by default** whenever `kin` is on your `PATH`: `claudebox.sh` resolves the store the same way kindex itself would for that repo, mounts a copy, and refreshes it every review cycle.
+If the reviewed repo has a [kindex](https://github.com/jmcentire/kindex) knowledge graph on the host, the reviewer gets a read-only copy of it: recorded decisions, constraints, open questions, prior findings, searchable through the kindex MCP tools alongside Linear. It's on **by default** whenever `kin` is on your `PATH` and you're mounting a repo: `claudebox.sh` resolves the store the same way kindex itself would for that repo, mounts the store itself read-only, and the container makes its own private copy before it refreshes each review cycle. `--no-repo` skips this resolution, since there's no repo to resolve it against; give `--kindex-profile` or `--kindex-dir` to name a store anyway.
 
 **The exposure: reviewers can read the whole resolved store, and can post anything they read there onto a PR.** kindex has no per-PR or per-persona scoping, and nothing here adds one. The reviewer's write channel is `gh pr comment`, so whatever's in the graph can end up in a comment on a possibly-public PR. How well that's contained comes down to how you've partitioned kindex profiles on your host; a repo that falls back to your default profile exposes everything in it.
 
@@ -471,6 +471,8 @@ Three launcher flags control it:
 - `--no-kindex`: don't give the reviewer a kindex graph at all.
 - `--kindex-profile NAME`: use this named profile instead of whatever kindex would otherwise resolve.
 - `--kindex-dir DIR`: mount this data directory directly (it must hold a `kindex.db`), skipping resolution entirely.
+
+Both overrides work under `--no-repo` too. `--kindex-profile` then resolves from your current directory rather than the repo, since there isn't one; `--kindex-dir` never asked kindex anything to begin with.
 
 The container never opens your live store: it's mounted read-only as a source, and the loop copies it into the container before anything queries it, verifying the copy before use. Nothing the reviewer does can write back to your host graph.
 
