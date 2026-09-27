@@ -90,7 +90,13 @@ fi
 L="auto: no kin on PATH means no mount and no error"
 if selected "$L"; then
   launch "$L" 0 -- -- "${RUN[@]}"
-  expect "$L" 0 -- "!/kindex-src"
+  expect "$L" 0 -- "!/kindex-src" "!WARN:" "!kindex"
+fi
+
+L="--kindex-profile with no kin on PATH is fatal"
+if selected "$L"; then
+  launch "$L" 0 -- -- "${RUN[@]}" --kindex-profile hoo3
+  expect "$L" 1 -- "ERROR:" "kin is not on PATH"
 fi
 
 L="auto: an unknown profile warns and launches without kindex"

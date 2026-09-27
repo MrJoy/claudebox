@@ -181,6 +181,56 @@ class RefreshTest(unittest.TestCase):
             h.snap.refresh()
         self.assertEqual(titles(h.dst), ["only-in-the-wal"])
 
+    def test_a_store_that_opens_but_fails_quick_check_is_refused(self):
+        # SQLite opens a truncated store without complaint; only the result
+        # row of quick_check says it is corrupt. The garbage-bytes case above
+        # never reaches that row, since the PRAGMA itself raises there.
+        src, conn = make_store(self)
+        h = Harness(self, src)
+        h.snap.refresh()
+        conn.executemany("INSERT INTO nodes VALUES (?)",
+                         [("n%05d" % i,) for i in range(2000)])
+        conn.commit()
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.close()
+        db = os.path.join(src, "kindex.db")
+        with open(db, "r+b") as fh:
+            fh.truncate(os.path.getsize(db) - 200)
+        with self.assertRaisesRegex(SnapshotError, "failed quick_check"):
+            h.snap.refresh()
+        self.assertEqual(titles(h.dst), ["only-in-the-wal"])
+        self.assertFalse(os.path.exists(h.dst + ".staging"))
+
+    def test_a_staging_os_error_is_a_snapshot_error_and_dst_is_untouched(self):
+        # ENOSPC while staging must reach review_loop as SnapshotError, which
+        # is all its handlers catch; a bare OSError would exit PID 1.
+        src, conn = make_store(self)
+        h = Harness(self, src)
+        h.snap.refresh()
+        conn.execute("INSERT INTO nodes VALUES ('newer')")
+        conn.commit()
+
+        def full_disk(a, b):
+            raise OSError(28, "No space left on device")
+
+        h.snap._copy = full_disk
+        with self.assertRaisesRegex(SnapshotError, "could not stage the copy"):
+            h.snap.refresh()
+        self.assertEqual(titles(h.dst), ["only-in-the-wal"])
+        self.assertFalse(os.path.exists(h.dst + ".staging"))
+
+    def test_the_default_opener_runs_kindex_against_the_staged_copy(self):
+        src, _ = make_store(self)
+        stub = ArgvStub(self)
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        dst = os.path.join(root, "kindex")
+        Snapshotter(src, dst, python=stub.path, sleep=lambda s: None).refresh()
+        argv, cwd = stub.calls()[0]
+        staging = os.path.realpath(dst + ".staging")
+        self.assertEqual(os.path.realpath(argv[3]), staging)
+        self.assertEqual(os.path.realpath(cwd), staging)
+
     def test_an_opener_refusal_leaves_dst_alone(self):
         # Review Focus 5's lower half: the image's kindex refusing a newer
         # schema must not replace a snapshot that works.
@@ -230,9 +280,39 @@ class RefreshTest(unittest.TestCase):
         self.assertFalse(os.path.exists(h.dst + ".staging"))
 
 
+class ArgvStub:
+    """A stand-in interpreter that records its argv and cwd, then exits 0."""
+
+    def __init__(self, case):
+        self.dir = tempfile.mkdtemp()
+        case.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.log = os.path.join(self.dir, "calls")
+        self.path = os.path.join(self.dir, "python")
+        with open(self.path, "w") as fh:
+            fh.write("#!/bin/sh\n"
+                     f"{{ for a; do printf '%s\\0' \"$a\"; done; printf '%s\\0\\n' \"$(pwd)\"; }} >>'{self.log}'\n")
+        os.chmod(self.path, 0o755)
+
+    def calls(self):
+        with open(self.log) as fh:
+            out = []
+            for record in fh.read().split("\0\n")[:-1]:
+                fields = record.split("\0")
+                out.append((fields[:-1], fields[-1]))
+            return out
+
+
 class WarmUpTest(unittest.TestCase):
-    def test_a_zero_exit_is_accepted(self):
-        graph_snapshot.warm_up("/usr/bin/true", tempfile.gettempdir())
+    def test_kindex_is_handed_the_profile_and_the_data_dir(self):
+        stub = ArgvStub(self)
+        data_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, data_dir, ignore_errors=True)
+        graph_snapshot.warm_up(stub.path, data_dir)
+        [(argv, cwd)] = stub.calls()
+        self.assertEqual(argv[0], "-c")
+        self.assertIn("load_config(profile=sys.argv[1], data_dir=sys.argv[2])", argv[1])
+        self.assertEqual(argv[2:], [CONTAINER_PROFILE, data_dir])
+        self.assertEqual(os.path.realpath(cwd), os.path.realpath(data_dir))
 
     def test_a_non_zero_exit_names_the_last_stderr_line(self):
         script = tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False)

@@ -686,7 +686,7 @@ wires "kindex: a mounted store wires the server, the profile, and the deny list"
      ARGV:'kindex knowledge graph' \
      LOG:'kindex MCP enabled'
 wires "kindex: no store means no server, no flag, no stanza" \
-  PROVIDER=ollama OLLAMA_API_KEY=k \
+  PROVIDER=ollama OLLAMA_API_KEY=k KINDEX_SRC="$WORK/nonexistent" \
   -- 'NOMCP:"kindex"' NOARGV:'--disallowedTools' NOARGV:'kindex knowledge graph'
 wires "kindex: an env-file KINDEX_ENABLED without a store does nothing" \
   PROVIDER=ollama OLLAMA_API_KEY=k KINDEX_ENABLED=1 KINDEX_SRC="$WORK/nonexistent" \
