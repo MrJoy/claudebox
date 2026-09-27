@@ -46,6 +46,12 @@ class DefaultsMatchTheShellTest(unittest.TestCase):
         )
         self.assertEqual(built, fixture("prompt-code-review-linear.txt"))
 
+    def test_kindex_stanza_lands_on_the_default(self):
+        built = prompts.render(
+            prompts.build({"KINDEX_ENABLED": "1"}).review["code"], 1
+        )
+        self.assertEqual(built, fixture("prompt-code-review-kindex.txt"))
+
 
 class StanzaScopeTest(unittest.TestCase):
     def test_plan_prompts_carry_no_test_stanza(self):
@@ -74,6 +80,33 @@ class StanzaScopeTest(unittest.TestCase):
     def test_linear_stanza_is_absent_without_a_key(self):
         self.assertEqual(prompts.linear_stanza({}), "")
         self.assertEqual(prompts.linear_stanza({"LINEAR_API_KEY": ""}), "")
+
+
+class KindexStanzaTest(unittest.TestCase):
+    ON = {"KINDEX_ENABLED": "1"}
+
+    def test_off_unless_the_entrypoint_turned_it_on(self):
+        self.assertEqual(prompts.kindex_stanza({}), "")
+        self.assertEqual(prompts.kindex_stanza({"KINDEX_ENABLED": "0"}), "")
+        self.assertEqual(prompts.kindex_stanza({"KINDEX_ENABLED": "yes"}), "")
+
+    def test_all_four_defaults_carry_it(self):
+        p = prompts.build(self.ON)
+        for mode in ("code", "plan"):
+            self.assertTrue(p.review[mode].endswith(prompts.KINDEX_STANZA), mode)
+            self.assertTrue(p.followup[mode].endswith(prompts.KINDEX_STANZA), mode)
+
+    def test_an_override_stays_verbatim(self):
+        p = prompts.build(dict(self.ON, REVIEW_PROMPT="just look at #{{PR}}"))
+        self.assertEqual(p.review["code"], "just look at #{{PR}}")
+
+    def test_it_follows_the_linear_stanza(self):
+        p = prompts.build(dict(self.ON, LINEAR_API_KEY="lin_test"))
+        self.assertIn(prompts.linear_stanza({"LINEAR_API_KEY": "x"}) + prompts.KINDEX_STANZA,
+                      p.review["code"])
+
+    def test_off_leaves_the_defaults_byte_identical(self):
+        self.assertEqual(prompts.build({}).review, prompts.build({"KINDEX_ENABLED": "0"}).review)
 
 
 class OverrideTest(unittest.TestCase):
