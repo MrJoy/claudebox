@@ -165,10 +165,26 @@ cat >"$BIN/claude" <<'STUB'
   # Likewise for the normalizer behind it: which upstream it was pointed at, and
   # on which port, is the whole wiring of the chain.
   if [ -f "$HOME/shim-argv" ]; then echo "SHIM $(cat "$HOME/shim-argv")"; fi
+  # The generated MCP config and the container's kindex profile, one compact
+  # line each, so a case can assert what servers were wired and how.
+  if [ -f "$HOME/mcp.json" ]; then echo "MCP $(jq -c . "$HOME/mcp.json")"; fi
+  if [ -f "$HOME/.config/kindex/kin.yaml" ]; then echo "KINY $(jq -c . "$HOME/.config/kindex/kin.yaml")"; fi
 } >"$HOME/dump"
 exit 42
 STUB
 chmod +x "$BIN"/*
+
+# A kindex-shaped store for the kindex cases, outside $HOME because each run
+# wipes $HOME. KINDEX_PYTHON stands in for the image's kindex, which the
+# supervisor runs once to open each snapshot: one that accepts it, one that
+# refuses it the way a too-new schema would.
+KSRC="$WORK/kindex-src"; mkdir -p "$KSRC"
+"$REAL_PYTHON3" -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)'); c.commit()" "$KSRC/kindex.db"
+printf 'add\nsearch\nshow\n' >"$WORK/kindex-tools.txt"
+printf '#!/bin/sh\nexit 0\n' >"$BIN/kindex-python"
+printf '#!/bin/sh\necho "SchemaMigrationPending: schema 16 is newer than 15" >&2\nexit 1\n' >"$BIN/kindex-python-refuses"
+chmod +x "$BIN/kindex-python" "$BIN/kindex-python-refuses"
+KINDEX_ON=(KINDEX_SRC="$KSRC" KINDEX_PYTHON="$BIN/kindex-python" KINDEX_TOOLS_FILE="$WORK/kindex-tools.txt" KINDEX_MCP_BIN=/opt/kindex/bin/kin-mcp)
 
 PASS=0; FAIL=0; SKIP=0
 FAILED_LABELS=""
@@ -288,6 +304,11 @@ wires() {
       # SHIM:<substring> / NOSHIM:<substring> — how the normalizer was launched.
       SHIM:*) grep -q -- "SHIM .*${expect#SHIM:}" "$DUMP" || missing="$missing [shim launch missing: ${expect#SHIM:}]"; continue ;;
       NOSHIM:*) grep -q -- "SHIM .*${expect#NOSHIM:}" "$DUMP" && missing="$missing [shim launch should not have: ${expect#NOSHIM:}]"; continue ;;
+      # MCP:<substring> / NOMCP:<substring> -- the generated mcp.json, compacted.
+      MCP:*) grep -qF -- "MCP " "$DUMP" && grep '^MCP ' "$DUMP" | grep -qF -- "${expect#MCP:}" || missing="$missing [mcp.json missing: ${expect#MCP:}]"; continue ;;
+      NOMCP:*) grep '^MCP ' "$DUMP" 2>/dev/null | grep -qF -- "${expect#NOMCP:}" && missing="$missing [mcp.json should not have: ${expect#NOMCP:}]"; continue ;;
+      # KINY:<substring> -- the container's kin.yaml, compacted.
+      KINY:*) grep '^KINY ' "$DUMP" | grep -qF -- "${expect#KINY:}" || missing="$missing [kin.yaml missing: ${expect#KINY:}]"; continue ;;
       # ARGV:<substring> / NOARGV:<substring> — claude's own argv, which is where
       # the prompt lands. -F because prompt text is full of characters grep would
       # otherwise read as pattern syntax. Isolating the ARGV line is "everything
@@ -649,6 +670,33 @@ wires "prompt: a suffix appends to an override" \
   PROVIDER=ollama OLLAMA_API_KEY=k REVIEW_PROMPT='review {{PR}}' \
   REVIEW_PROMPT_SUFFIX='and skip the tests' \
   -- ARGV:'review 1 and skip the tests'
+
+# --- kindex -------------------------------------------------------------------
+# A store mounted at KINDEX_SRC is snapshotted by the supervisor and served by
+# kin-mcp under the fixed container profile `claudebox`. KIN_PROFILE in the
+# server's env is what outranks the `profile:` key a reviewed repo's tracked
+# .kin/config may carry. Only the read tools survive --disallowedTools.
+wires "kindex: a mounted store wires the server, the profile, and the deny list" \
+  PROVIDER=ollama OLLAMA_API_KEY=k "${KINDEX_ON[@]}" \
+  -- 'MCP:"kindex":{"type":"stdio","command":"/opt/kindex/bin/kin-mcp","args":[],"env":{"KIN_PROFILE":"claudebox"}}' \
+     'KINY:"default_profile":"claudebox"' \
+     "KINY:\"data_dir\":\"$WORK/home/kindex\"" \
+     'ARGV:--disallowedTools mcp__kindex__add' \
+     NOARGV:'mcp__kindex__search' \
+     ARGV:'kindex knowledge graph' \
+     LOG:'kindex MCP enabled'
+wires "kindex: no store means no server, no flag, no stanza" \
+  PROVIDER=ollama OLLAMA_API_KEY=k \
+  -- 'NOMCP:"kindex"' NOARGV:'--disallowedTools' NOARGV:'kindex knowledge graph'
+wires "kindex: an env-file KINDEX_ENABLED without a store does nothing" \
+  PROVIDER=ollama OLLAMA_API_KEY=k KINDEX_ENABLED=1 KINDEX_SRC="$WORK/nonexistent" \
+  -- NOARGV:'kindex knowledge graph' NOARGV:'--disallowedTools'
+wires "kindex: alongside Linear, both servers are wired" \
+  PROVIDER=ollama OLLAMA_API_KEY=k LINEAR_API_KEY=lin_x "${KINDEX_ON[@]}" \
+  -- 'MCP:"linear":{"type":"http"' 'MCP:"kindex":{"type":"stdio"' LOG:'Linear MCP enabled'
+refuses "kindex: a store the image cannot open stops the container" \
+  "kindex snapshot failed: kindex refused the copy: SchemaMigrationPending: schema 16 is newer than 15" \
+  -- PROVIDER=ollama OLLAMA_API_KEY=k "${KINDEX_ON[@]}" KINDEX_PYTHON="$BIN/kindex-python-refuses"
 
 # --- Seed selection ----------------------------------------------------------
 # Which path the working clone is made from. The launcher mounts only the host
