@@ -248,5 +248,17 @@ if selected "$L"; then
   fi
 fi
 
+L="selectors: --new combines with --assignee"
+if selected "$L"; then
+  launch "$L" 0 -- -- "${RUN[@]}" --new --assignee alice
+  expect "$L" 0 -- "PR_ASSIGNEE=alice" "PR_NEW=1"
+fi
+
+L="selectors: --new with any other selector is refused"
+if selected "$L"; then
+  launch "$L" 0 -- -- "${RUN[@]}" --all --new
+  expect "$L" 1 -- "ERROR:" "--new cannot be combined with --all"
+fi
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = 0 ] || { printf 'Failed:%s\n' "$FAILED"; exit 1; }

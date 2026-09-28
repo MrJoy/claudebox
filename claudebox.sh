@@ -122,7 +122,8 @@ OPTIONS
                     query.
   --new             Review open PRs created after this container started. The
                     cutoff is captured once at startup and resets on restart.
-                    Provide exactly ONE of
+                    Combine with --assignee to review only that user's new PRs.
+                    Otherwise provide exactly ONE of
                     --all/--assignee/--prs/--search/--new (here or via PR_* in
                     the env file).
   --persona LIST    Review with these adversarial personas only (comma list, or
@@ -167,6 +168,7 @@ EXAMPLES
   claudebox run --assignee alice                             # PRs assigned to alice
   claudebox run --prs 12,15,20                               # just these PRs
   claudebox run --new                                        # only PRs opened after startup
+  claudebox run --assignee alice --new                       # alice's PRs opened after startup
   ./claudebox.sh test --repo ~/src/myrepo                    # one-off foreground run
   ./claudebox.sh logs
   ./claudebox.sh stop
@@ -196,7 +198,7 @@ while [ $# -gt 0 ]; do
     --assignee)    PR_ASSIGNEE="${2:?--assignee requires a LOGIN}"; PR_SEL_COUNT=$((PR_SEL_COUNT + 1)); PR_SEL_NAMES="$PR_SEL_NAMES --assignee"; shift ;;
     --prs)         PR_IDS="${2:?--prs requires a comma/space list of PR numbers}"; PR_SEL_COUNT=$((PR_SEL_COUNT + 1)); PR_SEL_NAMES="$PR_SEL_NAMES --prs"; shift ;;
     --search)      PR_SEARCH="${2:?--search requires a gh search query}"; PR_SEL_COUNT=$((PR_SEL_COUNT + 1)); PR_SEL_NAMES="$PR_SEL_NAMES --search"; shift ;;
-    --new)         PR_NEW=1;      PR_SEL_COUNT=$((PR_SEL_COUNT + 1)); PR_SEL_NAMES="$PR_SEL_NAMES --new" ;;
+    --new)         PR_NEW=1 ;;
     --persona)     PERSONAS="${2:?--persona requires a comma-separated list of persona names}"; shift ;;
     --max-concurrent-passes)
                    MAX_CONCURRENT_PASSES="${2:?--max-concurrent-passes requires a non-negative integer}"; shift ;;
@@ -217,7 +219,11 @@ done
 # Selector flags are mutually exclusive (the entrypoint is authoritative and
 # also errors when none/multiple are set via the env file; this is the friendly
 # early check for CLI flags). Zero flags is fine here — the env file may set one.
-[ "$PR_SEL_COUNT" -le 1 ] || die "multiple PR selector flags given ($(echo "$PR_SEL_NAMES" | xargs)); provide exactly one of --all, --assignee, --prs, --search, --new."
+# --new stands alone or narrows --assignee to PRs created after startup.
+[ "$PR_SEL_COUNT" -le 1 ] || die "multiple PR selector flags given ($(echo "$PR_SEL_NAMES" | xargs)); provide exactly one of --all, --assignee, --prs, --search, --new (--new may also be combined with --assignee)."
+if [ "$PR_NEW" = 1 ] && [ "$PR_SEL_COUNT" = 1 ] && [ -z "$PR_ASSIGNEE" ]; then
+  die "--new cannot be combined with$PR_SEL_NAMES; it works alone or with --assignee."
+fi
 
 if [ "$KINDEX" = 0 ] && { [ -n "$KINDEX_PROFILE" ] || [ -n "$KINDEX_DIR" ]; }; then
   die "--no-kindex contradicts --kindex-profile/--kindex-dir; give one or the other."

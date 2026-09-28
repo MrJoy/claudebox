@@ -1,5 +1,9 @@
 # History
 
+## Unreleased
+
+* **`PR_NEW` (`--new`) now combines with `PR_ASSIGNEE` (`--assignee`)** to review only that user's PRs created after startup. Every other pairing is still refused. The combination rides the assignee selector's non-search listing, adds `createdAt` to its field list, and keeps PRs created strictly after the startup cutoff, so unlike `PR_NEW` alone it works on a privilege-minimized token.
+
 ## 0.8.0 - 2026-09-27
 
 * **A seventh persona, Pat Helland (`helland`), imported from advocate.** advocate added it after claudebox's first import, so it was missing rather than excluded. It asks who owns each fact, who may mutate it, and what the business does when a guess turns out wrong. Plan mode runs it by default, since ownership and reconciliation questions cost least to act on before code exists. Code mode leaves it opt-in through `PERSONAS`, because most diffs never cross a system boundary. Only `helland.md` was copied from the importer's output; a full re-run would have dropped Sage's `phase: 2` and its rebuttal section.

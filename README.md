@@ -415,7 +415,7 @@ Optional:
 
 ### PR selection
 
-Set **exactly one** of these (or pass the matching launcher flag). Zero or more than one is a startup error:
+Set **exactly one** of these (or pass the matching launcher flag), except that `PR_NEW` may also be paired with `PR_ASSIGNEE`. Zero, or any other combination, is a startup error:
 
 | Env var | Launcher flag | Reviews |
 |---|---|---|
@@ -424,6 +424,8 @@ Set **exactly one** of these (or pass the matching launcher flag). Zero or more 
 | `PR_IDS=12,15,20` | `--prs 12,15,20` | exactly those PR numbers |
 | `PR_SEARCH=is:open label:x` | `--search "…"` | PRs matching a gh search query (you control state) |
 | `PR_NEW=1` | `--new` | open PRs created after this container started (cutoff captured once at startup, reset on restart) |
+
+`PR_NEW` is the one selector that combines with another: set it alongside `PR_ASSIGNEE` (`--assignee login --new`) to review only that user's PRs opened after startup. That combination stays off the search API, filtering the assignee listing by `createdAt` itself, so it works on a privilege-minimized token even though `PR_NEW` alone does not.
 
 > **`PR_SEARCH` and `PR_NEW` need a token that can search.** Both are backed by GitHub's issue/PR search, which returns nothing for a fine-grained PAT — so on a privilege-minimized token they silently find no PRs. `PR_ALL`, `PR_ASSIGNEE`, and `PR_IDS` avoid search (`PR_ASSIGNEE` lists open PRs and matches the login itself), so they work with a PR-read-only token. Use a classic PAT with `repo` scope if you need the search-backed selectors.
 
