@@ -72,7 +72,9 @@ def resolve_pr_selection(env: Mapping[str, str]) -> str:
         active.append("ids")
     if env.get("PR_SEARCH"):
         active.append("search")
-    if pr_truthy(env.get("PR_NEW")):
+    # PR_NEW alongside PR_ASSIGNEE narrows the assignee selector to PRs
+    # created after startup instead of counting as a second selector.
+    if pr_truthy(env.get("PR_NEW")) and not env.get("PR_ASSIGNEE"):
         active.append("new")
 
     if not active:
@@ -84,13 +86,19 @@ def resolve_pr_selection(env: Mapping[str, str]) -> str:
     if len(active) > 1:
         raise ConfigError(
             "multiple PR selectors set; provide exactly one of PR_ALL, "
-            "PR_ASSIGNEE, PR_IDS, PR_SEARCH, PR_NEW."
+            "PR_ASSIGNEE, PR_IDS, PR_SEARCH, PR_NEW (PR_NEW may also be "
+            "combined with PR_ASSIGNEE)."
         )
     selector = active[0]
     # Validate the ID list up front so a bad value fails fast, not every cycle.
     if selector == "ids":
         parse_pr_ids(env.get("PR_IDS", ""))
     return selector
+
+
+def wants_new(selector: str, env: Mapping[str, str]) -> bool:
+    """True when this run only reviews PRs created after startup."""
+    return selector == "new" or (selector == "assignee" and pr_truthy(env.get("PR_NEW")))
 
 
 def pr_modes(payload: Any, plan_label: str) -> List[PRSnapshot]:
@@ -214,11 +222,14 @@ def enumerate_candidate_prs(
         # Deliberately NOT `--assignee`: that filter is search-backed, and
         # GitHub's issue/PR search returns nothing for a fine-grained /
         # privilege-minimized token, so the selector silently saw no PRs. List
-        # open PRs the non-search way and match the assignee below.
-        argv = base + [
-            "--state", "open", "--limit", "100", "--json",
-            "number,labels,headRefOid,updatedAt,assignees",
-        ]
+        # open PRs the non-search way and match the assignee below. PR_NEW's
+        # cutoff is matched below too, off createdAt, for the same reason.
+        fields = "number,labels,headRefOid,updatedAt,assignees"
+        if wants_new(selector, env):
+            if not since:
+                raise ConfigError("PR_NEW with PR_ASSIGNEE needs a baseline timestamp.")
+            fields += ",createdAt"
+        argv = base + ["--state", "open", "--limit", "100", "--json", fields]
     elif selector == "search":
         argv = base + [
             "--search", env["PR_SEARCH"], "--limit", "100", "--json",
@@ -243,6 +254,11 @@ def enumerate_candidate_prs(
     if selector == "assignee" and isinstance(payload, list):
         payload = [e for e in payload
                    if isinstance(e, dict) and _assigned_to(e, env["PR_ASSIGNEE"])]
+        if wants_new(selector, env):
+            # Both sides are GitHub's second-resolution UTC form, so string
+            # order is time order. Strictly after, matching `created:>`.
+            payload = [e for e in payload
+                       if isinstance(e.get("createdAt"), str) and e["createdAt"] > since]
     if payload is None:
         # Deliberate departure from the shell, which logged the same
         # "No candidate PRs" line whether gh failed or there simply were none.

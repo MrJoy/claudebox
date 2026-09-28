@@ -120,6 +120,20 @@ class SelectorTest(unittest.TestCase):
             gh.resolve_pr_selection({"PR_NEW": "1", "PR_ALL": "1"})
         self.assertIn("multiple PR selectors", str(cm.exception))
 
+    def test_pr_new_combines_with_assignee(self):
+        # --new narrows --assignee rather than competing with it.
+        env = {"PR_NEW": "1", "PR_ASSIGNEE": "me"}
+        self.assertEqual(gh.resolve_pr_selection(env), "assignee")
+        self.assertTrue(gh.wants_new("assignee", env))
+        # ...and only that pair: a third selector beside it is still refused,
+        # not swallowed by the exception.
+        with self.assertRaises(ConfigError):
+            gh.resolve_pr_selection(dict(env, PR_ALL="1"))
+
+    def test_wants_new_is_false_for_a_plain_assignee(self):
+        self.assertFalse(gh.wants_new("assignee", {"PR_ASSIGNEE": "me"}))
+        self.assertTrue(gh.wants_new("new", {"PR_NEW": "1"}))
+
     def test_pr_new_is_named_in_the_no_selector_message(self):
         with self.assertRaises(ConfigError) as cm:
             gh.resolve_pr_selection({})
@@ -341,6 +355,34 @@ class EnumerateTest(unittest.TestCase):
         self.assertIn("--search", run.calls[0])
         self.assertIn("is:open created:>2026-09-16T10:00:00Z", run.calls[0])
         self.assertIn("number,labels,headRefOid,updatedAt", run.calls[0])
+
+    def test_assignee_with_new_keeps_only_prs_created_after_the_baseline(self):
+        # Filtered client-side, like the assignee match, so it stays off the
+        # search API a privilege-minimized token cannot use.
+        payload = json.dumps([
+            {"number": 11, "labels": [], "createdAt": "2026-09-16T09:59:59Z",
+             "assignees": [{"login": "MrJoy"}]},
+            {"number": 12, "labels": [], "createdAt": "2026-09-16T10:00:00Z",
+             "assignees": [{"login": "MrJoy"}]},
+            {"number": 13, "labels": [], "createdAt": "2026-09-16T10:00:01Z",
+             "assignees": [{"login": "MrJoy"}]},
+            {"number": 14, "labels": [], "createdAt": "2026-09-16T11:00:00Z",
+             "assignees": [{"login": "alice"}]},
+        ])
+        run = runner(Result(0, payload))
+        got = gh.enumerate_candidate_prs(
+            "assignee", dict(self.ENV, PR_ASSIGNEE="MrJoy", PR_NEW="1"), run=run,
+            since="2026-09-16T10:00:00Z",
+        )
+        self.assertEqual(got, [snap(13, "code")])
+        self.assertNotIn("--search", run.calls[0])
+        self.assertIn("number,labels,headRefOid,updatedAt,assignees,createdAt", run.calls[0])
+
+    def test_assignee_with_new_without_a_baseline_is_a_config_error(self):
+        run = runner(Result(0, "[]"))
+        with self.assertRaises(ConfigError):
+            gh.enumerate_candidate_prs(
+                "assignee", dict(self.ENV, PR_ASSIGNEE="MrJoy", PR_NEW="1"), run=run)
 
     def test_new_selector_without_a_baseline_is_a_config_error(self):
         # main captures the baseline once at process start and always passes it;
