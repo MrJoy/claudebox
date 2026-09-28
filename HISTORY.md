@@ -1,6 +1,6 @@
 # History
 
-## Unreleased
+## 0.8.0 - 2026-09-27
 
 * **A seventh persona, Pat Helland (`helland`), imported from advocate.** advocate added it after claudebox's first import, so it was missing rather than excluded. It asks who owns each fact, who may mutate it, and what the business does when a guess turns out wrong. Plan mode runs it by default, since ownership and reconciliation questions cost least to act on before code exists. Code mode leaves it opt-in through `PERSONAS`, because most diffs never cross a system boundary. Only `helland.md` was copied from the importer's output; a full re-run would have dropped Sage's `phase: 2` and its rebuttal section.
 * **Reviewers get read-only access to the reviewed repo's kindex knowledge graph, on by default.** `claudebox.sh` resolves the store kindex itself would resolve for that repo (its own tiered lookup: `--profile`/`KIN_PROFILE`/a tracked `.kin/config`/cwd-matched profile roots/`default_profile`/legacy `~/.kindex`) from inside the repo, since profile-root matching keys on cwd, and mounts it read-only. `--no-kindex` opts out; `--kindex-profile`/`--kindex-dir` override resolution, and a failure under either is a hard `die` rather than a warn-and-continue.
@@ -9,6 +9,7 @@
 * **Tool access is a fail-closed allowlist.** The build dumps every MCP tool the pinned kindex registers; `reviewer/kindex_tools.py` denies everything not in its hand-classified read set via `--disallowedTools`, so a kindex version bump ships its new tools denied until someone reads them and says otherwise. Verified against claude 2.1.283 (2026-09-26): `--disallowedTools` does hold for MCP tools under `--dangerously-skip-permissions`.
 * **`claudebox.sh build` pins the image's kindex to the host's `kin --version`** when `kin` is on `PATH`. A host kindex newer than the image's fails the first snapshot at startup with a message telling you to rebuild; an older host schema gets migrated into the copy instead of refused. A host kindex upgraded while a container keeps running fails later instead, at the next cycle's refresh, logging a WARN and keeping the previous good snapshot until an operator rebuilds.
 * Vector search stays out of scope for now: the container carries no `VOYAGE_API_KEY`, so search runs on FTS and the graph alone. Tracked as issue #4.
+* `CheckLitellmTest.test_a_dead_normalizer_is_fatal_too` failed about one run in twenty under load. The test read a child's stdout EOF and assumed the child was already a zombie, and the kernel doesn't promise that. It now waits for the zombie itself: `os.waitid` with `WNOWAIT` on Linux, which asks without reaping, and `ps` on macOS, where Python has no `waitid`. The image has no `ps`, and claudebox's own reviewers run this suite inside it, so the Linux path needed to work without one.
 
 ## 0.7.0 - 2026-09-16
 
