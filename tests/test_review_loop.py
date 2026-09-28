@@ -1268,6 +1268,43 @@ class CheckModeTest(unittest.TestCase):
         self.assertIn("--dry-run", err)
 
 
+class CutoffLogTest(unittest.TestCase):
+    """main() names the startup cutoff whenever one narrows the candidates."""
+
+    def _log(self, **selector):
+        env = preflight_env(
+            WORK_REPO=scratch_repo(self), REVIEW_MODEL="m", MAX_CYCLES="1",
+            REVIEW_INTERVAL_SECONDS="0", PR_IDS="", **selector,
+        )
+        original_env = os.environ.copy()
+        os.environ.clear()
+        os.environ.update(env)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(original_env)))
+
+        original_run = review_loop.subprocess.run
+        review_loop.subprocess.run = lambda a, **k: subprocess.CompletedProcess(a, 0, "", "")
+        self.addCleanup(setattr, review_loop.subprocess, "run", original_run)
+
+        original_enum = review_loop.gh.enumerate_candidate_prs
+        review_loop.gh.enumerate_candidate_prs = lambda *a, **k: []
+        self.addCleanup(setattr, review_loop.gh, "enumerate_candidate_prs", original_enum)
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            review_loop.main([])
+        return buf.getvalue()
+
+    def test_new_alone_logs_the_cutoff(self):
+        self.assertIn("Selecting PRs created after", self._log(PR_NEW="1"))
+
+    def test_assignee_with_new_logs_the_cutoff(self):
+        self.assertIn("Selecting PRs created after",
+                      self._log(PR_ASSIGNEE="alice", PR_NEW="1"))
+
+    def test_plain_assignee_does_not(self):
+        self.assertNotIn("Selecting PRs created after", self._log(PR_ASSIGNEE="alice"))
+
+
 class GitFetchFailureTest(unittest.TestCase):
     """The shell wrote `git fetch ... || log WARN`, which covers a git that
     cannot be spawned as well as one that exits non-zero."""

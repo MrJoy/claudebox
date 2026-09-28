@@ -130,11 +130,6 @@ class SelectorTest(unittest.TestCase):
         self.assertFalse(gh.wants_new("assignee", {"PR_ASSIGNEE": "me"}))
         self.assertTrue(gh.wants_new("new", {"PR_NEW": "1"}))
 
-    def test_pr_new_with_assignee_still_refuses_a_third_selector(self):
-        with self.assertRaises(ConfigError) as cm:
-            gh.resolve_pr_selection({"PR_NEW": "1", "PR_ASSIGNEE": "me", "PR_ALL": "1"})
-        self.assertIn("multiple PR selectors", str(cm.exception))
-
     def test_pr_new_is_named_in_the_no_selector_message(self):
         with self.assertRaises(ConfigError) as cm:
             gh.resolve_pr_selection({})

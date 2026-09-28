@@ -248,6 +248,12 @@ if selected "$L"; then
   fi
 fi
 
+L="selectors: --new alone is accepted"
+if selected "$L"; then
+  launch "$L" 0 -- -- "${RUN[@]}" --new
+  expect "$L" 0 -- "PR_NEW=1" "!ERROR:"
+fi
+
 L="selectors: --new combines with --assignee"
 if selected "$L"; then
   launch "$L" 0 -- -- "${RUN[@]}" --new --assignee alice
