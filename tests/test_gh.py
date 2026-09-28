@@ -125,6 +125,10 @@ class SelectorTest(unittest.TestCase):
         env = {"PR_NEW": "1", "PR_ASSIGNEE": "me"}
         self.assertEqual(gh.resolve_pr_selection(env), "assignee")
         self.assertTrue(gh.wants_new("assignee", env))
+        # ...and only that pair: a third selector beside it is still refused,
+        # not swallowed by the exception.
+        with self.assertRaises(ConfigError):
+            gh.resolve_pr_selection(dict(env, PR_ALL="1"))
 
     def test_wants_new_is_false_for_a_plain_assignee(self):
         self.assertFalse(gh.wants_new("assignee", {"PR_ASSIGNEE": "me"}))
