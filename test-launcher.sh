@@ -260,6 +260,24 @@ if selected "$L"; then
   expect "$L" 0 -- "PR_ASSIGNEE=alice" "PR_NEW=1"
 fi
 
+L="selectors: --author passes PR_AUTHOR"
+if selected "$L"; then
+  launch "$L" 0 -- -- "${RUN[@]}" --author alice
+  expect "$L" 0 -- "PR_AUTHOR=alice" "!PR_NEW=1" "!ERROR:"
+fi
+
+L="selectors: --new combines with --author"
+if selected "$L"; then
+  launch "$L" 0 -- -- "${RUN[@]}" --author alice --new
+  expect "$L" 0 -- "PR_AUTHOR=alice" "PR_NEW=1"
+fi
+
+L="selectors: --author with --assignee is refused"
+if selected "$L"; then
+  launch "$L" 0 -- -- "${RUN[@]}" --author alice --assignee bob --new
+  expect "$L" 1 -- "ERROR:" "multiple PR selector flags"
+fi
+
 L="selectors: --new with any other selector is refused"
 if selected "$L"; then
   launch "$L" 0 -- -- "${RUN[@]}" --all --new
