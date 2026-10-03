@@ -1301,6 +1301,10 @@ class CutoffLogTest(unittest.TestCase):
         self.assertIn("Selecting PRs created after",
                       self._log(PR_ASSIGNEE="alice", PR_NEW="1"))
 
+    def test_author_with_new_logs_the_cutoff(self):
+        self.assertIn("Selecting PRs created after",
+                      self._log(PR_AUTHOR="alice", PR_NEW="1"))
+
     def test_plain_assignee_does_not(self):
         self.assertNotIn("Selecting PRs created after", self._log(PR_ASSIGNEE="alice"))
 

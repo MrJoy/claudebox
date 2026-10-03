@@ -102,6 +102,7 @@ class SelectorTest(unittest.TestCase):
     def test_each_selector(self):
         self.assertEqual(gh.resolve_pr_selection({"PR_ALL": "true"}), "all")
         self.assertEqual(gh.resolve_pr_selection({"PR_ASSIGNEE": "me"}), "assignee")
+        self.assertEqual(gh.resolve_pr_selection({"PR_AUTHOR": "me"}), "author")
         self.assertEqual(gh.resolve_pr_selection({"PR_IDS": "3"}), "ids")
         self.assertEqual(gh.resolve_pr_selection({"PR_SEARCH": "is:open"}), "search")
         self.assertEqual(gh.resolve_pr_selection({"PR_NEW": "1"}), "new")
@@ -129,6 +130,31 @@ class SelectorTest(unittest.TestCase):
         # not swallowed by the exception.
         with self.assertRaises(ConfigError):
             gh.resolve_pr_selection(dict(env, PR_ALL="1"))
+
+    def test_pr_new_combines_with_author(self):
+        # The same narrowing --assignee gets, and the same limit on it.
+        env = {"PR_NEW": "1", "PR_AUTHOR": "me"}
+        self.assertEqual(gh.resolve_pr_selection(env), "author")
+        self.assertTrue(gh.wants_new("author", env))
+        with self.assertRaises(ConfigError):
+            gh.resolve_pr_selection(dict(env, PR_ALL="1"))
+
+    def test_author_and_assignee_together_are_refused(self):
+        # PR_NEW beside them must not hide the collision either.
+        for env in ({"PR_AUTHOR": "me", "PR_ASSIGNEE": "me"},
+                    {"PR_AUTHOR": "me", "PR_ASSIGNEE": "me", "PR_NEW": "1"}):
+            with self.assertRaises(ConfigError) as cm:
+                gh.resolve_pr_selection(env)
+            self.assertIn("multiple PR selectors", str(cm.exception))
+
+    def test_wants_new_is_false_for_a_plain_author(self):
+        self.assertFalse(gh.wants_new("author", {"PR_AUTHOR": "me"}))
+
+    def test_pr_author_is_named_in_the_no_selector_message(self):
+        with self.assertRaises(ConfigError) as cm:
+            gh.resolve_pr_selection({})
+        self.assertIn("PR_AUTHOR", str(cm.exception))
+        self.assertIn("--author", str(cm.exception))
 
     def test_wants_new_is_false_for_a_plain_assignee(self):
         self.assertFalse(gh.wants_new("assignee", {"PR_ASSIGNEE": "me"}))
@@ -337,6 +363,76 @@ class EnumerateTest(unittest.TestCase):
             gh.enumerate_candidate_prs("assignee", dict(self.ENV, PR_ASSIGNEE="MrJoy"), run=run),
             [snap(12, "code")],
         )
+
+    def test_author_selector_lists_open_prs_and_filters_client_side(self):
+        # gh pr list --author is search-backed, like --assignee, so it gets the
+        # same treatment: list open PRs the non-search way and match here.
+        payload = json.dumps([
+            {"number": 12, "labels": [], "author": {"login": "MrJoy"}},
+            {"number": 13, "labels": [], "author": {"login": "alice"}},
+        ])
+        run = runner(Result(0, payload))
+        got = gh.enumerate_candidate_prs("author", dict(self.ENV, PR_AUTHOR="MrJoy"), run=run)
+        self.assertEqual(got, [snap(12, "code")])
+        argv = run.calls[0]
+        self.assertNotIn("--author", argv)
+        self.assertNotIn("--search", argv)
+        self.assertIn("--state", argv)
+        self.assertIn("number,labels,headRefOid,updatedAt,author", argv)
+        self.assertEqual(len(run.calls), 1)
+
+    def test_author_match_is_case_insensitive(self):
+        payload = json.dumps([{"number": 12, "labels": [], "author": {"login": "MrJoy"}}])
+        run = runner(Result(0, payload))
+        got = gh.enumerate_candidate_prs("author", dict(self.ENV, PR_AUTHOR="mrjoy"), run=run)
+        self.assertEqual(got, [snap(12, "code")])
+
+    def test_author_pr_with_no_usable_author_is_excluded(self):
+        # A deleted account comes back as a null author, or with no login.
+        payload = json.dumps([
+            {"number": 12, "labels": []},
+            {"number": 13, "labels": [], "author": None},
+            {"number": 14, "labels": [], "author": {}},
+            {"number": 15, "labels": [], "author": "MrJoy"},
+        ])
+        run = runner(Result(0, payload))
+        self.assertEqual(
+            gh.enumerate_candidate_prs("author", dict(self.ENV, PR_AUTHOR="MrJoy"), run=run), []
+        )
+
+    def test_author_matches_a_bot_by_the_login_gh_reports(self):
+        payload = json.dumps([{"number": 12, "labels": [],
+                               "author": {"login": "app/dependabot", "is_bot": True}}])
+        run = runner(Result(0, payload))
+        self.assertEqual(
+            gh.enumerate_candidate_prs("author", dict(self.ENV, PR_AUTHOR="app/dependabot"),
+                                       run=run),
+            [snap(12, "code")],
+        )
+
+    def test_author_with_new_keeps_only_prs_created_after_the_baseline(self):
+        payload = json.dumps([
+            {"number": 12, "labels": [], "createdAt": "2026-09-16T10:00:00Z",
+             "author": {"login": "MrJoy"}},
+            {"number": 13, "labels": [], "createdAt": "2026-09-16T10:00:01Z",
+             "author": {"login": "MrJoy"}},
+            {"number": 14, "labels": [], "createdAt": "2026-09-16T11:00:00Z",
+             "author": {"login": "alice"}},
+        ])
+        run = runner(Result(0, payload))
+        got = gh.enumerate_candidate_prs(
+            "author", dict(self.ENV, PR_AUTHOR="MrJoy", PR_NEW="1"), run=run,
+            since="2026-09-16T10:00:00Z",
+        )
+        self.assertEqual(got, [snap(13, "code")])
+        self.assertNotIn("--search", run.calls[0])
+        self.assertIn("number,labels,headRefOid,updatedAt,author,createdAt", run.calls[0])
+
+    def test_author_with_new_without_a_baseline_is_a_config_error(self):
+        run = runner(Result(0, "[]"))
+        with self.assertRaises(ConfigError):
+            gh.enumerate_candidate_prs(
+                "author", dict(self.ENV, PR_AUTHOR="MrJoy", PR_NEW="1"), run=run)
 
     def test_search_selector_passes_the_query(self):
         run = runner(Result(0, "[]"))

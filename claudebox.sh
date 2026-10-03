@@ -33,6 +33,7 @@ DRY_RUN=0
 # PR selectors (mutually exclusive; passed through to the container as -e VARs).
 PR_ALL=0
 PR_ASSIGNEE=""
+PR_AUTHOR=""
 PR_IDS=""
 PR_SEARCH=""
 PR_NEW=0
@@ -115,6 +116,8 @@ OPTIONS
                     `logs` command). Ctrl-C stops following; the container runs on.
   --all             Review all open PRs.
   --assignee LOGIN  Review open PRs assigned to this GitHub user.
+  --author LOGIN    Review open PRs opened by this GitHub user (an app's login
+                    carries an app/ prefix, e.g. app/dependabot).
   --prs LIST        Review exactly these PR numbers (comma/space list, e.g.
                     12,15,20).
   --search QUERY    Review PRs matching this gh search query (e.g.
@@ -122,10 +125,10 @@ OPTIONS
                     query.
   --new             Review open PRs created after this container started. The
                     cutoff is captured once at startup and resets on restart.
-                    Combine with --assignee to review only that user's new PRs.
-                    Otherwise provide exactly ONE of
-                    --all/--assignee/--prs/--search/--new (here or via PR_* in
-                    the env file).
+                    Combine with --assignee or --author to review only that
+                    user's new PRs. Otherwise provide exactly ONE of
+                    --all/--assignee/--author/--prs/--search/--new (here or via
+                    PR_* in the env file).
   --persona LIST    Review with these adversarial personas only (comma list, or
                     'all'). Default: red_team,adversarial,sme,sage. Also
                     available: user, good_friend, helland. One session per PR per persona,
@@ -166,9 +169,11 @@ EXAMPLES
   cd ~/src/myrepo && claudebox run --tail                    # infer env+repo+name, then follow logs
   claudebox run --all --tail                                 # review every open PR
   claudebox run --assignee alice                             # PRs assigned to alice
+  claudebox run --author alice                               # PRs alice opened
   claudebox run --prs 12,15,20                               # just these PRs
   claudebox run --new                                        # only PRs opened after startup
   claudebox run --assignee alice --new                       # alice's PRs opened after startup
+  claudebox run --author alice --new                         # PRs alice opened after startup
   ./claudebox.sh test --repo ~/src/myrepo                    # one-off foreground run
   ./claudebox.sh logs
   ./claudebox.sh stop
@@ -196,6 +201,7 @@ while [ $# -gt 0 ]; do
     --tail)        TAIL=1 ;;
     --all)         PR_ALL=1;      PR_SEL_COUNT=$((PR_SEL_COUNT + 1)); PR_SEL_NAMES="$PR_SEL_NAMES --all" ;;
     --assignee)    PR_ASSIGNEE="${2:?--assignee requires a LOGIN}"; PR_SEL_COUNT=$((PR_SEL_COUNT + 1)); PR_SEL_NAMES="$PR_SEL_NAMES --assignee"; shift ;;
+    --author)      PR_AUTHOR="${2:?--author requires a LOGIN}"; PR_SEL_COUNT=$((PR_SEL_COUNT + 1)); PR_SEL_NAMES="$PR_SEL_NAMES --author"; shift ;;
     --prs)         PR_IDS="${2:?--prs requires a comma/space list of PR numbers}"; PR_SEL_COUNT=$((PR_SEL_COUNT + 1)); PR_SEL_NAMES="$PR_SEL_NAMES --prs"; shift ;;
     --search)      PR_SEARCH="${2:?--search requires a gh search query}"; PR_SEL_COUNT=$((PR_SEL_COUNT + 1)); PR_SEL_NAMES="$PR_SEL_NAMES --search"; shift ;;
     --new)         PR_NEW=1 ;;
@@ -219,10 +225,11 @@ done
 # Selector flags are mutually exclusive (the entrypoint is authoritative and
 # also errors when none/multiple are set via the env file; this is the friendly
 # early check for CLI flags). Zero flags is fine here — the env file may set one.
-# --new stands alone or narrows --assignee to PRs created after startup.
-[ "$PR_SEL_COUNT" -le 1 ] || die "multiple PR selector flags given ($(echo "$PR_SEL_NAMES" | xargs)); provide exactly one of --all, --assignee, --prs, --search, --new (--new may also be combined with --assignee)."
-if [ "$PR_NEW" = 1 ] && [ "$PR_SEL_COUNT" = 1 ] && [ -z "$PR_ASSIGNEE" ]; then
-  die "--new cannot be combined with$PR_SEL_NAMES; it works alone or with --assignee."
+# --new stands alone or narrows --assignee or --author to PRs created after
+# startup.
+[ "$PR_SEL_COUNT" -le 1 ] || die "multiple PR selector flags given ($(echo "$PR_SEL_NAMES" | xargs)); provide exactly one of --all, --assignee, --author, --prs, --search, --new (--new may also be combined with --assignee or --author)."
+if [ "$PR_NEW" = 1 ] && [ "$PR_SEL_COUNT" = 1 ] && [ -z "$PR_ASSIGNEE" ] && [ -z "$PR_AUTHOR" ]; then
+  die "--new cannot be combined with$PR_SEL_NAMES; it works alone or with --assignee or --author."
 fi
 
 if [ "$KINDEX" = 0 ] && { [ -n "$KINDEX_PROFILE" ] || [ -n "$KINDEX_DIR" ]; }; then
@@ -439,6 +446,7 @@ build_run_flags() {
   # is what the entrypoint rejects.)
   [ "$PR_ALL" = 1 ]     && RUN_FLAGS+=(-e "PR_ALL=1")
   [ -n "$PR_ASSIGNEE" ] && RUN_FLAGS+=(-e "PR_ASSIGNEE=$PR_ASSIGNEE")
+  [ -n "$PR_AUTHOR" ]   && RUN_FLAGS+=(-e "PR_AUTHOR=$PR_AUTHOR")
   [ -n "$PR_IDS" ]      && RUN_FLAGS+=(-e "PR_IDS=$PR_IDS")
   [ -n "$PR_SEARCH" ]   && RUN_FLAGS+=(-e "PR_SEARCH=$PR_SEARCH")
   [ "$PR_NEW" = 1 ]     && RUN_FLAGS+=(-e "PR_NEW=1")
