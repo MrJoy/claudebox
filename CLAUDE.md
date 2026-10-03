@@ -409,7 +409,13 @@ Tool access works as a fail-closed allowlist. The Dockerfile dumps every MCP too
 
 This design's exposure: the reviewer sees the **whole** resolved store, since kindex has no per-PR or per-persona scoping and the design didn't add one. The reviewer's one write channel out is `gh pr comment`, so anything sitting in that graph can end up posted onto a PR by a prompt-injected pass. How well that's contained comes down to how the operator partitions kindex profiles on the host. A repo that falls through to the user-wide default profile exposes everything in it.
 
-Vector search is deliberately out of scope (tracked as issue #4): the container has no `VOYAGE_API_KEY`, so kindex's hybrid search runs on FTS and the graph alone, with no embeddings. Passing that key through would send PR-derived query text to Voyage, which nothing here does.
+Vector search is optional and off unless `VOYAGE_API_KEY` is in the env file (issue #4). Three things make it work, and losing any one of them turns it off without a word:
+
+- **The `vectors` extra.** kindex runs vector search only when `import sqlite_vec` succeeds, so the image installs `kindex[mcp,vectors]`.
+- **SQLite 3.41 or newer under kin-mcp.** sqlite-vec needs it to see the `LIMIT` on kindex's KNN query; bookworm's 3.40.1 raises "A LIMIT or 'k = ?' constraint is required" on every vector search, and kindex's `vector_search` catches that and returns nothing. So `/opt/kindex` is a venv on a uv-managed Python (`KINDEX_PYTHON_VERSION`, interpreter under `/opt/kindex-python`, both root-owned), which bundles its own SQLite. The Dockerfile runs a real `LIMIT` KNN query after the install, so an interpreter that regresses fails the build. The system `python3` still runs the supervisor and `_check_and_restamp`; `quick_check` reads vec0's shadow tables as ordinary tables and needs no extension.
+- **A matching embedding fingerprint.** The vectors come from the host: they live in `kindex.db`, so the snapshot carries them. `ensure_vec_table` drops the vector tables when the store's recorded fingerprint differs from the configured one, and the container's `kin.yaml` sets no embedding config, so this works for a host on kindex's default (`voyage-context-4`, contextual) and silently empties the copy's vectors for any other. Only the copy, never the host.
+
+What reaches Voyage is query text only, and query text can come from the PR. Read tools never embed nodes: kindex's writes only enqueue an embedding for the host daemon to drain, the container runs no daemon, and the write tools are denied anyway. `write_mcp_config` puts the key into the `kindex` server's own `env` in `mcp.json`, read from `env.VOYAGE_API_KEY` like the Linear key, and the entrypoint `unset`s it before the supervisor starts, so `claude` and every shell a pass spawns never inherit it. That protects against a pass that dumps `env`, not a determined one: kin-mcp runs as `reviewer`, which can read `mcp.json` and `/proc/<pid>/environ`. Closing that would take a second uid. A key set with no store is logged as unused and unset all the same.
 
 ## Configuration
 
@@ -462,10 +468,11 @@ All config is via environment variables (`.env.example` documents them). Always 
   body of anything newly present there before adding it to
   `kindex_tools.READ_TOOLS`: the allowlist fails closed on purpose, and a tool
   added without reading it first defeats that.
-- The image's Python is 3.11 (Debian bookworm), and kindex 0.44.0's
-  `kindex/cli.py` uses 3.12-only f-string syntax, so the `kin` CLI does not run
-  inside the container. `kin-mcp` and the snapshot warm-up never import
-  `kindex.cli` and are unaffected, but anyone debugging inside the container
-  cannot reach for `kin` the way they would on the host. A future kindex bump
-  that makes `mcp_server` import `cli` would break the tools at runtime
-  instead, since the build never runs `kin` itself.
+- The image has two Pythons. The system one (3.11, Debian bookworm, SQLite
+  3.40.1) runs the supervisor, LiteLLM, and the shim. `/opt/kindex` runs on a
+  uv-managed 3.12 with its own SQLite, because sqlite-vec's KNN queries need
+  3.41+ (see "Read-only kindex access"). Rebuilding the kindex venv on
+  `python3 -m venv` would still build, import, and serve, with vector search
+  dead; the KNN query in the Dockerfile's check is what stops that. A side
+  effect: kindex 0.44.0's `kindex/cli.py` needs 3.12, so `/opt/kindex/bin/kin`
+  now runs inside the container.

@@ -76,7 +76,7 @@ strip_surrounding_quotes \
   ANTHROPIC_VERTEX_PROJECT_ID CLOUD_ML_REGION ANTHROPIC_CUSTOM_HEADERS \
   ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN OLLAMA_API_KEY \
   CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN \
-  GITHUB_TOKEN GITHUB_REPOSITORY LINEAR_API_KEY \
+  GITHUB_TOKEN GITHUB_REPOSITORY LINEAR_API_KEY VOYAGE_API_KEY \
   PR_ASSIGNEE PR_IDS PR_SEARCH \
   PERSONAS PLAN_PERSONAS PERSONA_DIR PLAN_LABEL LIMIT_BACKOFF_SECONDS MAX_CYCLES \
   MAX_CONCURRENT_PASSES REPO_PATH SETTLE_SECONDS REVIEW_ON_CHANGE
@@ -146,8 +146,9 @@ check_resource_limit() {
 # scope can't be checked from in here, so it's on the operator.
 
 # Write the MCP server config to $1 and return 0, or return 1 when there's
-# nothing to configure: no Linear key and no kindex store. The key is passed via
-# env.LINEAR_API_KEY (not --arg) so it never appears in the jq argv/`ps` output;
+# nothing to configure: no Linear key and no kindex store. The keys are passed
+# via env.LINEAR_API_KEY / env.VOYAGE_API_KEY (not --arg) so they never appear
+# in the jq argv/`ps` output;
 # jq's JSON string handling still does the escaping, so a key containing a quote
 # or backslash can't produce a broken file. umask in a subshell makes the file
 # 600 at creation, so the key is never briefly world-readable.
@@ -155,6 +156,7 @@ write_mcp_config() {
   [ -n "${LINEAR_API_KEY:-}" ] || [ "${KINDEX_ENABLED:-}" = 1 ] || return 1
   ( umask 077
     LINEAR_API_KEY="${LINEAR_API_KEY:-}" KINDEX_ENABLED="${KINDEX_ENABLED:-}" \
+    VOYAGE_API_KEY="${VOYAGE_API_KEY:-}" \
     KINDEX_MCP_BIN="$KINDEX_MCP_BIN" jq -n '{
       mcpServers: (
         (if env.LINEAR_API_KEY != "" then {
@@ -169,7 +171,9 @@ write_mcp_config() {
             type: "stdio",
             command: env.KINDEX_MCP_BIN,
             args: [],
-            env: { KIN_PROFILE: "claudebox" }
+            env: ({ KIN_PROFILE: "claudebox" }
+              + (if env.VOYAGE_API_KEY != ""
+                 then { VOYAGE_API_KEY: env.VOYAGE_API_KEY } else {} end))
           }
         } else {} end)
       )
@@ -784,6 +788,9 @@ rm -f "$MCP_CONFIG_FILE"
 if write_mcp_config "$MCP_CONFIG_FILE"; then
   [ -z "${LINEAR_API_KEY:-}" ] || log "Linear MCP enabled (expects a READ-ONLY Linear API key)."
   [ "${KINDEX_ENABLED:-}" != 1 ] || log "kindex MCP enabled (a read-only snapshot of $KINDEX_SRC; read tools only)."
+  if [ "${KINDEX_ENABLED:-}" = 1 ] && [ -n "${VOYAGE_API_KEY:-}" ]; then
+    log "kindex vector search enabled (VOYAGE_API_KEY set): reviewer search queries are sent to Voyage AI to be embedded."
+  fi
 else
   # A write that created the file and then failed partway (jq killed, the disk
   # full after the open) would otherwise hand claude truncated JSON on every
@@ -794,6 +801,15 @@ else
   rm -f "$MCP_CONFIG_FILE"
   unset KINDEX_ENABLED
 fi
+# VOYAGE_API_KEY belongs to kin-mcp alone, which now has it in its own env in
+# mcp.json. Unset it here so claude, and every shell a pass spawns, never
+# inherits it. That keeps it out of an `env` a pass might paste into a
+# comment; it does not hide it from a determined pass, which runs as the same
+# user that can read mcp.json, the same exposure LINEAR_API_KEY has.
+if [ -n "${VOYAGE_API_KEY:-}" ] && [ "${KINDEX_ENABLED:-}" != 1 ]; then
+  log "VOYAGE_API_KEY is set but kindex is not enabled; ignoring it."
+fi
+unset VOYAGE_API_KEY
 
 # --- Prepare a writable working copy ---------------------------------------
 # We make a cheap LOCAL clone of whatever seed is mounted: git copies the local

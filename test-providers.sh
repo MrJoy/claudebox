@@ -148,7 +148,8 @@ cat >"$BIN/claude" <<'STUB'
            CLAUDE_CODE_SKIP_BEDROCK_AUTH CLAUDE_CODE_SKIP_VERTEX_AUTH \
            ANTHROPIC_MODEL ANTHROPIC_DEFAULT_FABLE_MODEL \
            ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL \
-           ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_SMALL_FAST_MODEL; do
+           ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_SMALL_FAST_MODEL \
+           VOYAGE_API_KEY; do
     # Escape newlines back to a literal \n: ANTHROPIC_CUSTOM_HEADERS is genuinely
     # multi-line, and one dump line per variable keeps the assertions greppable.
     # Backslashes are escaped FIRST, so a real newline (dumped as \n) can't be
@@ -294,6 +295,8 @@ wires() {
     # A LOG:<substring> expectation checks the run's log instead of the env dump.
     case "$expect" in
       LOG:*) grep -qF "${expect#LOG:}" "$OUT" || missing="$missing [log missing: ${expect#LOG:}]"; continue ;;
+      # NOLOG:<substring> -- the log must NOT contain it (a credential, say).
+      NOLOG:*) grep -qF -- "${expect#NOLOG:}" "$OUT" && missing="$missing [log should not have: ${expect#NOLOG:}]"; continue ;;
       # A CFG:<line> expectation checks a line of the generated litellm.yaml.
       CFG:*) grep -qxF "CFG ${expect#CFG:}" "$DUMP" || missing="$missing [config missing: ${expect#CFG:}]"; continue ;;
       # A NOT:VAR=value expectation asserts claude did NOT get that exact value —
@@ -697,6 +700,28 @@ wires "kindex: an env-file KINDEX_ENABLED without a store does nothing" \
 wires "kindex: alongside Linear, both servers are wired" \
   PROVIDER=ollama OLLAMA_API_KEY=k LINEAR_API_KEY=lin_x "${KINDEX_ON[@]}" \
   -- 'MCP:"linear":{"type":"http"' 'MCP:"kindex":{"type":"stdio"' LOG:'Linear MCP enabled'
+# VOYAGE_API_KEY turns on kindex's vector search. It belongs to kin-mcp alone:
+# written into that server's env in mcp.json, and unset before the supervisor
+# runs, so claude (and every shell a pass spawns) never inherits it.
+wires "kindex: VOYAGE_API_KEY reaches kin-mcp and nothing else" \
+  PROVIDER=ollama OLLAMA_API_KEY=k VOYAGE_API_KEY=pa-voy "${KINDEX_ON[@]}" \
+  -- 'MCP:"env":{"KIN_PROFILE":"claudebox","VOYAGE_API_KEY":"pa-voy"}' \
+     VOYAGE_API_KEY='<unset>' \
+     LOG:'kindex vector search enabled' NOLOG:'pa-voy'
+wires "kindex: a quoted VOYAGE_API_KEY is unquoted before it is wired" \
+  PROVIDER=ollama OLLAMA_API_KEY=k VOYAGE_API_KEY='"pa-voy"' "${KINDEX_ON[@]}" \
+  -- 'MCP:"VOYAGE_API_KEY":"pa-voy"}' VOYAGE_API_KEY='<unset>'
+wires "kindex: without VOYAGE_API_KEY the server env is unchanged" \
+  PROVIDER=ollama OLLAMA_API_KEY=k "${KINDEX_ON[@]}" \
+  -- 'MCP:"env":{"KIN_PROFILE":"claudebox"}}' 'NOMCP:VOYAGE_API_KEY' \
+     NOLOG:'vector search'
+wires "kindex: VOYAGE_API_KEY with no store is unused and still unset" \
+  PROVIDER=ollama OLLAMA_API_KEY=k VOYAGE_API_KEY=pa-voy \
+  -- 'NOMCP:"kindex"' VOYAGE_API_KEY='<unset>' LOG:'VOYAGE_API_KEY is set but kindex is not enabled'
+wires "kindex: VOYAGE_API_KEY with a store and Linear stays out of the linear server" \
+  PROVIDER=ollama OLLAMA_API_KEY=k LINEAR_API_KEY=lin_x VOYAGE_API_KEY=pa-voy "${KINDEX_ON[@]}" \
+  -- 'MCP:"linear":{"type":"http","url":"https://mcp.linear.app/mcp","headers":{"Authorization":"Bearer lin_x"}}' \
+     'MCP:"VOYAGE_API_KEY":"pa-voy"' VOYAGE_API_KEY='<unset>'
 refuses "kindex: a store the image cannot open stops the container" \
   "kindex snapshot failed: kindex refused the copy: SchemaMigrationPending: schema 16 is newer than 15" \
   -- PROVIDER=ollama OLLAMA_API_KEY=k "${KINDEX_ON[@]}" KINDEX_PYTHON="$BIN/kindex-python-refuses"
