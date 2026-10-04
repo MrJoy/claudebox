@@ -68,26 +68,28 @@ def resolve_pr_selection(env: Mapping[str, str]) -> str:
         active.append("all")
     if env.get("PR_ASSIGNEE"):
         active.append("assignee")
+    if env.get("PR_AUTHOR"):
+        active.append("author")
     if env.get("PR_IDS"):
         active.append("ids")
     if env.get("PR_SEARCH"):
         active.append("search")
-    # PR_NEW alongside PR_ASSIGNEE narrows the assignee selector to PRs
+    # PR_NEW alongside PR_ASSIGNEE or PR_AUTHOR narrows that selector to PRs
     # created after startup instead of counting as a second selector.
-    if pr_truthy(env.get("PR_NEW")) and not env.get("PR_ASSIGNEE"):
+    if pr_truthy(env.get("PR_NEW")) and not (env.get("PR_ASSIGNEE") or env.get("PR_AUTHOR")):
         active.append("new")
 
     if not active:
         raise ConfigError(
             "no PR selector set; provide exactly one of PR_ALL, PR_ASSIGNEE, "
-            "PR_IDS, PR_SEARCH, PR_NEW (launcher: --all / --assignee / --prs "
-            "/ --search / --new)."
+            "PR_AUTHOR, PR_IDS, PR_SEARCH, PR_NEW (launcher: --all / --assignee "
+            "/ --author / --prs / --search / --new)."
         )
     if len(active) > 1:
         raise ConfigError(
             "multiple PR selectors set; provide exactly one of PR_ALL, "
-            "PR_ASSIGNEE, PR_IDS, PR_SEARCH, PR_NEW (PR_NEW may also be "
-            "combined with PR_ASSIGNEE)."
+            "PR_ASSIGNEE, PR_AUTHOR, PR_IDS, PR_SEARCH, PR_NEW (PR_NEW may "
+            "also be combined with PR_ASSIGNEE or PR_AUTHOR)."
         )
     selector = active[0]
     # Validate the ID list up front so a bad value fails fast, not every cycle.
@@ -98,7 +100,9 @@ def resolve_pr_selection(env: Mapping[str, str]) -> str:
 
 def wants_new(selector: str, env: Mapping[str, str]) -> bool:
     """True when this run only reviews PRs created after startup."""
-    return selector == "new" or (selector == "assignee" and pr_truthy(env.get("PR_NEW")))
+    return selector == "new" or (
+        selector in ("assignee", "author") and pr_truthy(env.get("PR_NEW"))
+    )
 
 
 def pr_modes(payload: Any, plan_label: str) -> List[PRSnapshot]:
@@ -152,6 +156,19 @@ def _assigned_to(entry: dict, login: str) -> bool:
         if isinstance(a, dict) and (a.get("login") or "").lower() == target:
             return True
     return False
+
+
+def _authored_by(entry: dict, login: str) -> bool:
+    """True when this PR object's author is `login`, case-insensitively.
+
+    gh reports an app's login with an `app/` prefix (`app/dependabot`), and
+    that is the spelling PR_AUTHOR has to use to match one. A deleted account
+    comes back as a null author and matches nobody.
+    """
+    author = entry.get("author")
+    if not isinstance(author, dict):
+        return False
+    return (author.get("login") or "").lower() == (login or "").lower()
 
 
 def _read_json(result) -> Any:
@@ -218,16 +235,19 @@ def enumerate_candidate_prs(
             "--state", "open", "--limit", "100", "--json",
             "number,labels,headRefOid,updatedAt",
         ]
-    elif selector == "assignee":
-        # Deliberately NOT `--assignee`: that filter is search-backed, and
-        # GitHub's issue/PR search returns nothing for a fine-grained /
-        # privilege-minimized token, so the selector silently saw no PRs. List
-        # open PRs the non-search way and match the assignee below. PR_NEW's
-        # cutoff is matched below too, off createdAt, for the same reason.
-        fields = "number,labels,headRefOid,updatedAt,assignees"
+    elif selector in ("assignee", "author"):
+        # Deliberately NOT `--assignee`/`--author`: both filters are
+        # search-backed, and GitHub's issue/PR search returns nothing for a
+        # fine-grained / privilege-minimized token, so the selector silently
+        # saw no PRs. List open PRs the non-search way and match the login
+        # below. PR_NEW's cutoff is matched below too, off createdAt, for the
+        # same reason.
+        fields = "number,labels,headRefOid,updatedAt," + (
+            "assignees" if selector == "assignee" else "author")
         if wants_new(selector, env):
             if not since:
-                raise ConfigError("PR_NEW with PR_ASSIGNEE needs a baseline timestamp.")
+                raise ConfigError(
+                    f"PR_NEW with PR_{selector.upper()} needs a baseline timestamp.")
             fields += ",createdAt"
         argv = base + ["--state", "open", "--limit", "100", "--json", fields]
     elif selector == "search":
@@ -251,9 +271,12 @@ def enumerate_candidate_prs(
 
     result = gh_run(argv)
     payload = _read_json(result)
-    if selector == "assignee" and isinstance(payload, list):
-        payload = [e for e in payload
-                   if isinstance(e, dict) and _assigned_to(e, env["PR_ASSIGNEE"])]
+    if selector in ("assignee", "author") and isinstance(payload, list):
+        if selector == "assignee":
+            matches, login = _assigned_to, env["PR_ASSIGNEE"]
+        else:
+            matches, login = _authored_by, env["PR_AUTHOR"]
+        payload = [e for e in payload if isinstance(e, dict) and matches(e, login)]
         if wants_new(selector, env):
             # Both sides are GitHub's second-resolution UTC form, so string
             # order is time order. Strictly after, matching `created:>`.

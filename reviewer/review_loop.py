@@ -1014,8 +1014,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # The "new" selector's cutoff: captured once here, at supervisor start, and
     # held fixed so the window does not slide forward each cycle. It resets to
     # now on a container restart, matching the in-memory stance of the session
-    # map, reviewed, and Tracker. Used by "new", and by "assignee" when PR_NEW
-    # narrows it.
+    # map, reviewed, and Tracker. Used by "new", and by "assignee" or "author"
+    # when PR_NEW narrows it.
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     if gh.wants_new(selector, env):
         log(f"Selecting PRs created after {started_at}.")

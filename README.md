@@ -416,19 +416,20 @@ Optional:
 
 ### PR selection
 
-Set **exactly one** of these (or pass the matching launcher flag), except that `PR_NEW` may also be paired with `PR_ASSIGNEE`. Zero, or any other combination, is a startup error:
+Set **exactly one** of these (or pass the matching launcher flag), except that `PR_NEW` may also be paired with `PR_ASSIGNEE` or `PR_AUTHOR`. Zero, or any other combination, is a startup error:
 
 | Env var | Launcher flag | Reviews |
 |---|---|---|
 | `PR_ALL=1` | `--all` | all open PRs |
 | `PR_ASSIGNEE=login` | `--assignee login` | open PRs assigned to that user |
+| `PR_AUTHOR=login` | `--author login` | open PRs opened by that user (an app's login carries an `app/` prefix, e.g. `app/dependabot`) |
 | `PR_IDS=12,15,20` | `--prs 12,15,20` | exactly those PR numbers |
 | `PR_SEARCH=is:open label:x` | `--search "…"` | PRs matching a gh search query (you control state) |
 | `PR_NEW=1` | `--new` | open PRs created after this container started (cutoff captured once at startup, reset on restart) |
 
-`PR_NEW` is the one selector that combines with another: set it alongside `PR_ASSIGNEE` (`--assignee login --new`) to review only that user's PRs opened after startup. That combination stays off the search API, filtering the assignee listing by `createdAt` itself, so it works on a privilege-minimized token even though `PR_NEW` alone does not.
+`PR_NEW` is the one selector that combines with another: set it alongside `PR_ASSIGNEE` or `PR_AUTHOR` (`--assignee login --new`, `--author login --new`) to review only that user's PRs opened after startup. Those combinations stay off the search API, filtering the listing by `createdAt` itself, so they work on a privilege-minimized token even though `PR_NEW` alone does not. `PR_ASSIGNEE` and `PR_AUTHOR` cannot be combined with each other.
 
-> **`PR_SEARCH` and `PR_NEW` need a token that can search.** Both are backed by GitHub's issue/PR search, which returns nothing for a fine-grained PAT — so on a privilege-minimized token they silently find no PRs. `PR_ALL`, `PR_ASSIGNEE`, and `PR_IDS` avoid search (`PR_ASSIGNEE` lists open PRs and matches the login itself), so they work with a PR-read-only token. Use a classic PAT with `repo` scope if you need the search-backed selectors.
+> **`PR_SEARCH` and `PR_NEW` need a token that can search.** Both are backed by GitHub's issue/PR search, which returns nothing for a fine-grained PAT — so on a privilege-minimized token they silently find no PRs. `PR_ALL`, `PR_ASSIGNEE`, `PR_AUTHOR`, and `PR_IDS` avoid search (`PR_ASSIGNEE` and `PR_AUTHOR` list open PRs and match the login themselves), so they work with a PR-read-only token. Use a classic PAT with `repo` scope if you need the search-backed selectors.
 
 All eight prompt variables use a `{{PR}}` token (substituted with the PR number), and `MAX_PASSES_PER_SESSION` applies per (PR, mode, persona) pair.
 
