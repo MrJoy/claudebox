@@ -89,6 +89,13 @@ strip_surrounding_quotes \
 # their back -- against the guarantee that an operator-supplied prompt reaches
 # Claude verbatim.
 
+# VOYAGE_API_KEY belongs to kin-mcp alone. Take it out of the environment now,
+# before anything below starts a child: the Workers AI translator and its shim
+# are long-lived, and would otherwise carry it for the container's life. Held
+# in an unexported variable and handed only to the jq that writes mcp.json.
+voyage_api_key="${VOYAGE_API_KEY:-}"
+unset VOYAGE_API_KEY
+
 # --- Required configuration ------------------------------------------------
 # Provider-specific credentials are validated in "Backend selection" below.
 : "${GITHUB_TOKEN:?set GITHUB_TOKEN (privilege-minimized: read repo/PRs, write PR comments)}"
@@ -156,7 +163,7 @@ write_mcp_config() {
   [ -n "${LINEAR_API_KEY:-}" ] || [ "${KINDEX_ENABLED:-}" = 1 ] || return 1
   ( umask 077
     LINEAR_API_KEY="${LINEAR_API_KEY:-}" KINDEX_ENABLED="${KINDEX_ENABLED:-}" \
-    VOYAGE_API_KEY="${VOYAGE_API_KEY:-}" \
+    VOYAGE_API_KEY="$voyage_api_key" \
     KINDEX_MCP_BIN="$KINDEX_MCP_BIN" jq -n '{
       mcpServers: (
         (if env.LINEAR_API_KEY != "" then {
@@ -788,7 +795,7 @@ rm -f "$MCP_CONFIG_FILE"
 if write_mcp_config "$MCP_CONFIG_FILE"; then
   [ -z "${LINEAR_API_KEY:-}" ] || log "Linear MCP enabled (expects a READ-ONLY Linear API key)."
   [ "${KINDEX_ENABLED:-}" != 1 ] || log "kindex MCP enabled (a read-only snapshot of $KINDEX_SRC; read tools only)."
-  if [ "${KINDEX_ENABLED:-}" = 1 ] && [ -n "${VOYAGE_API_KEY:-}" ]; then
+  if [ "${KINDEX_ENABLED:-}" = 1 ] && [ -n "$voyage_api_key" ]; then
     log "kindex vector search enabled (VOYAGE_API_KEY set): reviewer search queries are sent to Voyage AI to be embedded."
   fi
 else
@@ -801,15 +808,15 @@ else
   rm -f "$MCP_CONFIG_FILE"
   unset KINDEX_ENABLED
 fi
-# VOYAGE_API_KEY belongs to kin-mcp alone, which now has it in its own env in
-# mcp.json. Unset it here so claude, and every shell a pass spawns, never
-# inherits it. That keeps it out of an `env` a pass might paste into a
-# comment; it does not hide it from a determined pass, which runs as the same
-# user that can read mcp.json, the same exposure LINEAR_API_KEY has.
-if [ -n "${VOYAGE_API_KEY:-}" ] && [ "${KINDEX_ENABLED:-}" != 1 ]; then
+# kin-mcp now has VOYAGE_API_KEY in its own env in mcp.json, and nothing else
+# ever had it (see where it was unset, at the top). That keeps it out of an
+# `env` a pass might paste into a comment; it does not hide it from a
+# determined pass, which runs as the same user that can read mcp.json, the same
+# exposure LINEAR_API_KEY has.
+if [ -n "$voyage_api_key" ] && [ "${KINDEX_ENABLED:-}" != 1 ]; then
   log "VOYAGE_API_KEY is set but kindex is not enabled; ignoring it."
 fi
-unset VOYAGE_API_KEY
+unset voyage_api_key
 
 # --- Prepare a writable working copy ---------------------------------------
 # We make a cheap LOCAL clone of whatever seed is mounted: git copies the local

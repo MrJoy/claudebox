@@ -106,7 +106,9 @@ printf '#!/bin/sh\nexit 0\n' >"$BIN/sleep"
 # alive so the entrypoint's kill -0 check passes (`tail -f`, since the `sleep`
 # stub above returns at once and would leave nothing running), and `curl`
 # reports it ready on the first poll so the readiness wait returns immediately.
-printf '#!/bin/sh\nprintf "%%s" "$*" >"$HOME/litellm-argv"\nexec tail -f /dev/null\n' >"$BIN/litellm"
+# It also records whether it inherited VOYAGE_API_KEY, which belongs to kin-mcp
+# alone and must be gone from the environment before either helper starts.
+printf '#!/bin/sh\nprintf "%%s voyage=%%s" "$*" "${VOYAGE_API_KEY-<unset>}" >"$HOME/litellm-argv"\nexec tail -f /dev/null\n' >"$BIN/litellm"
 printf '#!/bin/sh\nexit 0\n' >"$BIN/curl"
 
 # python3 has two callers now, and only one of them may be stubbed. The
@@ -125,7 +127,7 @@ cat >"$BIN/python3" <<'STUB'
 #!/bin/sh
 case "$1" in
   *workersai-shim.py)
-    printf '%s upstream=%s port=%s' "$*" "$SHIM_UPSTREAM_URL" "$SHIM_PORT" >"$HOME/shim-argv"
+    printf '%s upstream=%s port=%s voyage=%s' "$*" "$SHIM_UPSTREAM_URL" "$SHIM_PORT" "${VOYAGE_API_KEY-<unset>}" >"$HOME/shim-argv"
     exec tail -f /dev/null ;;
   */reviewer/review_loop.py)
     shift; exec "$REAL_PYTHON3" "$REVIEWER_MAIN" "$@" ;;
@@ -715,6 +717,11 @@ wires "kindex: without VOYAGE_API_KEY the server env is unchanged" \
   PROVIDER=ollama OLLAMA_API_KEY=k "${KINDEX_ON[@]}" \
   -- 'MCP:"env":{"KIN_PROFILE":"claudebox"}}' 'NOMCP:VOYAGE_API_KEY' \
      NOLOG:'vector search'
+wires "kindex: VOYAGE_API_KEY never reaches the Workers AI translator or shim" \
+  PROVIDER=workersai CLOUDFLARE_ACCOUNT_ID=acct CLOUDFLARE_API_TOKEN=cftok \
+  VOYAGE_API_KEY=pa-voy "${KINDEX_ON[@]}" \
+  -- PROXY:'voyage=<unset>' SHIM:'voyage=<unset>' \
+     'MCP:"VOYAGE_API_KEY":"pa-voy"' VOYAGE_API_KEY='<unset>'
 wires "kindex: VOYAGE_API_KEY with no store is unused and still unset" \
   PROVIDER=ollama OLLAMA_API_KEY=k VOYAGE_API_KEY=pa-voy \
   -- 'NOMCP:"kindex"' VOYAGE_API_KEY='<unset>' LOG:'VOYAGE_API_KEY is set but kindex is not enabled'
