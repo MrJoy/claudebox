@@ -411,6 +411,7 @@ Optional:
 - `MAX_CONCURRENT_PASSES` / `--max-concurrent-passes` (how many of a PR's personas review it at the same time; unset or `0` is all of them, `1` reviews one at a time — see [Personas](#personas))
 - `LINEAR_API_KEY` (optional Linear ticket context; use a **read-only** key — see [Linear ticket context](#linear-ticket-context))
 - `--no-kindex` / `--kindex-profile NAME` / `--kindex-dir DIR` (launcher flags, not env vars) control the reviewer's read-only kindex graph access, on by default when `kin` is on your `PATH`; see [kindex knowledge graph](#kindex-knowledge-graph)
+- `VOYAGE_API_KEY` (optional kindex vector search; see [kindex knowledge graph](#kindex-knowledge-graph))
 - `--export-sessions` (launcher flag, not an env var) — export review transcripts to the host and align the session folder; see [Exporting review sessions to your host](#exporting-review-sessions-to-your-host)
 
 ### PR selection
@@ -476,6 +477,8 @@ Three launcher flags control it:
 - `--kindex-dir DIR`: mount this data directory directly (it must hold a `kindex.db`), skipping resolution entirely.
 
 Both overrides work under `--no-repo` too. `--kindex-profile` then resolves from your current directory rather than the repo, since there isn't one; `--kindex-dir` never asked kindex anything to begin with.
+
+**Vector search is optional.** Put `VOYAGE_API_KEY` in your env file and the reviewer's kindex searches also match on meaning, using the embeddings already stored in your host graph. Without it, search runs on keywords and graph links alone, as it always has. With it, each search query the reviewer runs goes to Voyage AI to be embedded, and that query text can come from the PR under review; nothing else in the graph is sent, and the container never embeds nodes. The key is handed to the kindex MCP server alone and removed from the reviewer's environment, so a pass running `env` won't print it. That doesn't stop a hijacked pass from finding it, since the MCP server runs as the same user, which is the same exposure `LINEAR_API_KEY` has. Only the embeddings your host already made are searched: vectors kindex writes for nodes newer than the last snapshot come with the next cycle's refresh, and a host using a non-default kindex embedding config gets no vector hits in the container.
 
 The container never opens your live store: it's mounted read-only as a source, and the loop copies it into the container before anything queries it, verifying the copy before use. Nothing the reviewer does can write back to your host graph.
 
