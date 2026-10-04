@@ -429,10 +429,13 @@ class EnumerateTest(unittest.TestCase):
         self.assertIn("number,labels,headRefOid,updatedAt,author,createdAt", run.calls[0])
 
     def test_author_with_new_without_a_baseline_is_a_config_error(self):
+        # Asserts the message, not just the type: an enumerate_candidate_prs
+        # with no author arm raises ConfigError too ("unknown PR selector").
         run = runner(Result(0, "[]"))
-        with self.assertRaises(ConfigError):
+        with self.assertRaises(ConfigError) as cm:
             gh.enumerate_candidate_prs(
                 "author", dict(self.ENV, PR_AUTHOR="MrJoy", PR_NEW="1"), run=run)
+        self.assertIn("PR_NEW with PR_AUTHOR needs a baseline timestamp", str(cm.exception))
 
     def test_search_selector_passes_the_query(self):
         run = runner(Result(0, "[]"))
