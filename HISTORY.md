@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+* **Optional kindex vector search (issue #4).** Set `VOYAGE_API_KEY` in the env file and the reviewer's kindex searches also match on meaning, using the embeddings already stored in the host graph. The key goes only into the kindex MCP server's own env in `mcp.json` and is unset at the top of the entrypoint, before any child process starts, so `claude`, the shells a pass spawns, and the Workers AI translator and shim never inherit it. Only search query text reaches Voyage, and the startup log says so. Unset, nothing changes.
+* **The kindex venv runs on a uv-managed Python 3.12.** Vector search needs sqlite-vec, which needs SQLite 3.41+ for kindex's KNN query; bookworm's 3.40.1 made every vector search fail, and kindex swallowed the error into "no hits". uv's Python carries its own SQLite (3.50.4 at this pin), and the build now runs a real KNN query so a regression fails the build. The `kin` CLI also runs inside the container now, since kindex's `cli.py` needed 3.12. The image grows by about 90 MB.
 * **`PR_NEW` (`--new`) now combines with `PR_ASSIGNEE` (`--assignee`)** to review only that user's PRs created after startup. Every other pairing is still refused. The combination rides the assignee selector's non-search listing, adds `createdAt` to its field list, and keeps PRs created strictly after the startup cutoff, so unlike `PR_NEW` alone it works on a privilege-minimized token.
 
 ## 0.8.0 - 2026-09-27

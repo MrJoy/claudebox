@@ -85,9 +85,30 @@ ENV LITELLM_BIN=/opt/litellm/bin/litellm \
 # denies all of them except a hand-classified read set, so a tool a bump adds
 # is denied until someone classifies it. The dump runs with a throwaway HOME:
 # importing the server must not touch a real store, and there is none here.
+#
+# The vectors extra is sqlite-vec. kindex runs vector search only when it can
+# import it, so without the extra a VOYAGE_API_KEY would do nothing and say
+# nothing. Without a key the extension sits unused: the query embedding fails
+# and search returns its FTS and graph results as before.
+#
+# The venv runs on a uv-managed Python, not the system python3, because of the
+# SQLite underneath it. sqlite-vec needs SQLite 3.41+ to see the LIMIT on
+# kindex's KNN query; bookworm ships 3.40.1, where every vector search raises
+# "A LIMIT or 'k = ?' constraint is required", which kindex catches and turns
+# into no hits. uv's Python bundles its own SQLite. It also runs kindex.cli,
+# which needs 3.12. The interpreter lives under /opt/kindex-python, root-owned
+# like the venv. The check after the install runs a real LIMIT KNN query, so
+# an interpreter whose SQLite is too old fails the build rather than quietly
+# serving FTS only.
 ARG KINDEX_VERSION=0.44.0
-RUN python3 -m venv /opt/kindex \
- && /opt/kindex/bin/pip install --no-cache-dir "kindex[mcp]==${KINDEX_VERSION}" \
+ARG KINDEX_PYTHON_VERSION=3.12
+COPY --from=ghcr.io/astral-sh/uv:0.9.30 /uv /usr/local/bin/uv
+RUN UV_PYTHON_INSTALL_DIR=/opt/kindex-python \
+      uv venv --no-config --python "${KINDEX_PYTHON_VERSION}" /opt/kindex \
+ && VIRTUAL_ENV=/opt/kindex uv pip install --no-config --no-cache \
+      "kindex[mcp,vectors]==${KINDEX_VERSION}" \
+ && /opt/kindex/bin/python -c \
+      'import sqlite3, sqlite_vec; c = sqlite3.connect(":memory:"); c.enable_load_extension(True); sqlite_vec.load(c); v = sqlite_vec.serialize_float32([1.0, 0.0]); c.execute("create virtual table t using vec0(e float[2])"); c.execute("insert into t(rowid, e) values (1, ?)", (v,)); assert c.execute("select rowid from t where e match ? order by distance limit 1", (v,)).fetchall() == [(1,)]; print("sqlite", sqlite3.sqlite_version, "sqlite-vec", c.execute("select vec_version()").fetchone()[0])' \
  && HOME=/tmp/kindex-build /opt/kindex/bin/python -c \
       'import asyncio; from kindex.mcp_server import mcp; print("\n".join(sorted(t.name for t in asyncio.run(mcp.list_tools()))))' \
       >/opt/kindex/tools.txt \
