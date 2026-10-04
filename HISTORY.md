@@ -3,7 +3,7 @@
 ## Unreleased
 
 * **A sixth PR selector, `PR_AUTHOR` (launcher `--author`), reviews open PRs opened by one GitHub user.** `gh pr list --author` goes through search, which a privilege-minimized token cannot use, so it follows the assignee selector: list open PRs with an `author` field and match the login case-insensitively. An app's login carries gh's `app/` prefix (`app/dependabot`). `PR_NEW` narrows it the same way it narrows `PR_ASSIGNEE`; `PR_AUTHOR` and `PR_ASSIGNEE` together are refused.
-* **`PR_NEW` (`--new`) now combines with `PR_ASSIGNEE` (`--assignee`)** to review only that user's PRs created after startup. Every other pairing is still refused. The combination rides the assignee selector's non-search listing, adds `createdAt` to its field list, and keeps PRs created strictly after the startup cutoff, so unlike `PR_NEW` alone it works on a privilege-minimized token.
+* **`PR_NEW` (`--new`) now combines with `PR_ASSIGNEE` (`--assignee`)** to review only that user's PRs created after startup. Apart from the same narrowing of `PR_AUTHOR` (above), every other pairing is still refused. The combination rides the assignee selector's non-search listing, adds `createdAt` to its field list, and keeps PRs created strictly after the startup cutoff, so unlike `PR_NEW` alone it works on a privilege-minimized token.
 
 ## 0.8.0 - 2026-09-27
 
