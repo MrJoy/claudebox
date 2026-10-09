@@ -1,7 +1,7 @@
 # claudebox as a hosted GitHub App: design
 
 **Date:** 2026-10-09
-**Status:** plan, revision 8, filed for review under the `plan` label
+**Status:** plan, revision 9, filed for review under the `plan` label
 
 ## Problem
 
@@ -127,9 +127,10 @@ per-repo clone-byte cap (default 2 GB) is therefore sized against the size
 of the head tree, and a repo whose head tree exceeds it needs an override in
 the deployment file (`caps.clone_bytes.overrides`). A pair that hits the cap
 parks as `too large`, which names the measured size and the key and pages
-the operator. The pair is retried, and the head tree measured again, when the
-repo's `clone_bytes` override changes or the head moves; an ask alone does
-not retry it, since nothing it measured has changed. A per-installation bare mirror that would make clones
+the operator once. The pair is retried, and the head tree measured again,
+when the repo's `clone_bytes` override changes or the head moves; a retry
+that is still over the cap leaves it in the same `too large` state, so it
+does not page again. An ask alone does not retry it. A per-installation bare mirror that would make clones
 local is deferred until clone volume is measured.
 
 ### Resuming a session in a fresh container
@@ -679,17 +680,27 @@ directions carries a per-deployment secret the supervisor hands to both at
 startup. A worker, in its own container, cannot reach it. When the gateway
 starts, the control plane pushes it the committed counts it enforces against
 (each live pair's usage so far, and the day's budget use per profile and per
-repo) along with the live jobs' read tokens, so a restart does not reset any
-cap.
+repo) along with the live jobs' read tokens. Until it has them, a starting
+gateway serves no provider traffic, so a restart never resets a cap; the
+requests it holds back in that window are a claudebox fault (below), not a
+provider failure.
 
-At `complete pair` the control plane first asks the gateway to flush and
-acknowledge every report for that pair's token, then applies the record,
+At `complete pair` the control plane first asks the gateway to flush that
+pair's token. Reports carry a per-token sequence number and the flush
+answers with the last one sent, so the control plane knows when it holds
+every report, not just that the gateway is up. Then it applies the record,
 together with its own record of clone outcomes. The worker contributes the
 transcript, the session id and its own notes, never the outcome. If the
-flush succeeds and the record shows no successful provider response, the
-pair is `failed`. If the gateway cannot be reached to flush, that is a
-claudebox fault, not a provider failure: the pair is `revoked` (stays owed,
-no park, nothing spent) and the fault is logged and counted.
+record is complete and shows no successful provider response, the pair is
+`failed`.
+
+If the flush cannot complete (the gateway is unreachable, or reports are
+missing), that is a claudebox fault, never a provider failure, and the pair
+is held **pending**: its transcript is stored, nothing else is applied, it is
+not redispatched, and the control plane retries the flush in the background
+until it completes and the ordinary row applies. A pending pair costs no
+pass and loses nothing. A pair pending for more than ten minutes pages, as a
+claudebox fault.
 
 - A usage limit (429, or a limit body) parks the pair for the profile's
   `limit_backoff_seconds`. Pairs on two different PRs hitting a limit inside
@@ -837,6 +848,8 @@ gateway record, or no successful provider response, is `failed`.
 | `capped` (a provider cap) | committed | unchanged | unchanged | stays, parked until the head moves or an ask; pages | spent |
 | `too large` (the clone cap) | none | unchanged | unchanged | stays, parked until the override changes or the head moves; pages once | not spent |
 | `usage-limited` | committed | unchanged | unchanged | stays, parked for the backoff | spent only if a provider response succeeded |
+| `budget` (the day's budget ran out mid-pass) | committed | unchanged | unchanged | stays, parked until the UTC reset; does not page | spent |
+| pending (a claudebox fault; see "The gateway") | stored | unchanged until the flush completes | unchanged | not redispatched | not spent until the flush completes |
 | `failed` | discarded; session dropped | unchanged | unchanged | stays, parked for the backoff (provider failure) or until the head moves (pair failure) | spent only if a provider response succeeded |
 | `refused read` | committed | unchanged | unchanged | stays, parked for the backoff | spent |
 | `revoked` (timeout, access change, restart) | discarded | unchanged | unchanged | stays | spent only if a provider response succeeded |
@@ -995,9 +1008,12 @@ order is:
 4. `hosted deploy --admins ADMINS`, which writes the admin roles into the
    platform secret store and restarts the control plane. `ADMINS` is a small
    YAML file mapping each role (`operators`, `transcript_readers`,
-   `erasers`) to a list of numeric GitHub user ids; `hosted deploy` resolves
-   logins to ids for the operator and prints the result before writing it.
-5. `claudebox.sh hosted login`, then `claudebox.sh hosted config apply FILE`,
+   `erasers`) to a list of numeric GitHub user ids, and only ids;
+   `claudebox.sh hosted whois LOGIN` prints a login's id for the operator to
+   check and copy, and nothing resolves logins on the write path.
+5. Enable the device flow in the App's settings (unless spike S8 lets the
+   manifest do it).
+6. `claudebox.sh hosted login`, then `claudebox.sh hosted config apply FILE`,
    an ordinary role-gated call, since an operator now exists.
 
 **Admins are platform configuration, not deployment configuration.** The
@@ -1039,10 +1055,10 @@ GitHub's App manifest flow:
    deployment encryption key beside them.
 5. It prints what is left, as a checklist `claudebox.sh hosted doctor`
    re-checks against the running deployment: add each profile's provider
-   credential to the secret store, write the admin roles (numeric ids, which
-   `hosted deploy` can look up from logins), run `hosted deploy --admins
-   ADMINS`, apply `claudebox.deploy.yml`, enable the device flow in
-   the App's settings, create the review team if any repo will use
+   credential to the secret store, write the admin roles (numeric ids, from
+   `hosted whois`), run `hosted deploy --admins ADMINS`, enable the device
+   flow in the App's settings, log in and apply `claudebox.deploy.yml`,
+   create the review team if any repo will use
    `requested` mode, and install the App, including the org's `.github` repo
    if org defaults will be used.
 
