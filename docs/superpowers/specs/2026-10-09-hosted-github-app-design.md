@@ -1,7 +1,7 @@
 # claudebox as a hosted GitHub App: design
 
 **Date:** 2026-10-09
-**Status:** plan, revision 6, filed for review under the `plan` label
+**Status:** plan, revision 7, filed for review under the `plan` label
 
 ## Problem
 
@@ -127,7 +127,8 @@ per-repo clone-byte cap (default 2 GB) is therefore sized against the size
 of the head tree, and a repo whose head tree exceeds it needs an override in
 the deployment file (`caps.clone_bytes.overrides`). A pair that hits the cap
 parks as `too large`, which names the measured size and the key and pages
-the operator, since neither a push nor an ask can clear it. A per-installation bare mirror that would make clones
+the operator. Only a change to that repo's `clone_bytes` override clears it;
+a push or an ask does not. A per-installation bare mirror that would make clones
 local is deferred until clone volume is measured.
 
 ### Resuming a session in a fresh container
@@ -250,10 +251,14 @@ stop the review, not guess at the diff.
   it.
 - **too long**: the body is over the comment size cap. Exit non-zero and
   tell the model to shorten it and post again.
-The size cap is enforced here, at acceptance, so the outbox only ever holds
-items it can post. There is no per-PR comment cap: comment volume is already
-bounded by the round ladder, `rounds.cap` and the per-pair provider caps,
-and a cap that ends a review mid-pass costs more than the comments it saves.
+- **enough**: the pass has posted `caps.comments_per_pass` findings (default
+  25). Exit non-zero and tell the model to stop posting and finish its
+  review. The pass is not cut short and its outcome is unaffected; the extra
+  findings are counted on the check run as not posted.
+
+Both caps are enforced here, at acceptance, so the outbox only ever holds
+items it can post. A per-pass limit bounds what one prompt-injected pass can
+post without ending any review mid-pass.
 
 ## Posting and the outbox
 
@@ -277,7 +282,12 @@ finds "the commits since your last review" from the date of the persona's
 newest signed comment, and a late post would push that date past commits no
 one has reviewed. So in hosted mode the round line the control plane hands
 each pass names the head that pair last reviewed (from its committed
-fingerprint), and the scope is the commits after that head. The decision core
+fingerprint), and the scope is the commits after that head. Two cases
+widen it to the whole PR: if that head is no longer an ancestor of the
+current head (a rebase or force-push rewrote the branch), the pass runs as
+round 1 at the `should-fix` floor and the check run says the branch was
+rewritten; and if the pass answers an ask at a head the pair has already
+reviewed, the scope is the whole PR at the pair's current rung. The decision core
 takes the head as an optional input; local mode, which posts synchronously,
 passes none and keeps today's procedure.
 
@@ -309,8 +319,9 @@ Before each post the queue:
    control-plane comment would read as human activity and buy the PR another
    round.
 
-Size and per-PR caps are enforced at acceptance (above), not here, so they
-never strand an item.
+The size and per-pass caps are enforced at acceptance (above), not here, so
+they never strand an item. The queue drains round-robin across PRs, so one
+PR with a deep backlog cannot hold back another PR's findings.
 
 ## Triggers
 
@@ -363,8 +374,10 @@ and the docs say so. Approved-fork review is deferred.
 ### The per-PR check run
 
 Every non-fork PR the App sees carries one `claudebox` check run on its
-current head. A check run belongs to a commit, and creation is idempotent per
-(head, name), so the control plane creates one wherever it learns of a head:
+current head. A check run belongs to a commit. The Checks API does not deduplicate runs
+by name, so the control plane records each run's id against its head in the
+records store and creates a run only for a head with none recorded. It does
+so wherever it learns of a head:
 on the `pull_request` `opened`, `synchronize` and `reopened` events, for
 every candidate head the reconciliation poll enumerates (which is the only
 source on a local trial with webhooks off, and covers missed deliveries and
@@ -504,12 +517,9 @@ timing:
   max_passes_per_session: 0           # today's MAX_PASSES_PER_SESSION; 0 never rotates
 caps:                                 # see "Caps" for every cap and its default
   github_reads_per_pair: 300
+  comments_per_pass: 25
   comment_bytes: 60000
   clone_bytes: { default: 2000000000, overrides: { big-monorepo: 8000000000 } }
-admin:                                # GitHub numeric user ids, never logins
-  operators: [583231]                 # status, profiles, doctor, kindex push
-  transcript_readers: [583231]        # transcripts and withheld-finding records
-  erasers: [583231]
 retention:
   closed_pr_days: 14
 kindex:
@@ -543,6 +553,8 @@ noun the gateway counts are the same.
 | provider tokens per pair | 4,000,000 | `profiles.*.per_pair.tokens` | pair `capped` |
 | GitHub reads per pair | 300 | `caps.github_reads_per_pair` | pair parked, `refused read` |
 | comment size | 60,000 bytes | `caps.comment_bytes` | model told to shorten |
+| comments per pass | 25 | `caps.comments_per_pass` | model told to stop posting |
+| job deadline | 55 minutes | fixed (under the read token's hour) | running pairs `revoked`, stay owed |
 | clone bytes per job | 2 GB | `caps.clone_bytes` | pair parked, `too large` |
 | provider request body | 4 MB | fixed | request refused |
 
@@ -648,11 +660,19 @@ dispatch. Hitting one ends the pair as `capped`.
 **The gateway is the author of every pair's provider outcome (phase 2a).** It
 sees each upstream response and knows its pair from the token, and it writes
 a per-token record: successes, tokens, the first usage limit, the first
-failure, a cap hit. The control plane is the records store's only writer:
-the gateway reports each response's counts to it over the same internal
-socket the control plane uses to push read tokens, and the control plane
-commits them. A crash can lose at most the counts of responses in flight at
-that moment, which the per-pair caps bound. The control plane applies the
+failure, a cap hit. The control plane is the records store's only writer.
+The gateway enforces per-pair caps from its own counts, so provider traffic
+never waits on the control plane, and reports each response's counts to it
+asynchronously; the control plane commits them and acknowledges. What a
+gateway crash can lose is the reports not yet acknowledged, a window the
+per-pair caps bound. If the control plane is unreachable, the gateway keeps
+serving within the caps and buffers its reports; a failure inside claudebox
+is never classified as a provider failure and never parks a profile.
+
+The two processes talk over a unix socket in their shared container, owned
+by a group only those two uids belong to, and every message in both
+directions carries a per-deployment secret the supervisor hands to both at
+startup. A worker, in its own container, cannot reach it. The control plane applies the
 record at `complete pair`, together with its own record of clone outcomes;
 the
 worker contributes the transcript, the session id and its own notes, never
@@ -802,7 +822,7 @@ gateway record, or no successful provider response, is `failed`.
 |---|---|---|---|---|---|
 | `ok` | committed | committed | +1 | cleared | spent |
 | `capped` (a provider cap) | committed | unchanged | unchanged | stays, parked until the head moves or an ask; pages | spent |
-| `too large` (the clone cap) | none | unchanged | unchanged | stays, parked until the cap or the head changes; pages | not spent |
+| `too large` (the clone cap) | none | unchanged | unchanged | stays, parked until the repo's `clone_bytes` override changes; pages once | not spent |
 | `usage-limited` | committed | unchanged | unchanged | stays, parked for the backoff | spent only if a provider response succeeded |
 | `failed` | discarded; session dropped | unchanged | unchanged | stays, parked for the backoff (provider failure) or until the head moves (pair failure) | spent only if a provider response succeeded |
 | `refused read` | committed | unchanged | unchanged | stays, parked for the backoff | spent |
@@ -879,7 +899,7 @@ settings, so `app create` lists that as a checklist step unless spike S8
 finds the manifest can set it, and `hosted doctor` checks it. Every admin
 call presents the token; the
 control plane resolves it to a GitHub numeric user id and checks that against
-the deployment's role lists. Logins are never matched, because a renamed
+the role lists (platform configuration; see "Bringing a deployment up"). Logins are never matched, because a renamed
 account releases its login for someone else to claim. There are three roles,
 because the powers differ: `operators` (status, profiles, doctor, kindex
 pushes), `transcript_readers` (transcripts and withheld-finding records), and
@@ -959,22 +979,26 @@ order is:
 2. `app create`, which writes the App's secrets into them.
 3. The provider credentials, added to the platform secret store by the
    operator.
-4. `hosted deploy --deploy-file FILE`, which writes the first deployment file
-   into the platform secret store as a seed and restarts the control plane.
+4. `hosted deploy --admins ADMINS --deploy-file FILE`, which writes the admin
+   roles and the first deployment file into the platform secret store and
+   restarts the control plane.
 
-The root of authority is platform access, the same thing that can already
-read every secret, and nothing else: there is no code to intercept and no
-admin call that works without a role. On startup the control plane loads
-the seed only if the records store holds no deployment file. After that,
-`config apply` is role-gated like everything else, and editing the file
-never needs a redeploy.
+**Admins are platform configuration, not deployment configuration.** The
+role lists live only in the platform secret store, never in the deployment
+file, and only `hosted deploy --admins` changes them; `config apply` cannot.
+So there is one source of truth for who may administer the deployment, its
+root is platform access (the same access that can already read every
+secret), and revoking an admin is a `hosted deploy --admins` that takes
+effect on the restart it causes. There is no code to intercept and no admin
+call that works without a role. `hosted login` prints the numeric id it
+resolved, and `hosted deploy` warns when the operators list does not contain
+the id of the person running it.
 
-**Recovery.** If the applied file names the wrong admins, `hosted deploy
---reset-admins FILE` replaces the `admin` block from the platform side the
-same way, through the seed. `hosted login` prints the numeric id it resolved,
-and `hosted deploy` warns when the seed's `operators` list does not contain
-the id of the person running it, so a wrong id is caught before it locks
-anyone out. `hosted deploy` also reports the control plane's state, which is
+The deployment file seed is read only when the records store holds no
+deployment file, which happens on a fresh deployment or after the store is
+lost. After that the file changes only through `config apply`, and
+`hosted deploy --deploy-file` refreshes the seed so that a lost store comes
+back with the current file rather than the first one. `hosted deploy` also reports the control plane's state, which is
 how an operator diagnoses a deployment no one can log into yet. The control
 plane itself gets a live smoke test per target like the job runners do.
 
@@ -1000,9 +1024,9 @@ GitHub's App manifest flow:
    deployment encryption key beside them.
 5. It prints what is left, as a checklist `claudebox.sh hosted doctor`
    re-checks against the running deployment: add each profile's provider
-   credential to the secret store, redeploy, write and apply
-   `claudebox.deploy.yml` (with the numeric ids of the people in each admin
-   role, which `doctor` can look up from logins), enable the device flow in
+   credential to the secret store, write the admin roles (numeric ids, which
+   `hosted deploy` can look up from logins) and `claudebox.deploy.yml`, run
+   `hosted deploy --admins ADMINS --deploy-file FILE`, enable the device flow in
    the App's settings, create the review team if any repo will use
    `requested` mode, and install the App, including the org's `.github` repo
    if org defaults will be used.
@@ -1067,7 +1091,7 @@ the gateway's provider route as the author of pair outcomes, the local Docker
 job runner, a hardened single-uid worker holding a narrowed read token and no
 provider credential, the fork rule, the outbox with the scan, the signature
 and its terminal states, the per-PR check run, `auto` mode only, `app create
---target local`, the deployment-file seed, `hosted login` with roles and the
+--target local`, the admin and deployment-file seeds, `hosted login` with roles and the
 role-gated `status` and `config apply`, and `/healthz`. At the end an org can create
 an App, install it, and get reviews from a laptop on repos whose contributors
 it trusts, and no worker holds the org's provider credential.
@@ -1128,14 +1152,11 @@ The no-Docker, no-network suites stay the main line of defense.
 Implementation detail that review raised and that changes no decision in
 this plan is settled in the spec for the phase that builds it:
 
-- The wording of each check-run state, and which states page on entry versus
-  on persistence (2a).
-- Whether `too large` re-checks the cap on a push or only when the override
-  changes (2a).
+- The wording of each check-run state (2a).
 - The stage-one lookup cache that keeps a quiet poll cheap, and metering the
   poll against the installation's rate limit (2b).
-- Paging thresholds, and paging once per state entry rather than per push
-  (2b).
+- Paging thresholds (2b). This plan fixes only that a parked state pages once
+  when a pair enters it, never again per push while it stays parked.
 
 ## Deferred
 
