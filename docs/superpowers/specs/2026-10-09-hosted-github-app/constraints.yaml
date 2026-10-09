@@ -1,0 +1,434 @@
+version: "1.0"
+constraints:
+  - id: C001
+    boundary: "Config source"
+    condition: "Per-repo and org-default config are read from the default branch only; org defaults live in the org .github repo"
+    violation: "A PR changes its own model, personas, or trigger mode by editing config on its head"
+    severity: must
+    rationale: "A PR must not be able to choose who reviews it"
+    classification_tier: null
+    affected_components: ["control-plane"]
+  - id: C002
+    boundary: "Repo files"
+    condition: "No repo or org config file holds a secret; secrets live only in the deployment secret store"
+    violation: "A provider key or LINEAR_API_KEY appears in a committed config file"
+    severity: must
+    rationale: "Repo contents are readable by reviewers and sometimes the public"
+    classification_tier: AUTH
+    affected_components: ["control-plane", "secret-store"]
+  - id: C003
+    boundary: "GitHub write authority"
+    condition: "Only the control plane holds GitHub write (PR/issue comments, checks:write); workers hold read-only access"
+    violation: "A worker token can post, push, or create check runs"
+    severity: must
+    rationale: "Prompt-injected workers must not act on GitHub directly"
+    classification_tier: AUTH
+    affected_components: ["control-plane", "gateway", "reviewer", "worker-broker"]
+  - id: C004
+    boundary: "Worker GitHub token"
+    condition: "The gateway GitHub route mints a per-job installation token narrowed to the job's repo and read permissions, never reuses an installation-wide token, filters paths and GraphQL as a second layer, refuses mutations, and does not follow git redirects off github.com"
+    violation: "Search, /repositories/{id}, or GraphQL repository() reads reach another repo"
+    severity: must
+    rationale: "GitHub-enforced scoping is the primary repo boundary"
+    classification_tier: AUTH
+    affected_components: ["gateway", "control-plane"]
+  - id: C005
+    boundary: "Credential exposure in worker"
+    condition: "No credential reaches the worker, broker included; fetch job returns none; the reviewer holds only two per-job gateway tokens valid only at the gateway until the job ends"
+    violation: "The provider key, Voyage key, or Linear key is readable anywhere in the worker"
+    severity: must
+    rationale: "Worker content is shaped by untrusted PR input"
+    classification_tier: AUTH
+    affected_components: ["worker-broker", "reviewer", "gateway"]
+  - id: C006
+    boundary: "Job capability"
+    condition: "The broker uid alone holds the capability; the reviewer uid cannot read the broker's env, files, or /proc; the image adds only SETUID/SETGID and the broker drops all capabilities before spawning; CapBnd/NoNewPrivs checks apply to the reviewer"
+    violation: "Claude Code reads the capability and calls channel operations directly"
+    severity: must
+    rationale: "The capability authorises posting and committing"
+    classification_tier: AUTH
+    affected_components: ["worker-broker", "reviewer", "gh-shim"]
+  - id: C007
+    boundary: "Worker channel"
+    condition: "A job is one PR group (one PR at one head, its mode's personas). The channel carries fetch job, fetch snapshot, post finding, append pass log, and complete pair, each bound to one job capability that returns only that job's material and writes only that job's pairs; the ledger stores a salted hash; the capability expires at the deadline and is revoked at completion, timeout, and access change"
+    violation: "A capability outlives its job, is stored raw, or loads another pair's data"
+    severity: must
+    rationale: "No general load or save operation may exist; renew read token is superseded by gateway token minting"
+    classification_tier: AUTH
+    affected_components: ["control-plane", "worker-broker"]
+  - id: C008
+    boundary: "Job spec"
+    condition: "A job spec carries only an opaque job id, capability, and control-plane URL on every target; no transcript content in platform metadata"
+    violation: "Transcript or capability persists in Cloud Run execution metadata or Fly machine config"
+    severity: must
+    rationale: "Platform metadata sits outside encryption, retention, and erasure"
+    classification_tier: AUTH
+    affected_components: ["launcher", "control-plane"]
+  - id: C009
+    boundary: "Control-plane reachability"
+    condition: "The job endpoint is reachable only privately (Fly private network, internal-ingress Cloud Run with IAM, Docker network)"
+    violation: "The channel or gateway is reachable from the internet"
+    severity: must
+    rationale: "Limits who can present capabilities"
+    classification_tier: AUTH
+    affected_components: ["control-plane", "gateway"]
+  - id: C010
+    boundary: "Worker egress"
+    condition: "A worker reaches only the internal gateway (Docker --internal; Direct VPC egress with firewall on GCP); on Fly confinement is a spike and open egress, if accepted, is documented with its exposure"
+    violation: "The reviewer exfiltrates source or kindex content to an external host"
+    severity: must
+    rationale: "Egress is a leak path the comment scan never sees"
+    classification_tier: COMPLIANCE
+    affected_components: ["worker-broker", "reviewer", "launcher"]
+  - id: C011
+    boundary: "Platform secrets"
+    condition: "Platform secret mounts hold control-plane secrets only; workers run with no secret bindings (separate Fly app, Cloud Run job with minimal service account, local container with no env file)"
+    violation: "Fork workers inherit the main provider credential through Fly app secrets"
+    severity: must
+    rationale: "Per-job credential selection only works if nothing is mounted globally"
+    classification_tier: AUTH
+    affected_components: ["launcher", "secret-store", "worker-broker"]
+  - id: C012
+    boundary: "Fork PR authorization"
+    condition: "A fork PR whose author lacks write access is reviewed only after a writer asks (team review request or comment command), verified through the API and not author_association; approval covers one head SHA"
+    violation: "A stranger's push or comment triggers a review"
+    severity: must
+    rationale: "Ranked-second failure: strangers spending budget"
+    classification_tier: FINANCIAL
+    affected_components: ["control-plane"]
+  - id: C013
+    boundary: "Non-writer commands"
+    condition: "A comment command from a non-writer produces no review and no reply"
+    violation: "The bot replies to refusals"
+    severity: must
+    rationale: "Replies would let anyone make the bot talk"
+    classification_tier: PUBLIC
+    affected_components: ["control-plane"]
+  - id: C014
+    boundary: "Fork reduced worker"
+    condition: "Fork passes run with no kindex and no Linear, on the fork profile if configured, start a fresh session each time, keep the round count, and store no transcript; a repo setting can disable fork review"
+    violation: "Stranger-shaped transcripts are resumed or retained"
+    severity: must
+    rationale: "Fork content is untrusted"
+    classification_tier: COMPLIANCE
+    affected_components: ["control-plane", "worker-broker"]
+  - id: C015
+    boundary: "Visibility floor"
+    condition: "Public repos use only their own kindex store or none and get no Linear; internal counts as private; an org-store request on a public repo is refused with a visible error and review runs without kindex"
+    violation: "Org kindex content is quoted into a public PR"
+    severity: must
+    rationale: "Ranked-worst failure: private knowledge leaking"
+    classification_tier: COMPLIANCE
+    affected_components: ["control-plane", "kindex-mcp-proxy"]
+  - id: C016
+    boundary: "Pre-pass checks"
+    condition: "Visibility and permission are re-checked before every pass; an error or rate limit fails closed with no dispatch, the pair still owed, and no round"
+    violation: "A GitHub outage lets a pass run with stale visibility"
+    severity: must
+    rationale: "Failing open leaks"
+    classification_tier: COMPLIANCE
+    affected_components: ["control-plane"]
+  - id: C017
+    boundary: "Post-time visibility"
+    condition: "Post finding re-checks visibility (cache at most 60s); a change revokes; an error holds and retries to the deadline, then drops the finding and parks the job github-unavailable"
+    violation: "A mid-pass public flip lets org-store or Linear content be posted"
+    severity: must
+    rationale: "Visibility can change during a 55-minute pass"
+    classification_tier: COMPLIANCE
+    affected_components: ["control-plane"]
+  - id: C018
+    boundary: "Access loss"
+    condition: "A public flip, failed visibility check, uninstall, repo removal, or deletion bumps every pair generation in the repo and revokes live capabilities; a public flip discards transcripts and sessions before any further pass while rounds and approvals survive"
+    violation: "A late complete job writes a transcript after the discard"
+    severity: must
+    rationale: "Resumed transcripts would bypass the per-pass re-check"
+    classification_tier: COMPLIANCE
+    affected_components: ["control-plane", "blob-store"]
+  - id: C019
+    boundary: "Comment scan"
+    condition: "Findings matching a secret shape or a literal credential the deployment holds are dropped and never posted; the record holds job, PR, detector, salted hash, and redacted comment; the scan covers credentials only"
+    violation: "A credential is posted or stored raw in the dropped-findings log"
+    severity: must
+    rationale: "Ranked-worst failure"
+    classification_tier: AUTH
+    affected_components: ["control-plane"]
+  - id: C020
+    boundary: "Comment hygiene"
+    condition: "The control plane adds the -claudebox signature if missing and enforces per-pass, per-PR, and size caps"
+    violation: "An injected worker floods a PR"
+    severity: must
+    rationale: "Ranked-third failure: junk comments"
+    classification_tier: PUBLIC
+    affected_components: ["control-plane"]
+  - id: C021
+    boundary: "Posting rate"
+    condition: "Posts go through one per-installation queue at no more than 1 per second and 400 per hour (configurable); 403/429 secondary limits take the hold path and honour Retry-After"
+    violation: "Concurrent personas trip GitHub content-creation limits"
+    severity: must
+    rationale: "Header-based reserves do not see secondary limits"
+    classification_tier: null
+    affected_components: ["control-plane"]
+  - id: C022
+    boundary: "gh shim"
+    condition: "The shim waits up to 90s; on success it prints the URL and exits 0; if the finding is held or dropped it exits non-zero, telling the model the finding was not posted and to end its review"
+    violation: "The reviewer blocks until the deadline, or believes an unposted finding was posted"
+    severity: must
+    rationale: "Keeps the session aligned with GitHub without changing persona prompts"
+    classification_tier: null
+    affected_components: ["gh-shim", "worker-broker"]
+  - id: C023
+    boundary: "Commit point"
+    condition: "On ok, the control plane writes the transcript under a new immutable name, then in one transaction points the pair at it, records the fingerprint, increments the round, and removes the owed pair; this happens only if the pair's generation is unchanged"
+    violation: "A fingerprint is persisted without its session"
+    severity: must
+    rationale: "Known bug shape"
+    classification_tier: null
+    affected_components: ["control-plane", "records-store", "blob-store"]
+  - id: C024
+    boundary: "Commit shapes"
+    condition: "The state model lists ok, superseded, failed, budget-exceeded, usage-limited, github-unavailable, and revoked with exactly what each writes; github-unavailable commits the transcript (held finding marked failed) but not fingerprint or round, and the pair stays owed"
+    violation: "github-unavailable is implemented as a full commit"
+    severity: must
+    rationale: "A review cut short must not count as complete"
+    classification_tier: null
+    affected_components: ["control-plane"]
+  - id: C025
+    boundary: "Concurrency per pair"
+    condition: "A per-pair lease blocks a second live job; on timeout the control plane revokes, then releases the lease, then retries; a stale-generation completion is recorded superseded with no round"
+    violation: "An older job overwrites a newer commit"
+    severity: must
+    rationale: "Webhook plus poll, and zombie workers, create duplicates"
+    classification_tier: null
+    affected_components: ["control-plane"]
+  - id: C026
+    boundary: "Complete job validation"
+    condition: "For complete pair, the job must be live and unexpired and the pair one of the job's pairs; the transcript must parse as a Claude Code session under a size cap with a matching session id; ok requires a stream-json result event and at least one gateway-observed provider success"
+    violation: "A short fake transcript marks a head reviewed"
+    severity: must
+    rationale: "Worker reports are untrusted"
+    classification_tier: null
+    affected_components: ["control-plane", "worker-broker", "gateway"]
+  - id: C027
+    boundary: "Usage-limit parking"
+    condition: "The gateway classifies limits from upstream responses; one limit parks only its own pair; a profile-wide park needs limits on jobs for two different PRs within the window; fork jobs never count; hitting a cap is budget-exceeded, never a limit"
+    violation: "One fork pass stalls the org's profile"
+    severity: must
+    rationale: "Self-induced 429s must not stall everyone"
+    classification_tier: FINANCIAL
+    affected_components: ["gateway", "control-plane"]
+  - id: C028
+    boundary: "Provider route"
+    condition: "The gateway overwrites the model with the job's model and allows only POST /v1/messages and /v1/messages/count_tokens for Anthropic-shaped profiles; Workers AI translation runs behind the gateway"
+    violation: "The reviewer selects a pricier model or calls batch or files endpoints"
+    severity: must
+    rationale: "Spend and asynchronous calls would escape the caps"
+    classification_tier: FINANCIAL
+    affected_components: ["gateway", "workers-ai-translator"]
+  - id: C029
+    boundary: "Token caps"
+    condition: "Per-job caps count input plus output; max_tokens is clamped to the remaining output budget; oversize estimated input is refused; a request-body cap applies; profiles without usage reporting use documented approximate estimates"
+    violation: "Large-context loops or one big stream overshoot the cap"
+    severity: must
+    rationale: "Bound spend before it happens"
+    classification_tier: FINANCIAL
+    affected_components: ["gateway"]
+  - id: C030
+    boundary: "GitHub caps"
+    condition: "Per job the gateway caps 300 requests and 2 GB of clone bytes (defaults) and refuses worker reads under a 20% reserve, tracked separately for REST and GraphQL; control-plane calls are never refused"
+    violation: "A reviewer drains the rate limit so visibility checks fail"
+    severity: must
+    rationale: "Control-plane checks must stay available"
+    classification_tier: null
+    affected_components: ["gateway", "control-plane"]
+  - id: C031
+    boundary: "Gateway persistence"
+    condition: "The gateway streams and never buffers, caches, or logs bodies; it records job id, route, status, and token counts; it does not retry; it runs apart from the App-key process"
+    violation: "Plaintext provider traffic lands on disk"
+    severity: must
+    rationale: "Any body store would sit outside the state model"
+    classification_tier: COMPLIANCE
+    affected_components: ["gateway"]
+  - id: C032
+    boundary: "Voyage route"
+    condition: "Only single-input query embeddings under a length cap, with a per-job request cap"
+    violation: "Bulk embedding is used as an exfiltration or spend channel"
+    severity: should
+    rationale: "Bounds the one non-provider upstream"
+    classification_tier: FINANCIAL
+    affected_components: ["gateway"]
+  - id: C033
+    boundary: "kindex access"
+    condition: "Hosted kindex is served by the broker behind a filtering MCP proxy exposing only kindex_tools.READ_TOOLS, fail-closed, with --disallowedTools as a second layer; the snapshot arrives through the channel"
+    violation: "The reviewer calls a kindex write tool over loopback HTTP"
+    severity: must
+    rationale: "The allowlist must not depend on Claude Code config alone"
+    classification_tier: COMPLIANCE
+    affected_components: ["kindex-mcp-proxy", "worker-broker"]
+  - id: C034
+    boundary: "Linear access"
+    condition: "Hosted workers have no Linear MCP; the control plane resolves tickets at dispatch from title, body, and branch at the issued head, for private non-fork PRs only, as read-only job material"
+    violation: "The reviewer reads arbitrary tickets, or the author swaps the ticket mid-pass"
+    severity: must
+    rationale: "Single-ticket scope fixed by a trusted party"
+    classification_tier: PII
+    affected_components: ["control-plane"]
+  - id: C035
+    boundary: "Job material"
+    condition: "Job material is an encrypted blob tied to the job record, deleted at complete, timeout, or revoke, and covered by erasure and public-flip discard"
+    violation: "Linear text persists outside the encryption and erasure rules"
+    severity: must
+    rationale: "Dispatch-time content is a store"
+    classification_tier: COMPLIANCE
+    affected_components: ["control-plane", "blob-store"]
+  - id: C036
+    boundary: "Process logs"
+    condition: "Worker and control-plane stdout/stderr carry only job id, lifecycle phases, outcome, and timings"
+    violation: "stream-json lands in Cloud Logging or Fly logs"
+    severity: must
+    rationale: "Platform logs are outside retention and erasure"
+    classification_tier: COMPLIANCE
+    affected_components: ["worker-broker", "reviewer", "control-plane", "gateway"]
+  - id: C037
+    boundary: "Pass logs"
+    condition: "Detectors redact pass-log chunks at append and transcripts at complete, before encryption; pass logs are capped at 5 MB per job with a truncation marker; cost, turns, and duration go to the records store"
+    violation: "Raw secret text from a committed .env is stored"
+    severity: must
+    rationale: "No store keeps a raw detector match"
+    classification_tier: COMPLIANCE
+    affected_components: ["control-plane", "blob-store"]
+  - id: C038
+    boundary: "Encryption"
+    condition: "The control plane encrypts transcripts, pass logs, and job material with the deployment key on every target; rotation re-encrypts live blobs and destroys retired versions; key loss restarts pairs fresh at their current round"
+    violation: "Retired key versions keep backups readable"
+    severity: must
+    rationale: "Defines recovery and the erasure window"
+    classification_tier: AUTH
+    affected_components: ["control-plane", "secret-store", "blob-store"]
+  - id: C039
+    boundary: "Retention and erasure"
+    condition: "Transcripts, session state, and pass logs are deleted 14 days after close or merge (configurable), immediately on loss of access, and on demand via the erasure CLI by repo or PR; fork pass logs are kept 14 days"
+    violation: "Transcripts survive uninstall"
+    severity: must
+    rationale: "An erasure path must exist"
+    classification_tier: COMPLIANCE
+    affected_components: ["control-plane", "records-store", "blob-store"]
+  - id: C040
+    boundary: "Erasure window"
+    condition: "The plan states the real window per target, and setup tooling minimizes it (GCS soft delete and versioning off, minimal Cloud SQL backup/PITR, minimal Fly snapshots, SQLite secure_delete=ON); the window is the shorter of backup retention and time to the next key-version destruction"
+    violation: "Erased data survives silently in backups"
+    severity: must
+    rationale: "Docs must not overpromise"
+    classification_tier: COMPLIANCE
+    affected_components: ["records-store", "blob-store", "secret-store"]
+  - id: C041
+    boundary: "Audit records"
+    condition: "Approvals, park events, and pass-log reads (who, job, when) are content-free, stored apart from transcripts, kept one year, and survive erasure"
+    violation: "Erasure deletes the approval trail"
+    severity: must
+    rationale: "Accountability outlives content"
+    classification_tier: COMPLIANCE
+    affected_components: ["control-plane", "records-store"]
+  - id: C042
+    boundary: "Admin roles"
+    condition: "Operator and log-reader roles are separate lists of GitHub logins authenticated through the App's user OAuth; the local trial holder has both"
+    violation: "Any org member reads pass logs"
+    severity: must
+    rationale: "Pass logs hold private content"
+    classification_tier: AUTH
+    affected_components: ["control-plane"]
+  - id: C043
+    boundary: "Pass budget"
+    condition: "Each profile has a concurrency cap and a daily pass budget reset at 00:00 UTC; an explicit ask does not bypass it; fork passes count against their profile; the plan states which outcomes consume a unit"
+    violation: "Spend continues after the budget is exhausted"
+    severity: must
+    rationale: "Bound spend before it happens"
+    classification_tier: FINANCIAL
+    affected_components: ["control-plane"]
+  - id: C044
+    boundary: "Round cap"
+    condition: "After the per-repo round cap, automatic re-review stops; an explicit ask runs at the blocking-only rung; fork re-asks continue the round ladder"
+    violation: "A long ladder burns budget"
+    severity: must
+    rationale: "Bounds busy repos"
+    classification_tier: FINANCIAL
+    affected_components: ["control-plane"]
+  - id: C045
+    boundary: "Park comments"
+    condition: "Each budget or round-cap park posts exactly one comment with the reason and how to proceed (UTC reset time); repeat polls post nothing; github-unavailable parks silently; parks keep sessions and owed pairs"
+    violation: "Park comments repeat every poll"
+    severity: must
+    rationale: "Avoid junk comments"
+    classification_tier: PUBLIC
+    affected_components: ["control-plane"]
+  - id: C046
+    boundary: "Cost"
+    condition: "Reported cost is recorded for the dashboard and never gates a pass"
+    violation: "Providers without cost data are treated as free or blocked"
+    severity: should
+    rationale: "Pass count is the only measure every provider shares"
+    classification_tier: FINANCIAL
+    affected_components: ["control-plane", "records-store"]
+  - id: C047
+    boundary: "Control-plane topology"
+    condition: "A single instance on every target (Cloud Run min=max=1 with CPU always allocated, or a single GCE VM); running counters live in memory and are checkpointed; a restart revokes all live jobs; deploys do not overlap instances"
+    violation: "Two instances keep independent counters and capabilities"
+    severity: must
+    rationale: "Caps and the reserve must have one authority"
+    classification_tier: FINANCIAL
+    affected_components: ["control-plane", "gateway", "records-store"]
+  - id: C048
+    boundary: "Job deadline"
+    condition: "The deadline defaults to 55 minutes and no provider stream outlives the job"
+    violation: "The Cloud Run 60-minute ceiling cuts streams mid-pass"
+    severity: must
+    rationale: "Fits the platform ceiling"
+    classification_tier: null
+    affected_components: ["control-plane", "gateway", "launcher"]
+  - id: C049
+    boundary: "Runtime seam"
+    condition: "The launcher is an interface with Fly, Cloud Run/baton, and local Docker implementations; nothing else assumes a runtime"
+    violation: "The plan bakes in one platform"
+    severity: must
+    rationale: "Three named targets"
+    classification_tier: null
+    affected_components: ["launcher"]
+  - id: C050
+    boundary: "Local mode"
+    condition: "claudebox.sh run --repo keeps working with its PAT, direct posting, and Linear MCP"
+    violation: "The hosted work breaks single-repo use"
+    severity: must
+    rationale: "Existing users"
+    classification_tier: AUTH
+    affected_components: ["local-supervisor"]
+  - id: C051
+    boundary: "Manifest permissions"
+    condition: "Every App manifest permission is justified; the write-access check permission is confirmed by a spike"
+    violation: "Unjustified or assumed permissions"
+    severity: must
+    rationale: "Least privilege"
+    classification_tier: AUTH
+    affected_components: ["control-plane"]
+  - id: C052
+    boundary: "Config validation"
+    condition: "The control plane posts a check run on PRs that change the claudebox config file"
+    violation: "Bad config is merged unnoticed"
+    severity: should
+    rationale: "Easy config management"
+    classification_tier: PUBLIC
+    affected_components: ["control-plane"]
+  - id: C053
+    boundary: "Resume behaviour"
+    condition: "Persona text is passed again on every resume, and the change gate (head moved, unsigned comment, mode flip, settle window) is preserved"
+    violation: "Resumed sessions lose their persona"
+    severity: must
+    rationale: "--append-system-prompt does not survive --resume"
+    classification_tier: null
+    affected_components: ["worker-broker", "control-plane"]
+  - id: C054
+    boundary: "Plan deliverable"
+    condition: "The plan PR is labelled plan, has a phased build order with the local trial first, and has a per-phase test strategy that keeps the no-Docker, no-network suites primary"
+    violation: "Phases that ship nothing usable"
+    severity: must
+    rationale: "Deliverable scope"
+    classification_tier: null
+    affected_components: ["control-plane"]

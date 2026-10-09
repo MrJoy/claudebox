@@ -1,0 +1,258 @@
+version: "1.0"
+generated_by: constrain
+session_id: null
+_note: "No session id was supplied in the conversation."
+
+components:
+  - name: "webhook-ingress"
+    description: "Public endpoint that receives GitHub webhooks and hands them to the control plane; the reconciliation poll covers missed deliveries"
+    type: ingress
+    port: 8080
+    protocol: http
+    data_access:
+      reads: [PUBLIC, AUTH]
+      writes: [PUBLIC]
+      rationale: "Verifies deliveries with the webhook secret and forwards event payloads"
+    authority:
+      domains: []
+      rationale: null
+    dependencies: ["control-plane"]
+    constraints: ["C009"]
+  - name: "control-plane"
+    description: "Scheduler, job ledger, pair leases and generations, visibility and permission checks, Linear resolution, posting queue, check runs, commits, erasure CLI, admin surface"
+    type: service
+    port: 8081
+    protocol: http
+    data_access:
+      reads: [AUTH, COMPLIANCE, PII, FINANCIAL, PUBLIC]
+      writes: [AUTH, COMPLIANCE, PII, FINANCIAL, PUBLIC]
+      rationale: "Holds the App key, encrypts all content stores, and is the sole durable and GitHub writer"
+    authority:
+      domains: ["session_state.*", "fingerprint.*", "round.*", "owed_pair.*", "approval.*", "park.*", "job_ledger.*", "budget.*", "visibility.*", "github.write.*", "linear_resolution.*", "erasure.*"]
+      rationale: "Workers are authoritative for nothing durable"
+    dependencies: ["records-store", "blob-store", "secret-store", "launcher"]
+    constraints: ["C001", "C002", "C003", "C007", "C008", "C012", "C013", "C014", "C015", "C016", "C017", "C018", "C019", "C020", "C021", "C023", "C024", "C025", "C026", "C034", "C035", "C037", "C038", "C039", "C041", "C042", "C043", "C044", "C045", "C046", "C047", "C051", "C052", "C054"]
+  - name: "gateway"
+    description: "Internal egress proxy: provider route (model pin, endpoint allowlist, caps), GitHub read route (per-job narrowed token, caps, reserve), Voyage route"
+    type: egress
+    port: 8082
+    protocol: http
+    data_access:
+      reads: [AUTH, COMPLIANCE, FINANCIAL]
+      writes: [FINANCIAL]
+      rationale: "Injects credentials and streams content without storing bodies; records only token counts and status"
+    authority:
+      domains: ["gateway.job_cap.*", "gateway.rate_limit_view.*", "upstream.limit_classification.*", "upstream.route_policy.*"]
+      rationale: "Sees upstream responses first-hand"
+    dependencies: ["control-plane", "secret-store", "workers-ai-translator"]
+    constraints: ["C004", "C005", "C009", "C027", "C028", "C029", "C030", "C031", "C032", "C047", "C048"]
+  - name: "workers-ai-translator"
+    description: "LiteLLM plus normalizer translating the Anthropic shape to Workers AI, inside the control-plane deployment"
+    type: service
+    port: 4000
+    protocol: http
+    data_access:
+      reads: [COMPLIANCE]
+      writes: []
+      rationale: "Passes prompt content through without storing it"
+    authority:
+      domains: []
+      rationale: null
+    dependencies: []
+    constraints: ["C028"]
+  - name: "launcher"
+    description: "Runtime seam that starts a worker with only a job id, capability, and control-plane URL (Fly Machines, Cloud Run jobs via baton, local Docker)"
+    type: library
+    port: null
+    protocol: http
+    data_access:
+      reads: [AUTH]
+      writes: []
+      rationale: "Hands over the capability without persisting it in platform metadata"
+    authority:
+      domains: []
+      rationale: null
+    dependencies: ["worker-broker"]
+    constraints: ["C008", "C010", "C011", "C048", "C049"]
+  - name: "worker-broker"
+    description: "Worker entry uid; sole holder of the job capability; calls fetch job, post finding, append pass log, and complete job; hosts the kindex proxy; spawns the reviewer"
+    type: worker
+    port: null
+    protocol: http
+    data_access:
+      reads: [AUTH, COMPLIANCE]
+      writes: [COMPLIANCE]
+      rationale: "Holds the capability but no credentials; relays findings, pass logs, and the transcript"
+    authority:
+      domains: ["pass_outcome_report.*"]
+      rationale: "The only caller of complete job; low-trust, corroborated by the gateway"
+    dependencies: ["control-plane", "kindex-mcp-proxy", "reviewer"]
+    constraints: ["C005", "C006", "C007", "C010", "C011", "C014", "C022", "C026", "C033", "C036", "C053"]
+  - name: "reviewer"
+    description: "Unprivileged uid running Claude Code headless with a persona; holds only two per-job gateway tokens"
+    type: worker
+    port: null
+    protocol: http
+    data_access:
+      reads: [COMPLIANCE, PUBLIC]
+      writes: []
+      rationale: "Reads repo source, kindex, and job material; writes only through the shim"
+    authority:
+      domains: []
+      rationale: null
+    dependencies: ["gateway", "gh-shim", "kindex-mcp-proxy"]
+    constraints: ["C003", "C005", "C006", "C010", "C036"]
+  - name: "gh-shim"
+    description: "In-image gh replacement routing gh pr comment to the broker over a unix socket with 90s wait semantics"
+    type: library
+    port: null
+    protocol: tcp
+    data_access:
+      reads: []
+      writes: [PUBLIC]
+      rationale: "Carries finding text toward posting"
+    authority:
+      domains: []
+      rationale: null
+    dependencies: ["worker-broker"]
+    constraints: ["C006", "C022"]
+  - name: "kindex-mcp-proxy"
+    description: "Broker-served loopback MCP proxy exposing only kindex_tools.READ_TOOLS over the job's snapshot"
+    type: service
+    port: null
+    protocol: http
+    data_access:
+      reads: [COMPLIANCE]
+      writes: []
+      rationale: "Read-only knowledge graph access; Voyage goes through the gateway"
+    authority:
+      domains: []
+      rationale: null
+    dependencies: ["gateway"]
+    constraints: ["C015", "C033"]
+  - name: "records-store"
+    description: "SQL records: job ledger, pairs, fingerprints, rounds, budgets, audit records, dropped findings, counters (SQLite locally and on Fly, Cloud SQL Postgres on GCP)"
+    type: service
+    port: null
+    protocol: tcp
+    data_access:
+      reads: [AUTH, COMPLIANCE, PII, FINANCIAL]
+      writes: [AUTH, COMPLIANCE, PII, FINANCIAL]
+      rationale: "Hashed capabilities, content-free audit records, and redacted dropped findings"
+    authority:
+      domains: []
+      rationale: null
+    dependencies: []
+    constraints: ["C023", "C039", "C040", "C041", "C047"]
+  - name: "blob-store"
+    description: "Encrypted transcripts, pass logs, and job material (local directory, Fly volume, GCS)"
+    type: service
+    port: null
+    protocol: tcp
+    data_access:
+      reads: [COMPLIANCE]
+      writes: [COMPLIANCE]
+      rationale: "Content encrypted by the control plane with the deployment key"
+    authority:
+      domains: []
+      rationale: null
+    dependencies: []
+    constraints: ["C018", "C023", "C035", "C037", "C038", "C039", "C040"]
+  - name: "secret-store"
+    description: "Platform secret store holding control-plane secrets only (App key, webhook secret, provider profiles, Voyage, Linear, deployment key)"
+    type: service
+    port: null
+    protocol: http
+    data_access:
+      reads: [AUTH]
+      writes: [AUTH]
+      rationale: "Root of all credentials; never bound to workers"
+    authority:
+      domains: ["secret.*"]
+      rationale: "Platform-managed secret custody"
+    dependencies: []
+    constraints: ["C002", "C011", "C038", "C040"]
+  - name: "local-supervisor"
+    description: "Existing claudebox.sh run --repo mode with PAT, direct posting, and Linear MCP"
+    type: worker
+    port: null
+    protocol: http
+    data_access:
+      reads: [AUTH, COMPLIANCE, PUBLIC]
+      writes: [PUBLIC]
+      rationale: "One operator's own repo threat model"
+    authority:
+      domains: []
+      rationale: null
+    dependencies: []
+    constraints: ["C050"]
+
+edges:
+  - from: "webhook-ingress"
+    to: "control-plane"
+    protocol: http
+    description: "Verified PR, comment, review-request, installation, and repository events"
+  - from: "control-plane"
+    to: "records-store"
+    protocol: tcp
+    description: "Ledger, pair state, commits, budgets, audit records, counter checkpoints"
+  - from: "control-plane"
+    to: "blob-store"
+    protocol: tcp
+    description: "Encrypted transcripts, pass logs, and job material written under immutable names"
+  - from: "control-plane"
+    to: "secret-store"
+    protocol: http
+    description: "App key, webhook secret, deployment key, and profile credentials at startup"
+  - from: "control-plane"
+    to: "launcher"
+    protocol: http
+    description: "Dispatch: job id, capability, control-plane URL"
+  - from: "launcher"
+    to: "worker-broker"
+    protocol: http
+    description: "Starts the worker with the minimal job spec"
+  - from: "worker-broker"
+    to: "control-plane"
+    protocol: http
+    description: "fetch job, post finding, append pass log, complete job, bound to the capability"
+  - from: "worker-broker"
+    to: "reviewer"
+    protocol: tcp
+    description: "Spawns Claude Code with persona text, job material, and two gateway tokens"
+  - from: "worker-broker"
+    to: "kindex-mcp-proxy"
+    protocol: http
+    description: "Serves the kindex snapshot over loopback"
+  - from: "reviewer"
+    to: "gateway"
+    protocol: http
+    description: "Provider messages and GitHub reads with per-job tokens"
+  - from: "reviewer"
+    to: "gh-shim"
+    protocol: tcp
+    description: "gh pr comment invocations"
+  - from: "reviewer"
+    to: "kindex-mcp-proxy"
+    protocol: http
+    description: "Read-only kindex tool calls"
+  - from: "gh-shim"
+    to: "worker-broker"
+    protocol: tcp
+    description: "Findings over a unix socket; post result or held/dropped status back"
+  - from: "kindex-mcp-proxy"
+    to: "gateway"
+    protocol: http
+    description: "Single-input Voyage query embeddings"
+  - from: "gateway"
+    to: "control-plane"
+    protocol: http
+    description: "Per-job narrowed token minting, job validation, observed-success and limit reports, counters"
+  - from: "gateway"
+    to: "secret-store"
+    protocol: http
+    description: "Provider and Voyage credentials for injection"
+  - from: "gateway"
+    to: "workers-ai-translator"
+    protocol: http
+    description: "Anthropic-shaped requests for Workers AI profiles"
