@@ -109,6 +109,19 @@ class ShippedPersonasTest(unittest.TestCase):
         plan_sage = personas.resolve("plan", SHIPPED, {"PLAN_PERSONAS": "sage"})[0].prompt
         self.assertNotIn("## Your second job", plan_sage)
 
+    def test_minimalist_code_body_reconciles_itself_with_the_contract(self):
+        # _shared.md is appended after the body, so it has the last word, and
+        # its non-findings list names defences and extension points while its
+        # tag rule makes "nothing breaks without these lines" a nit. Without
+        # the carve-out, read literally, the contract tells this persona to
+        # post nothing at all. The plan contract carries neither rule.
+        body = personas.resolve("code", SHIPPED, {"PERSONAS": "minimalist"})[0].prompt
+        carve_out = "## How the contract below applies to you"
+        self.assertIn(carve_out, body)
+        self.assertLess(body.index(carve_out), body.index("## What a finding costs"))
+        plan = personas.resolve("plan", SHIPPED, {"PLAN_PERSONAS": "minimalist"})[0].prompt
+        self.assertNotIn(carve_out, plan)
+
     def test_unterminated_frontmatter_yields_no_body(self):
         # What the awk it replaced did: it never set body without a closing
         # ---. Returning the rest of the file instead would ship the frontmatter
