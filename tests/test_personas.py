@@ -120,7 +120,8 @@ class ShippedPersonasTest(unittest.TestCase):
         self.assertIn(carve_out, body)
         # The two halves of the reconciliation, not just its heading: the
         # non-findings list is about requests, and a deletion has a tag.
-        self.assertIn("Code the author already wrote", body)
+        self.assertIn("asking the author to add them.", body)
+        self.assertIn("is the opposite case, and it is your finding.", body)
         self.assertIn("A deletion that passes both is `should-fix`.", body)
         plan = personas.resolve("plan", SHIPPED, {"PLAN_PERSONAS": "minimalist"})[0].prompt
         self.assertNotIn(carve_out, plan)
