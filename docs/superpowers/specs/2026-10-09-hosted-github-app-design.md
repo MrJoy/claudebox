@@ -1,7 +1,7 @@
 # claudebox as a hosted GitHub App: design
 
 **Date:** 2026-10-09
-**Status:** plan, revision 7, filed for review under the `plan` label
+**Status:** plan, revision 8, filed for review under the `plan` label
 
 ## Problem
 
@@ -127,8 +127,9 @@ per-repo clone-byte cap (default 2 GB) is therefore sized against the size
 of the head tree, and a repo whose head tree exceeds it needs an override in
 the deployment file (`caps.clone_bytes.overrides`). A pair that hits the cap
 parks as `too large`, which names the measured size and the key and pages
-the operator. Only a change to that repo's `clone_bytes` override clears it;
-a push or an ask does not. A per-installation bare mirror that would make clones
+the operator. The pair is retried, and the head tree measured again, when the
+repo's `clone_bytes` override changes or the head moves; an ask alone does
+not retry it, since nothing it measured has changed. A per-installation bare mirror that would make clones
 local is deferred until clone volume is measured.
 
 ### Resuming a session in a fresh container
@@ -253,8 +254,10 @@ stop the review, not guess at the diff.
   tell the model to shorten it and post again.
 - **enough**: the pass has posted `caps.comments_per_pass` findings (default
   25). Exit non-zero and tell the model to stop posting and finish its
-  review. The pass is not cut short and its outcome is unaffected; the extra
-  findings are counted on the check run as not posted.
+  review. The pass is not cut short and its outcome is unaffected. The
+  control plane counts accepted findings per pair per job, which is what
+  makes this possible; the findings it turns away are counted on the check
+  run and in `/metrics` as not posted.
 
 Both caps are enforced here, at acceptance, so the outbox only ever holds
 items it can post. A per-pass limit bounds what one prompt-injected pass can
@@ -286,7 +289,8 @@ fingerprint), and the scope is the commits after that head. Two cases
 widen it to the whole PR: if that head is no longer an ancestor of the
 current head (a rebase or force-push rewrote the branch), the pass runs as
 round 1 at the `should-fix` floor and the check run says the branch was
-rewritten; and if the pass answers an ask at a head the pair has already
+rewritten (scope only: the pair's round count, which `rounds.cap` measures,
+still advances); and if the pass answers an ask at a head the pair has already
 reviewed, the scope is the whole PR at the pair's current rung. The decision core
 takes the head as an optional input; local mode, which posts synchronously,
 passes none and keeps today's procedure.
@@ -577,8 +581,8 @@ changes away from `org`, or the org store is removed) is an access change
 for that repo, handled as loss of access is: its queued items are dropped,
 its pairs' sessions and transcripts are deleted so the next pass starts
 fresh, and its running jobs are revoked. Applying a file is role-gated
-(`operators`); the first file arrives another way (see "Bringing a deployment
-up"). The file is loaded with a safe YAML loader (no
+(`operators`), the first time included: admins are platform configuration
+that exists before any deployment file (see "Bringing a deployment up"). The file is loaded with a safe YAML loader (no
 tags, no anchors that expand past a size cap) and capped at 256 KB, and the
 same loader reads repo files, which are capped at 64 KB.
 
@@ -672,12 +676,20 @@ is never classified as a provider failure and never parks a profile.
 The two processes talk over a unix socket in their shared container, owned
 by a group only those two uids belong to, and every message in both
 directions carries a per-deployment secret the supervisor hands to both at
-startup. A worker, in its own container, cannot reach it. The control plane applies the
-record at `complete pair`, together with its own record of clone outcomes;
-the
-worker contributes the transcript, the session id and its own notes, never
-the outcome. A pair whose token has no gateway record had no provider
-traffic, and is `failed`.
+startup. A worker, in its own container, cannot reach it. When the gateway
+starts, the control plane pushes it the committed counts it enforces against
+(each live pair's usage so far, and the day's budget use per profile and per
+repo) along with the live jobs' read tokens, so a restart does not reset any
+cap.
+
+At `complete pair` the control plane first asks the gateway to flush and
+acknowledge every report for that pair's token, then applies the record,
+together with its own record of clone outcomes. The worker contributes the
+transcript, the session id and its own notes, never the outcome. If the
+flush succeeds and the record shows no successful provider response, the
+pair is `failed`. If the gateway cannot be reached to flush, that is a
+claudebox fault, not a provider failure: the pair is `revoked` (stays owed,
+no park, nothing spent) and the fault is logged and counted.
 
 - A usage limit (429, or a limit body) parks the pair for the profile's
   `limit_backoff_seconds`. Pairs on two different PRs hitting a limit inside
@@ -787,6 +799,7 @@ R" by name (see "Retention and erasure").
 |---|---|---|---|
 | pair state: fingerprint, round, owed, session id, transcript ref, parked-until, failure count | records | none | the PR, then 14 days |
 | capabilities and gateway tokens (hashes) | records | none | until expiry or revocation |
+| check-run ids per head | records | none | the PR, then 14 days |
 | per-token outcome records (successes, tokens, limits, failures, cap hits) | records | none | the pair |
 | asks, budgets, park events, audit rows | records | user ids only | one year; survive erasure |
 | per-detector withheld counts | records | none | one year; survive erasure |
@@ -822,7 +835,7 @@ gateway record, or no successful provider response, is `failed`.
 |---|---|---|---|---|---|
 | `ok` | committed | committed | +1 | cleared | spent |
 | `capped` (a provider cap) | committed | unchanged | unchanged | stays, parked until the head moves or an ask; pages | spent |
-| `too large` (the clone cap) | none | unchanged | unchanged | stays, parked until the repo's `clone_bytes` override changes; pages once | not spent |
+| `too large` (the clone cap) | none | unchanged | unchanged | stays, parked until the override changes or the head moves; pages once | not spent |
 | `usage-limited` | committed | unchanged | unchanged | stays, parked for the backoff | spent only if a provider response succeeded |
 | `failed` | discarded; session dropped | unchanged | unchanged | stays, parked for the backoff (provider failure) or until the head moves (pair failure) | spent only if a provider response succeeded |
 | `refused read` | committed | unchanged | unchanged | stays, parked for the backoff | spent |
@@ -979,9 +992,13 @@ order is:
 2. `app create`, which writes the App's secrets into them.
 3. The provider credentials, added to the platform secret store by the
    operator.
-4. `hosted deploy --admins ADMINS --deploy-file FILE`, which writes the admin
-   roles and the first deployment file into the platform secret store and
-   restarts the control plane.
+4. `hosted deploy --admins ADMINS`, which writes the admin roles into the
+   platform secret store and restarts the control plane. `ADMINS` is a small
+   YAML file mapping each role (`operators`, `transcript_readers`,
+   `erasers`) to a list of numeric GitHub user ids; `hosted deploy` resolves
+   logins to ids for the operator and prints the result before writing it.
+5. `claudebox.sh hosted login`, then `claudebox.sh hosted config apply FILE`,
+   an ordinary role-gated call, since an operator now exists.
 
 **Admins are platform configuration, not deployment configuration.** The
 role lists live only in the platform secret store, never in the deployment
@@ -994,11 +1011,9 @@ call that works without a role. `hosted login` prints the numeric id it
 resolved, and `hosted deploy` warns when the operators list does not contain
 the id of the person running it.
 
-The deployment file seed is read only when the records store holds no
-deployment file, which happens on a fresh deployment or after the store is
-lost. After that the file changes only through `config apply`, and
-`hosted deploy --deploy-file` refreshes the seed so that a lost store comes
-back with the current file rather than the first one. `hosted deploy` also reports the control plane's state, which is
+The deployment file has one copy, in the records store, and changes only
+through `config apply`. There is no seed: operators keep the file in version
+control, and after a lost store they apply it again. `hosted deploy` also reports the control plane's state, which is
 how an operator diagnoses a deployment no one can log into yet. The control
 plane itself gets a live smoke test per target like the job runners do.
 
@@ -1025,8 +1040,8 @@ GitHub's App manifest flow:
 5. It prints what is left, as a checklist `claudebox.sh hosted doctor`
    re-checks against the running deployment: add each profile's provider
    credential to the secret store, write the admin roles (numeric ids, which
-   `hosted deploy` can look up from logins) and `claudebox.deploy.yml`, run
-   `hosted deploy --admins ADMINS --deploy-file FILE`, enable the device flow in
+   `hosted deploy` can look up from logins), run `hosted deploy --admins
+   ADMINS`, apply `claudebox.deploy.yml`, enable the device flow in
    the App's settings, create the review team if any repo will use
    `requested` mode, and install the App, including the org's `.github` repo
    if org defaults will be used.
@@ -1091,7 +1106,7 @@ the gateway's provider route as the author of pair outcomes, the local Docker
 job runner, a hardened single-uid worker holding a narrowed read token and no
 provider credential, the fork rule, the outbox with the scan, the signature
 and its terminal states, the per-PR check run, `auto` mode only, `app create
---target local`, the admin and deployment-file seeds, `hosted login` with roles and the
+--target local`, the admin roles, `hosted login` with roles and the
 role-gated `status` and `config apply`, and `/healthz`. At the end an org can create
 an App, install it, and get reviews from a laptop on repos whose contributors
 it trusts, and no worker holds the org's provider credential.
