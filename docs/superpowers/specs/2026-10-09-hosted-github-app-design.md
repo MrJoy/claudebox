@@ -1,7 +1,7 @@
 # claudebox as a hosted GitHub App: design
 
 **Date:** 2026-10-09
-**Status:** plan, revision 10, filed for review under the `plan` label
+**Status:** plan, revision 11, filed for review under the `plan` label
 
 ## Problem
 
@@ -696,15 +696,16 @@ record is complete and shows no successful provider response, the pair is
 `failed`.
 
 If the flush cannot complete within a minute (the gateway is unreachable,
-or reports are missing), or the pass ran into the window while a restarting
-gateway held traffic back, that is a claudebox fault, never a provider
-failure, and the pair is `deferred`: its transcript is committed so it
-resumes where it was, its fingerprint and round stay where they were, it
-stays owed and is parked for the profile's `limit_backoff_seconds`, nothing
-is spent, and no profile is parked. The retry is an ordinary pass. A repo
+or reports are missing), or the token's record carries a `held` mark (which
+a starting gateway writes on every request it turns away before it has its
+counts), that is a claudebox fault, never a provider failure, and the pair is
+`deferred`: its transcript is committed so it resumes where it was, its
+fingerprint and round stay where they were, it stays owed and is parked for
+the profile's `limit_backoff_seconds`, and no profile is parked. Budget is
+charged as the gateway counts, before any outcome is known, so a deferred
+pass has spent whatever provider work it actually did, like every other
+row; it adds no charge of its own. The retry is an ordinary pass. A repo
 whose pairs are deferred three times in a row pages, as a claudebox fault.
-`failed` is applied only when the flush completed and the complete record
-shows no successful provider response.
 
 - A usage limit (429, or a limit body) parks the pair for the profile's
   `limit_backoff_seconds`. Pairs on two different PRs hitting a limit inside
@@ -843,8 +844,10 @@ removes.
 The outcome comes from the gateway's record for the pair's token (see "The
 gateway"), never from the worker. An `ok` additionally needs the job's
 capability to be live, the transcript to parse as a Claude Code session under
-a size cap, and its session id to be the pair's. A pair whose token has no
-gateway record, or no successful provider response, is `failed`.
+a size cap, and its session id to be the pair's. When the flush completed
+and the complete record shows no successful provider response, the pair is
+`failed`; when the flush did not complete, it is `deferred` (see "The
+gateway").
 
 | Outcome | Transcript | Fingerprint | Round | Owed | Budget |
 |---|---|---|---|---|---|
@@ -853,7 +856,7 @@ gateway record, or no successful provider response, is `failed`.
 | `too large` (the clone cap) | none | unchanged | unchanged | stays, parked until the override changes or the head moves; pages once | not spent |
 | `usage-limited` | committed | unchanged | unchanged | stays, parked for the backoff | spent only if a provider response succeeded |
 | `budget` (the day's budget ran out mid-pass) | committed | unchanged | unchanged | stays, parked until the UTC reset; does not page | spent |
-| `deferred` (a claudebox fault; see "The gateway") | committed | unchanged | unchanged | stays, parked for the backoff | not spent |
+| `deferred` (a claudebox fault; see "The gateway") | committed | unchanged | unchanged | stays, parked for the backoff | what the gateway counted, nothing more |
 | `failed` | discarded; session dropped | unchanged | unchanged | stays, parked for the backoff (provider failure) or until the head moves (pair failure) | spent only if a provider response succeeded |
 | `refused read` | committed | unchanged | unchanged | stays, parked for the backoff | spent |
 | `revoked` (timeout, access change, restart) | discarded | unchanged | unchanged | stays | spent only if a provider response succeeded |
@@ -981,7 +984,9 @@ The docs name the conditions worth paging on, with suggested thresholds:
 open; the oldest owed pair that is not parked older than two hours; any pair
 parked as `failing`, `capped` or `too large` (each waits on a person: a
 broken pair, a cap value, a clone override); the oldest outbox item
-older than an hour; a profile parked for failures; withheld findings on any
+older than an hour; a profile parked for failures; a repo deferred three
+times in a row (a claudebox fault); a `tokens` profile receiving a response
+without usage; withheld findings on any
 repo (a reviewer quoting a credential is the earliest sign of consequence
 #1); webhook signature failures; the installation suspended or uninstalled;
 any repo whose config is invalid. Parked pairs that are waiting by design
