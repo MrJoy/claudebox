@@ -1,7 +1,7 @@
 # claudebox as a hosted GitHub App: design
 
 **Date:** 2026-10-09
-**Status:** plan, revision 12, filed for review under the `plan` label
+**Status:** plan, revision 13, filed for review under the `plan` label
 
 ## Problem
 
@@ -694,19 +694,18 @@ together with its own record of clone outcomes. The worker contributes the
 transcript, the session id and its own notes, never the outcome. The order
 in which the outcome is decided is stated once, in "The commit point".
 
-**Gateway outages are recorded by the control plane, not the gateway.** The
-control plane is what seeds the gateway, so it records every interval in
-which the gateway was not serving: from the last report it acknowledged
-before the gateway stopped answering until the gateway is seeded again.
-The gateway's own record cannot do this, because a gateway that is down
-writes nothing and a crash loses its unacknowledged reports. Requests that
-never reached the gateway are not provider failures in any count: the
-profile's failure counter moves only on responses from upstream that the
-gateway itself saw.
+**What counts as a provider failure.** The record holds only what upstream
+did, as the gateway saw it: an upstream response (success, limit, 5xx) or an
+upstream transport failure (the provider refused or dropped the connection).
+Anything that fails before upstream, or inside claudebox, is not in the
+record: a request that never reached the gateway, one a starting gateway
+turned away, or a dead Workers AI translator, which runs inside the
+control-plane deployment. Those are claudebox faults, and they never move
+the profile's failure counter.
 
-If the flush cannot complete within a minute, or the pair's pass overlapped
-a recorded gateway outage, that is a claudebox fault, never a provider
-failure, and the pair is `deferred`: its transcript is committed so it resumes where it was, its
+So if the flush cannot complete within a minute, or the complete record is
+empty (the pass never reached upstream), that is a claudebox fault and the
+pair is `deferred`: its transcript is committed so it resumes where it was, its
 fingerprint and round stay where they were, it stays owed and is parked for
 the profile's `limit_backoff_seconds`, and no profile is parked. Budget is
 charged as the gateway counts, before any outcome is known, so a deferred
@@ -717,8 +716,8 @@ whose pairs are deferred three times in a row pages, as a claudebox fault.
 - A usage limit (429, or a limit body) parks the pair for the profile's
   `limit_backoff_seconds`. Pairs on two different PRs hitting a limit inside
   that window park the whole profile for the same interval.
-- Any other provider failure (connection refused, 5xx, a dead translator) is
-  counted per profile. Three consecutive failed pairs on a profile, with no
+- Any other provider failure (an upstream 5xx, or the provider refusing or
+  dropping the connection) is counted per profile. Three consecutive failed pairs on a profile, with no
   success between them, park the profile for `limit_backoff_seconds`, as
   today's `MAX_CONSECUTIVE_FAILURES` stops the cycle. A provider failure parks
   a single pair for the same time-boxed interval, never longer, and any
@@ -823,7 +822,7 @@ R" by name (see "Retention and erasure").
 | pair state: fingerprint, round, owed, session id, transcript ref, parked-until, failure count | records | none | the PR, then 14 days |
 | capabilities and gateway tokens (hashes) | records | none | until expiry or revocation |
 | check-run ids per head | records | none | the PR, then 14 days |
-| per-token outcome records (successes, tokens, limits, failures, cap hits); gateway outage intervals | records | none | the pair |
+| per-token outcome records (successes, tokens, limits, failures, cap hits) | records | none | the pair |
 | asks, budgets, park events, audit rows | records | user ids only | one year; survive erasure |
 | per-detector withheld counts | records | none | one year; survive erasure |
 | withheld-finding records (detector, salted hash, redacted body) | records | yes | as transcripts |
@@ -851,12 +850,16 @@ removes.
 The outcome comes from the gateway's record for the pair's token (see "The
 gateway"), never from the worker. An `ok` additionally needs the job's
 capability to be live, the transcript to parse as a Claude Code session under
-a size cap, and its session id to be the pair's. The rules apply in this
-order, and this is the only place they are stated as a whole: a pass that
-overlapped a recorded gateway outage, or whose flush did not complete, is
-`deferred`; otherwise a complete record with no successful provider response
-is `failed`; otherwise the record decides (`ok`, `capped`, `usage-limited`,
-`budget`, `refused read`) as the table below says.
+a size cap, and its session id to be the pair's. The outcome of a pair
+that reaches `complete pair` is decided in this order, and only here: a
+transcript that will not parse, or a session id that is not the pair's, is
+`failing`, checked first so a bad session id is never committed; otherwise
+an incomplete flush or an empty record is `deferred`; otherwise a record of
+upstream failures with no success is `failed`; otherwise the record decides
+(`ok`, `capped`, `usage-limited`, `budget`) as the table below says. Three
+outcomes are decided elsewhere, without a `complete pair`: `too large` at
+clone time, `refused read` by the read route, and `revoked` by timeout,
+access change or restart.
 
 | Outcome | Transcript | Fingerprint | Round | Owed | Budget |
 |---|---|---|---|---|---|
@@ -866,7 +869,8 @@ is `failed`; otherwise the record decides (`ok`, `capped`, `usage-limited`,
 | `usage-limited` | committed | unchanged | unchanged | stays, parked for the backoff | spent only if a provider response succeeded |
 | `budget` (the day's budget ran out mid-pass) | committed | unchanged | unchanged | stays, parked until the UTC reset; does not page | spent |
 | `deferred` (a claudebox fault; see "The gateway") | committed | unchanged | unchanged | stays, parked for the backoff | what the gateway counted, nothing more |
-| `failed` | discarded; session dropped | unchanged | unchanged | stays, parked for the backoff (provider failure) or until the head moves (pair failure) | spent only if a provider response succeeded |
+| `failing` (a pair failure) | discarded; session dropped | unchanged | unchanged | stays, parked until the head moves or an ask; pages | what the gateway counted |
+| `failed` (a provider failure) | discarded; session dropped | unchanged | unchanged | stays, parked for the backoff | spent only if a provider response succeeded |
 | `refused read` | committed | unchanged | unchanged | stays, parked for the backoff | spent |
 | `revoked` (timeout, access change, restart) | discarded | unchanged | unchanged | stays | spent only if a provider response succeeded |
 
