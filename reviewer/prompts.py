@@ -91,8 +91,7 @@ WORKTREE_STANZA = (
 # ladder overrides the prompts and writes their own. The line goes in the
 # SYSTEM prompt beside the persona, for the same two reasons the persona does:
 # it must be re-passed on --resume, and it must reach an operator override
-# without editing it. Plan mode has no ladder; its personas review a document,
-# and the failure modes the ladder exists for are code-shaped.
+# without editing it. Plan mode has its own ladder, below the code one.
 _ROUND_DELTA = (
     "Read closely only the commits since your last review: find your own most "
     "recent comment on this pull request, the newest one signed with your label, "
@@ -119,17 +118,59 @@ _ROUND_LATER = (
 )
 
 
+# The plan ladder. Plan mode once had none, on the theory that the failures the
+# ladder exists for are code-shaped. PR #11 disproved it: thirteen revisions,
+# every persona at full sensitivity every round, findings settling at about
+# five a round while the document nearly doubled, and the late rounds aimed
+# almost entirely at mechanisms earlier revisions had added to answer earlier
+# findings. A large plan always has a gap in it somewhere, so "no findings" is
+# not a state the review can reach; the ladder makes it reachable by raising
+# the floor. Same shape as the code ladder, worded for a document: revisions
+# rather than commits to mutate, and a settled architecture rather than sound
+# code.
+_PLAN_ROUND_DELTA = (
+    "Read closely only the revisions since your last review: find your own most "
+    "recent comment on this pull request, the newest one signed with your label, "
+    "and read what changed in the commits `gh pr view` lists with a date after it. "
+    "If you have no earlier comment, read the whole plan. Raise something in a part "
+    "of the plan no revision touched only if a revision broke it."
+)
+
+_PLAN_ROUND_FIRST = (
+    "This is round 1 of your review of this plan. Review the whole proposal. "
+    "Post nothing tagged below `should-fix`."
+)
+
+_PLAN_ROUND_SECOND = (
+    "This is round 2 of your review of this plan. " + _PLAN_ROUND_DELTA
+    + " Post nothing tagged below `should-fix`."
+)
+
+_PLAN_ROUND_LATER = (
+    "This is round {n} of your review of this plan, which has already survived "
+    "{k} rounds of it. " + _PLAN_ROUND_DELTA + " Post only `blocking` findings. "
+    "Presume the plan's architecture is settled: a gap in how a mechanism behaves "
+    "belongs to the phase spec that builds it unless the plan cannot work with the "
+    "gap left open. Finding nothing new is the expected outcome, and saying so is "
+    "the right report."
+)
+
+_LADDERS = {
+    "code": (_ROUND_FIRST, _ROUND_SECOND, _ROUND_LATER),
+    "plan": (_PLAN_ROUND_FIRST, _PLAN_ROUND_SECOND, _PLAN_ROUND_LATER),
+}
+
+
 def round_stanza(mode: str, round: int) -> str:
-    """The round line for the system prompt, or "" for a mode with no ladder."""
+    """The round line for the system prompt."""
     if round < 1:
         raise ValueError(f"round must be >= 1, got {round}")
-    if mode != "code":
-        return ""
+    first, second, later = _LADDERS[mode]
     if round == 1:
-        return _ROUND_FIRST
+        return first
     if round == 2:
-        return _ROUND_SECOND
-    return _ROUND_LATER.format(n=round, k=round - 1)
+        return second
+    return later.format(n=round, k=round - 1)
 
 
 @dataclass(frozen=True)

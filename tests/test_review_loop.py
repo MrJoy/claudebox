@@ -1221,6 +1221,11 @@ class PreflightTest(unittest.TestCase):
         with self.assertRaises(ConfigError):
             review_loop.preflight(preflight_env(PR_IDS=""))
 
+    def test_an_unparsable_plan_max_rounds_is_a_config_error(self):
+        # Same reasoning as SETTLE_SECONDS below: --check must catch it.
+        with self.assertRaises(ConfigError):
+            review_loop.preflight(preflight_env(PLAN_MAX_ROUNDS="four"))
+
     def test_an_unparsable_settle_seconds_is_a_config_error(self):
         # Validated here as well as in main because --check returns before
         # main's config block, and entrypoint.sh runs --check ahead of the
@@ -1365,11 +1370,13 @@ class CycleGateTest(unittest.TestCase):
     def _cycle(self, snapshots, **env):
         original = os.environ.copy()
         os.environ.clear()
-        os.environ.update(preflight_env(
+        base = dict(
             WORK_REPO=scratch_repo(self), REVIEW_MODEL="m", MAX_CYCLES="1",
             PERSONAS="red_team", PLAN_PERSONAS="red_team",
-            REVIEW_INTERVAL_SECONDS="0", **env
-        ))
+            REVIEW_INTERVAL_SECONDS="0",
+        )
+        base.update(env)
+        os.environ.update(preflight_env(**base))
         self.addCleanup(lambda: (os.environ.clear(), os.environ.update(original)))
 
         looked_up, reviewed = [], []
@@ -1402,9 +1409,19 @@ class CycleGateTest(unittest.TestCase):
             review_loop.main([])
         return looked_up, reviewed, out.getvalue()
 
-    def _snap(self, number=12, age=3600.0):
+    def _snap(self, number=12, age=3600.0, mode="code"):
         stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - age))
-        return gh.PRSnapshot(number, "code", "abc", stamp)
+        return gh.PRSnapshot(number, mode, "abc", stamp)
+
+    def test_a_finished_plan_is_logged_as_finished_not_unchanged(self):
+        # "Unchanged" would tell the operator a push will wake it, and under
+        # the cap a push does not.
+        _, reviewed, log = self._cycle(
+            [self._snap(mode="plan")], REVIEW_ON_CHANGE="0", MAX_CYCLES="2",
+            PLAN_MAX_ROUNDS="1")
+        self.assertEqual(reviewed, [12])
+        self.assertIn("Finished reviewing (PLAN_MAX_ROUNDS reached): #12.", log)
+        self.assertNotIn("Unchanged since their last review", log)
 
     def test_the_gate_off_makes_no_stage_two_lookup(self):
         # An operator who turns the gate off stops paying for the extra
@@ -2706,6 +2723,78 @@ class RoundsTest(unittest.TestCase):
         self.assertIn("review complete (session S1, pass 1, round 1).", buf.getvalue())
 
 
+class RoundCapTest(unittest.TestCase):
+    """PLAN_MAX_ROUNDS: the backstop behind the plan ladder.
+
+    Zero findings is not a stopping rule a large plan can reach, so a plan
+    pair that has completed the cap's worth of rounds stops being reviewed,
+    whatever the gate says. Code mode keeps its ladder and has no cap.
+    """
+
+    PL = Pair(11, "plan", "red_team")
+    CD = Pair(12, "code", "red_team")
+    MOVED = signals.Signal(head_oid="b", mode="plan", newest_human="")
+
+    def cycle(self, s, groups, signals_by_pr=None):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            s.run_cycle(groups, signals_by_pr or {})
+        return buf.getvalue()
+
+    def test_a_capped_plan_pair_stops_running_with_the_gate_off(self):
+        s = supervisor([], personas={"plan": ["red_team"]}, plan_max_rounds=2)
+        for _ in range(4):
+            self.cycle(s, grouped(self.PL))
+        self.assertEqual(s.attempted, [self.PL, self.PL])
+
+    def test_a_capped_plan_pair_ignores_a_moved_head(self):
+        # The spiral's engine is a revision per round: each push moves the
+        # head, and a moved head is exactly what the gate reads as "review".
+        s = supervisor([], personas={"plan": ["red_team"]}, plan_max_rounds=1)
+        self.cycle(s, grouped(self.PL), {11: self.MOVED})
+        moved_again = signals.Signal(head_oid="c", mode="plan", newest_human="")
+        self.cycle(s, grouped(self.PL), {11: moved_again})
+        self.assertEqual(s.attempted, [self.PL])
+
+    def test_zero_is_unlimited(self):
+        s = supervisor([], personas={"plan": ["red_team"]}, plan_max_rounds=0)
+        for _ in range(5):
+            self.cycle(s, grouped(self.PL))
+        self.assertEqual(len(s.attempted), 5)
+
+    def test_code_mode_is_not_capped(self):
+        s = supervisor([], personas={"code": ["red_team"]}, plan_max_rounds=1)
+        for _ in range(3):
+            self.cycle(s, grouped(self.CD))
+        self.assertEqual(s.attempted, [self.CD] * 3)
+
+    def test_a_capped_pair_is_not_owed(self):
+        # A limit cuts the cycle in the code group; the plan group after it
+        # was never reached. Its capped pair has nothing to run, so owing it
+        # would only narrow the next visit to a pair that will not run.
+        s = supervisor([limited("S1")], personas={"code": ["red_team"], "plan": ["red_team"]},
+                       plan_max_rounds=1)
+        s.rounds[self.PL] = 1
+        s.sessions[self.PL] = "Sp"
+        self.cycle(s, grouped(self.CD, self.PL))
+        self.assertNotIn(self.PL, s.owed)
+        self.assertEqual(s.debt_for(grouped(self.PL)[0]), [])
+
+    def test_reaching_the_cap_is_logged_once(self):
+        s = supervisor([], personas={"plan": ["red_team"]}, plan_max_rounds=1)
+        first = self.cycle(s, grouped(self.PL))
+        second = self.cycle(s, grouped(self.PL))
+        self.assertIn("reached PLAN_MAX_ROUNDS=1", first)
+        self.assertNotIn("PLAN_MAX_ROUNDS", second)
+
+    def test_finished_names_a_group_whose_every_pair_is_capped(self):
+        s = supervisor([], personas={"plan": ["red_team"]}, plan_max_rounds=1)
+        group = grouped(self.PL)[0]
+        self.assertFalse(s.finished(group))
+        self.cycle(s, [group])
+        self.assertTrue(s.finished(group))
+
+
 class SystemPromptTest(unittest.TestCase):
     """The round line rides beside the persona, in the system prompt."""
 
@@ -2722,9 +2811,11 @@ class SystemPromptTest(unittest.TestCase):
         self.assertIn("This is round 2 of your review",
                       s.system_prompt_for(Pair(12, "code", "red_team")))
 
-    def test_plan_mode_is_the_bare_persona(self):
+    def test_plan_mode_carries_its_own_round_line(self):
         s = supervisor([], personas={"plan": ["red_team"]})
-        self.assertEqual(s.system_prompt_for(Pair(12, "plan", "red_team")), "rt")
+        got = s.system_prompt_for(Pair(12, "plan", "red_team"))
+        self.assertTrue(got.startswith("rt\n"))
+        self.assertIn("This is round 1 of your review of this plan", got)
 
     def test_run_one_hands_the_composed_prompt_to_run_pass(self):
         # Through the real _run_one, with run_pass stubbed at the seam, so this

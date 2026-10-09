@@ -876,6 +876,24 @@ cycle "modes: a resumed plan pass still carries its plan persona" \
      ARGV:2:"--resume S1" \
      ARGV:2:"--append-system-prompt You are a User advocate"
 
+# Plan mode has a ladder of its own now, and its round line rides beside the
+# persona for the same reason: it has to survive --resume.
+cycle "rounds: a resumed plan pass carries the plan ladder's round 2" \
+  PLAN_PERSONAS=user STUB_PLAN_PRS=1 \
+  -- CALLS:2 \
+     ARGV:1:"This is round 1 of your review of this plan" \
+     ARGV:2:"--resume S1" \
+     ARGV:2:"This is round 2 of your review of this plan"
+
+# The stub moves the head between its two cycles, which is what makes the
+# second cycle run in the case above. With the cap at one round, the same
+# moved head runs nothing.
+cycle "rounds: PLAN_MAX_ROUNDS stops a plan pair a moved head would rerun" \
+  PLAN_PERSONAS=user STUB_PLAN_PRS=1 PLAN_MAX_ROUNDS=1 \
+  -- CALLS:1 \
+     LOG:"reached PLAN_MAX_ROUNDS=1" \
+     LOG:"Finished reviewing (PLAN_MAX_ROUNDS reached): #1."
+
 # A label added between cycles changes the pair key, so the old session is
 # orphaned and the new mode starts fresh rather than resuming a code session
 # under a plan persona.

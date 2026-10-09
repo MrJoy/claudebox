@@ -297,6 +297,12 @@ def _required(env: Mapping[str, str], name: str) -> str:
     return value
 
 
+# Four rounds: the whole plan, the first revision, then two blocking-only
+# passes. With the ladder in place the last two should mostly post nothing,
+# so the cap is a backstop rather than the thing that ends a review.
+DEFAULT_PLAN_MAX_ROUNDS = 4
+
+
 def _positive_int(env: Mapping[str, str], name: str, default: int) -> int:
     raw = env.get(name, "").strip()
     if not raw:
@@ -396,6 +402,7 @@ class Supervisor:
         max_passes_per_session: int,
         max_concurrent: int = 0,
         persona_phases: Optional[Dict[Tuple[str, str], int]] = None,
+        plan_max_rounds: int = 0,
     ):
         self.personas = personas
         self.persona_prompts = persona_prompts
@@ -410,6 +417,8 @@ class Supervisor:
         # phase-1 pass in the group has finished, which is what lets Sage read
         # what its siblings posted this round.
         self.persona_phases: Dict[Tuple[str, str], int] = dict(persona_phases or {})
+        # PLAN_MAX_ROUNDS, the backstop behind the plan ladder. 0 is no cap.
+        self.plan_max_rounds = plan_max_rounds
 
         self.sessions: Dict[Pair, str] = {}
         self.passes_done: Dict[Pair, int] = {}
@@ -623,10 +632,32 @@ class Supervisor:
         both mean "run it". A pair with no session always runs, which is what
         makes first sight, a session dropped by _record_failure, and
         MAX_PASSES_PER_SESSION rotation work without knowing about the gate.
+        A plan pair at PLAN_MAX_ROUNDS holds whatever the signal says.
         """
+        if self._capped(pair):
+            return True
         if signal is None:
             return False
         return self.sessions.get(pair) is not None and self.reviewed.get(pair) == signal
+
+    def _capped(self, pair: Pair) -> bool:
+        """True when a plan pair has completed PLAN_MAX_ROUNDS rounds.
+
+        Checked ahead of the signal, so it holds with the gate off too, and
+        it counts as the gate holding everywhere _gate_holds is asked, so a
+        capped pair is never owed. A moved head does not lift it: a revision
+        per round is the very thing the cap exists to stop. The count is in
+        memory, so a restart lifts it.
+        """
+        return (
+            pair.mode == "plan"
+            and self.plan_max_rounds > 0
+            and self.rounds.get(pair, 0) >= self.plan_max_rounds
+        )
+
+    def finished(self, group: Group) -> bool:
+        """True when every pair in the group is capped, for the cycle's log."""
+        return bool(group.pairs) and all(self._capped(p) for p in group.pairs)
 
     def debt_for(
         self, group: Group, signal: Optional["signals_mod.Signal"] = None
@@ -831,6 +862,10 @@ class Supervisor:
         self.rounds[pair] = self.rounds.get(pair, 0) + 1
         log(f"review complete (session {self.sessions.get(pair)}, "
             f"pass {self.passes_done[pair]}, round {self.rounds[pair]}).", pair=pair)
+        if self._capped(pair):
+            log(f"reached PLAN_MAX_ROUNDS={self.plan_max_rounds}; no further "
+                "reviews of this plan by this persona until the container "
+                "restarts.", pair=pair)
         if (
             self.max_passes_per_session > 0
             and self.passes_done[pair] >= self.max_passes_per_session
@@ -885,6 +920,7 @@ def preflight(env: Mapping[str, str]) -> Tuple[str, Dict[str, List[personas_mod.
     # and a translator. Reads only the environment, which is what --check is
     # allowed to touch.
     _positive_int(env, "SETTLE_SECONDS", 30)
+    _positive_int(env, "PLAN_MAX_ROUNDS", DEFAULT_PLAN_MAX_ROUNDS)
     return selector, resolved
 
 
@@ -923,6 +959,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         gate_on = signals_mod.enabled(env)
         backoff = _positive_int(env, "LIMIT_BACKOFF_SECONDS", 1800)
         max_passes = _positive_int(env, "MAX_PASSES_PER_SESSION", 0)
+        plan_max_rounds = _positive_int(env, "PLAN_MAX_ROUNDS", DEFAULT_PLAN_MAX_ROUNDS)
         review_model = _required(env, "REVIEW_MODEL")
         work_repo = _required(env, "WORK_REPO")
 
@@ -1008,6 +1045,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_passes_per_session=max_passes,
         max_concurrent=max_concurrent,
         persona_phases={(m, p.id): p.phase for m, ps in resolved.items() for p in ps},
+        plan_max_rounds=plan_max_rounds,
     )
     tracker = signals_mod.Tracker()
 
@@ -1104,9 +1142,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             g for g in groups
             if not supervisor.pairs_to_run(g, signals_by_pr.get(g.pr))
         ]
-        if skipped:
+        # A finished plan is not "unchanged": a push will not wake it.
+        finished = [g for g in skipped if supervisor.finished(g)]
+        unchanged = [g for g in skipped if not supervisor.finished(g)]
+        if finished:
+            log("Finished reviewing (PLAN_MAX_ROUNDS reached): "
+                + " ".join(f"#{g.pr}" for g in finished) + ".")
+        if unchanged:
             log("Unchanged since their last review: "
-                + " ".join(f"#{g.pr}" for g in skipped) + ".")
+                + " ".join(f"#{g.pr}" for g in unchanged) + ".")
 
         outcome = supervisor.run_cycle(groups, signals_by_pr)
 
