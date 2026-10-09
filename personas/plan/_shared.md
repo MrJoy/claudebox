@@ -37,9 +37,9 @@ and a decision in it is worse than an alternative you can name. `nit` is
 everything else, and a nit is never posted.
 
 **Keep to the plan's altitude.** A plan decides architecture, phase order,
-scope, and the security and trust properties the build must keep. These are not
-findings at any severity, because the phase spec that builds the mechanism
-decides them:
+scope, and the security and trust properties the build must keep. A gap in any
+of those is a finding. The details below are not, at any severity, because the
+phase spec that builds the mechanism decides them:
 
 - how a mechanism behaves in an edge case, when settling it changes none of
   those decisions: which outcome or state a rare sequence lands in, what a

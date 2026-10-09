@@ -77,6 +77,11 @@ class ShippedPersonasTest(unittest.TestCase):
         plan = personas.resolve("plan", SHIPPED, {"PLAN_PERSONAS": "red_team"})[0].prompt
         self.assertNotIn("does not exist in the repository", plan)
         self.assertIn("phase spec", plan)
+        # The altitude rule excludes edge-case detail, never the decisions it
+        # names: an earlier wording read as excluding architecture itself.
+        flat = " ".join(plan.split())
+        self.assertIn("A gap in any of those is a finding.", flat)
+        self.assertIn("The details below are not, at any severity", flat)
 
     def test_the_plan_contract_prefers_removal(self):
         # PR #11's `pending` and `held` each drew a full round of findings
