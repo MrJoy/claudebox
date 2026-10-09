@@ -43,13 +43,26 @@ class TreeBuilder:
 
 
 class ShippedPersonasTest(unittest.TestCase):
-    def test_code_default_resolves_to_four(self):
+    def test_code_default_resolves_to_five(self):
         got = personas.resolve("code", SHIPPED, {})
-        self.assertEqual([p.id for p in got], ["red_team", "adversarial", "sme", "sage"])
+        self.assertEqual(
+            [p.id for p in got], ["red_team", "adversarial", "sme", "minimalist", "sage"]
+        )
 
-    def test_plan_default_resolves_to_seven(self):
+    def test_plan_default_resolves_to_eight(self):
         got = personas.resolve("plan", SHIPPED, {})
-        self.assertEqual(len(got), 7)
+        self.assertEqual(len(got), 8)
+        self.assertIn("minimalist", [p.id for p in got])
+
+    def test_minimalist_ships_in_both_trees_at_phase_one(self):
+        # claudebox's own persona, not advocate's, so the importer never writes
+        # it. It reviews the author's code rather than its siblings' comments,
+        # which is why it runs beside them and not after them with Sage.
+        for mode, var in (("code", "PERSONAS"), ("plan", "PLAN_PERSONAS")):
+            got = personas.resolve(mode, SHIPPED, {var: "minimalist"})
+            self.assertEqual([(p.id, p.label, p.phase) for p in got],
+                             [("minimalist", "Minimalist", 1)])
+            self.assertIn("requirement", got[0].prompt)
 
     def test_prompt_is_body_then_shared_contract(self):
         got = personas.resolve("code", SHIPPED, {"PERSONAS": "red_team"})
@@ -107,11 +120,11 @@ class ShippedPersonasTest(unittest.TestCase):
 
     def test_all_selects_every_persona_in_the_tree(self):
         got = personas.resolve("code", SHIPPED, {"PERSONAS": "all"})
-        self.assertEqual(len(got), 7)
+        self.assertEqual(len(got), 8)
 
     def test_all_is_case_insensitive(self):
         self.assertEqual(
-            len(personas.resolve("code", SHIPPED, {"PERSONAS": "ALL"})), 7
+            len(personas.resolve("code", SHIPPED, {"PERSONAS": "ALL"})), 8
         )
 
     def test_selector_order_is_preserved(self):
@@ -124,7 +137,7 @@ class ShippedPersonasTest(unittest.TestCase):
 
     def test_plan_selector_var_is_separate(self):
         got = personas.resolve("plan", SHIPPED, {"PERSONAS": "sage"})
-        self.assertEqual(len(got), 7)
+        self.assertEqual(len(got), 8)
 
 
 class RefusalTest(unittest.TestCase):
