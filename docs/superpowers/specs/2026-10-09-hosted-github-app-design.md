@@ -1,7 +1,7 @@
 # claudebox as a hosted GitHub App: design
 
 **Date:** 2026-10-09
-**Status:** plan, revision 11, filed for review under the `plan` label
+**Status:** plan, revision 12, filed for review under the `plan` label
 
 ## Problem
 
@@ -691,15 +691,22 @@ pair's token. Reports carry a per-token sequence number and the flush
 answers with the last one sent, so the control plane knows when it holds
 every report, not just that the gateway is up. Then it applies the record,
 together with its own record of clone outcomes. The worker contributes the
-transcript, the session id and its own notes, never the outcome. If the
-record is complete and shows no successful provider response, the pair is
-`failed`.
+transcript, the session id and its own notes, never the outcome. The order
+in which the outcome is decided is stated once, in "The commit point".
 
-If the flush cannot complete within a minute (the gateway is unreachable,
-or reports are missing), or the token's record carries a `held` mark (which
-a starting gateway writes on every request it turns away before it has its
-counts), that is a claudebox fault, never a provider failure, and the pair is
-`deferred`: its transcript is committed so it resumes where it was, its
+**Gateway outages are recorded by the control plane, not the gateway.** The
+control plane is what seeds the gateway, so it records every interval in
+which the gateway was not serving: from the last report it acknowledged
+before the gateway stopped answering until the gateway is seeded again.
+The gateway's own record cannot do this, because a gateway that is down
+writes nothing and a crash loses its unacknowledged reports. Requests that
+never reached the gateway are not provider failures in any count: the
+profile's failure counter moves only on responses from upstream that the
+gateway itself saw.
+
+If the flush cannot complete within a minute, or the pair's pass overlapped
+a recorded gateway outage, that is a claudebox fault, never a provider
+failure, and the pair is `deferred`: its transcript is committed so it resumes where it was, its
 fingerprint and round stay where they were, it stays owed and is parked for
 the profile's `limit_backoff_seconds`, and no profile is parked. Budget is
 charged as the gateway counts, before any outcome is known, so a deferred
@@ -816,7 +823,7 @@ R" by name (see "Retention and erasure").
 | pair state: fingerprint, round, owed, session id, transcript ref, parked-until, failure count | records | none | the PR, then 14 days |
 | capabilities and gateway tokens (hashes) | records | none | until expiry or revocation |
 | check-run ids per head | records | none | the PR, then 14 days |
-| per-token outcome records (successes, tokens, limits, failures, cap hits) | records | none | the pair |
+| per-token outcome records (successes, tokens, limits, failures, cap hits); gateway outage intervals | records | none | the pair |
 | asks, budgets, park events, audit rows | records | user ids only | one year; survive erasure |
 | per-detector withheld counts | records | none | one year; survive erasure |
 | withheld-finding records (detector, salted hash, redacted body) | records | yes | as transcripts |
@@ -844,10 +851,12 @@ removes.
 The outcome comes from the gateway's record for the pair's token (see "The
 gateway"), never from the worker. An `ok` additionally needs the job's
 capability to be live, the transcript to parse as a Claude Code session under
-a size cap, and its session id to be the pair's. When the flush completed
-and the complete record shows no successful provider response, the pair is
-`failed`; when the flush did not complete, it is `deferred` (see "The
-gateway").
+a size cap, and its session id to be the pair's. The rules apply in this
+order, and this is the only place they are stated as a whole: a pass that
+overlapped a recorded gateway outage, or whose flush did not complete, is
+`deferred`; otherwise a complete record with no successful provider response
+is `failed`; otherwise the record decides (`ok`, `capped`, `usage-limited`,
+`budget`, `refused read`) as the table below says.
 
 | Outcome | Transcript | Fingerprint | Round | Owed | Budget |
 |---|---|---|---|---|---|
