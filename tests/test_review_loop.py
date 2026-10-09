@@ -1423,6 +1423,15 @@ class CycleGateTest(unittest.TestCase):
         self.assertIn("Finished reviewing (PLAN_MAX_ROUNDS reached): #12.", log)
         self.assertNotIn("Unchanged since their last review", log)
 
+    def test_the_default_plan_cap_is_four_rounds(self):
+        # The default is the backstop for every operator who never sets the
+        # knob, and the docs promise 4. Gate off, so every cycle would rerun
+        # the pair if nothing stopped it.
+        _, reviewed, log = self._cycle(
+            [self._snap(mode="plan")], REVIEW_ON_CHANGE="0", MAX_CYCLES="6")
+        self.assertEqual(reviewed, [12] * 4)
+        self.assertIn("reached PLAN_MAX_ROUNDS=4", log)
+
     def test_the_gate_off_makes_no_stage_two_lookup(self):
         # An operator who turns the gate off stops paying for the extra
         # requests too. Consulting the tracker and discarding the answer would
@@ -2793,6 +2802,15 @@ class RoundCapTest(unittest.TestCase):
         self.assertFalse(s.finished(group))
         self.cycle(s, [group])
         self.assertTrue(s.finished(group))
+
+    def test_a_partly_capped_group_is_not_finished(self):
+        # Pairs reach the cap at different times, since a failed or limited
+        # pass leaves its round where it was. One uncapped persona means a
+        # push still wakes the PR, so it must not be logged as finished.
+        sg = Pair(11, "plan", "sage")
+        s = supervisor([], personas={"plan": ["red_team", "sage"]}, plan_max_rounds=1)
+        s.rounds[self.PL] = 1
+        self.assertFalse(s.finished(grouped(self.PL, sg)[0]))
 
 
 class SystemPromptTest(unittest.TestCase):

@@ -587,7 +587,7 @@ class Supervisor:
         """
         base = self.persona_prompts[(pair.mode, pair.persona)]
         line = prompts_mod.round_stanza(pair.mode, self.round_for(pair))
-        return f"{base}\n{line}" if line else base
+        return f"{base}\n{line}"
 
     def pairs_to_run(
         self, group: Group, signal: Optional["signals_mod.Signal"] = None

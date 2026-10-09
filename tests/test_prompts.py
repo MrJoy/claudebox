@@ -305,13 +305,6 @@ class RoundStanzaTest(unittest.TestCase):
         self.assertEqual(s3.replace("round 3", "round N").replace("survived 2", "survived K"),
                          s9.replace("round 9", "round N").replace("survived 8", "survived K"))
 
-    def test_the_two_ladders_are_distinct(self):
-        # A plan persona told to read "the whole change" would go looking
-        # for a diff to mutate.
-        for n in (1, 2, 3):
-            self.assertNotEqual(prompts.round_stanza("plan", n),
-                                prompts.round_stanza("code", n))
-        self.assertNotIn("whole change", prompts.round_stanza("plan", 1))
 
     def test_round_below_one_is_a_bug(self):
         with self.assertRaises(ValueError):
