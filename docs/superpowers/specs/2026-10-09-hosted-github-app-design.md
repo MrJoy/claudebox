@@ -1,7 +1,7 @@
 # claudebox as a hosted GitHub App: design
 
 **Date:** 2026-10-09
-**Status:** plan, revision 9, filed for review under the `plan` label
+**Status:** plan, revision 10, filed for review under the `plan` label
 
 ## Problem
 
@@ -396,7 +396,8 @@ updates the run of the head each finding was written against as items post
 or drop, so its counts settle once the outbox drains.
 
 Its states mirror the pair's: not requested (naming both ways to ask),
-reviewed, and one per park reason (budget, round cap, usage limit, failing,
+reviewed, deferred (a claudebox fault, with its retry time), and one per
+park reason (budget, round cap, usage limit, failing,
 capped, too large, refused read, config invalid), each saying why and what
 clears it. The exact wording of each state is decided in the phase 2a spec.
 
@@ -680,10 +681,10 @@ directions carries a per-deployment secret the supervisor hands to both at
 startup. A worker, in its own container, cannot reach it. When the gateway
 starts, the control plane pushes it the committed counts it enforces against
 (each live pair's usage so far, and the day's budget use per profile and per
-repo) along with the live jobs' read tokens. Until it has them, a starting
-gateway serves no provider traffic, so a restart never resets a cap; the
-requests it holds back in that window are a claudebox fault (below), not a
-provider failure.
+repo), the live jobs' read tokens, and the map from each live provider
+token to its pair (which is a durable row, so it survives a restart). Until
+it has them, a starting gateway serves no provider traffic, so a restart
+never resets a cap or loses a pair's attribution.
 
 At `complete pair` the control plane first asks the gateway to flush that
 pair's token. Reports carry a per-token sequence number and the flush
@@ -694,13 +695,16 @@ transcript, the session id and its own notes, never the outcome. If the
 record is complete and shows no successful provider response, the pair is
 `failed`.
 
-If the flush cannot complete (the gateway is unreachable, or reports are
-missing), that is a claudebox fault, never a provider failure, and the pair
-is held **pending**: its transcript is stored, nothing else is applied, it is
-not redispatched, and the control plane retries the flush in the background
-until it completes and the ordinary row applies. A pending pair costs no
-pass and loses nothing. A pair pending for more than ten minutes pages, as a
-claudebox fault.
+If the flush cannot complete within a minute (the gateway is unreachable,
+or reports are missing), or the pass ran into the window while a restarting
+gateway held traffic back, that is a claudebox fault, never a provider
+failure, and the pair is `deferred`: its transcript is committed so it
+resumes where it was, its fingerprint and round stay where they were, it
+stays owed and is parked for the profile's `limit_backoff_seconds`, nothing
+is spent, and no profile is parked. The retry is an ordinary pass. A repo
+whose pairs are deferred three times in a row pages, as a claudebox fault.
+`failed` is applied only when the flush completed and the complete record
+shows no successful provider response.
 
 - A usage limit (429, or a limit body) parks the pair for the profile's
   `limit_backoff_seconds`. Pairs on two different PRs hitting a limit inside
@@ -849,7 +853,7 @@ gateway record, or no successful provider response, is `failed`.
 | `too large` (the clone cap) | none | unchanged | unchanged | stays, parked until the override changes or the head moves; pages once | not spent |
 | `usage-limited` | committed | unchanged | unchanged | stays, parked for the backoff | spent only if a provider response succeeded |
 | `budget` (the day's budget ran out mid-pass) | committed | unchanged | unchanged | stays, parked until the UTC reset; does not page | spent |
-| pending (a claudebox fault; see "The gateway") | stored | unchanged until the flush completes | unchanged | not redispatched | not spent until the flush completes |
+| `deferred` (a claudebox fault; see "The gateway") | committed | unchanged | unchanged | stays, parked for the backoff | not spent |
 | `failed` | discarded; session dropped | unchanged | unchanged | stays, parked for the backoff (provider failure) or until the head moves (pair failure) | spent only if a provider response succeeded |
 | `refused read` | committed | unchanged | unchanged | stays, parked for the backoff | spent |
 | `revoked` (timeout, access change, restart) | discarded | unchanged | unchanged | stays | spent only if a provider response succeeded |
@@ -899,7 +903,8 @@ volume locally. Setup proposes the shortest retention each target allows.
 
 Two kinds of command live under `claudebox.sh`. **Platform-scoped** commands
 use the operator's own platform credentials (Docker, `fly`, `gcloud`/baton)
-and never touch the admin API: `app create` and `hosted deploy`. **Role-gated**
+and never touch the admin API: `app create`, `hosted deploy` and `hosted
+whois`. **Role-gated**
 commands go through the control plane's admin API: `hosted login`, `config
 apply`, `status`, `profiles`, `doctor`, `kindex push`, `erase`, `withheld`
 (withheld-finding records), and transcript reads. The `hosted` namespace
@@ -1009,8 +1014,11 @@ order is:
    platform secret store and restarts the control plane. `ADMINS` is a small
    YAML file mapping each role (`operators`, `transcript_readers`,
    `erasers`) to a list of numeric GitHub user ids, and only ids;
-   `claudebox.sh hosted whois LOGIN` prints a login's id for the operator to
-   check and copy, and nothing resolves logins on the write path.
+   `claudebox.sh hosted whois LOGIN`, a platform-scoped helper that only
+   reads GitHub's public user API, prints a login's id for the operator to
+   check and copy, and nothing resolves logins on the write path. A wrong id
+   cannot lock anyone out for good: `hosted deploy --admins` is
+   platform-scoped and can always be run again.
 5. Enable the device flow in the App's settings (unless spike S8 lets the
    manifest do it).
 6. `claudebox.sh hosted login`, then `claudebox.sh hosted config apply FILE`,
@@ -1024,8 +1032,7 @@ root is platform access (the same access that can already read every
 secret), and revoking an admin is a `hosted deploy --admins` that takes
 effect on the restart it causes. There is no code to intercept and no admin
 call that works without a role. `hosted login` prints the numeric id it
-resolved, and `hosted deploy` warns when the operators list does not contain
-the id of the person running it.
+resolved, so an operator can confirm the id they listed is theirs.
 
 The deployment file has one copy, in the records store, and changes only
 through `config apply`. There is no seed: operators keep the file in version
