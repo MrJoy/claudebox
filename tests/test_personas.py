@@ -118,7 +118,10 @@ class ShippedPersonasTest(unittest.TestCase):
         body = personas.resolve("code", SHIPPED, {"PERSONAS": "minimalist"})[0].prompt
         carve_out = "## How the contract below applies to you"
         self.assertIn(carve_out, body)
-        self.assertLess(body.index(carve_out), body.index("## What a finding costs"))
+        # The two halves of the reconciliation, not just its heading: the
+        # non-findings list is about requests, and a deletion has a tag.
+        self.assertIn("Code the author already wrote", body)
+        self.assertIn("A deletion that passes both is `should-fix`.", body)
         plan = personas.resolve("plan", SHIPPED, {"PLAN_PERSONAS": "minimalist"})[0].prompt
         self.assertNotIn(carve_out, plan)
 
