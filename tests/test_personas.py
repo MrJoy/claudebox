@@ -75,14 +75,34 @@ class ShippedPersonasTest(unittest.TestCase):
         got = personas.resolve("code", SHIPPED, {"PERSONAS": "red_team"})
         self.assertNotIn("success:", got[0].prompt)
 
-    def test_the_code_contract_prices_a_finding(self):
-        # The price rides in the system prompt of every code pass. The plan
-        # tree does not carry it: a plan has no diff to demonstrate against.
-        code = personas.resolve("code", SHIPPED, {"PERSONAS": "red_team"})[0].prompt
+    def test_both_contracts_price_a_finding(self):
+        # The price rides in the system prompt of every pass, in both modes.
+        # The round ladder's floors name these tags, so a tree without them
+        # would be told to post nothing below a severity it never defined.
+        for mode, var in (("code", "PERSONAS"), ("plan", "PLAN_PERSONAS")):
+            got = personas.resolve(mode, SHIPPED, {var: "red_team"})[0].prompt
+            for needle in ("## What a finding costs", "`blocking`", "`should-fix`", "`nit`"):
+                self.assertIn(needle, got, mode)
+
+    def test_the_plan_contract_is_priced_for_a_document(self):
+        # The code contract's demonstration is against a diff; a plan has
+        # none, so its non-findings are a different list.
         plan = personas.resolve("plan", SHIPPED, {"PLAN_PERSONAS": "red_team"})[0].prompt
-        for needle in ("## What a finding costs", "`blocking`", "`should-fix`", "`nit`"):
-            self.assertIn(needle, code)
-            self.assertNotIn(needle, plan)
+        self.assertNotIn("does not exist in the repository", plan)
+        self.assertIn("phase spec", plan)
+        # The altitude rule excludes edge-case detail, never the decisions it
+        # names: an earlier wording read as excluding architecture itself.
+        flat = " ".join(plan.split())
+        self.assertIn("A gap in any of those is a finding.", flat)
+        self.assertIn("The details below are not, at any severity", flat)
+
+    def test_the_plan_contract_prefers_removal(self):
+        # PR #11's `pending` and `held` each drew a full round of findings
+        # and were each struck the revision after. The contract asks first
+        # whether a mechanism a revision added should exist at all.
+        plan = personas.resolve("plan", SHIPPED, {"PLAN_PERSONAS": "red_team"})[0].prompt
+        self.assertIn("## Prefer removal", plan)
+        self.assertIn("should exist at all", plan)
 
     def test_the_code_contract_names_the_speculative_non_findings(self):
         code = personas.resolve("code", SHIPPED, {"PERSONAS": "red_team"})[0].prompt
