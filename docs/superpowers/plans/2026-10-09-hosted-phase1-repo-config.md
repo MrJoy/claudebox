@@ -24,7 +24,7 @@
 - "A repo file overrides org defaults key by key."
 - "When the repo file is invalid, the repo falls back to the org defaults; if those are invalid too, the repo is not reviewed. There is no 'last valid config' rung."
 - Persona selectors use "same selector syntax as PLAN_PERSONAS today": `personas.resolve` is the one validator of them.
-- The JSON Schema ships at `schema/claudebox.schema.json` and "enumerates persona names and the shape of every field."
+- The JSON Schema ships at `schema/claudebox.schema.json`. The spec says it "enumerates persona names and the shape of every field"; this plan keeps the shape of every field and lists persona names in each persona field's `description` rather than as an `enum` or `pattern`, a deliberate deviation recorded as decision 9.
 - `budget.unit` is required, `tokens` | `passes`; with `passes`, `per_pair.tokens` is an error; `custom` is non-reporting unless the profile sets `usage: reported`.
 - Local mode is unchanged apart from one startup line: "When `.github/claudebox.yml` exists in the repo, local mode logs once at startup that it does not read it and names `.env.claudebox` as the local equivalent." (Here: `.github/claudebox.json`.)
 - `claudebox.sh` runs on macOS bash 3.2: expand possibly-empty arrays as `${arr[@]+"${arr[@]}"}`.
@@ -44,7 +44,7 @@ The spec leaves these open, and each one changes code. They are this plan's answ
 7. **Deployment defaults the spec does not state:** `concurrency: 8`, `max_concurrent_jobs: 4`, `limit_backoff_seconds: 1800` (today's `LIMIT_BACKOFF_SECONDS`), `timing.max_passes_per_session: 0`, `retention.closed_pr_days: 14`. Required: `provider`, `models`, `default_model`, `credential`, `budget.unit`, `budget.daily`, and at least one profile.
    Defaults the spec does state, copied rather than decided: `budget.repo_share: 0.25` ("default 0.25, so one busy repo parks only itself"; a one-repo deployment scales `daily` rather than raising the share), `timing.settle_seconds: 30`, `per_pair.requests: 200`, `per_pair.tokens: 4000000` (tokens budgets only), and the caps table. `timing.poll_seconds` defaults to `60`, the spec's value "when webhooks are off", since webhooks arrive in phase 4.
 8. **`$schema`** is an allowed, ignored top-level string in the repo file, so an editor can be pointed at the schema.
-9. **The schema does not re-implement the persona selector grammar.** `plan.personas` and `code.personas` are plain strings whose description lists the shipped persona names; `personas.resolve` is the one validator, as the Global Constraints say. A pattern would disagree with it in both directions (`ALL` and `sage,` work and would squiggle; `sage,sage` is refused and would pass), and an editor that cries wolf costs more than the squiggle on a typo buys.
+9. **The schema does not re-implement the persona selector grammar.** `plan.personas` and `code.personas` are plain strings whose description lists the shipped persona names; `personas.resolve` is the one validator, as the Global Constraints say. A pattern would disagree with it in both directions (`ALL` and `sage,` work and would squiggle; `sage,sage` is refused and would pass), and an editor that cries wolf costs more than the squiggle on a typo buys. This departs from the spec's "enumerates persona names": the names are listed for hover, not offered for completion.
 
 ## Review Focus
 
