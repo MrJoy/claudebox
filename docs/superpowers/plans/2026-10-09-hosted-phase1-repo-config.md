@@ -37,11 +37,14 @@ The spec leaves these open, and each one changes code. They are this plan's answ
 1. **Merge depth.** "Key by key" is applied at leaf keys: a repo file that sets only `plan.label` keeps the org's `plan.personas`.
 2. **Org invalid, repo valid.** The repo file is applied over the built-in defaults, and the org file's problems are reported. (The spec covers only the repo-invalid direction.)
 3. **Built-in defaults** when neither file sets a key: `trigger: auto`, no team, no profile, no model, `plan.label: plan`, both persona selectors at `personas.DEFAULTS`, `max_concurrent_personas: 0`, `rounds.cap: 4` (today's `PLAN_MAX_ROUNDS` default; the spec's example shows 6), `kindex.store: none`.
+   `kindex.store` accepts `none` and `org` only. `repo` joins in phase 3a, which ships per-repo stores; until then nothing could serve it, so it is unknown and an error, the same rule the spec gives `kindex.vectors`. `org` stays because the deployment gates it: `--deploy` refuses it when the deployment declares no org store.
 4. **A profile is required only against a deployment.** Without `--deploy`, a file naming no profile is valid; with it, the effective config must name one of the deployment's profiles.
-5. **What `--deploy` cannot check offline** (whether the team exists, whether the repo is public) is printed as "not checked here", never passed silently. `kindex.store: org` against a `share_with` list needs `--repo-name NAME`.
+5. **What a run cannot check is printed as "not checked here", never passed silently.** Without `--deploy` that is everything only a deployment can judge (`profile`, `model`, `team`, `kindex.store`), and the success line says the deployment was not checked. With `--deploy` it is what only the control plane can judge (whether the team exists, whether the repo is public). `kindex.store: org` against a `share_with` list needs `--repo-name NAME`.
 6. **`tokens` budgets, provisionally:** allowed for every provider type except `custom` without `usage: reported`. Phase 2a narrows this set from live responses.
-7. **Deployment defaults:** `concurrency: 8`, `budget.repo_share: 1.0`, `limit_backoff_seconds: 1800`, `per_pair.requests: 200`, `per_pair.tokens: 4000000` (tokens budgets only), `max_concurrent_jobs: 4`, `timing.poll_seconds: 300`, `timing.settle_seconds: 30`, `timing.max_passes_per_session: 0`, the caps table's defaults, `retention.closed_pr_days: 14`. Required: `provider`, `models`, `default_model`, `credential`, `budget.unit`, `budget.daily`, and at least one profile.
+7. **Deployment defaults the spec does not state:** `concurrency: 8`, `max_concurrent_jobs: 4`, `limit_backoff_seconds: 1800` (today's `LIMIT_BACKOFF_SECONDS`), `timing.max_passes_per_session: 0`, `retention.closed_pr_days: 14`. Required: `provider`, `models`, `default_model`, `credential`, `budget.unit`, `budget.daily`, and at least one profile.
+   Defaults the spec does state, copied rather than decided: `budget.repo_share: 0.25` ("default 0.25, so one busy repo parks only itself"; a one-repo deployment scales `daily` rather than raising the share), `timing.settle_seconds: 30`, `per_pair.requests: 200`, `per_pair.tokens: 4000000` (tokens budgets only), and the caps table. `timing.poll_seconds` defaults to `60`, the spec's value "when webhooks are off", since webhooks arrive in phase 4.
 8. **`$schema`** is an allowed, ignored top-level string in the repo file, so an editor can be pointed at the schema.
+9. **The schema does not re-implement the persona selector grammar.** `plan.personas` and `code.personas` are plain strings whose description lists the shipped persona names; `personas.resolve` is the one validator, as the Global Constraints say. A pattern would disagree with it in both directions (`ALL` and `sage,` work and would squiggle; `sage,sage` is refused and would pass), and an editor that cries wolf costs more than the squiggle on a typo buys.
 
 ## Review Focus
 
@@ -49,6 +52,8 @@ The spec leaves these open, and each one changes code. They are this plan's answ
 - **A duplicated key** in one object (`{"trigger": "auto", "trigger": "requested"}`). `json.loads` keeps the last silently; a reasonable person expects the duplicate named as an error. Pinned in Task 1.
 - **A valid JSON value that is not an object** (`[]`, `"auto"`, `null`, an empty file). Expected: one error saying the file must hold an object, never a traceback. Pinned in Task 1.
 - **A file over its cap, or not UTF-8.** Expected: a single clean error naming the cap or the encoding. Pinned in Task 1.
+- **Deep nesting inside the cap** (`[` a thousand times is 1 KB). `json.loads` raises `RecursionError`, which is not a `ValueError`; in phase 2a that file is on a repo's default branch and the reader is the control plane. Expected: the same named `ConfigError`. Pinned in Task 1.
+- **A name with a trailing newline** (`"profile": "ollama\n"`, `"credential": "OLLAMA_API_KEY\n"`). Python's `$` matches before a final newline, so `re.match` with `$` accepts it. Expected: refused. Pinned in Tasks 2 and 4 (`fullmatch`).
 - **A partial nested override** (repo sets `plan.label`, org sets `plan.personas`). Expected: both apply. Pinned in Task 3.
 
 ---
@@ -138,6 +143,12 @@ class ReadJsonTest(unittest.TestCase):
         raw = b'{"a": "' + b"x" * 10 + b'"}'
         self.assertEqual(read_json(raw, len(raw), "repo file"), {"a": "x" * 10})
 
+    def test_deep_nesting_is_an_error_not_a_traceback(self):
+        for raw in (b"[" * 2000, b'{"a": ' + b"[" * 1000 + b"]" * 1000 + b"}"):
+            with self.subTest(size=len(raw)), self.assertRaises(ConfigError) as ctx:
+                read_json(raw, 65536, "repo file")
+            self.assertIn("nested too deeply", str(ctx.exception))
+
     def test_non_utf8_is_an_error(self):
         with self.assertRaises(ConfigError) as ctx:
             read_json(b'{"a": "\xff"}', 100, "repo file")
@@ -190,8 +201,9 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'config_load'`
 The repo, org and deployment files are JSON for now (founder ruling,
 2026-10-09; the design names YAML). JSON's own parser is lax in exactly the
 ways a strict loader cannot afford: it keeps the last of two duplicate keys,
-accepts NaN and Infinity, and reads `true` back as something Python treats as
-the integer 1. This module closes each of those, and everything it refuses
+accepts NaN and Infinity, reads `true` back as something Python treats as
+the integer 1, and raises RecursionError, which is not a ValueError, on deep
+nesting well inside any byte cap. This module closes each of those, and everything it refuses
 comes back as one ConfigError that names the file.
 """
 
@@ -272,6 +284,12 @@ def read_json(data: bytes, cap: int, label: str) -> dict:
         )
     except ValueError as exc:
         raise ConfigError(f"{label}: {exc}.")
+    except RecursionError:
+        # json's decoder recurses once per nesting level, and RecursionError
+        # is not a ValueError. A byte cap does not bound depth: 1 KB of "["
+        # is enough, and in phase 2a this file comes from a repo's default
+        # branch and the reader is the control plane.
+        raise ConfigError(f"{label}: is nested too deeply to read.")
     if not is_obj(value):
         raise ConfigError(f"{label}: must hold a JSON object at the top level.")
     return value
@@ -301,7 +319,7 @@ git commit -m "config: strict JSON reading and a problem list"
 - Consumes: Task 1 (`Problems`, `join`, `is_int`, `is_str`, `is_obj`); `personas.resolve(mode, persona_dir, env)`, `personas.SELECTOR_VAR`, `personas.DEFAULTS`; `common.ConfigError`.
 - Produces:
   - `REPO_FILE = ".github/claudebox.json"`, `REPO_FILE_CAP = 65536`.
-  - `TRIGGERS = ("auto", "requested")`, `KINDEX_STORES = ("none", "org", "repo")`, `DEFAULT_ROUNDS_CAP = 4`.
+  - `TRIGGERS = ("auto", "requested")`, `KINDEX_STORES = ("none", "org")`, `DEFAULT_ROUNDS_CAP = 4`.
   - `KEYS`: the allowed key tree, `{"$schema": None, "version": None, "trigger": None, "team": None, "profile": None, "model": None, "plan": {"label": None, "personas": None}, "code": {"personas": None}, "max_concurrent_personas": None, "rounds": {"cap": None}, "kindex": {"store": None}}`. Task 7's schema test compares against it.
   - `check(raw: dict, persona_dir: str) -> Tuple[Dict[str, object], Problems]`: the file's leaf values keyed by dotted path (`"plan.label"`), omitting `$schema` and `version`, plus every problem found. A path with a problem is left out of the dict.
 
@@ -403,6 +421,16 @@ class CheckTest(unittest.TestCase):
         _, problems = check({"team": "org/claudebox"})
         self.assertTrue(problems)
 
+    def test_a_name_with_a_trailing_newline_is_an_error(self):
+        for key in ("profile", "team"):
+            with self.subTest(key=key):
+                _, problems = check({key: "ollama\n"})
+                self.assertTrue(problems)
+
+    def test_kindex_store_repo_is_unknown_until_phase_3a(self):
+        _, problems = check({"kindex": {"store": "repo"}})
+        self.assertIn("kindex.store: must be one of none, org; got 'repo'", problems.lines())
+
     def test_every_problem_is_reported_at_once(self):
         _, problems = check({"trigger": "x", "team": "", "model": 3})
         self.assertEqual(len(problems.lines()), 3)
@@ -450,7 +478,8 @@ REPO_FILE = ".github/claudebox.json"
 REPO_FILE_CAP = 64 * 1024
 
 TRIGGERS = ("auto", "requested")
-KINDEX_STORES = ("none", "org", "repo")
+# `repo` joins in phase 3a, with per-repo stores (plan decision 3).
+KINDEX_STORES = ("none", "org")
 DEFAULT_ROUNDS_CAP = 4
 
 # The allowed keys, as a tree. A leaf is None. `$schema` is allowed so an
@@ -469,7 +498,7 @@ KEYS = {
     "kindex": {"store": None},
 }
 
-_NAME_OK = re.compile(r"^[A-Za-z0-9._-]+$")
+_NAME_OK = re.compile(r"[A-Za-z0-9._-]+")
 
 
 def _enum(problems, path, value, allowed):
@@ -480,7 +509,9 @@ def _enum(problems, path, value, allowed):
 
 
 def _name(problems, path, value, what):
-    if is_str(value) and _NAME_OK.match(value):
+    # fullmatch, not match: Python's `$` also matches before a final newline,
+    # so "ollama\n" would pass and then miss every lookup.
+    if is_str(value) and _NAME_OK.fullmatch(value):
         return True
     problems.add(path, f"must be a {what} (letters, digits, '.', '_' and '-')")
     return False
@@ -639,6 +670,22 @@ class MergeTest(unittest.TestCase):
         self.assertEqual(cfg.plan_label, "rfc")
         self.assertEqual(cfg.plan_personas, "sage")
 
+    def test_every_leaf_key_has_a_field(self):
+        def leaves(tree, path=""):
+            for k, v in tree.items():
+                here = f"{path}.{k}" if path else k
+                if isinstance(v, dict):
+                    yield from leaves(v, here)
+                elif k not in ("$schema", "version"):
+                    yield here
+        names = {f.name for f in repo_config.fields(repo_config.RepoConfig)}
+        for path in leaves(repo_config.KEYS):
+            self.assertIn(path.replace(".", "_"), names)
+
+    def test_a_checked_key_with_no_field_raises_rather_than_dropping(self):
+        with self.assertRaises(AssertionError):
+            repo_config.merge({}, {"kindex.vectors": True})
+
     def test_a_zero_from_the_repo_overrides_a_nonzero_org_value(self):
         cfg = repo_config.merge({"rounds.cap": 6}, {"rounds.cap": 0})
         self.assertEqual(cfg.rounds_cap, 0)
@@ -719,14 +766,21 @@ class RepoConfig:
 
 
 def merge(org: Dict[str, object], repo: Dict[str, object]) -> RepoConfig:
-    """Built-in defaults, then the org's leaves, then the repo's: key by key."""
+    """Built-in defaults, then the org's leaves, then the repo's: key by key.
+
+    A checked path with no RepoConfig field raises rather than being dropped:
+    KEYS, _leaf and RepoConfig are three spellings of one key set, and a key
+    added to the first two alone would otherwise validate, print OK, and be
+    ignored.
+    """
     known = {f.name for f in fields(RepoConfig)}
     values = {}
     for layer in (org, repo):
         for path, value in layer.items():
             name = path.replace(".", "_")
-            if name in known:
-                values[name] = value
+            if name not in known:
+                raise AssertionError(f"{path} is a checked key with no RepoConfig field")
+            values[name] = value
     return RepoConfig(**values)
 
 
@@ -797,6 +851,7 @@ git commit -m "config: merge org and repo key by key, with the fallback rungs"
 **Interfaces:**
 - Consumes: Task 1 (`read_json`, `Problems`, `join`, `is_int`, `is_str`, `is_obj`); `providers.PROVIDERS` (Phase 0).
 - Produces:
+  - Name checks use `re.fullmatch`, never `re.match` with `$` (Python's `$` matches before a final newline).
   - `DEPLOY_FILE = "claudebox.deploy.json"`, `DEPLOY_FILE_CAP = 262144`.
   - `TOKEN_REPORTING = frozenset({"ollama", "anthropic", "cloudflare", "workersai"})`.
   - `KEYS`: the allowed key tree for the file (below). `"*"` stands for any profile name or override repo name.
@@ -879,9 +934,9 @@ class LoadTest(unittest.TestCase):
     def test_defaults_fill_what_is_omitted(self):
         d = load({"profiles": {"ollama": profile()}})
         p = d.profiles["ollama"]
-        self.assertEqual((p.concurrency, p.repo_share, p.limit_backoff_seconds), (8, 1.0, 1800))
+        self.assertEqual((p.concurrency, p.repo_share, p.limit_backoff_seconds), (8, 0.25, 1800))
         self.assertEqual((p.per_pair_requests, p.per_pair_tokens), (200, 4000000))
-        self.assertEqual((d.max_concurrent_jobs, d.poll_seconds, d.settle_seconds), (4, 300, 30))
+        self.assertEqual((d.max_concurrent_jobs, d.poll_seconds, d.settle_seconds), (4, 60, 30))
         self.assertEqual((d.github_reads_per_pair, d.comments_per_pass, d.comment_bytes),
                          (300, 25, 60000))
         self.assertEqual(d.clone_bytes_default, 2000000000)
@@ -921,6 +976,10 @@ class LoadTest(unittest.TestCase):
     def test_a_credential_is_a_reference_not_a_value(self):
         self.assertIn("profiles.o.credential",
                       problems({"profiles": {"o": profile(credential="sk-ant-abc123")}}))
+
+    def test_a_credential_with_a_trailing_newline_is_refused(self):
+        self.assertIn("profiles.o.credential",
+                      problems({"profiles": {"o": profile(credential="OLLAMA_API_KEY\n")}}))
 
     def test_budget_unit_is_required(self):
         self.assertIn("profiles.o.budget.unit",
@@ -1029,8 +1088,9 @@ KEYS = {
     "kindex": {"org_store": {"share_with": None}},
 }
 
-_NAME_OK = re.compile(r"^[A-Za-z0-9._-]+$")
-_ENV_NAME_OK = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+# Used with fullmatch: Python's `$` matches before a final newline.
+_NAME_OK = re.compile(r"[A-Za-z0-9._-]+")
+_ENV_NAME_OK = re.compile(r"[A-Z_][A-Z0-9_]*")
 
 
 class DeployError(ConfigError):
@@ -1108,7 +1168,7 @@ def _int(problems, raw, key, path, default, minimum=0) -> int:
 def _profile(problems: Problems, name: str, raw) -> Optional[Profile]:
     path = join("profiles", name)
     before = len(problems.lines())
-    if not _NAME_OK.match(name):
+    if not _NAME_OK.fullmatch(name):
         problems.add(path, "profile names use letters, digits, '.', '_' and '-'")
     if not is_obj(raw):
         problems.add(path, "must be an object")
@@ -1128,7 +1188,7 @@ def _profile(problems: Problems, name: str, raw) -> Optional[Profile]:
         problems.add(join(path, "default_model"), "must be one of this profile's models")
 
     credential = raw.get("credential")
-    if not (is_str(credential) and _ENV_NAME_OK.match(credential)):
+    if not (is_str(credential) and _ENV_NAME_OK.fullmatch(credential)):
         problems.add(join(path, "credential"),
                      "must name a secret in the platform secret store (UPPER_SNAKE_CASE), "
                      "never hold its value")
@@ -1153,11 +1213,12 @@ def _profile(problems: Problems, name: str, raw) -> Optional[Profile]:
     if "daily" not in budget:
         problems.add(join(bpath, "daily"), "is required")
     daily = _int(problems, budget, "daily", bpath, 1, minimum=1)
-    repo_share = budget.get("repo_share", 1.0)
+    # The spec's default: "so one busy repo parks only itself".
+    repo_share = budget.get("repo_share", 0.25)
     if isinstance(repo_share, bool) or not isinstance(repo_share, (int, float)) \
             or not 0 < repo_share <= 1:
         problems.add(join(bpath, "repo_share"), "must be a number above 0 and at most 1")
-        repo_share = 1.0
+        repo_share = 0.25
 
     per_pair = _section(problems, raw, "per_pair", path)
     ppath = join(path, "per_pair")
@@ -1211,7 +1272,7 @@ def load_deploy(data: bytes) -> Deploy:
         value = org_store.get("share_with")
         if value == "all-private":
             share_with = value
-        elif isinstance(value, list) and all(is_str(v) and _NAME_OK.match(v) for v in value):
+        elif isinstance(value, list) and all(is_str(v) and _NAME_OK.fullmatch(v) for v in value):
             share_with = tuple(value)
         else:
             problems.add("kindex.org_store.share_with",
@@ -1220,7 +1281,8 @@ def load_deploy(data: bytes) -> Deploy:
     deploy = Deploy(
         profiles=profiles,
         max_concurrent_jobs=_int(problems, raw, "max_concurrent_jobs", "", 4, minimum=1),
-        poll_seconds=_int(problems, timing, "poll_seconds", "timing", 300, minimum=1),
+        # The spec's value "when webhooks are off"; webhooks arrive in phase 4.
+        poll_seconds=_int(problems, timing, "poll_seconds", "timing", 60, minimum=1),
         settle_seconds=_int(problems, timing, "settle_seconds", "timing", 30),
         max_passes_per_session=_int(problems, timing, "max_passes_per_session", "timing", 0),
         github_reads_per_pair=_int(problems, caps, "github_reads_per_pair", "caps", 300, minimum=1),
@@ -1261,7 +1323,7 @@ git commit -m "config: the deployment file"
 - Consumes: Task 3 `RepoConfig`; Task 4 `Deploy`, `Profile`.
 - Produces:
   - `@dataclass(frozen=True) class DeployCheck`: `problems: List[str]`, `unchecked: List[str]`, `model: Optional[str]` (the model the repo would run: its own, or the profile's default; `None` when the profile is unresolved).
-  - `against_deploy(cfg: RepoConfig, deploy: Deploy, repo_name: Optional[str]) -> DeployCheck`. `repo_name` is `owner/name` or bare `name`; only the part after the last `/` is compared with `share_with` and the clone-bytes overrides.
+  - `against_deploy(cfg: RepoConfig, deploy: Deploy, repo_name: Optional[str]) -> DeployCheck`. `repo_name` is `owner/name` or bare `name`; only the part after the last `/` is compared with `share_with`. (Checking the clone-bytes overrides against installed repos belongs to `hosted config apply`, phase 2a, which knows the installed repos.)
 
 Exact problem strings (tests match them):
 - no profile: `profile: this deployment requires one; its profiles: <names sorted, comma-separated>`
@@ -1441,7 +1503,8 @@ Output contract (tests match it):
 - Every problem goes to stderr as `ERROR: <problem>`, one line each. Repo and org problems already carry their `repo file: ` / `org file: ` prefix; deploy-file problems (`DeployError.lines`) carry `deploy file: `; `against_deploy` problems are prefixed `against deploy file: `.
 - FILE is judged strictly: if the repo file has any problem, the exit code is 1 even though a hosted repo would fall back to the org defaults. stderr then also carries `ERROR: a hosted repo with this file falls back to <the org file|the built-in defaults>`, or, with an invalid `--org` too, `ERROR: a hosted repo with this file and this org file is not reviewed`.
 - An invalid `--org` file is exit 1 the same way.
-- On success, stdout carries `OK: config is valid (source: <source>)`, then one line per `RepoConfig` field, `  <field>: <value>`, in field order (`None` printed as `-`), then, with `--deploy`, `  effective model: <model>` and one line per unchecked item, `NOT CHECKED HERE: <item>`.
+- On success with `--deploy`, stdout carries `OK: config is valid (source: <source>)`, then one line per `RepoConfig` field, `  <field>: <value>`, in field order (`None` printed as `-`), then `  effective model: <model>` and one line per unchecked item, `NOT CHECKED HERE: <item>`.
+- On success without `--deploy`, the first line is `OK: config is valid (source: <source>; deployment not checked)`, the field lines follow, and the last line is exactly `NOT CHECKED HERE: profile, model, team and kindex.store are checked only against a deployment (pass --deploy)`. A repo author usually cannot get the deployment file, and this run is the only answer they get in phase 1, so it must not read as a judgement of fields it never looked up.
 - A FILE, `--org` or `--deploy` path that cannot be read: `ERROR: cannot read <role> <path>: <reason>`, exit 1. Roles: `repo file`, `org file`, `deploy file`.
 
 - [ ] **Step 1: Write the failing test**
@@ -1485,9 +1548,10 @@ class CliTest(unittest.TestCase):
     def test_a_valid_file_exits_zero_and_prints_the_effective_config(self):
         rc, out, err = self.run_cli("validate", self.write("r.json", {"trigger": "requested"}))
         self.assertEqual((rc, err), (0, ""))
-        self.assertIn("OK: config is valid (source: repo)", out)
+        self.assertIn("OK: config is valid (source: repo; deployment not checked)", out)
         self.assertIn("  trigger: requested", out)
         self.assertIn("  profile: -", out)
+        self.assertIn("NOT CHECKED HERE: profile, model, team and kindex.store", out)
 
     def test_an_invalid_file_exits_one_with_each_problem_on_stderr(self):
         rc, out, err = self.run_cli("validate", self.write("r.json", {"trigger": "x", "team": ""}))
@@ -1524,7 +1588,9 @@ class CliTest(unittest.TestCase):
         rc, out, err = self.run_cli("validate", self.write("r.json", {"profile": "ollama"}),
                                     "--deploy", self.write("d.json", DEPLOY))
         self.assertEqual((rc, err), (0, ""))
+        self.assertIn("OK: config is valid (source: repo)\n", out)
         self.assertIn("  effective model: glm-5.2:cloud", out)
+        self.assertNotIn("deployment not checked", out)
 
     def test_deploy_check_uses_the_org_profile(self):
         rc, _, err = self.run_cli("validate", self.write("r.json", {}),
@@ -1648,7 +1714,8 @@ def main(argv: Sequence[str], stdout=sys.stdout, stderr=sys.stderr,
     if failed:
         return 1
 
-    stdout.write(f"OK: config is valid (source: {res.source})\n")
+    scope = "" if check is not None else "; deployment not checked"
+    stdout.write(f"OK: config is valid (source: {res.source}{scope})\n")
     for f in fields(repo_config.RepoConfig):
         value = getattr(res.config, f.name)
         stdout.write(f"  {f.name}: {'-' if value is None else value}\n")
@@ -1656,6 +1723,9 @@ def main(argv: Sequence[str], stdout=sys.stdout, stderr=sys.stderr,
         stdout.write(f"  effective model: {check.model}\n")
         for item in check.unchecked:
             stdout.write(f"NOT CHECKED HERE: {item}\n")
+    else:
+        stdout.write("NOT CHECKED HERE: profile, model, team and kindex.store are checked "
+                     "only against a deployment (pass --deploy)\n")
     return 0
 
 
@@ -1686,11 +1756,11 @@ git commit -m "config: the validate command line"
 
 **Interfaces:**
 - Consumes: Task 2 `KEYS`, `TRIGGERS`, `KINDEX_STORES`; `personas._available(directory)` over `personas/code` and `personas/plan`.
-- Produces: `tools/gen-config-schema.py` with `_selector(names) -> str`, `build(persona_dir: str) -> dict` and a `main()` that writes `json.dumps(build(...), indent=2) + "\n"` to `schema/claudebox.schema.json` (paths relative to the repo root, found from the script's own location). Run with `--check` it exits 1 when the committed file differs from what it would write.
+- Produces: `tools/gen-config-schema.py` with `_personas(mode: str, names) -> dict`, `build(persona_dir: str) -> dict` and a `main()` that writes `json.dumps(build(...), indent=2) + "\n"` to `schema/claudebox.schema.json` (paths relative to the repo root, found from the script's own location). Run with `--check` it exits 1 when the committed file differs from what it would write.
 
-The schema: Draft 2020-12 (`"$schema": "https://json-schema.org/draft/2020-12/schema"`), `"title": "claudebox repo config"`, `"type": "object"`, `"additionalProperties": false` at every object level, properties mirroring `KEYS`: `$schema` string; `version` `{"const": 1}`; `trigger` `{"enum": TRIGGERS}`; `team` and `profile` `{"type": "string", "pattern": "^[A-Za-z0-9._-]+$"}`; `model` `{"type": "string", "pattern": "^\\S+$"}`; `plan.label` `{"type": "string", "minLength": 1}`; `plan.personas` and `code.personas` `{"type": "string", "pattern": <selector pattern for that mode>}`; `max_concurrent_personas` and `rounds.cap` `{"type": "integer", "minimum": 0}`; `kindex.store` `{"enum": KINDEX_STORES}`. Each property carries a one-line `description`.
+The schema: Draft 2020-12 (`"$schema": "https://json-schema.org/draft/2020-12/schema"`), `"title": "claudebox repo config"`, `"type": "object"`, `"additionalProperties": false` at every object level, properties mirroring `KEYS`: `$schema` string; `version` `{"const": 1}`; `trigger` `{"enum": TRIGGERS}`; `team` and `profile` `{"type": "string", "pattern": "^[A-Za-z0-9._-]+$"}`; `model` `{"type": "string", "pattern": "^\\S+$"}`; `plan.label` `{"type": "string", "pattern": "^\\S(?:.*\\S)?$"}` (non-empty, no surrounding whitespace, as the loader requires); `plan.personas` and `code.personas` `{"type": "string"}` whose `description` lists that mode's shipped persona names (plan decision 9: no grammar pattern); `max_concurrent_personas` and `rounds.cap` `{"type": "integer", "minimum": 0}`; `kindex.store` `{"enum": KINDEX_STORES}`. Each property carries a one-line `description`.
 
-The selector pattern for a mode, with `names` the sorted ids from that mode's tree: `"^\\s*(?:all|(?:N)(?:[\\s,]+(?:N))*)\\s*$"` where `N` is `"|".join(names)`.
+The persona description for a mode, with `names` the sorted ids from that mode's tree: `f"{Mode}-mode personas: a comma or space separated list, or all. Shipped: {', '.join(names)}."` where `Mode` is `Code` or `Plan`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1740,18 +1810,22 @@ class SchemaTest(unittest.TestCase):
                     walk(sub)
         walk(self.schema)
 
-    def test_the_persona_pattern_names_exactly_the_shipped_personas(self):
+    def test_the_persona_description_names_every_shipped_persona(self):
         for mode in ("code", "plan"):
-            pattern = self.schema["properties"][mode]["properties"]["personas"]["pattern"]
-            shipped = personas._available(os.path.join(ROOT, "personas", mode))
-            self.assertEqual(pattern, gen._selector(shipped))
-            for name in shipped:
-                self.assertRegex(name, pattern)
-            self.assertRegex("red_team, sage", pattern)
-            self.assertRegex("red_team sage", pattern)
-            self.assertRegex("all", pattern)
-            self.assertNotRegex("saeg", pattern)
-            self.assertNotRegex("red_team,saeg", pattern)
+            prop = self.schema["properties"][mode]["properties"]["personas"]
+            self.assertEqual(prop["type"], "string")
+            # No grammar: personas.resolve is the one validator (decision 9).
+            self.assertNotIn("pattern", prop)
+            for name in personas._available(os.path.join(ROOT, "personas", mode)):
+                self.assertIn(name, prop["description"])
+
+    def test_the_label_pattern_agrees_with_the_loader(self):
+        import re
+        pattern = self.schema["properties"]["plan"]["properties"]["label"]["pattern"]
+        for label in ("plan", "needs plan", " plan", "plan ", " ", ""):
+            _, problems = repo_config.check({"plan": {"label": label}},
+                                            os.path.join(ROOT, "personas"))
+            self.assertEqual(bool(re.search(pattern, label)), not problems, label)
 
     def test_enums_come_from_the_loader(self):
         props = self.schema["properties"]
@@ -1795,9 +1869,12 @@ OUT = os.path.join(ROOT, "schema", "claudebox.schema.json")
 NAME = {"type": "string", "pattern": "^[A-Za-z0-9._-]+$"}
 
 
-def _selector(names):
-    alt = "|".join(sorted(names))
-    return f"^\\s*(?:all|(?:{alt})(?:[\\s,]+(?:{alt}))*)\\s*$"
+def _personas(mode, names):
+    # A description, not a pattern: personas.resolve is the one validator, and
+    # a hand-written grammar would disagree with it in both directions.
+    return {"type": "string",
+            "description": f"{mode.capitalize()}-mode personas: a comma or space separated "
+                           f"list, or all. Shipped: {', '.join(sorted(names))}."}
 
 
 def _obj(properties):
@@ -1817,14 +1894,12 @@ def build(persona_dir: str) -> dict:
         "model": {"type": "string", "pattern": "^\\S+$",
                   "description": "A model the profile allows; omit for its default."},
         "plan": _obj({
-            "label": {"type": "string", "minLength": 1,
+            "label": {"type": "string", "pattern": "^\\S(?:.*\\S)?$",
                       "description": "The label that makes a PR a plan review."},
-            "personas": {"type": "string", "pattern": _selector(plan),
-                         "description": "Plan-mode personas: comma list, or all."},
+            "personas": _personas("plan", plan),
         }),
         "code": _obj({
-            "personas": {"type": "string", "pattern": _selector(code),
-                         "description": "Code-mode personas: comma list, or all."},
+            "personas": _personas("code", code),
         }),
         "max_concurrent_personas": {"type": "integer", "minimum": 0,
                                     "description": "A PR's personas at once; 0 is all."},
@@ -1981,6 +2056,13 @@ if selected "$L"; then
   expect "$L" 1 -- "only apply to config validate"
 fi
 
+L="config validate: a FILE named like a command is still a FILE"
+if selected "$L"; then
+  printf '{}\n' >"$WORK/run"
+  (cd "$WORK" && env -i PATH="$BASE_PATH" HOME="$WORK" /bin/bash "$LAUNCHER" --dry-run config validate run >"$WORK/out" 2>&1); RC=$?
+  expect "$L" 0 -- "$WORK/run:/config/claudebox.json:ro" '!more than one command'
+fi
+
 L="config validate: needs no env file and no repo"
 if selected "$L"; then
   (cd "$WORK" && env -i PATH="$BASE_PATH" HOME="$WORK" /bin/bash "$LAUNCHER" --dry-run --no-repo config validate "$CFG" >"$WORK/out" 2>&1); RC=$?
@@ -2023,8 +2105,13 @@ Argument parsing: add `config` to the command arm, three flag arms, and route ba
 
 ```bash
     build|run|test|logs|shell|stop|status|config)
-      [ -z "$COMMAND" ] || die "more than one command given ('$COMMAND' and '$1')."
-      COMMAND="$1" ;;
+      # After `config`, every bare word is its own positional: a file may
+      # be called `run` or `test`.
+      if [ "$COMMAND" = config ]; then CONFIG_POS+=("$1")
+      else
+        [ -z "$COMMAND" ] || die "more than one command given ('$COMMAND' and '$1')."
+        COMMAND="$1"
+      fi ;;
     --org)         CONFIG_ORG="${2:?--org requires a FILE}"; shift ;;
     --deploy)      CONFIG_DEPLOY="${2:?--deploy requires a FILE}"; shift ;;
     --repo-name)   CONFIG_REPO_NAME="${2:?--repo-name requires OWNER/NAME}"; shift ;;
