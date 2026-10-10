@@ -22,7 +22,6 @@ import sys
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import dataclass
 from typing import Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
 
 import gh
@@ -31,8 +30,11 @@ import kindex_tools
 import passes
 import personas as personas_mod
 import prompts as prompts_mod
+import providers
 import signals as signals_mod
 from common import ConfigError, Pair, die, log
+from decisions import Decider, Group
+from state import MemoryStateStore
 
 # What a cycle stopped for, and whether the next poll waits the backoff.
 # CYCLE_OK is falsy and the other two are truthy, so "should we back off" is
@@ -47,20 +49,6 @@ CYCLE_UNHEALTHY = "unhealthy"
 # walking a whole list into a dead endpoint costs a duplicate-comment burst per
 # pair.
 MAX_CONSECUTIVE_FAILURES = 3
-
-
-@dataclass(frozen=True)
-class Group:
-    """One PR's personas, run together behind a barrier.
-
-    The group is the unit of both concurrency and cut-short accounting: a limit
-    reported by one persona cannot recall its in-flight siblings, so the group
-    finishes and only then does the cycle stop.
-    """
-
-    pr: int
-    mode: str
-    pairs: Tuple[Pair, ...]
 
 
 def parse_max_concurrent(env: Mapping[str, str]) -> int:
@@ -384,10 +372,17 @@ def check_litellm(env: Mapping[str, str]) -> None:
 
 
 class Supervisor:
-    """Owns the per-(PR, mode, persona) state and the shape of a cycle.
+    """Local mode's runner: the shape of a cycle, over the decision core.
 
-    All of this is in memory, so a container restart re-reviews each PR once per
-    persona and may re-comment once. Persisting it is deferred.
+    What to review, at which round, and what a cut owes are decisions.Decider's,
+    over a state.StateStore. This class runs a group's passes in a worker pool,
+    walks a cycle's groups in order, and hands every outcome to the Decider. The
+    attributes and methods that used to hold that logic here delegate to it, so
+    the state reads the same from outside as it always has.
+
+    The state is in memory, so a container restart re-reviews each PR once
+    per persona and may re-comment once. The hosted control plane builds its
+    own Decider over its own store; it does not build a Supervisor.
     """
 
     def __init__(
@@ -404,69 +399,70 @@ class Supervisor:
         persona_phases: Optional[Dict[Tuple[str, str], int]] = None,
         plan_max_rounds: int = 0,
     ):
-        self.personas = personas
-        self.persona_prompts = persona_prompts
         self.review_prompts = review_prompts
         self.followup_prompts = followup_prompts
         self.model = model
         self.mcp_args = mcp_args
         self.cwd = cwd
-        self.max_passes_per_session = max_passes_per_session
         self.max_concurrent = max_concurrent
-        # (mode, persona) -> 1 or 2. Absent means 1. Phase 2 runs after every
-        # phase-1 pass in the group has finished, which is what lets Sage read
-        # what its siblings posted this round.
-        self.persona_phases: Dict[Tuple[str, str], int] = dict(persona_phases or {})
-        # PLAN_MAX_ROUNDS, the backstop behind the plan ladder. 0 is no cap.
-        self.plan_max_rounds = plan_max_rounds
+        self.state = MemoryStateStore()
+        self.decider = Decider(
+            state=self.state,
+            personas=personas,
+            persona_prompts=persona_prompts,
+            persona_phases=dict(persona_phases or {}),
+            max_passes_per_session=max_passes_per_session,
+            plan_max_rounds=plan_max_rounds,
+        )
 
-        self.sessions: Dict[Pair, str] = {}
-        self.passes_done: Dict[Pair, int] = {}
-        # Completed passes per pair, whatever session they ran in. Drives the
-        # round ladder in the system prompt. Not reset by rotation or by a
-        # failed pass: those are about the session, the round is about the
-        # PR's history with this persona. In memory for the same reason
-        # `reviewed` is -- a persisted round beside an unpersisted session map
-        # would tell a session that has never read the PR that the PR has
-        # survived three of its reviews.
-        self.rounds: Dict[Pair, int] = {}
-        # Pairs the last cycle owed but did not run: the personas a limit cut,
-        # plus everything in the groups it never reached. Normally empty.
-        # Without it, a limit that allows only a few passes per backoff window
-        # would review the leading pairs forever and the trailing ones never.
-        # In memory alongside the session map; surviving a restart is deferred.
-        self.owed: Set[Pair] = set()
-        # The group a cut stopped in, so the next cycle can start at the one
-        # after it. Serving the debt first instead would let a PR whose persona
-        # reports a limit on every attempt re-cut the cycle at the head of the
-        # list forever, and nothing else would ever be reviewed again.
-        self.cut_group: Optional[Tuple[int, str]] = None
-        # The fingerprint each pair last successfully reviewed at. A pair whose
-        # PR still fingerprints the same has nothing new to read, so it does not
-        # run. In memory alongside the session map, and deliberately not
-        # persisted: sessions are in memory too, so a fingerprint that outlived
-        # a restart would leave a fresh session that has never read the PR
-        # believing it had already reviewed it.
-        self.reviewed: Dict[Pair, signals_mod.Signal] = {}
+    # Configuration the Decider holds.
+
+    @property
+    def personas(self) -> Dict[str, List[str]]:
+        return self.decider.personas
+
+    @property
+    def persona_prompts(self) -> Dict[Tuple[str, str], str]:
+        return self.decider.persona_prompts
+
+    # State the store holds.
+
+    @property
+    def sessions(self):
+        return self.state.sessions
+
+    @property
+    def passes_done(self):
+        return self.state.passes_done
+
+    @property
+    def rounds(self):
+        return self.state.rounds
+
+    @property
+    def reviewed(self):
+        return self.state.reviewed
+
+    @property
+    def owed(self) -> Set[Pair]:
+        return self.state.owed
+
+    @owed.setter
+    def owed(self, value: Set[Pair]) -> None:
+        self.state.owed = value
+
+    @property
+    def cut_group(self) -> Optional[Tuple[int, str]]:
+        return self.state.cut_group
 
     def build_groups(self, candidates: Sequence[Tuple[int, str]]) -> List[Group]:
-        return [
-            Group(
-                pr=pr,
-                mode=mode,
-                pairs=tuple(Pair(pr, mode, p) for p in self.personas[mode]),
-            )
-            for pr, mode in candidates
-        ]
+        return self.decider.build_groups(candidates)
 
     def workers_for(self, group: Group, to_run: Sequence[Pair]) -> int:
         """Effective concurrency for this group: the cap, or how many pairs run."""
         if self.max_concurrent > 0:
             return max(1, min(self.max_concurrent, len(to_run)))
         return max(1, len(to_run))
-
-    def phase_of(self, pair: Pair) -> int:
-        return self.persona_phases.get((pair.mode, pair.persona), 1)
 
     def run_group(self, group: Group, to_run: Sequence[Pair]) -> Dict[Pair, "passes.PassResult"]:
         """Run to_run in phases, each phase concurrent, and wait for all of them.
@@ -575,134 +571,38 @@ class Supervisor:
             log(f"WARN: could not run claude: {exc}", pair=pair)
             return passes.PassResult(rc=1, session_id=session_id, limited=False, limit_line="")
 
+    # Decisions, delegated to the Decider.
+
+    def phase_of(self, pair: Pair) -> int:
+        return self.decider.phase_of(pair)
+
     def round_for(self, pair: Pair) -> int:
-        """The round the pair's next pass runs at."""
-        return self.rounds.get(pair, 0) + 1
+        return self.decider.round_for(pair)
 
     def system_prompt_for(self, pair: Pair) -> str:
-        """Persona, then the round line. Composed per pass, since the round moves.
-
-        This is the whole --append-system-prompt value. The task prompt is
-        not touched, which keeps the verbatim-operator-prompt guarantee.
-        """
-        base = self.persona_prompts[(pair.mode, pair.persona)]
-        line = prompts_mod.round_stanza(pair.mode, self.round_for(pair))
-        return f"{base}\n{line}"
+        return self.decider.system_prompt_for(pair)
 
     def pairs_to_run(
         self, group: Group, signal: Optional["signals_mod.Signal"] = None
     ) -> List[Pair]:
-        """Which of this group's personas run this cycle.
+        return self.decider.pairs_to_run(group, signal)
 
-        A group that owes something runs ONLY what it owes: those personas did
-        not run last cycle, and the rest of the group did. A group that owes
-        nothing runs in full. The narrowing lasts until the group is served
-        without being cut again, which is one cycle in the ordinary case and
-        longer while a pair keeps reporting a limit -- the siblings the OWED
-        narrowing leaves out are owed by the cut that stopped it, so they come
-        back on the visit after. The gate narrowing below is not like that: the
-        pairs it leaves out are excused rather than deferred, and debt_for
-        keeps them out of the debt for the same reason.
-
-        A group that owes nothing is then filtered by the change gate, whose
-        one definition of "unchanged" lives in _gate_holds. A failed lookup
-        against a non-empty updatedAt arrives here as a degraded Signal rather
-        than as None, so it's gated like a real one and stops re-running once
-        it's been served -- see signals.degraded. A mode flip needs no case of
-        its own: it makes a different Pair, and that Pair has no session.
-        """
-        owed_here = [p for p in group.pairs if p in self.owed]
-        if owed_here:
-            return owed_here
-        return [p for p in group.pairs if not self._gate_holds(p, signal)]
-
-    def _gate_holds(
-        self, pair: Pair, signal: Optional["signals_mod.Signal"]
-    ) -> bool:
-        """True when the change gate has nothing for this pair to review.
-
-        One definition of "unchanged", three callers: the group about to run,
-        the group the cycle never reached, and the debt a cut leaves behind.
-        They were written in three sittings and disagreed, which is how a cut
-        came to owe personas the gate had just excused. Keep it that way -- a
-        change to what "unchanged" means belongs here and nowhere else.
-
-        `signal` is None when the gate is off, and when stage two failed
-        against an empty updatedAt (nothing to key a degraded fingerprint on);
-        both mean "run it". A pair with no session always runs, which is what
-        makes first sight, a session dropped by _record_failure, and
-        MAX_PASSES_PER_SESSION rotation work without knowing about the gate.
-        A plan pair at PLAN_MAX_ROUNDS holds whatever the signal says.
-        """
-        if self._capped(pair):
-            return True
-        if signal is None:
-            return False
-        return self.sessions.get(pair) is not None and self.reviewed.get(pair) == signal
+    def _gate_holds(self, pair: Pair, signal: Optional["signals_mod.Signal"]) -> bool:
+        return self.decider.gate_holds(pair, signal)
 
     def _capped(self, pair: Pair) -> bool:
-        """True when a plan pair has completed PLAN_MAX_ROUNDS rounds.
-
-        Checked ahead of the signal, so it holds with the gate off too, and
-        it counts as the gate holding everywhere _gate_holds is asked, so a
-        capped pair is never owed. A moved head does not lift it: a revision
-        per round is the very thing the cap exists to stop. The count is in
-        memory, so a restart lifts it.
-        """
-        return (
-            pair.mode == "plan"
-            and self.plan_max_rounds > 0
-            and self.rounds.get(pair, 0) >= self.plan_max_rounds
-        )
+        return self.decider.capped(pair)
 
     def finished(self, group: Group) -> bool:
-        """True when every pair in the group is capped, for the cycle's log."""
-        return bool(group.pairs) and all(self._capped(p) for p in group.pairs)
+        return self.decider.finished(group)
 
     def debt_for(
         self, group: Group, signal: Optional["signals_mod.Signal"] = None
     ) -> List[Pair]:
-        """What a group owes the next cycle, before this cycle's results.
-
-        Two callers, and neither can use `pairs_to_run`: that narrows a group
-        to what it already owes, which is right for a group about to run and
-        wrong for one a cut left behind, since the narrowing was justified by a
-        cut two cycles back. So the whole persona set is owed, minus the pairs
-        the change gate would have withheld had the cycle got that far --
-        otherwise a limit owes the entire tail of an unchanged PR list and the
-        next cycle spends the budget that just ran out re-reviewing it. A pair
-        already owed keeps its debt whatever the gate says: it has no result to
-        preserve.
-
-        The cut group's own debt is this minus the pairs that did produce a
-        result; the groups the cycle never reached take it whole.
-        """
-        return [
-            p for p in group.pairs
-            if p in self.owed or not self._gate_holds(p, signal)
-        ]
+        return self.decider.debt_for(group, signal)
 
     def order_groups(self, groups: List[Group]) -> List[Group]:
-        """This cycle's groups, rotated to start after the last cut.
-
-        Phase A resumed at the pair after the one a limit cut and wrapped
-        around; this is that rotation, at group granularity. Serving the debt
-        first instead reads as the obvious thing and is a trap: a pair that
-        reports a limit on every attempt would re-cut the cycle at the head of
-        the list every time, and no other PR would ever be reviewed again. The
-        cut group goes last, keeps its debt, and is served when the rotation
-        reaches it.
-        """
-        if self.cut_group is None:
-            return list(groups)
-        keys = [(g.pr, g.mode) for g in groups]
-        try:
-            start = keys.index(self.cut_group) + 1
-        except ValueError:
-            # The group the cut stopped in is gone -- closed, or relabelled into
-            # the other mode. Start at the head rather than skipping a cycle.
-            return list(groups)
-        return list(groups[start:]) + list(groups[:start])
+        return self.decider.order_groups(groups)
 
     def run_cycle(
         self,
@@ -816,84 +716,25 @@ class Supervisor:
                 cut_index, cut_owes = index, still_owed
                 break
 
-        # Both exits rebuild `owed` from this cycle's own groups, which is what
-        # keeps a debt whose PR closed out of it: a dead pair matches no live
-        # group while the cycle runs, and does not survive the end of it.
+        skipped = self.decider.settle_cycle(ordered, cut_index, cut_owes, signals_by_pr)
         if cut_index is None:
-            self.owed = set()
-            self.cut_group = None
             return outcome
-
-        # The cut group's own debt, plus every pair of every group the cycle
-        # never reached -- their whole persona set, narrowed or not, since none
-        # of them ran. Both go through debt_for, which is the one place that
-        # decides what "unchanged" means, so a persona the gate excused is in
-        # neither; the pairs a limit or the pool prevented are, because they
-        # were selected to run and the gate has no say over them.
-        # self.owed still holds last cycle's debt at this point, which is what
-        # keeps a group that was already owed and was never reached owed.
-        new_owed = set(cut_owes)
-        skipped: List[Pair] = []
-        for group in ordered[cut_index + 1:]:
-            for pair in self.debt_for(group, signals_by_pr.get(group.pr)):
-                new_owed.add(pair)
-                skipped.append(pair)
-        self.owed = new_owed
-        self.cut_group = (ordered[cut_index].pr, ordered[cut_index].mode)
-
         if skipped:
             log("Not reviewed this cycle: " + " ".join(str(p) for p in skipped) + ".")
-        if new_owed:
-            log("Owed next cycle: " + " ".join(str(p) for p in sorted(new_owed)) + ".")
+        if self.owed:
+            log("Owed next cycle: " + " ".join(str(p) for p in sorted(self.owed)) + ".")
         return outcome
 
     def _record_success(
         self, pair: Pair, result, signal: Optional["signals_mod.Signal"] = None
     ) -> None:
-        # Only when one was supplied: None arrives from the gate being off and
-        # from a failed lookup against an empty updatedAt (a failed lookup
-        # against a non-empty one arrives as a degraded Signal, not None), and
-        # recording it would claim knowledge we do not have.
-        if signal is not None:
-            self.reviewed[pair] = signal
-        if result.session_id:
-            self.sessions[pair] = result.session_id
-        self.passes_done[pair] = self.passes_done.get(pair, 0) + 1
-        self.rounds[pair] = self.rounds.get(pair, 0) + 1
-        log(f"review complete (session {self.sessions.get(pair)}, "
-            f"pass {self.passes_done[pair]}, round {self.rounds[pair]}).", pair=pair)
-        if self._capped(pair):
-            log(f"reached PLAN_MAX_ROUNDS={self.plan_max_rounds}; no further "
-                "reviews of this plan by this persona until the container "
-                "restarts.", pair=pair)
-        if (
-            self.max_passes_per_session > 0
-            and self.passes_done[pair] >= self.max_passes_per_session
-        ):
-            log(f"reached MAX_PASSES_PER_SESSION={self.max_passes_per_session}; "
-                "rotating its session next cycle.", pair=pair)
-            self.sessions.pop(pair, None)
-            self.passes_done[pair] = 0
+        self.decider.record_success(pair, result, signal)
 
     def _record_limit(self, pair: Pair, result) -> None:
-        # The session is kept. Dropping it would make the next attempt re-read
-        # the whole PR and re-post findings already posted, spending more of the
-        # resource that just ran out.
-        if result.session_id:
-            self.sessions[pair] = result.session_id
-            log("WARN: hit a usage or rate limit; keeping its session and "
-                "ending this cycle after the group finishes.", pair=pair)
-        else:
-            log("WARN: hit a usage or rate limit before it had a session; "
-                "ending this cycle after the group finishes.", pair=pair)
-        if result.limit_line:
-            log(f"  limit reported by claude: {result.limit_line}", pair=pair)
+        self.decider.record_limit(pair, result)
 
     def _record_failure(self, pair: Pair) -> None:
-        log("WARN: review failed; starting a fresh session for it next cycle.", pair=pair)
-        self.sessions.pop(pair, None)
-        self.passes_done[pair] = 0
-
+        self.decider.record_failure(pair)
 
 def preflight(env: Mapping[str, str]) -> Tuple[str, Dict[str, List[personas_mod.Persona]]]:
     """The PR selector and both modes' persona sets.
@@ -932,13 +773,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         sys.stdout.reconfigure(line_buffering=True)
     args = list(sys.argv[1:] if argv is None else argv)
     check_only = "--check" in args
-    unknown = [a for a in args if a != "--check"]
+    check_provider = "--provider" in args
+    unknown = [a for a in args if a not in ("--check", "--provider")]
     if unknown:
-        die(f"unknown argument: {unknown[0]} (the only flag is --check)")
+        die(f"unknown argument: {unknown[0]} (the flags are --check and --provider)")
+    if check_provider and not check_only:
+        die("--provider only means something alongside --check")
     env = os.environ
 
     try:
         selector, resolved = preflight(env)
+        if check_provider:
+            # Opt-in rather than part of --check itself: entrypoint.sh asks for
+            # it, ahead of the provider case block that used to do this, and a
+            # caller with no provider in its environment (the hosted control
+            # plane, a unit test) can still check the selector and personas.
+            providers.validate(env)
         if check_only:
             return 0
         for mode in personas_mod.REVIEW_MODES:
