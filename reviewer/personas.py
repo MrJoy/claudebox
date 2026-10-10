@@ -25,9 +25,12 @@ REVIEW_MODES: Tuple[str, ...] = ("code", "plan")
 # bite on, which is why the plan default is everything. `helland` is plan-only
 # by default for a narrower reason: it hunts ownership and reconciliation
 # defects across system boundaries, and most diffs never cross one.
+# `minimalist` is claudebox's own rather than advocate's, and it is in both
+# defaults: whether a line traces to a stated requirement is a question every
+# diff and every plan can answer.
 DEFAULTS: Dict[str, str] = {
-    "code": "red_team,adversarial,sme,sage",
-    "plan": "adversarial,good_friend,helland,red_team,sage,sme,user",
+    "code": "red_team,adversarial,sme,minimalist,sage",
+    "plan": "adversarial,good_friend,helland,minimalist,red_team,sage,sme,user",
 }
 
 # The selector env var per mode. The bare name means code mode.

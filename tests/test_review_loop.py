@@ -1207,7 +1207,10 @@ class PreflightTest(unittest.TestCase):
         selector, resolved = review_loop.preflight(preflight_env())
         self.assertEqual(selector, "ids")
         self.assertEqual(sorted(resolved), ["code", "plan"])
-        self.assertEqual([p.id for p in resolved["code"]], ["red_team", "adversarial", "sme", "sage"])
+        self.assertEqual(
+            [p.id for p in resolved["code"]],
+            ["red_team", "adversarial", "sme", "minimalist", "sage"],
+        )
 
     def test_a_bad_persona_name_is_a_config_error(self):
         with self.assertRaises(ConfigError):

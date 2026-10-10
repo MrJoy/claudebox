@@ -130,8 +130,8 @@ OPTIONS
                     --all/--assignee/--author/--prs/--search/--new (here or via
                     PR_* in the env file).
   --persona LIST    Review with these adversarial personas only (comma list, or
-                    'all'). Default: red_team,adversarial,sme,sage. Also
-                    available: user, good_friend, helland. One session per PR per persona,
+                    'all'). Default: red_team,adversarial,sme,minimalist,sage.
+                    Also available: user, good_friend, helland. One session per PR per persona,
                     so a cycle is (PRs x personas) reviews, a PR's personas
                     running together -- see --max-concurrent-passes.
   --max-concurrent-passes N

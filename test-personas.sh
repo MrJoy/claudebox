@@ -511,8 +511,8 @@ if selected "definitions: every persona file is well formed"; then
 fi
 
 # --- selection --------------------------------------------------------------
-cycle "selection: default set is the four code-facing personas in order" \
-  -- CALLS:8 LOG:"code personas: red_team adversarial sme sage"
+cycle "selection: default set is the five code-facing personas in order" \
+  -- CALLS:10 LOG:"code personas: red_team adversarial sme minimalist sage"
 
 cycle "selection: an explicit list is honoured, in the order given" \
   PERSONAS=sage,red_team \
@@ -520,7 +520,7 @@ cycle "selection: an explicit list is honoured, in the order given" \
 
 cycle "selection: all expands to every shipped persona" \
   PERSONAS=all \
-  -- CALLS:14 LOG:"code personas: adversarial good_friend helland red_team sage sme user"
+  -- CALLS:16 LOG:"code personas: adversarial good_friend helland minimalist red_team sage sme user"
 
 refuses "selection: an unknown persona name refuses at startup" \
   "unknown persona 'red-team'" \
@@ -837,13 +837,13 @@ cycle "mode: a null label response skips the PR rather than reviewing PR #null" 
      NOLOG:"PR #null"
 
 # --- per-mode persona sets ---------------------------------------------------
-cycle "modes: plan mode runs all seven personas by default" \
+cycle "modes: plan mode runs all eight personas by default" \
   STUB_PLAN_PRS=1 MAX_CYCLES=1 \
-  -- CALLS:7 LOG:"plan personas: adversarial good_friend helland red_team sage sme user"
+  -- CALLS:8 LOG:"plan personas: adversarial good_friend helland minimalist red_team sage sme user"
 
-cycle "modes: code mode still runs the four code-facing personas by default" \
+cycle "modes: code mode still runs the five code-facing personas by default" \
   MAX_CYCLES=1 \
-  -- CALLS:4 LOG:"code personas: red_team adversarial sme sage"
+  -- CALLS:5 LOG:"code personas: red_team adversarial sme minimalist sage"
 
 cycle "modes: PLAN_PERSONAS selects the plan set, PERSONAS the code set" \
   PR_IDS=1,2 PERSONAS=red_team PLAN_PERSONAS=user,sage STUB_PLAN_PRS=2 MAX_CYCLES=1 \
@@ -1084,22 +1084,23 @@ cycle "mcp: a Linear key adds the generated config to every invocation" \
 # The floor: a group's personas each get their own pass, on both cycles.
 cycle "parallel: every code persona of a group gets its own pass, both cycles" \
   PR_IDS=12 MAX_CONCURRENT_PASSES= \
-  -- CALLS:8 \
+  -- CALLS:10 \
      MATCHCOUNT:"You are a Red Team security reviewer":2 \
      MATCHCOUNT:"You are an Adversarial reviewer":2 \
      MATCHCOUNT:"You are a Subject Matter Expert":2 \
+     MATCHCOUNT:"You are a Minimalist":2 \
      MATCHCOUNT:"You are a Sage":2
 
-# ... and they really do overlap. This is the assertion CALLS:8 cannot make: a
-# supervisor that ran the four one after another satisfies every count above.
+# ... and they really do overlap. This is the assertion CALLS:10 cannot make: a
+# supervisor that ran the five one after another satisfies every count above.
 # STUB_HOLD keeps each pass alive long enough that the peak is a property of the
 # dispatch rather than of how fast a process starts.
-# The default set peaks at three, not four: Sage is phase 2 and waits for the
-# other three to finish. The second case is the same claim with four phase-1
-# personas, so "unlimited means all of them" is still pinned directly.
+# The default set peaks at four, not five: Sage is phase 2 and waits for the
+# other four to finish. The second case is the same claim with no phase-2
+# persona in the set, so "unlimited means all of them" is still pinned directly.
 cycle "parallel: the personas of a group are in flight at the same time" \
   PR_IDS=12 MAX_CONCURRENT_PASSES= STUB_HOLD=0.3 MAX_CYCLES=1 \
-  -- CALLS:4 MAXINFLIGHT:3
+  -- CALLS:5 MAXINFLIGHT:4
 
 cycle "parallel: four phase-1 personas are all in flight at once" \
   PR_IDS=12 PERSONAS=red_team,adversarial,sme,good_friend MAX_CONCURRENT_PASSES= STUB_HOLD=0.3 MAX_CYCLES=1 \
@@ -1110,25 +1111,26 @@ cycle "parallel: four phase-1 personas are all in flight at once" \
 # assertions up there are not a race that happens to be winning.
 cycle "parallel: a cap of one runs the group one pass at a time" \
   PR_IDS=12 STUB_HOLD=0.3 MAX_CYCLES=1 \
-  -- CALLS:4 MAXINFLIGHT:1
+  -- CALLS:5 MAXINFLIGHT:1
 
 # ... and a cap between the two is honoured rather than rounded to either end.
 cycle "parallel: MAX_CONCURRENT_PASSES caps the peak without dropping a pass" \
   PR_IDS=12 MAX_CONCURRENT_PASSES=2 STUB_HOLD=0.3 MAX_CYCLES=1 \
-  -- CALLS:4 MAXINFLIGHT:2
+  -- CALLS:5 MAXINFLIGHT:2
 
 # The property the persona design rests on, now under concurrency:
 # --append-system-prompt does not survive --resume, so cycle two has to re-pass
-# it. Four resumed passes, and each carries its OWN persona -- the part that a
+# it. Five resumed passes, and each carries its OWN persona -- the part that a
 # session map keyed on something coarser than the pair would break, and that
-# MATCHCOUNT:--resume:4 on its own would not notice.
+# MATCHCOUNT:--resume:5 on its own would not notice.
 cycle "parallel: a resumed pass still carries its own persona" \
   PR_IDS=12 MAX_CONCURRENT_PASSES= \
-  -- CALLS:8 \
-     MATCHCOUNT:"--resume":4 \
+  -- CALLS:10 \
+     MATCHCOUNT:"--resume":5 \
      MATCHCOUNT:"--resume&&--append-system-prompt&&You are a Red Team security reviewer":1 \
      MATCHCOUNT:"--resume&&--append-system-prompt&&You are an Adversarial reviewer":1 \
      MATCHCOUNT:"--resume&&--append-system-prompt&&You are a Subject Matter Expert":1 \
+     MATCHCOUNT:"--resume&&--append-system-prompt&&You are a Minimalist":1 \
      MATCHCOUNT:"--resume&&--append-system-prompt&&You are a Sage":1
 
 # --- the shared working copy -------------------------------------------------
@@ -1137,8 +1139,8 @@ cycle "parallel: a resumed pass still carries its own persona" \
 # siblings are reading, and a resumed pass is as able to do that as a new one.
 cycle "worktree: the shared-copy stanza reaches every pass, resumed ones included" \
   PR_IDS=12 MAX_CONCURRENT_PASSES= \
-  -- CALLS:8 \
-     MATCHCOUNT:"One more constraint":8 \
+  -- CALLS:10 \
+     MATCHCOUNT:"One more constraint":10 \
      LOG:"Shared-worktree constraint active for: code plan"
 
 # Nothing runs beside a pass at a cap of one, so the constraint is not true and
@@ -1147,7 +1149,7 @@ cycle "worktree: the shared-copy stanza reaches every pass, resumed ones include
 # each mode's effective concurrency one.
 cycle "worktree: no shared-copy stanza when nothing runs beside the pass" \
   PR_IDS=12 \
-  -- CALLS:8 \
+  -- CALLS:10 \
      MATCHCOUNT:"One more constraint":0 \
      NOLOG:"Shared-worktree constraint active"
 
@@ -1158,8 +1160,8 @@ cycle "worktree: no shared-copy stanza when nothing runs beside the pass" \
 # say.
 cycle "worktree: the stanza is appended even to an operator prompt override" \
   PR_IDS=12 MAX_CONCURRENT_PASSES= REVIEW_PROMPT='look at #{{PR}}' MAX_CYCLES=1 \
-  -- CALLS:4 \
-     MATCHCOUNT:"look at #12":4 \
+  -- CALLS:5 \
+     MATCHCOUNT:"look at #12":5 \
      MATCHCOUNT:"You are a Red Team security reviewer&&look at #12&&One more constraint":1 \
      MATCHCOUNT:"Perform a thorough review of pull request":0 \
      MATCHCOUNT:"Treat the tests in this PR as code under review":0
@@ -1176,9 +1178,10 @@ cycle "worktree: the stanza is appended even to an operator prompt override" \
 # runs -- the case above this one's "phases:" sibling pins that.
 cycle "parallel: a limit owes the persona it cut and the withheld Sage; the phase-1 siblings finish" \
   PR_IDS=12 MAX_CONCURRENT_PASSES= STUB_FAIL_PERSONA="Red Team" STUB_FAIL_MODE=limit \
-  -- CALLS:4 \
+  -- CALLS:5 \
      MATCHCOUNT:"You are an Adversarial reviewer":1 \
      MATCHCOUNT:"You are a Subject Matter Expert":1 \
+     MATCHCOUNT:"You are a Minimalist":1 \
      MATCHCOUNT:"You are a Sage":0 \
      MATCHCOUNT:"You are a Red Team security reviewer":2 \
      MATCHCOUNT:"--resume":1 \
@@ -1196,22 +1199,22 @@ cycle "parallel: a limit owes the persona it cut and the withheld Sage; the phas
 # never.
 cycle "parallel: the cut abandons the groups after it and the next cycle starts past it" \
   PR_IDS=12,13 MAX_CONCURRENT_PASSES= STUB_FAIL_PERSONA="Red Team" STUB_FAIL_MODE=limit \
-  -- CALLS:6 \
-     MATCHCOUNT:"request #12":3 \
-     MATCHCOUNT:"request #13":3 \
+  -- CALLS:8 \
+     MATCHCOUNT:"request #12":4 \
+     MATCHCOUNT:"request #13":4 \
      MATCHCOUNT:"--resume":0 \
-     LOG:"Not reviewed this cycle: #13 code/red_team #13 code/adversarial #13 code/sme #13 code/sage." \
-     LOG:"Resuming with #13 code/red_team #13 code/adversarial #13 code/sme #13 code/sage #12 code/red_team #12 code/sage." \
-     LOG:"Not reviewed this cycle: #12 code/red_team #12 code/adversarial #12 code/sme #12 code/sage."
+     LOG:"Not reviewed this cycle: #13 code/red_team #13 code/adversarial #13 code/sme #13 code/minimalist #13 code/sage." \
+     LOG:"Resuming with #13 code/red_team #13 code/adversarial #13 code/sme #13 code/minimalist #13 code/sage #12 code/red_team #12 code/sage." \
+     LOG:"Not reviewed this cycle: #12 code/red_team #12 code/adversarial #12 code/sme #12 code/minimalist #12 code/sage."
 
 # A non-limit failure is not a cut: the group finishes, the cycle carries on to
-# the next group, and the three siblings keep the sessions they opened. Red Team
+# the next group, and the four siblings keep the sessions they opened. Red Team
 # has none to keep -- it has never completed a pass -- which is why the compound
 # count is zero rather than one.
 cycle "parallel: a non-limit failure neither cuts the cycle nor costs its siblings their sessions" \
   PR_IDS=12 MAX_CONCURRENT_PASSES= STUB_FAIL_PERSONA="Red Team" STUB_FAIL_MODE=other \
-  -- CALLS:8 \
-     MATCHCOUNT:"--resume":3 \
+  -- CALLS:10 \
+     MATCHCOUNT:"--resume":4 \
      MATCHCOUNT:"--resume&&You are a Red Team security reviewer":0 \
      MATCHCOUNT:"You are a Red Team security reviewer":2 \
      LOG:"starting a fresh session for it next cycle" \
