@@ -1819,13 +1819,28 @@ class SchemaTest(unittest.TestCase):
             for name in personas._available(os.path.join(ROOT, "personas", mode)):
                 self.assertIn(name, prop["description"])
 
-    def test_the_label_pattern_agrees_with_the_loader(self):
+    def test_the_string_patterns_agree_with_the_loader(self):
+        # A JSON Schema pattern is ECMA-262, where `$` does not match before a
+        # final newline; Python's does. Swap the end anchor for \Z so this
+        # test judges the pattern the way an editor will.
         import re
-        pattern = self.schema["properties"]["plan"]["properties"]["label"]["pattern"]
-        for label in ("plan", "needs plan", " plan", "plan ", " ", ""):
-            _, problems = repo_config.check({"plan": {"label": label}},
-                                            os.path.join(ROOT, "personas"))
-            self.assertEqual(bool(re.search(pattern, label)), not problems, label)
+
+        def ecma(pattern, value):
+            return re.search(pattern[:-1] + r"\Z" if pattern.endswith("$") else pattern, value)
+
+        props = self.schema["properties"]
+        cases = [
+            (("plan", "label"), props["plan"]["properties"]["label"]["pattern"],
+             ("plan", "needs plan", " plan", "plan ", " ", "", "plan\n")),
+            (("team",), props["team"]["pattern"], ("rev", "a/b", "", "rev\n", "r v")),
+            (("profile",), props["profile"]["pattern"], ("ollama", "", "ollama\n")),
+            (("model",), props["model"]["pattern"], ("glm-5.2:cloud", "a b", "", "glm\n")),
+        ]
+        for path, pattern, values in cases:
+            for value in values:
+                doc = {path[0]: {path[1]: value}} if len(path) == 2 else {path[0]: value}
+                _, problems = repo_config.check(doc, os.path.join(ROOT, "personas"))
+                self.assertEqual(bool(ecma(pattern, value)), not problems, (path, value))
 
     def test_enums_come_from_the_loader(self):
         props = self.schema["properties"]
