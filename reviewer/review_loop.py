@@ -34,7 +34,7 @@ import providers
 import signals as signals_mod
 from common import ConfigError, Pair, die, log
 from decisions import Decider, Group
-from state import MemoryStateStore, StateStore
+from state import MemoryStateStore
 
 # What a cycle stopped for, and whether the next poll waits the backoff.
 # CYCLE_OK is falsy and the other two are truthy, so "should we back off" is
@@ -380,8 +380,9 @@ class Supervisor:
     attributes and methods that used to hold that logic here delegate to it, so
     the state reads the same from outside as it always has.
 
-    With no store supplied the state is in memory, so a container restart
-    re-reviews each PR once per persona and may re-comment once.
+    The state is in memory, so a container restart re-reviews each PR once
+    per persona and may re-comment once. The hosted control plane builds its
+    own Decider over its own store; it does not build a Supervisor.
     """
 
     def __init__(
@@ -397,7 +398,6 @@ class Supervisor:
         max_concurrent: int = 0,
         persona_phases: Optional[Dict[Tuple[str, str], int]] = None,
         plan_max_rounds: int = 0,
-        state: Optional[StateStore] = None,
     ):
         self.review_prompts = review_prompts
         self.followup_prompts = followup_prompts
@@ -405,7 +405,7 @@ class Supervisor:
         self.mcp_args = mcp_args
         self.cwd = cwd
         self.max_concurrent = max_concurrent
-        self.state: StateStore = state if state is not None else MemoryStateStore()
+        self.state = MemoryStateStore()
         self.decider = Decider(
             state=self.state,
             personas=personas,
@@ -424,18 +424,6 @@ class Supervisor:
     @property
     def persona_prompts(self) -> Dict[Tuple[str, str], str]:
         return self.decider.persona_prompts
-
-    @property
-    def persona_phases(self) -> Dict[Tuple[str, str], int]:
-        return self.decider.persona_phases
-
-    @property
-    def max_passes_per_session(self) -> int:
-        return self.decider.max_passes_per_session
-
-    @property
-    def plan_max_rounds(self) -> int:
-        return self.decider.plan_max_rounds
 
     # State the store holds.
 
@@ -466,10 +454,6 @@ class Supervisor:
     @property
     def cut_group(self) -> Optional[Tuple[int, str]]:
         return self.state.cut_group
-
-    @cut_group.setter
-    def cut_group(self, value: Optional[Tuple[int, str]]) -> None:
-        self.state.cut_group = value
 
     def build_groups(self, candidates: Sequence[Tuple[int, str]]) -> List[Group]:
         return self.decider.build_groups(candidates)
