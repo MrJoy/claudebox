@@ -44,18 +44,19 @@ The spec and the overview leave these open, and each one changes code. They are 
 7. **`claude` gets a built environment, never an inherited one**: `HOME`, `PATH`, `DISABLE_AUTOUPDATER=1`, `ANTHROPIC_BASE_URL` (the gateway), the pair's provider token under `auth_env`, `GH_TOKEN` (the read token), the channel URL, the capability, the persona and the PR number for the shim, and the job's model in every model-tier variable the local entrypoint pins. `ANTHROPIC_API_KEY` is never set. Every pass carries `--strict-mcp-config` and no other MCP flag, since hosted Linear is deferred and kindex is 3a.
 8. **The `.git` lock applies when any phase runs two personas at once**, by local mode's rule (`min(cap, size) > 1`, with an unset or zero cap meaning the phase's size), using `review_loop.lock_git_dir` unchanged. Assembling `WORKTREE_STANZA` into the prompts is the control plane's (2a.4), by the same rule.
 9. **The session id is read from the transcript.** The first line whose `sessionId` is a plausible id wins, and a session id that could escape the projects directory is refused. A transcript with no id starts a fresh session with a `WARN`. When the job's `session_id` disagrees with the transcript's, the transcript's resumes, with a `WARN`. A `session_id` with no transcript starts fresh.
-10. **A refused `start-pair` runs nothing and completes nothing**: the pair stays owed, and the log names the refusal's reason. A usage limit in phase 1 withholds phase 2, as `run_group` does, and those pairs are never started, so the control plane still owes them.
-11. **`complete-pair` notes are `{rc, limited, transcript}`**, where `transcript` is `ok`, `missing` or `over-cap`. They are evidence for the control plane, never an outcome.
-12. **The shim allows a fixed set of reads** (`pr view|diff|list|status`, `issue view|list`, `repo view`, `auth status`, `run view|list`, `search`, and `api`) and refuses everything else with one message that names `gh pr comment` as the only way to post. `gh api` is allowed only as a `GET`: an explicit method other than `GET`, or any field or input flag (which makes `gh` send a `POST`), is refused. `pr checks` is left out because the token cannot read check status (`GH_STANZA` already says so).
-13. **`gh pr comment` takes `--body`, `-b`, `--body=`, and `--body-file`/`-F` (with `-` for stdin)**, and one PR number, which must be the job's. Any other flag is refused with a message naming the two that work. The finding number `seq` is counted per persona in a mode-600 file under the reviewer's home, under `flock`, so a pair's concurrent shells never reuse one.
-14. **A refused finding exits 1 and prints the control plane's `message`** on stderr. An unreachable channel exits 1 and says the finding was not posted.
+10. **A pass that cannot start is an ordinary failed pass**, as in local mode's `_run_one`: any exception from spawning `claude` (`EAGAIN` at the PID limit, `ENOMEM`, no `claude` on `PATH`) becomes a failed `PassResult`, and the pair still sends `complete-pair`. Letting it out would abort the pool, and the started pair, its siblings and the next phase would never complete.
+11. **A refused `start-pair` runs nothing and completes nothing**: the pair stays owed, and the log names the refusal's reason. A usage limit in phase 1 withholds phase 2, as `run_group` does, and those pairs are never started, so the control plane still owes them.
+12. **`complete-pair` notes are `{rc, limited, transcript}`**, where `transcript` is `ok`, `missing` or `over-cap`. They are evidence for the control plane, never an outcome.
+13. **The shim allows a fixed set of reads** (`pr view|diff|list|status`, `issue view|list`, `repo view`, `auth status`, `run view|list`, `search`, and `api`) and refuses everything else with one message that names `gh pr comment` as the only way to post. `gh api` is checked by allowlist, because `gh` parses flags with pflag, which accepts attached short values (`-XPOST`, `-fbody=x`) and combined flags, so no list of write spellings is complete. It takes exactly one REST path, and only `--paginate`, `--slurp`, `-i`/`--include`, `--silent`, `--verbose`, `-q`/`--jq`, `-t`/`--template` and `--cache`. Every other flag is refused, `--hostname`, `-H` and `--method` included, and so are `graphql` (always a `POST`) and a full URL. `pr checks` is left out because the token cannot read check status (`GH_STANZA` already says so).
+14. **`gh pr comment` takes `--body`, `-b`, `--body=`, and `--body-file`/`-F` (with `-` for stdin)**, and one PR number, which must be the job's. Any other flag is refused with a message naming the two that work. The finding number `seq` is counted per persona in a mode-600 file under the reviewer's home, under `flock`, so a pair's concurrent shells never reuse one.
+15. **A refused finding exits 1 and prints the control plane's `message`** on stderr. An unreachable channel exits 1 and says the finding was not posted.
 
 ## Review Focus
 
 - **A job file planted as a symlink before root writes it.** Expected: replaced, never written through. Pinned in Task 2.
 - **A token reaching the reviewer's environment or argv.** Expected: `CLAUDEBOX_JOB` is unset before `setpriv`, and the token is in neither `setpriv`'s argv nor the wrapper's environment. Pinned in Task 2.
 - **A field crafted to smuggle a `docker` flag or path through `start` or `stop`.** Expected: refused before `docker` runs. Pinned in Task 1.
-- **A prompt-injected reviewer writing to GitHub through `gh`.** Expected: every write verb, `gh api` with a method or field, and a comment on another PR are refused without reaching the real `gh` or the channel. Pinned in Task 3.
+- **A prompt-injected reviewer writing to GitHub through `gh`.** Expected: every write verb, `gh api` with a method, field, header or host in any spelling (`-XPOST`, `-fbody=x`, `-iXPOST`), and a comment on another PR are refused without reaching the real `gh` or the channel. Pinned in Task 3.
 - **A resume that silently starts fresh.** Expected: a pair run twice in two fresh homes resumes the first run's session, and the second transcript holds both runs' turns. Pinned in Task 4.
 - **Personas racing on one clone.** Expected: the clone's `.git` is locked whenever a phase runs two at once. Pinned in Task 4.
 
@@ -726,7 +727,8 @@ git commit -m "worker: the root entrypoint that drops to the reviewer with setpr
 **Interfaces:**
 - Consumes: nothing from earlier tasks. At run time it reads `CLAUDEBOX_CHANNEL_URL`, `CLAUDEBOX_CAPABILITY`, `CLAUDEBOX_PERSONA`, `CLAUDEBOX_PR` and `HOME`, which Task 4 sets.
 - Produces:
-  - `REAL_GH = "/usr/bin/gh"`, `READS`, `WRITE_FLAGS` and `REFUSED`.
+  - `REAL_GH = "/usr/bin/gh"`, `READS`, `API_BOOL_FLAGS`, `API_VALUE_FLAGS` and `REFUSED`.
+  - `api_problem(args) -> Optional[str]`: why `gh api <args>` is refused, or None.
   - `parse_comment(args) -> (pr, body)`, raising `ValueError` naming what is wrong.
   - `next_seq(home, persona) -> int`, and `post_finding(args) -> int`.
   - `main(argv) -> int`, which `os.execv`s the real `gh` for an allowed read.
@@ -795,7 +797,17 @@ class ShimParseTest(unittest.TestCase):
                          ["issue", "comment", "7", "-b", "x"],
                          ["api", "-X", "POST", "repos/a/b/issues/7/comments"],
                          ["api", "repos/a/b/pulls/7/comments", "-f", "body=x"],
-                         ["api", "--method=PATCH", "x"]):
+                         ["api", "--method=PATCH", "x"],
+                         ["api", "-XPOST", "repos/a/b/issues/7/comments"],
+                         ["api", "repos/a/b/issues/7/comments", "-fbody=x"],
+                         ["api", "repos/a/b/issues/7/comments", "-Fbody=@f"],
+                         ["api", "-iXPOST", "repos/a/b/issues/7/comments"],
+                         ["api", "--input=f", "repos/a/b/issues/7/comments"],
+                         ["api", "graphql"],
+                         ["api", "https://evil.example/x"],
+                         ["api", "--hostname", "evil.example", "user"],
+                         ["api", "-H", "X-HTTP-Method-Override: POST", "x"],
+                         ["api", "a", "b"]):
                 with self.subTest(argv=argv):
                     self.assertEqual(self.gh.main(argv), 1)
             execv.assert_not_called()
@@ -803,7 +815,9 @@ class ShimParseTest(unittest.TestCase):
     def test_reads_go_to_the_real_gh(self):
         with mock.patch.object(self.gh.os, "execv") as execv:
             for argv in (["pr", "diff", "7"], ["pr", "view", "7", "--json", "title"],
-                         ["api", "repos/a/b/pulls/7/comments"], ["search", "prs", "x"]):
+                         ["api", "repos/a/b/pulls/7/comments"], ["search", "prs", "x"],
+                         ["api", "--paginate", "-q", ".[].body", "repos/a/b/pulls/7/comments"],
+                         ["api", "--jq=.title", "repos/a/b/pulls/7"], ["api", "-q.title", "x"]):
                 with self.subTest(argv=argv):
                     self.gh.main(argv)
                     self.assertEqual(execv.call_args.args[1][1:], argv)
@@ -907,12 +921,18 @@ import urllib.request
 # test-worker.sh rewrites this line.
 REAL_GH = "/usr/bin/gh"
 
-# Reads the reviewer may make. Everything else is refused.
+# Reads the reviewer may make. Everything else is refused. `gh api` is checked
+# separately, by api_problem.
 READS = {("pr", "view"), ("pr", "diff"), ("pr", "list"), ("pr", "status"),
          ("issue", "view"), ("issue", "list"), ("repo", "view"), ("auth", "status"),
-         ("search", None), ("api", None), ("run", "view"), ("run", "list")}
-# gh api flags that make a request a write (gh api with a field defaults to POST).
-WRITE_FLAGS = ("-f", "-F", "--field", "--raw-field", "--input")
+         ("search", None), ("run", "view"), ("run", "list")}
+# `gh api` flags allowed, by allowlist rather than by spotting writes: pflag
+# accepts attached short values (-XPOST, -fbody=x) and combined flags, so a
+# list of forbidden spellings is never complete. None of these changes the
+# method, the host or the body.
+API_BOOL_FLAGS = {"--paginate", "--slurp", "-i", "--include", "--silent", "--verbose"}
+API_VALUE_FLAGS = {"-q": "--jq", "--jq": "--jq", "-t": "--template", "--template": "--template",
+                   "--cache": "--cache"}
 REFUSED = ("This deployment posts review findings only with `gh pr comment <number> --body "
            "...`, one comment per finding, and allows nothing else that writes to GitHub.")
 
@@ -1003,21 +1023,49 @@ def post_finding(args) -> int:
     return fail(data.get("message") or f"gh pr comment: refused ({status}); the finding was not posted")
 
 
+def api_problem(args):
+    """Why `gh api <args>` is refused, or None for a plain GET of one endpoint."""
+    endpoints = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in API_BOOL_FLAGS:
+            i += 1
+            continue
+        if a in API_VALUE_FLAGS:
+            if i + 1 >= len(args):
+                return f"{a} needs a value"
+            i += 2
+            continue
+        name = a.split("=", 1)[0]
+        if a.startswith("--") and "=" in a and name in API_VALUE_FLAGS:
+            i += 1
+            continue
+        if a[:2] in ("-q", "-t") and len(a) > 2:      # attached value, e.g. -q.title
+            i += 1
+            continue
+        if a.startswith("-"):
+            return f"{name} is not available"
+        endpoints.append(a)
+        i += 1
+    if len(endpoints) != 1:
+        return "give exactly one endpoint"
+    endpoint = endpoints[0]
+    if "://" in endpoint or endpoint.lstrip("/").split("?")[0] == "graphql":
+        return "only REST paths on this repository's host are allowed"
+    return None
+
+
 def main(argv) -> int:
     if argv[:2] == ["pr", "comment"]:
         return post_finding(argv[2:])
     verb = (argv[0] if argv else None, argv[1] if len(argv) > 1 and not argv[1].startswith("-") else None)
     allowed = verb in READS or (verb[0], None) in READS
     if argv[:1] == ["api"]:
-        method = None
-        for i, a in enumerate(argv):
-            if a in ("-X", "--method") and i + 1 < len(argv):
-                method = argv[i + 1].upper()
-            elif a.startswith("--method="):
-                method = a.split("=", 1)[1].upper()
-        if (method not in (None, "GET")) or any(a in WRITE_FLAGS or a.startswith(("--field=", "--raw-field=", "--input="))
-                                               for a in argv):
-            return fail(f"gh api: only GET requests are allowed. {REFUSED}")
+        problem = api_problem(argv[1:])
+        if problem:
+            return fail(f"gh api: {problem}; only a plain GET of one REST path is allowed. {REFUSED}")
+        allowed = True
     if not allowed:
         return fail(f"gh {' '.join(argv[:2])}: not available. {REFUSED}")
     os.execv(REAL_GH, [REAL_GH] + argv)
@@ -1408,6 +1456,21 @@ class RunGroupTest(unittest.TestCase):
         w.run_group(job(pairs=[self.pair("sage", session_id="sess-7", transcript_b64=junk)]), "cap")
         self.assertNotIn("--resume", claude.calls[0]["argv"])
 
+    def test_a_pass_that_cannot_spawn_completes_as_a_failure_and_the_group_goes_on(self):
+        channel = FakeChannel()
+        claude = FakeClaude(self.home)
+
+        def popen(argv, **kw):
+            if kw["env"]["CLAUDEBOX_PERSONA"] == "red_team":
+                raise BlockingIOError(11, "Resource temporarily unavailable")
+            return claude(argv, **kw)
+
+        w = self.make(channel, popen)
+        w.run_group(job(pairs=[self.pair("red_team"), self.pair("sme"), self.pair("sage", 2)]), "cap")
+        done = {c[2]["persona"]: c[2] for c in channel.calls if c[0] == "/channel/complete-pair"}
+        self.assertEqual(set(done), {"red_team", "sme", "sage"})
+        self.assertEqual((done["red_team"]["notes"]["rc"], done["red_team"]["notes"]["limited"]), (1, False))
+
     def test_a_session_id_with_no_transcript_starts_fresh(self):
         channel, claude = FakeChannel(), FakeClaude(self.home)
         w = self.make(channel, claude)
@@ -1735,9 +1798,18 @@ class Worker:
                 with open(target, "wb") as f:
                     f.write(transcript)
         env = claude_env(job, self.home, self.path, data["provider_token"], capability, persona)
-        result = passes.run_pass(tag, pair["prompt"], session_id, pair["system_prompt"],
-                                 job["model"], ["--strict-mcp-config"], self.repo_dir,
-                                 popen=partial(self.popen, env=env))
+        try:
+            result = passes.run_pass(tag, pair["prompt"], session_id, pair["system_prompt"],
+                                     job["model"], ["--strict-mcp-config"], self.repo_dir,
+                                     popen=partial(self.popen, env=env))
+        except Exception as exc:
+            # A pass that never gets off the ground (EAGAIN against
+            # --pids-limit, ENOMEM against --memory, no claude on PATH) is an
+            # ordinary failed pass, as in local mode's _run_one. Letting it
+            # out would abort the pool, and this pair, already started, would
+            # never complete; nor would its siblings or the next phase.
+            log(f"WARN: could not run claude: {exc!r}", pair=tag)
+            result = passes.PassResult(rc=1, session_id=session_id, limited=False, limit_line="")
         self.complete(capability, tag, result)
         return result
 
@@ -1816,7 +1888,7 @@ if __name__ == "__main__":
 - [ ] **Step 5: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_worker.py'`, then `./test-python.sh`
-Expected: PASS, 29 tests. The whole suite passes.
+Expected: PASS, 30 tests. The whole suite passes.
 
 - [ ] **Step 6: Commit**
 
