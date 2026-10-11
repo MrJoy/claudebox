@@ -558,7 +558,7 @@ _SCHEMA = (
       seq INTEGER NOT NULL DEFAULT 0, requests INTEGER NOT NULL DEFAULT 0,
       successes INTEGER NOT NULL DEFAULT 0,
       input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
-      first_limit TEXT, first_failure TEXT, first_rejected TEXT, cap_hit TEXT,
+      first_limit TEXT, first_failure TEXT, first_rejected TEXT, first_abandoned TEXT, cap_hit TEXT,
       usage_missing INTEGER NOT NULL DEFAULT 0)""",
     """CREATE TABLE check_runs (
       repo TEXT NOT NULL, head TEXT NOT NULL, run_id INTEGER NOT NULL,
