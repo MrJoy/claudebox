@@ -1,0 +1,1773 @@
+# Hosted Phase 2a.2: The Gateway's Provider Route Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. This plan is executed by a factory run: the Validator derives a Coder brief (no test code) and a Tester brief (no implementation code) from it, and neither lane opens this file.
+
+**Goal:** The gateway process: a worker-facing HTTP route to the model provider that checks a per-pair token, overwrites the model, enforces per-pair caps, injects the profile's real credential, streams the response unbuffered, and reports every pair's provider outcome to the control plane over a unix socket.
+
+**Architecture:** `hosted/gwproto.py` is line-delimited JSON over unix sockets, with the per-deployment secret on every message in both directions. `hosted/gateway.py` is the process. The control plane connects to the gateway's socket to send `hello`, `add_token`, `revoke` and `flush`. The gateway connects to the control plane's socket to send `report`s, in order per token, buffered while the control plane is away. Workers reach the gateway over HTTP and present a provider token minted by `creds.py` (2a.1). The gateway checks it against rows the control plane handed it, so it holds no records store. `deploy_config` gains the two profile keys a hosted `custom` or `anthropic` profile needs, `base_url` and `auth`.
+
+**Tech Stack:** Python 3.9+ standard library (`http.server`, `http.client`, `ssl`, `socket`, `threading`, `json`, `unittest`).
+
+**Spec:** `docs/superpowers/specs/2026-10-09-hosted-github-app-design.md`, sections "The gateway" (provider route, author of every pair's provider outcome, what counts as a provider failure), "Deployment config" (budget units, caps), "Secrets" (the gateway holds provider credentials and not the App key), and "Configuration" (the provider types). Overview: `docs/superpowers/plans/2026-10-10-hosted-phase2a-overview.md`, decisions 8 and 9 and the gateway socket protocol. Both are copied under Global Constraints where this plan depends on them.
+
+**Prerequisite:** the 2a.1 foundations plan (PR #18) is built. `gateway.py` imports `creds.verify_against` and `creds.credential_id_of`, and the tests mint tokens with `creds.Creds` over `records.Records`.
+
+## Global Constraints
+
+- **Standard library only.** No module in this plan imports `cryptography`.
+- **Python 3.9 syntax** (overview decision 15). Flat modules, imported by plain name (overview decision 19).
+- **2a.2 serves `ollama`, `anthropic` and `custom`** (overview decision 8). `cloudflare` and `workersai` profiles load in `config validate`, and the gateway refuses them by name: "not served by the hosted gateway until phase 2a.6".
+- **`base_url`** is required on a `custom` profile and refused on every other. **`auth`** is `api_key` or `oauth_token` on `anthropic` (default `api_key`), `bearer` or `x_api_key` on `custom` (required), and refused elsewhere (overview decision 8).
+- **Spike S3** (overview decision 9): for an `oauth_token` profile the gateway swaps only the bearer value, and passes `anthropic-beta` through. Claude Code's `HEAD /api/hello` is answered with 200 and no upstream call.
+- The spec's route: it "Overwrites `model` with the job's model on every request. For Anthropic-shaped profiles it allows `POST /v1/messages` and `POST /v1/messages/count_tokens` and nothing else".
+- The spec's caps: "Where the provider reports usage it counts input plus output tokens per pair, clamps `max_tokens` to what remains, and caps body size; where it does not, it caps requests, body size and `max_tokens`". The body cap is "4 MB | fixed | request refused". "Hitting one ends the pair as `capped`."
+- The spec's record: "successes, tokens, the first usage limit, the first failure, a cap hit". "The gateway enforces per-pair caps from its own counts, so provider traffic never waits on the control plane". "If the control plane is unreachable, the gateway keeps serving within the caps and buffers its reports".
+- The spec's start: "Until it has them, a starting gateway serves no provider traffic, so a restart never resets a cap or loses a pair's attribution."
+- The spec's flush: "Reports carry a per-token sequence number and the flush answers with the last one sent". The control plane treats a flush that "cannot complete within a minute" as a claudebox fault.
+- The spec's usage rule: "If a profile set to `tokens` gets a response without usage, the gateway fails that pair closed and pages".
+- The spec's socket: the two processes talk "over a unix socket ... and every message in both directions carries a per-deployment secret". A worker cannot reach it.
+- "The gateway streams. It does not buffer, cache or log any body, and it does not retry for the client."
+- Every existing suite still passes. `tests/test_deploy_config.py` gains cases, and its custom-profile fixtures gain the two keys that are now required. No other existing test changes.
+
+## Decided here
+
+The spec and the overview leave these open, and each one changes code. They are this plan's answers, for the founder to ratify in Phase 1 of the factory run:
+
+1. **Two sockets, each with one direction of request and reply.** The gateway listens on `GATEWAY_SOCKET` for the control plane's `hello`, `add_token`, `revoke` and `flush`. The control plane listens on `CONTROL_SOCKET` for the gateway's `report`. Each side is a plain client of the other's server, so no connection ever carries requests both ways. Both socket files are mode 0660.
+2. **The `hello` message**, refining the overview's sketch: `{profiles: [{name, provider, base_url, auth, credential, per_pair_requests, per_pair_tokens, budget_unit}], tokens: [{credential_id, hash_hex, salt_hex, job_id, persona, profile, model, expires_at, counts}]}`. `credential` is the secret's name, and the gateway reads its value from its own environment, which the supervisor set. `counts` is the committed record (`seq`, `requests`, `successes`, `input_tokens`, `output_tokens`, `first_limit`, `first_failure`, `cap_hit`, `usage_missing`), so caps resume where they were. `add_token` carries one token row, and `revoke` carries `credential_ids`.
+3. **A cap refusal is HTTP 400 with an `invalid_request_error` body** naming the cap. Claude Code retries a 429 or a 5xx, and a 429 would also read as a usage limit, so neither is used. The refusal is reported as `cap_hit`. It does not count as a request.
+4. **A starting gateway answers 503**, and that refusal is in no record: the spec's "a request ... a starting gateway turned away" is a claudebox fault.
+5. **Tokens are counted as every kind of input the provider reports** (`input_tokens`, `cache_creation_input_tokens` and `cache_read_input_tokens`) plus the largest `output_tokens` seen. Output is cumulative across `message_delta`s, and summing it would double-count.
+6. **Classification.** HTTP 429 or 529, or an error event of type `rate_limit_error` or `overloaded_error`, is a usage limit. Any other non-2xx, or an error event of another type, is a failure, and that includes a 401 from upstream (the provider refusing the deployment's credential). A transport error reaching upstream is a failure named `upstream transport: <exception type>`, and the worker gets a 502. A 2xx on `/v1/messages` is a success, and a 2xx on `count_tokens` is neutral: it is counted as a request, never as a pass.
+7. **A passes profile clamps `max_tokens` to 64,000** (`MAX_TOKENS_CEILING`), the spec's "caps ... `max_tokens`" for a provider that cannot report usage. A tokens profile clamps to whatever its pair has left.
+8. **A response without usage on a tokens profile** is passed through to the worker. The pair is marked `usage_missing`, reported, and paged (`PAGE:` on stdout, overview decision 14), and every later request on that token is refused. "Fails that pair closed" is applied from the next request, because the response that revealed the problem has already streamed.
+9. **The token travels as `Authorization: Bearer`**, which is how Claude Code sends both `ANTHROPIC_AUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN`. `x-api-key` is accepted too. Neither is ever forwarded upstream.
+10. **A flush waits at most 50 seconds**, then answers with the last acknowledged sequence number, so the control plane's one-minute rule is decided on an answer rather than on a timeout.
+11. **The cap check and the forward are not atomic.** Concurrent requests on one pair can pass the request cap by however many are in flight. A pass's requests are mostly sequential, and the excess is bounded by Claude Code's own concurrency.
+12. **`TOKEN_REPORTING` stays provisional** (Phase 1 decision 6). Narrowing it needs a live response from each provider type, which is a check the human runs by hand (below).
+13. **A cleartext `base_url` is refused unless its host is loopback.** The gateway sends the profile's credential there, and `workersai-shim.py` applies the same rule to its upstream.
+
+## Review Focus
+
+- **A usage field split across two reads of the stream.** Expected: counted. Pinned in Task 3, at every split point of a sample stream.
+- **The worker presents its token in `x-api-key`** (a Claude Code configured with `ANTHROPIC_API_KEY`). Expected: accepted, never forwarded. Pinned in Task 4.
+- **The control plane is down while a pass runs.** Expected: the pass is served within its caps, the reports buffer, and they arrive in order once it returns. Pinned in Task 4.
+- **The gateway restarts mid-job.** Expected: nothing is served until the hello, and the caps resume from the committed counts. Pinned in Task 4 (`the_request_cap_holds_across_a_hello`).
+- **A body that declares more than 4 MB.** Expected: 413 before the body is read. Pinned in Task 4.
+- **The upstream is unreachable.** Expected: a 502 to the worker and a transport failure in the record, never a usage limit. Pinned in Task 4.
+
+## Not run here
+
+- **Anthropic accepting a forwarded OAuth request.** Spike S3 established the header shape offline. Whether Anthropic accepts the result needs a real subscription token. The human runs it by hand after 2a.5, when a deployment exists.
+- **Which providers report usage.** `ollama`'s Anthropic-compatible endpoint, Anthropic itself, and a `custom` upstream are each checked live by hand. The result narrows `deploy_config.TOKEN_REPORTING` in a later commit, which the spec calls "established in phase 2a from live responses".
+- **A worker that disconnects mid-stream.** The gateway stops relaying and records what it saw. No test drives a client that hangs up partway through.
+
+---
+
+### Task 1: The deployment file's endpoint keys
+
+**Files:**
+- Modify: `reviewer/deploy_config.py` (`KEYS`, `AUTH_MODES`, `Profile`, `_base_url_problem`, `_profile`)
+- Modify: `tests/test_deploy_config.py` (a `custom()` fixture; the parity rows; a new `EndpointKeysTest`)
+
+**Interfaces:**
+- Consumes: `providers.check_url` (unchanged).
+- Produces:
+  - `deploy_config.AUTH_MODES: Dict[str, Tuple[Optional[str], Tuple[str, ...]]]`: `anthropic` gives `("api_key", ("api_key", "oauth_token"))` and `custom` gives `(None, ("bearer", "x_api_key"))`.
+  - `Profile` gains `base_url: Optional[str] = None` and `auth: Optional[str] = None`, as its last two fields. An `anthropic` profile with no `auth` loads as `api_key`, and `ollama`, `cloudflare` and `workersai` load with `None` for both.
+  - Problem texts: `is required for a custom profile`; `applies only to a custom profile`; `must be https unless its host is loopback; the gateway sends the credential there`; `is required for a custom profile: bearer or x_api_key`; `must be api_key or oauth_token; got 'bearer'`; `does not apply to a <provider> profile`; and `check_url`'s own two messages, minus their leading name.
+
+- [ ] **Step 1: Write the failing tests**
+
+Apply this change to `tests/test_deploy_config.py`. The existing custom-profile fixtures gain the keys that are now required. The parity test gains rows for the two new leaves. A new class pins the rules:
+
+```diff
+diff --git a/tests/test_deploy_config.py b/tests/test_deploy_config.py
+index 8283e41..3fd9d06 100644
+--- a/tests/test_deploy_config.py
++++ b/tests/test_deploy_config.py
+@@ -24,6 +24,13 @@ def profile(**over):
+     return p
+ 
+ 
++def custom(**over):
++    """A custom profile: phase 2a.2 makes base_url and auth required on one."""
++    fields = {"provider": "custom", "base_url": "https://llm.example", "auth": "bearer"}
++    fields.update(over)
++    return profile(**fields)
++
++
+ def load(doc):
+     return deploy_config.load_deploy(json.dumps(doc).encode("utf-8"))
+ 
+@@ -151,8 +158,8 @@ class LoadTest(unittest.TestCase):
+         # Oracle: tester-brief.md, Task 4, Interfaces and signed starting oracle line 656.
+         # Mutation: Permit custom token budgets without usage reported.
+         self.assertIn("profiles.c.budget.unit",
+-                      problems({"profiles": {"c": profile(provider="custom")}}))
+-        d = load({"profiles": {"c": profile(provider="custom", usage="reported")}})
++                      problems({"profiles": {"c": custom()}}))
++        d = load({"profiles": {"c": custom(usage="reported")}})
+         self.assertTrue(d.profiles["c"].usage_reported)
+ 
+     def test_usage_is_only_for_custom(self):
+@@ -376,6 +383,10 @@ class DeployLeafCoverageTest(unittest.TestCase):
+             ("profiles.*.concurrency", "concurrency", 2, 3, 2, 3),
+             # None here means omitted: usage has only one accepted explicit value.
+             ("profiles.*.usage", "usage_reported", None, "reported", False, True),
++            ("profiles.*.base_url", "base_url",
++             "https://a.example", "https://b.example", "https://a.example", "https://b.example"),
++            # None here means omitted: anthropic's default is api_key.
++            ("profiles.*.auth", "auth", None, "oauth_token", "api_key", "oauth_token"),
+             ("profiles.*.limit_backoff_seconds", "limit_backoff_seconds", 17, 19, 17, 19),
+             ("profiles.*.budget.unit", "budget_unit", "tokens", "passes", "tokens", "passes"),
+             ("profiles.*.budget.daily", "budget_daily", 101, 103, 101, 103),
+@@ -406,8 +417,11 @@ class DeployLeafCoverageTest(unittest.TestCase):
+                 for value in (before, after):
+                     doc = {"profiles": {"o": profile()}}
+                     if path == "profiles.*.usage":
+-                        doc["profiles"]["o"] = profile(
+-                            provider="custom", budget={"unit": "passes", "daily": 101})
++                        doc["profiles"]["o"] = custom(budget={"unit": "passes", "daily": 101})
++                    if path == "profiles.*.base_url":
++                        doc["profiles"]["o"] = custom(usage="reported")
++                    if path == "profiles.*.auth":
++                        doc["profiles"]["o"] = profile(provider="anthropic")
+                     concrete = path.replace("profiles.*.", "profiles.o.")
+                     concrete = concrete.replace("overrides.*", "overrides.api")
+                     keys = concrete.split(".")
+@@ -421,3 +435,61 @@ class DeployLeafCoverageTest(unittest.TestCase):
+                     observed.append(getattr(target, field))
+                 self.assertEqual(observed, [expected_before, expected_after])
+                 self.assertNotEqual(observed[0], observed[1], "declared leaf has no observable effect")
++
++
++class EndpointKeysTest(unittest.TestCase):
++    """Phase 2a.2: what the gateway needs to reach a custom upstream and present a credential."""
++
++    def test_a_custom_profile_needs_base_url_and_auth(self):
++        text = problems({"profiles": {"c": profile(provider="custom", usage="reported")}})
++        self.assertIn("profiles.c.base_url: is required for a custom profile", text)
++        self.assertIn("profiles.c.auth: is required for a custom profile: bearer or x_api_key", text)
++
++    def test_a_custom_profile_loads_with_both(self):
++        p = load({"profiles": {"c": custom(auth="x_api_key", usage="reported")}}).profiles["c"]
++        self.assertEqual((p.base_url, p.auth), ("https://llm.example", "x_api_key"))
++
++    def test_base_url_is_refused_on_any_other_provider(self):
++        for provider in ("ollama", "anthropic", "cloudflare", "workersai"):
++            with self.subTest(provider=provider):
++                self.assertIn("profiles.o.base_url: applies only to a custom profile",
++                              problems({"profiles": {"o": profile(
++                                  provider=provider, base_url="https://x.example")}}))
++
++    def test_a_base_url_ending_in_an_endpoint_path_is_refused(self):
++        self.assertIn("ends with an endpoint path",
++                      problems({"profiles": {"c": custom(base_url="https://llm.example/v1/messages",
++                                                         usage="reported")}}))
++
++    def test_cleartext_is_refused_except_to_loopback(self):
++        self.assertIn("must be https unless its host is loopback",
++                      problems({"profiles": {"c": custom(base_url="http://llm.example",
++                                                         usage="reported")}}))
++        for host in ("127.0.0.1:8080", "localhost", "[::1]:9"):
++            with self.subTest(host=host):
++                load({"profiles": {"c": custom(base_url=f"http://{host}", usage="reported")}})
++
++    def test_a_non_url_is_refused(self):
++        self.assertIn("must be an http(s) URL",
++                      problems({"profiles": {"c": custom(base_url="llm.example", usage="reported")}}))
++
++    def test_anthropic_auth_defaults_to_api_key_and_accepts_oauth_token(self):
++        self.assertEqual(load({"profiles": {"a": profile(provider="anthropic")}})
++                         .profiles["a"].auth, "api_key")
++        self.assertEqual(load({"profiles": {"a": profile(provider="anthropic", auth="oauth_token")}})
++                         .profiles["a"].auth, "oauth_token")
++
++    def test_an_auth_mode_from_another_provider_is_refused(self):
++        self.assertIn("profiles.a.auth: must be api_key or oauth_token; got 'bearer'",
++                      problems({"profiles": {"a": profile(provider="anthropic", auth="bearer")}}))
++
++    def test_auth_is_refused_where_the_provider_has_no_modes(self):
++        for provider in ("ollama", "cloudflare", "workersai"):
++            with self.subTest(provider=provider):
++                self.assertIn(f"profiles.o.auth: does not apply to a {provider} profile",
++                              problems({"profiles": {"o": profile(provider=provider, auth="bearer")}}))
++
++    def test_an_ollama_profile_still_needs_neither(self):
++        p = load({"profiles": {"o": profile()}}).profiles["o"]
++        self.assertEqual((p.base_url, p.auth), (None, None))
++
+```
+
+- [ ] **Step 2: Run them to see them fail**
+
+Run: `./test-python.sh -p 'test_deploy_config.py'`
+Expected: FAIL. `EndpointKeysTest` fails, and the parity test reports two leaves with no `KEYS` entry.
+
+- [ ] **Step 3: Implement**
+
+Apply this change to `reviewer/deploy_config.py`:
+
+```diff
+diff --git a/reviewer/deploy_config.py b/reviewer/deploy_config.py
+index 14c5193..989ae27 100644
+--- a/reviewer/deploy_config.py
++++ b/reviewer/deploy_config.py
+@@ -9,12 +9,13 @@ YAML, by founder ruling (2026-10-09).
+ """
+ 
+ import re
++import urllib.parse
+ from dataclasses import dataclass
+ from typing import Dict, List, Optional, Tuple, Union
+ 
+ from common import ConfigError
+ from config_load import Problems, is_int, is_obj, is_str, join, read_json
+-from providers import PROVIDERS
++from providers import PROVIDERS, check_url
+ 
+ DEPLOY_FILE = "claudebox.deploy.json"
+ DEPLOY_FILE_CAP = 256 * 1024
+@@ -28,6 +29,7 @@ KEYS = {
+     "profiles": {"*": {
+         "provider": None, "models": None, "default_model": None, "credential": None,
+         "concurrency": None, "usage": None, "limit_backoff_seconds": None,
++        "base_url": None, "auth": None,
+         "budget": {"unit": None, "daily": None, "repo_share": None},
+         "per_pair": {"requests": None, "tokens": None},
+     }},
+@@ -43,6 +45,16 @@ KEYS = {
+ _NAME_OK = re.compile(r"[A-Za-z0-9._-]+")
+ _ENV_NAME_OK = re.compile(r"[A-Z_][A-Z0-9_]*")
+ 
++# How the gateway presents a profile's credential upstream, per provider type
++# (phase 2a.2). None means the key is refused for that type. The first value
++# is the default; a type with no default must state it. A hosted profile has
++# no environment to infer this from, and guessing from a credential's prefix
++# is the inference the design refuses.
++AUTH_MODES: Dict[str, Tuple[Optional[str], Tuple[str, ...]]] = {
++    "anthropic": ("api_key", ("api_key", "oauth_token")),
++    "custom": (None, ("bearer", "x_api_key")),
++}
++
+ 
+ class DeployError(ConfigError):
+     """Every schema problem in the deployment file, one per line."""
+@@ -67,6 +79,8 @@ class Profile:
+     per_pair_requests: int
+     per_pair_tokens: Optional[int]
+     usage_reported: bool
++    base_url: Optional[str] = None
++    auth: Optional[str] = None
+ 
+ 
+ @dataclass(frozen=True)
+@@ -116,6 +130,27 @@ def _int(problems, raw, key, path, default, minimum=0) -> int:
+     return default
+ 
+ 
++def _base_url_problem(value) -> Optional[str]:
++    """Why a custom profile's base_url is unusable, or None.
++
++    providers.check_url's two rules (an http(s) URL, no endpoint path), plus
++    one of the gateway's own: it relays the profile's credential there, so
++    cleartext is refused unless the host is loopback, the same rule
++    workersai-shim.py applies to its upstream.
++    """
++    if not is_str(value) or not value:
++        return "is required for a custom profile"
++    try:
++        check_url("base_url", value)
++    except ConfigError as exc:
++        return str(exc)[len("base_url "):]
++    if value.startswith("http://"):
++        host = urllib.parse.urlsplit(value).hostname or ""
++        if host not in ("127.0.0.1", "localhost", "::1"):
++            return "must be https unless its host is loopback; the gateway sends the credential there"
++    return None
++
++
+ def _profile(problems: Problems, name: str, raw) -> Optional[Profile]:
+     path = join("profiles", name)
+     before = len(problems.lines())
+@@ -149,6 +184,30 @@ def _profile(problems: Problems, name: str, raw) -> Optional[Profile]:
+         problems.add(join(path, "usage"), "only 'reported', and only on a custom profile")
+     usage_reported = usage == "reported" and provider == "custom"
+ 
++    base_url = raw.get("base_url")
++    if provider == "custom":
++        problem = _base_url_problem(base_url)
++        if problem:
++            problems.add(join(path, "base_url"), problem)
++            base_url = None
++    elif base_url is not None:
++        problems.add(join(path, "base_url"), "applies only to a custom profile")
++        base_url = None
++
++    auth = raw.get("auth")
++    default_auth, auth_modes = AUTH_MODES.get(provider, (None, ()))
++    if auth is None:
++        auth = default_auth
++        if provider in AUTH_MODES and auth is None:
++            problems.add(join(path, "auth"), f"is required for a {provider} profile: "
++                         f"{' or '.join(auth_modes)}")
++    elif provider in PROVIDERS and not auth_modes:
++        problems.add(join(path, "auth"), f"does not apply to a {provider} profile")
++        auth = None
++    elif auth_modes and auth not in auth_modes:
++        problems.add(join(path, "auth"), f"must be {' or '.join(auth_modes)}; got {auth!r}")
++        auth = None
++
+     budget = _section(problems, raw, "budget", path)
+     bpath = join(path, "budget")
+     unit = budget.get("unit")
+@@ -187,7 +246,8 @@ def _profile(problems: Problems, name: str, raw) -> Optional[Profile]:
+     if len(problems.lines()) > before:
+         return None
+     return Profile(name, provider, tuple(models), default_model, credential, concurrency,
+-                   unit, daily, float(repo_share), backoff, requests, tokens, usage_reported)
++                   unit, daily, float(repo_share), backoff, requests, tokens, usage_reported,
++                   base_url, auth)
+ 
+ 
+ def load_deploy(data: bytes) -> Deploy:
+```
+
+- [ ] **Step 4: Run them to see them pass, then the whole suite**
+
+Run: `./test-python.sh -p 'test_deploy_config.py'`, then `./test-python.sh`
+Expected: PASS, 49 tests. The whole suite passes.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add reviewer/deploy_config.py tests/test_deploy_config.py
+git commit -m "deploy: base_url and auth, what a hosted profile needs to reach its provider"
+```
+
+### Task 2: The socket protocol
+
+**Files:**
+- Create: `hosted/gwproto.py`
+- Test: `tests/test_hosted_gwproto.py`
+
+**Interfaces:**
+- Consumes: nothing.
+- Produces:
+  - `gwproto.MAX_LINE = 4 * 1024 * 1024`, `gwproto.ProtocolError(Exception)`.
+  - `encode(secret, op, fields) -> bytes` (one line) and `decode(line, secret) -> dict` (the message without its `secret`; `ProtocolError` on bad JSON, a non-object, a wrong or missing secret, or an oversized line).
+  - `Server(path, secret, handler, mode=0o660)` with `start() -> Server` and `stop()`. `handler(msg) -> dict` is called once per message. A handler exception is answered as `{"error": "<Type>: <message>"}`, and a wrong secret closes the connection without a reply.
+  - `Client(path, secret, timeout=10.0)` with `call(op, **fields) -> dict` (raises `OSError` or `ProtocolError`, and reconnects on the next call) and `close()`.
+
+- [ ] **Step 1: Write the failing test**
+
+`tests/test_hosted_gwproto.py`:
+
+```python
+import _path  # noqa: F401
+
+import os
+import shutil
+import socket
+import tempfile
+import unittest
+
+from gwproto import MAX_LINE, Client, ProtocolError, Server, decode, encode
+
+
+class CodecTest(unittest.TestCase):
+    def test_a_message_round_trips_without_its_secret(self):
+        line = encode("s3cret", "flush", {"credential_id": "abc"})
+        self.assertTrue(line.endswith(b"\n"))
+        self.assertEqual(decode(line, "s3cret"), {"op": "flush", "credential_id": "abc"})
+
+    def test_a_wrong_or_missing_secret_is_refused(self):
+        with self.assertRaises(ProtocolError):
+            decode(encode("other", "flush", {}), "s3cret")
+        with self.assertRaises(ProtocolError):
+            decode(b'{"op": "flush"}\n', "s3cret")
+
+    def test_junk_is_refused(self):
+        for junk in (b"not json\n", b"[1]\n", b'"x"\n'):
+            with self.subTest(junk=junk), self.assertRaises(ProtocolError):
+                decode(junk, "s")
+
+    def test_an_oversized_line_is_refused(self):
+        with self.assertRaises(ProtocolError):
+            decode(b"x" * (MAX_LINE + 1), "s")
+
+
+class SocketTest(unittest.TestCase):
+    def setUp(self):
+        # AF_UNIX paths are short on macOS; mkdtemp under /tmp keeps them so.
+        self.dir = tempfile.mkdtemp(dir="/tmp")
+        self.addCleanup(shutil.rmtree, self.dir)
+        self.path = os.path.join(self.dir, "g.sock")
+        self.seen = []
+
+        def handler(msg):
+            self.seen.append(msg)
+            if msg.get("op") == "boom":
+                raise RuntimeError("handler bug")
+            return {"echo": msg.get("value")}
+
+        self.server = Server(self.path, "s3cret", handler).start()
+        self.addCleanup(self.server.stop)
+
+    def test_a_call_gets_its_reply(self):
+        client = Client(self.path, "s3cret")
+        self.assertEqual(client.call("ping", value=1), {"echo": 1})
+        self.assertEqual(client.call("ping", value=2), {"echo": 2})
+        client.close()
+
+    def test_the_socket_file_is_0660(self):
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o660)
+
+    def test_a_client_with_the_wrong_secret_gets_no_reply_and_reaches_no_handler(self):
+        client = Client(self.path, "wrong", timeout=2)
+        with self.assertRaises(ProtocolError):
+            client.call("ping", value=1)
+        self.assertEqual(self.seen, [])
+
+    def test_a_reply_carrying_the_wrong_secret_is_refused_by_the_client(self):
+        other = os.path.join(self.dir, "o.sock")
+        impostor = Server(other, "impostor", lambda m: {"echo": 1}).start()
+        self.addCleanup(impostor.stop)
+        # The impostor drops our message for its wrong secret, so the client sees
+        # a closed connection, never a forged answer.
+        with self.assertRaises(ProtocolError):
+            Client(other, "s3cret", timeout=2).call("ping")
+
+    def test_a_handler_exception_is_answered_and_the_server_lives(self):
+        client = Client(self.path, "s3cret")
+        reply = client.call("boom")
+        self.assertIn("RuntimeError: handler bug", reply["error"])
+        self.assertEqual(client.call("ping", value=3), {"echo": 3})
+        client.close()
+
+    def test_a_client_reconnects_after_the_connection_drops(self):
+        client = Client(self.path, "s3cret")
+        client.call("ping", value=1)
+        client._conn.shutdown(socket.SHUT_RDWR)
+        with self.assertRaises((ProtocolError, OSError)):
+            client.call("ping", value=2)
+        self.assertEqual(client.call("ping", value=3), {"echo": 3})
+        client.close()
+
+    def test_no_server_is_an_oserror(self):
+        with self.assertRaises(OSError):
+            Client(os.path.join(self.dir, "none.sock"), "s3cret").call("ping")
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+- [ ] **Step 2: Run it to see it fail**
+
+Run: `./test-python.sh -p 'test_hosted_gwproto.py'`
+Expected: FAIL: `ModuleNotFoundError: No module named 'gwproto'`.
+
+- [ ] **Step 3: Implement**
+
+`hosted/gwproto.py`:
+
+```python
+"""Line-delimited JSON over a unix socket, between processes in one container.
+
+The control plane and the gateway talk this way (and, from 2a.3, the control
+plane and runnerd). Each message is one JSON object on one line, and every
+message in both directions carries the per-deployment secret the supervisor
+hands to both processes at startup. A message whose secret does not match
+closes the connection without a reply: a process that does not hold the
+secret learns nothing from the socket, not even which ops exist.
+
+The socket file is created mode 0660, so only the owner and the group the
+supervisor puts the two uids in can connect at all; the secret is the second
+layer, for the case where a third process lands in that group.
+
+One request, one reply, in order, on a connection either side may hold open.
+"""
+
+import hmac
+import json
+import os
+import socket
+import threading
+from typing import Any, Callable, Dict, Optional
+
+# A hello carrying every live token of a busy deployment is the largest
+# message; 4 MiB holds tens of thousands of rows.
+MAX_LINE = 4 * 1024 * 1024
+
+
+class ProtocolError(Exception):
+    """A message that is not ours: bad JSON, a wrong secret, or too long."""
+
+
+def encode(secret: str, op: Optional[str], fields: Dict[str, Any]) -> bytes:
+    msg = dict(fields)
+    msg["secret"] = secret
+    if op is not None:
+        msg["op"] = op
+    return (json.dumps(msg, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def decode(line: bytes, secret: str) -> Dict[str, Any]:
+    """The message without its secret. Raises ProtocolError on anything else."""
+    if len(line) > MAX_LINE:
+        raise ProtocolError("message too long")
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        raise ProtocolError("not JSON") from None
+    if not isinstance(msg, dict):
+        raise ProtocolError("not a JSON object")
+    presented = msg.pop("secret", None)
+    if not isinstance(presented, str) or not hmac.compare_digest(
+            presented.encode("utf-8"), secret.encode("utf-8")):
+        raise ProtocolError("wrong secret")
+    return msg
+
+
+def _readline(f) -> bytes:
+    line = f.readline(MAX_LINE + 1)
+    if len(line) > MAX_LINE:
+        raise ProtocolError("message too long")
+    return line
+
+
+Handler = Callable[[Dict[str, Any]], Dict[str, Any]]
+
+
+class Server:
+    """Accepts connections on a unix socket and answers each message with handler(msg)."""
+
+    def __init__(self, path: str, secret: str, handler: Handler, mode: int = 0o660):
+        self.path = path
+        self.secret = secret
+        self.handler = handler
+        if os.path.exists(path):
+            os.unlink(path)
+        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._sock.bind(path)
+        os.chmod(path, mode)
+        self._sock.listen(16)
+        self._stopping = False
+        self._thread = threading.Thread(target=self._accept, daemon=True)
+
+    def start(self) -> "Server":
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stopping = True
+        try:
+            self._sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self._sock.close()
+        if os.path.exists(self.path):
+            os.unlink(self.path)
+
+    def _accept(self) -> None:
+        while not self._stopping:
+            try:
+                conn, _ = self._sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
+
+    def _serve(self, conn: socket.socket) -> None:
+        with conn, conn.makefile("rb") as rf, conn.makefile("wb") as wf:
+            while True:
+                try:
+                    line = _readline(rf)
+                    if not line:
+                        return
+                    msg = decode(line, self.secret)
+                except (ProtocolError, OSError):
+                    return
+                try:
+                    reply = self.handler(msg)
+                except Exception as exc:  # a handler bug answers, never kills the server
+                    reply = {"error": f"{type(exc).__name__}: {exc}"}
+                try:
+                    wf.write(encode(self.secret, None, reply))
+                    wf.flush()
+                except OSError:
+                    return
+
+
+class Client:
+    """One persistent connection; reconnects on the next call after a failure."""
+
+    def __init__(self, path: str, secret: str, timeout: float = 10.0):
+        self.path = path
+        self.secret = secret
+        self.timeout = timeout
+        self._lock = threading.Lock()
+        self._conn: Optional[socket.socket] = None
+        self._rf = self._wf = None
+
+    def _connect(self) -> None:
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        conn.settimeout(self.timeout)
+        conn.connect(self.path)
+        self._conn, self._rf, self._wf = conn, conn.makefile("rb"), conn.makefile("wb")
+
+    def close(self) -> None:
+        for f in (self._rf, self._wf, self._conn):
+            if f is not None:
+                try:
+                    f.close()
+                except OSError:
+                    pass
+        self._conn = self._rf = self._wf = None
+
+    def call(self, op: str, **fields: Any) -> Dict[str, Any]:
+        """Send one message and return the reply. Raises OSError or ProtocolError."""
+        with self._lock:
+            try:
+                if self._conn is None:
+                    self._connect()
+                self._wf.write(encode(self.secret, op, fields))
+                self._wf.flush()
+                line = _readline(self._rf)
+                if not line:
+                    raise ProtocolError("connection closed without a reply")
+                return decode(line, self.secret)
+            except BaseException:
+                self.close()
+                raise
+```
+
+- [ ] **Step 4: Run it to see it pass, then the whole suite**
+
+Run: `./test-python.sh -p 'test_hosted_gwproto.py'`, then `./test-python.sh`
+Expected: PASS, 11 tests. The whole suite passes.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add hosted/gwproto.py tests/test_hosted_gwproto.py
+git commit -m "hosted: the socket protocol between the control plane and the gateway"
+```
+
+### Task 3: The route's pure parts: profiles, headers, usage, classification
+
+**Files:**
+- Create: `hosted/gateway.py` (its first half: everything above `TokenState`)
+- Test: `tests/test_hosted_gateway.py` (its first half)
+
+**Interfaces:**
+- Consumes: nothing beyond the standard library. The imports of `creds` and `gwproto` are used by Task 4.
+- Produces:
+  - Constants: `SERVED_PROVIDERS = ("ollama", "anthropic", "custom")`, `UPSTREAMS`, `BODY_MAX = 4 * 1024 * 1024`, `ROUTES`, `MAX_TOKENS_CEILING = 64000`, `JSON_KEEP`, `LIMIT_TYPES`, `FLUSH_SECONDS = 50.0`.
+  - `served_problems(profiles) -> List[str]`: one line per profile whose provider is not served, sorted by name.
+  - `Route(name, provider, base_url, auth, credential, per_pair_requests, per_pair_tokens, tokens_unit)`, frozen, with `Route.from_profile(p, env, upstreams) -> Route`. It raises `ValueError` for an unserved provider or a credential missing from `env`. `auth` resolves to `"bearer"` or `"x_api_key"`.
+  - `upstream_headers(route, incoming, length) -> Dict[str, str]`: the pass-through set plus the injected credential and `content-length`, with names lowercased.
+  - `UsageMeter(streaming)` with `feed(chunk)`, `finish()`, and the attributes `input_tokens`, `output_tokens`, `saw_usage` and `error_type`.
+  - `classify(path, status, meter) -> str`, one of `success`, `limit`, `failure` and `neutral`.
+
+- [ ] **Step 1: Write the failing test**
+
+`tests/test_hosted_gateway.py`, the meter, classification and route cases (Task 4 adds the rest of the file):
+
+```python
+import _path  # noqa: F401
+
+import http.client
+import http.server
+import json
+import os
+import shutil
+import tempfile
+import threading
+import time
+import unittest
+from types import SimpleNamespace
+
+import creds
+import gateway
+import gwproto
+from records import Records
+
+SSE_OK = (
+    b'event: message_start\ndata: {"type":"message_start","message":{"usage":'
+    b'{"input_tokens":100,"cache_read_input_tokens":20,"output_tokens":1}}}\n\n'
+    b'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"text":"hi"}}\n\n'
+    b'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":30}}\n\n'
+    b'event: message_stop\ndata: {"type":"message_stop"}\n\n')
+SSE_NO_USAGE = b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+SSE_OVERLOADED = (b'event: error\ndata: {"type":"error","error":{"type":"overloaded_error",'
+                  b'"message":"busy"}}\n\n')
+
+
+class MeterTest(unittest.TestCase):
+    def test_streamed_usage_is_counted_across_any_split(self):
+        for cut in range(1, len(SSE_OK)):
+            meter = gateway.UsageMeter(streaming=True)
+            meter.feed(SSE_OK[:cut])
+            meter.feed(SSE_OK[cut:])
+            meter.finish()
+            self.assertEqual((meter.input_tokens, meter.output_tokens, meter.saw_usage),
+                             (120, 30, True), f"split at {cut}")
+
+    def test_crlf_framing_is_read_too(self):
+        meter = gateway.UsageMeter(streaming=True)
+        meter.feed(SSE_OK.replace(b"\n", b"\r\n"))
+        self.assertEqual(meter.output_tokens, 30)
+
+    def test_a_stream_error_event_is_recorded(self):
+        meter = gateway.UsageMeter(streaming=True)
+        meter.feed(SSE_OVERLOADED)
+        self.assertEqual(meter.error_type, "overloaded_error")
+
+    def test_a_json_response_is_read_at_the_end(self):
+        meter = gateway.UsageMeter(streaming=False)
+        meter.feed(b'{"type":"message","usage":{"input_tokens":5,')
+        meter.feed(b'"output_tokens":7}}')
+        meter.finish()
+        self.assertEqual((meter.input_tokens, meter.output_tokens), (5, 7))
+
+    def test_no_usage_is_seen_as_none(self):
+        meter = gateway.UsageMeter(streaming=True)
+        meter.feed(SSE_NO_USAGE)
+        self.assertFalse(meter.saw_usage)
+
+
+class ClassifyTest(unittest.TestCase):
+    def meter(self, error=None):
+        m = gateway.UsageMeter(streaming=True)
+        m.error_type = error
+        return m
+
+    def test_the_outcomes(self):
+        cases = [
+            ("/v1/messages", 200, None, "success"),
+            ("/v1/messages/count_tokens", 200, None, "neutral"),
+            ("/v1/messages", 429, None, "limit"),
+            ("/v1/messages", 529, None, "limit"),
+            ("/v1/messages", 200, "overloaded_error", "limit"),
+            ("/v1/messages", 200, "rate_limit_error", "limit"),
+            ("/v1/messages", 200, "api_error", "failure"),
+            ("/v1/messages", 500, None, "failure"),
+            ("/v1/messages", 401, None, "failure"),
+        ]
+        for path, status, error, expected in cases:
+            with self.subTest(status=status, error=error):
+                self.assertEqual(gateway.classify(path, status, self.meter(error)), expected)
+
+
+class RouteTest(unittest.TestCase):
+    def profile(self, **over):
+        p = {"name": "p", "provider": "anthropic", "auth": "api_key", "base_url": None,
+             "credential": "ANTHROPIC_API_KEY", "per_pair_requests": 200,
+             "per_pair_tokens": 4000000, "budget_unit": "tokens"}
+        p.update(over)
+        return p
+
+    def headers(self, route):
+        incoming = {"Authorization": "Bearer cbx_p_worker", "x-api-key": "worker",
+                    "anthropic-beta": "oauth-2025-04-20", "anthropic-version": "2023-06-01",
+                    "Content-Type": "application/json", "Cookie": "c=1"}
+        return gateway.upstream_headers(route, incoming, 12)
+
+    def test_an_anthropic_api_key_goes_in_x_api_key_and_the_worker_token_does_not(self):
+        r = gateway.Route.from_profile(self.profile(), {"ANTHROPIC_API_KEY": "sk-real"},
+                                       gateway.UPSTREAMS)
+        h = self.headers(r)
+        self.assertEqual(r.base_url, "https://api.anthropic.com")
+        self.assertEqual(h["x-api-key"], "sk-real")
+        self.assertNotIn("authorization", h)
+        self.assertNotIn("cookie", h)
+        self.assertEqual(h["anthropic-beta"], "oauth-2025-04-20")
+        self.assertEqual(h["content-length"], "12")
+
+    def test_an_oauth_token_replaces_only_the_bearer(self):
+        r = gateway.Route.from_profile(self.profile(auth="oauth_token",
+                                                    credential="CLAUDE_CODE_OAUTH_TOKEN"),
+                                       {"CLAUDE_CODE_OAUTH_TOKEN": "oat-real"}, gateway.UPSTREAMS)
+        h = self.headers(r)
+        self.assertEqual(h["authorization"], "Bearer oat-real")
+        self.assertNotIn("x-api-key", h)
+        self.assertEqual(h["anthropic-beta"], "oauth-2025-04-20")
+
+    def test_ollama_is_a_bearer_to_ollama_com(self):
+        r = gateway.Route.from_profile(self.profile(provider="ollama", auth=None,
+                                                    credential="OLLAMA_API_KEY"),
+                                       {"OLLAMA_API_KEY": "olk"}, gateway.UPSTREAMS)
+        self.assertEqual((r.base_url, self.headers(r)["authorization"]),
+                         ("https://ollama.com", "Bearer olk"))
+
+    def test_custom_uses_its_base_url_and_auth_mode(self):
+        r = gateway.Route.from_profile(self.profile(provider="custom", auth="x_api_key",
+                                                    base_url="https://llm.example/",
+                                                    credential="K"), {"K": "v"},
+                                       gateway.UPSTREAMS)
+        self.assertEqual((r.base_url, self.headers(r)["x-api-key"]), ("https://llm.example", "v"))
+
+    def test_an_unserved_provider_or_a_missing_credential_is_refused(self):
+        with self.assertRaises(ValueError):
+            gateway.Route.from_profile(self.profile(provider="workersai"), {"ANTHROPIC_API_KEY": "x"},
+                                       gateway.UPSTREAMS)
+        with self.assertRaises(ValueError):
+            gateway.Route.from_profile(self.profile(), {}, gateway.UPSTREAMS)
+
+    def test_served_problems_names_each_unserved_profile(self):
+        profiles = {"a": SimpleNamespace(provider="anthropic"),
+                    "w": SimpleNamespace(provider="workersai"),
+                    "c": SimpleNamespace(provider="cloudflare")}
+        self.assertEqual(gateway.served_problems(profiles), [
+            "profiles.c: cloudflare profiles are not served by the hosted gateway until phase 2a.6",
+            "profiles.w: workersai profiles are not served by the hosted gateway until phase 2a.6"])
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+- [ ] **Step 2: Run it to see it fail**
+
+Run: `./test-python.sh -p 'test_hosted_gateway.py'`
+Expected: FAIL: `ModuleNotFoundError: No module named 'gateway'`.
+
+- [ ] **Step 3: Implement**
+
+`hosted/gateway.py`, its first half:
+
+```python
+"""The gateway's provider route: the worker's only way to a model provider.
+
+A worker's `claude` points ANTHROPIC_BASE_URL here and presents a per-pair
+provider token. The gateway checks the token, overwrites the model, enforces
+the pair's caps, swaps the token for the profile's real credential, streams
+the upstream response back unbuffered, and counts what it saw. It holds the
+provider credentials; the control plane, which holds the App key, does not,
+and no worker ever does.
+
+It is the author of every pair's provider outcome: for each token it keeps a
+record (requests, successes, tokens, the first usage limit, the first
+failure, a cap hit) and reports every change to the control plane over a
+unix socket, numbered per token, so the control plane knows when it holds
+all of them. It enforces caps from its own counts, so provider traffic never
+waits on the control plane. Until the control plane's hello has told it the
+live tokens and their committed counts, it serves no provider traffic, so a
+restart never resets a cap.
+
+It does not buffer, cache, log or retry a body.
+"""
+
+import http.client
+import http.server
+import json
+import os
+import socket
+import ssl
+import sys
+import threading
+import time
+import urllib.parse
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Tuple
+
+import creds
+import gwproto
+
+# Phase 2a.2 serves these three. cloudflare and workersai arrive in 2a.6.
+SERVED_PROVIDERS = ("ollama", "anthropic", "custom")
+UPSTREAMS = {"ollama": "https://ollama.com", "anthropic": "https://api.anthropic.com"}
+# The spec's "provider request body | 4 MB | fixed | request refused".
+BODY_MAX = 4 * 1024 * 1024
+ROUTES = {"/v1/messages", "/v1/messages/count_tokens"}
+# What a non-reporting (passes) profile clamps max_tokens to, since it cannot
+# count tokens: the spec's "it caps requests, body size and max_tokens".
+MAX_TOKENS_CEILING = 64000
+# How much of a non-streamed response is kept to read its usage from. A
+# messages response is a few KB; anything longer is streamed through uncounted.
+JSON_KEEP = 4 * 1024 * 1024
+LIMIT_TYPES = ("rate_limit_error", "overloaded_error")
+FLUSH_SECONDS = 50.0
+# Headers passed upstream from the worker's request, lowercased. Everything
+# else, Authorization and x-api-key above all, is dropped.
+_PASS_UP = ("content-type", "accept", "anthropic-version", "anthropic-beta", "user-agent",
+            "x-app", "anthropic-dangerous-direct-browser-access")
+# Headers passed back from upstream to the worker.
+_PASS_DOWN = ("content-type", "request-id", "retry-after", "x-should-retry")
+
+
+def served_problems(profiles: Mapping[str, Any]) -> List[str]:
+    """One line per deployment profile this gateway cannot serve yet.
+
+    `profiles` is deploy_config.Deploy.profiles. `hosted config apply` (2a.5)
+    refuses a deployment file with any; `config validate` does not call this,
+    since the file is valid, just not yet servable here.
+    """
+    return [f"profiles.{name}: {p.provider} profiles are not served by the hosted gateway "
+            "until phase 2a.6" for name, p in sorted(profiles.items())
+            if p.provider not in SERVED_PROVIDERS]
+
+
+@dataclass(frozen=True)
+class Route:
+    """One profile, as the gateway needs it: where, and how to authenticate."""
+    name: str
+    provider: str
+    base_url: str
+    auth: str               # "bearer" or "x_api_key", resolved from the profile
+    credential: str         # the value, never logged
+    per_pair_requests: int
+    per_pair_tokens: Optional[int]
+    tokens_unit: bool
+
+    @classmethod
+    def from_profile(cls, p: Mapping[str, Any], env: Mapping[str, str],
+                     upstreams: Mapping[str, str]) -> "Route":
+        provider = p["provider"]
+        if provider not in SERVED_PROVIDERS:
+            raise ValueError(f"profile {p['name']}: {provider} is not served until phase 2a.6")
+        value = env.get(p["credential"], "")
+        if not value:
+            raise ValueError(f"profile {p['name']}: {p['credential']} is not in the "
+                             "gateway's environment")
+        if provider == "custom":
+            base, auth = p["base_url"], p["auth"]
+        elif provider == "ollama":
+            base, auth = upstreams["ollama"], "bearer"
+        else:
+            base = upstreams["anthropic"]
+            auth = "bearer" if p.get("auth") == "oauth_token" else "x_api_key"
+        return cls(p["name"], provider, base.rstrip("/"), auth, value,
+                   int(p["per_pair_requests"]), p.get("per_pair_tokens"),
+                   p.get("budget_unit") == "tokens")
+
+
+def upstream_headers(route: Route, incoming: Mapping[str, str], length: int) -> Dict[str, str]:
+    headers = {k: v for k, v in ((k.lower(), v) for k, v in incoming.items()) if k in _PASS_UP}
+    if route.auth == "bearer":
+        headers["authorization"] = f"Bearer {route.credential}"
+    else:
+        headers["x-api-key"] = route.credential
+    headers["content-length"] = str(length)
+    return headers
+
+
+class UsageMeter:
+    """Reads usage and errors out of a response as it streams past.
+
+    Server-sent events are parsed incrementally, so a usage field split across
+    two reads is still counted. Input counts every kind of input token the
+    provider reports (plain, cache creation, cache read); output takes the
+    largest cumulative value seen, since message_delta repeats it.
+    """
+
+    def __init__(self, streaming: bool):
+        self.streaming = streaming
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.saw_usage = False
+        self.error_type: Optional[str] = None
+        self._buf = b""
+        self._kept = b""
+
+    def _usage(self, usage: Any) -> None:
+        if not isinstance(usage, dict):
+            return
+        inputs = [usage.get(k) for k in ("input_tokens", "cache_creation_input_tokens",
+                                         "cache_read_input_tokens")]
+        if any(isinstance(v, int) for v in inputs):
+            self.input_tokens = max(self.input_tokens, sum(v for v in inputs if isinstance(v, int)))
+            self.saw_usage = True
+        out = usage.get("output_tokens")
+        if isinstance(out, int):
+            self.output_tokens = max(self.output_tokens, out)
+            self.saw_usage = True
+
+    def _event(self, data: Any) -> None:
+        if not isinstance(data, dict):
+            return
+        kind = data.get("type")
+        if kind == "message_start":
+            self._usage((data.get("message") or {}).get("usage"))
+        elif kind == "message_delta":
+            self._usage(data.get("usage"))
+        elif kind == "error":
+            self.error_type = (data.get("error") or {}).get("type") or "error"
+        elif kind == "message":
+            self._usage(data.get("usage"))
+
+    def feed(self, chunk: bytes) -> None:
+        if not self.streaming:
+            if len(self._kept) < JSON_KEEP:
+                self._kept += chunk[:JSON_KEEP - len(self._kept)]
+            return
+        self._buf += chunk.replace(b"\r\n", b"\n")
+        while b"\n\n" in self._buf:
+            raw, self._buf = self._buf.split(b"\n\n", 1)
+            data = b"\n".join(line[5:].lstrip() for line in raw.split(b"\n")
+                              if line.startswith(b"data:"))
+            if data:
+                try:
+                    self._event(json.loads(data))
+                except ValueError:
+                    pass
+
+    def finish(self) -> None:
+        if not self.streaming and self._kept:
+            try:
+                self._event(json.loads(self._kept))
+            except ValueError:
+                pass
+
+
+def classify(path: str, status: int, meter: UsageMeter) -> str:
+    """success | limit | failure | neutral. The spec's record, as the gateway saw it."""
+    if status in (429, 529) or meter.error_type in LIMIT_TYPES:
+        return "limit"
+    if 200 <= status < 300 and meter.error_type is None:
+        return "success" if path == "/v1/messages" else "neutral"
+    return "failure"
+```
+
+- [ ] **Step 4: Run it to see it pass, then the whole suite**
+
+Run: `./test-python.sh -p 'test_hosted_gateway.py'`, then `./test-python.sh`
+Expected: PASS, 12 tests. The whole suite passes.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add hosted/gateway.py tests/test_hosted_gateway.py
+git commit -m "hosted: the gateway route's profiles, headers and usage meter"
+```
+
+### Task 4: The gateway process: tokens, caps, forwarding, reports
+
+**Files:**
+- Modify: `hosted/gateway.py` (append its second half)
+- Modify: `tests/test_hosted_gateway.py` (insert the process cases before its `if __name__` block)
+
+**Interfaces:**
+- Consumes: `creds.verify_against`, `creds.credential_id_of`, `creds.Creds` and `records.Records` (2a.1); `gwproto.Server` and `gwproto.Client` (Task 2); Task 3's names.
+- Produces:
+  - `TokenState` (a mutable dataclass) with `TokenState.from_row(row)`. The row is a `hello` token row, and its `counts` are the committed record.
+  - `Reporter(call, retry_seconds=1.0)` with `start()`, `stop()`, `enqueue(report)`, `pending(credential_id) -> int`, `acked(credential_id) -> int` and `flush(credential_id, timeout=FLUSH_SECONDS) -> int`. `call` is a `gwproto.Client.call`.
+  - `Gateway(env, reporter, upstreams=UPSTREAMS, clock=time.time, log=print)` with `handle_control(msg) -> dict` (ops `hello`, `add_token`, `revoke`, `flush`), `find(token) -> Optional[TokenState]` and `record(state, kind, meter=None, detail="", cap=None)`.
+  - A report is `{credential_id, seq, delta: {requests, successes, input_tokens, output_tokens}}`, plus whichever of `first_limit`, `first_failure`, `cap_hit` and `usage_missing` this response set for the first time.
+  - `make_server(gateway, host, port) -> ThreadingHTTPServer` and `main(env=os.environ)`. `main` reads `GATEWAY_SECRET`, `GATEWAY_SOCKET`, `CONTROL_SOCKET` and `GATEWAY_LISTEN` (default `0.0.0.0:8090`), and its first stdout line is `gateway listening on <host>:<port>; waiting for the control plane's hello`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Insert these classes into `tests/test_hosted_gateway.py`, above its `if __name__` block:
+
+```python
+class Upstream(http.server.BaseHTTPRequestHandler):
+    """A fake provider. Each test sets `reply` on the server: (status, content type, body)."""
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        self.server.seen.append({"path": self.path, "headers": dict(self.headers),
+                                 "body": json.loads(body)})
+        status, kind, payload = self.server.reply
+        self.send_response(status)
+        self.send_header("Content-Type", kind)
+        self.send_header("request-id", "req_1")
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+class GatewayTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(dir="/tmp")
+        self.addCleanup(shutil.rmtree, self.dir)
+        # A fake provider on loopback, reached through a custom profile.
+        self.up = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+        self.up.seen, self.up.reply = [], (200, "text/event-stream", SSE_OK)
+        threading.Thread(target=self.up.serve_forever, args=(0.01,), daemon=True).start()
+        self.addCleanup(self.up.server_close)
+        self.addCleanup(self.up.shutdown)
+        # A fake control plane that acknowledges every report.
+        self.reports = []
+        self.control_up = True
+
+        def control(msg):
+            if not self.control_up:
+                raise RuntimeError("down")
+            self.reports.append(msg)
+            return {"ack": msg["seq"]}
+
+        self.control = gwproto.Server(os.path.join(self.dir, "c.sock"), "s", control).start()
+        self.addCleanup(self.control.stop)
+        client = gwproto.Client(os.path.join(self.dir, "c.sock"), "s")
+        self.reporter = gateway.Reporter(client.call, retry_seconds=0.05).start()
+        self.addCleanup(self.reporter.stop)
+        self.gw = gateway.Gateway({"K": "real-upstream-key"}, self.reporter, log=self.logs.append)
+        self.server = gateway.make_server(self.gw, "127.0.0.1", 0)
+        threading.Thread(target=self.server.serve_forever, args=(0.01,), daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.records = Records(os.path.join(self.dir, "r.db"))
+        self.creds = creds.Creds(self.records)
+
+    logs: list = []
+
+    def profile(self, **over):
+        p = {"name": "p", "provider": "custom", "auth": "bearer",
+             "base_url": f"http://127.0.0.1:{self.up.server_port}", "credential": "K",
+             "per_pair_requests": 3, "per_pair_tokens": 1000, "budget_unit": "tokens"}
+        p.update(over)
+        return p
+
+    def hello(self, profile=None, counts=None):
+        token = self.creds.mint("provider", "job1", 600, persona="sage")
+        row = dict(self.creds.live_provider_rows()[0], profile="p", model="the-model",
+                   counts=counts or {})
+        reply = self.gw.handle_control({"op": "hello", "profiles": [profile or self.profile()],
+                                        "tokens": [row]})
+        self.assertEqual(reply, {"ok": True, "tokens": 1})
+        return token, row["credential_id"]
+
+    def post(self, token, path="/v1/messages?beta=true", body=None, raw=None, length=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=10)
+        payload = raw if raw is not None else json.dumps(
+            body if body is not None else {"model": "worker-chose", "max_tokens": 5000,
+                                           "messages": []}).encode()
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json",
+                   "anthropic-version": "2023-06-01"}
+        if length is not None:
+            headers["Content-Length"] = str(length)
+        conn.request("POST", path, body=payload, headers=headers)
+        resp = conn.getresponse()
+        data = resp.read()
+        conn.close()
+        return resp.status, data
+
+    def flush(self, cid):
+        return self.gw.handle_control({"op": "flush", "credential_id": cid})["last_seq"]
+
+    def test_nothing_is_served_before_the_hello(self):
+        token = self.creds.mint("provider", "job1", 600, persona="sage")
+        status, body = self.post(token)
+        self.assertEqual(status, 503)
+        self.assertIn(b"starting", body)
+        self.assertEqual(self.up.seen, [])
+
+    def test_head_api_hello_is_answered_without_upstream(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)
+        conn.request("HEAD", "/api/hello")
+        self.assertEqual(conn.getresponse().status, 200)
+        conn.close()
+        self.assertEqual(self.up.seen, [])
+
+    def test_other_paths_are_refused(self):
+        token, _ = self.hello()
+        for path in ("/v1/messages/batches", "/v1/files", "/v1/complete"):
+            with self.subTest(path=path):
+                self.assertEqual(self.post(token, path=path)[0], 404)
+        self.assertEqual(self.up.seen, [])
+
+    def test_an_unknown_wrong_or_revoked_token_is_refused(self):
+        token, cid = self.hello()
+        self.assertEqual(self.post("cbx_p_0000000000000000_" + "A" * 43)[0], 401)
+        self.assertEqual(self.post(token[:-1] + ("A" if token[-1] != "A" else "B"))[0], 401)
+        self.gw.handle_control({"op": "revoke", "credential_ids": [cid]})
+        self.assertEqual(self.post(token)[0], 401)
+        self.assertEqual(self.up.seen, [])
+
+    def test_a_forwarded_request_carries_the_real_credential_and_the_jobs_model(self):
+        token, _ = self.hello()
+        status, body = self.post(token)
+        self.assertEqual((status, body), (200, SSE_OK))
+        seen = self.up.seen[0]
+        self.assertEqual(seen["path"], "/v1/messages?beta=true")
+        self.assertEqual(seen["headers"]["authorization"], "Bearer real-upstream-key")
+        self.assertNotIn(token, json.dumps(seen))
+        self.assertEqual(seen["body"]["model"], "the-model")
+
+    def test_a_token_in_x_api_key_is_accepted_and_not_forwarded(self):
+        token, _ = self.hello()
+        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=10)
+        conn.request("POST", "/v1/messages", body=b'{"messages": []}',
+                     headers={"x-api-key": token, "Content-Type": "application/json"})
+        self.assertEqual(conn.getresponse().status, 200)
+        conn.close()
+        self.assertNotIn(token, json.dumps(self.up.seen[0]))
+
+    def test_usage_is_counted_and_reported_in_sequence(self):
+        token, cid = self.hello()
+        self.post(token)
+        self.post(token)
+        self.assertEqual(self.flush(cid), 2)
+        self.assertEqual([r["seq"] for r in self.reports], [1, 2])
+        self.assertEqual(self.reports[0]["delta"], {"requests": 1, "successes": 1,
+                                                    "input_tokens": 120, "output_tokens": 30})
+
+    def test_max_tokens_is_clamped_to_what_remains(self):
+        token, _ = self.hello()
+        self.post(token)  # spends 150 of 1000
+        self.post(token)
+        self.assertEqual(self.up.seen[0]["body"]["max_tokens"], 1000)
+        self.assertEqual(self.up.seen[1]["body"]["max_tokens"], 850)
+
+    def test_a_spent_token_cap_ends_the_pair_as_capped(self):
+        token, cid = self.hello(counts={"input_tokens": 600, "output_tokens": 400})
+        status, body = self.post(token)
+        self.assertEqual(status, 400)
+        self.assertIn(b"token cap", body)
+        self.assertEqual(self.up.seen, [])
+        self.flush(cid)
+        self.assertEqual(self.reports[-1]["cap_hit"], "tokens")
+
+    def test_the_request_cap_holds_across_a_hello(self):
+        token, cid = self.hello(counts={"requests": 3, "seq": 9})
+        status, body = self.post(token)
+        self.assertEqual(status, 400)
+        self.assertIn(b"request cap", body)
+        self.assertEqual(self.flush(cid), 10)
+        self.assertEqual(self.reports[-1]["cap_hit"], "requests")
+
+    def test_a_passes_profile_clamps_to_the_ceiling(self):
+        token, _ = self.hello(self.profile(budget_unit="passes", per_pair_tokens=None))
+        self.post(token, body={"max_tokens": 10 ** 9, "messages": []})
+        self.assertEqual(self.up.seen[0]["body"]["max_tokens"], gateway.MAX_TOKENS_CEILING)
+
+    def test_a_usage_limit_is_recorded_once(self):
+        token, cid = self.hello()
+        self.up.reply = (429, "application/json",
+                         b'{"type":"error","error":{"type":"rate_limit_error"}}')
+        self.post(token)
+        self.post(token)
+        self.flush(cid)
+        limits = [r for r in self.reports if "first_limit" in r]
+        self.assertEqual([r["first_limit"] for r in limits], ["upstream 429 rate_limit_error"])
+
+    def test_an_upstream_5xx_is_a_failure(self):
+        token, cid = self.hello()
+        self.up.reply = (502, "text/plain", b"bad gateway")
+        status, _ = self.post(token)
+        self.assertEqual(status, 502)
+        self.flush(cid)
+        self.assertEqual(self.reports[-1]["first_failure"], "upstream 502")
+        self.assertEqual(self.reports[-1]["delta"]["successes"], 0)
+
+    def test_an_unreachable_provider_is_a_transport_failure(self):
+        token, cid = self.hello(self.profile(base_url="http://127.0.0.1:9"))
+        status, _ = self.post(token)
+        self.assertEqual(status, 502)
+        self.flush(cid)
+        self.assertTrue(self.reports[-1]["first_failure"].startswith("upstream transport: "))
+
+    def test_a_tokens_profile_without_usage_fails_the_pair_closed_and_pages(self):
+        token, cid = self.hello()
+        self.up.reply = (200, "text/event-stream", SSE_NO_USAGE)
+        self.assertEqual(self.post(token)[0], 200)
+        self.flush(cid)
+        self.assertTrue(self.reports[-1]["usage_missing"])
+        self.assertTrue(any(line.startswith("PAGE: ") for line in self.logs))
+        status, body = self.post(token)
+        self.assertEqual(status, 400)
+        self.assertIn(b"failed closed", body)
+        self.assertEqual(len(self.up.seen), 1)
+
+    def test_a_passes_profile_without_usage_is_fine(self):
+        token, cid = self.hello(self.profile(budget_unit="passes", per_pair_tokens=None))
+        self.up.reply = (200, "text/event-stream", SSE_NO_USAGE)
+        self.post(token)
+        self.assertEqual(self.post(token)[0], 200)
+        self.flush(cid)
+        self.assertFalse(any(r.get("usage_missing") for r in self.reports))
+
+    def test_an_oversized_or_non_json_body_is_refused_without_upstream(self):
+        token, _ = self.hello()
+        # The gateway refuses on the declared length, before reading the body.
+        self.assertEqual(self.post(token, raw=b"{}", length=gateway.BODY_MAX + 1)[0], 413)
+        self.assertEqual(self.post(token, raw=b"[1,2]")[0], 400)
+        self.assertEqual(self.up.seen, [])
+
+    def test_reports_wait_for_the_control_plane_and_arrive_in_order(self):
+        token, cid = self.hello()
+        self.control_up = False
+        self.post(token)
+        self.post(token)
+        time.sleep(0.2)
+        self.assertEqual(self.reports, [])
+        self.assertEqual(self.reporter.pending(cid), 2)
+        self.control_up = True
+        self.assertEqual(self.flush(cid), 2)
+        self.assertEqual([r["seq"] for r in self.reports], [1, 2])
+
+    def test_a_flush_that_cannot_complete_returns_what_was_acknowledged(self):
+        token, cid = self.hello()
+        self.post(token)
+        self.assertEqual(self.flush(cid), 1)
+        self.control_up = False
+        self.post(token)
+        self.assertEqual(self.reporter.flush(cid, timeout=0.2), 1)
+
+    def test_an_unknown_control_op_is_an_error(self):
+        self.assertIn("error", self.gw.handle_control({"op": "drop_tables"}))
+
+
+
+class MainTest(unittest.TestCase):
+    """gateway.main as the supervisor will run it: a process, two sockets, one port."""
+
+    def test_the_process_serves_after_a_hello_over_its_socket(self):
+        import re
+        import subprocess
+        import sys
+        d = tempfile.mkdtemp(dir="/tmp")
+        self.addCleanup(shutil.rmtree, d)
+        control = gwproto.Server(os.path.join(d, "c.sock"), "s", lambda m: {"ack": m["seq"]}).start()
+        self.addCleanup(control.stop)
+        env = {"PATH": os.environ.get("PATH", ""), "GATEWAY_SECRET": "s",
+               "GATEWAY_SOCKET": os.path.join(d, "g.sock"),
+               "CONTROL_SOCKET": os.path.join(d, "c.sock"),
+               "GATEWAY_LISTEN": "127.0.0.1:0", "K": "real"}
+        script = os.path.join(os.path.dirname(gateway.__file__), "gateway.py")
+        proc = subprocess.Popen([sys.executable, script], env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        line = proc.stdout.readline()
+        port = int(re.search(r"listening on 127\.0\.0\.1:(\d+)", line).group(1))
+
+        def post():
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("POST", "/v1/messages", body=b"{}",
+                         headers={"Authorization": "Bearer x", "Content-Length": "2"})
+            status = conn.getresponse().status
+            conn.close()
+            return status
+
+        self.assertEqual(post(), 503)
+        client = gwproto.Client(os.path.join(d, "g.sock"), "s")
+        profile = {"name": "p", "provider": "custom", "auth": "bearer",
+                   "base_url": "http://127.0.0.1:9", "credential": "K",
+                   "per_pair_requests": 3, "per_pair_tokens": None, "budget_unit": "passes"}
+        self.assertEqual(client.call("hello", profiles=[profile], tokens=[]),
+                         {"ok": True, "tokens": 0})
+        client.close()
+        self.assertEqual(post(), 401)
+```
+
+- [ ] **Step 2: Run them to see them fail**
+
+Run: `./test-python.sh -p 'test_hosted_gateway.py'`
+Expected: FAIL: `AttributeError: module 'gateway' has no attribute 'Reporter'`.
+
+- [ ] **Step 3: Implement**
+
+Append to `hosted/gateway.py`:
+
+```python
+@dataclass
+class TokenState:
+    credential_id: str
+    salt_hex: str
+    hash_hex: str
+    job_id: str
+    persona: str
+    profile: str
+    model: str
+    expires_at: int
+    seq: int = 0
+    requests: int = 0
+    successes: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    first_limit: Optional[str] = None
+    first_failure: Optional[str] = None
+    cap_hit: Optional[str] = None
+    usage_missing: bool = False
+    revoked: bool = False
+
+    @classmethod
+    def from_row(cls, row: Mapping[str, Any]) -> "TokenState":
+        counts = row.get("counts") or {}
+        return cls(row["credential_id"], row["salt_hex"], row["hash_hex"], row["job_id"],
+                   row["persona"], row["profile"], row["model"], int(row["expires_at"]),
+                   seq=int(counts.get("seq", 0)), requests=int(counts.get("requests", 0)),
+                   successes=int(counts.get("successes", 0)),
+                   input_tokens=int(counts.get("input_tokens", 0)),
+                   output_tokens=int(counts.get("output_tokens", 0)),
+                   first_limit=counts.get("first_limit"),
+                   first_failure=counts.get("first_failure"),
+                   cap_hit=counts.get("cap_hit"),
+                   usage_missing=bool(counts.get("usage_missing", False)))
+
+
+class Reporter:
+    """Sends reports to the control plane in order, buffering while it is away.
+
+    Reports are deltas, so order matters: one thread, one FIFO. A report stays
+    at the head of the queue until acknowledged. What a gateway crash loses is
+    what is still queued, which the per-pair caps bound.
+    """
+
+    def __init__(self, call: Callable[..., Dict[str, Any]], retry_seconds: float = 1.0):
+        self._call = call
+        self._retry = retry_seconds
+        self._queue: Deque[Dict[str, Any]] = deque()
+        self._acked: Dict[str, int] = {}
+        self._cond = threading.Condition()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._stopping = False
+
+    def start(self) -> "Reporter":
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        with self._cond:
+            self._stopping = True
+            self._cond.notify_all()
+
+    def enqueue(self, report: Dict[str, Any]) -> None:
+        with self._cond:
+            self._queue.append(report)
+            self._cond.notify_all()
+
+    def pending(self, credential_id: str) -> int:
+        with self._cond:
+            return sum(1 for r in self._queue if r["credential_id"] == credential_id)
+
+    def acked(self, credential_id: str) -> int:
+        with self._cond:
+            return self._acked.get(credential_id, 0)
+
+    def flush(self, credential_id: str, timeout: float = FLUSH_SECONDS) -> int:
+        """Wait until nothing is queued for this token; return its last acknowledged seq."""
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while any(r["credential_id"] == credential_id for r in self._queue):
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                self._cond.wait(left)
+            return self._acked.get(credential_id, 0)
+
+    def _run(self) -> None:
+        while True:
+            with self._cond:
+                while not self._queue and not self._stopping:
+                    self._cond.wait()
+                if self._stopping:
+                    return
+                head = self._queue[0]
+            try:
+                reply = self._call("report", **head)
+                ok = reply.get("ack") == head["seq"]
+            except (OSError, gwproto.ProtocolError):
+                ok = False
+            with self._cond:
+                if ok:
+                    self._queue.popleft()
+                    self._acked[head["credential_id"]] = head["seq"]
+                    self._cond.notify_all()
+                    continue
+                self._cond.wait(self._retry)
+
+
+class Gateway:
+    """The provider route's state: routes, tokens, and the reporter."""
+
+    def __init__(self, env: Mapping[str, str], reporter: Reporter,
+                 upstreams: Mapping[str, str] = UPSTREAMS,
+                 clock: Callable[[], float] = time.time,
+                 log: Callable[[str], None] = lambda line: print(line, flush=True)):
+        self.env = env
+        self.reporter = reporter
+        self.upstreams = dict(upstreams)
+        self.clock = clock
+        self.log = log
+        self.ready = False
+        self.routes: Dict[str, Route] = {}
+        self.tokens: Dict[str, TokenState] = {}
+        self.lock = threading.Lock()
+
+    # -- the control plane's side (gateway.sock) --------------------------------
+    def handle_control(self, msg: Dict[str, Any]) -> Dict[str, Any]:
+        op = msg.get("op")
+        if op == "hello":
+            routes = {p["name"]: Route.from_profile(p, self.env, self.upstreams)
+                      for p in msg.get("profiles", [])}
+            tokens = {r["credential_id"]: TokenState.from_row(r) for r in msg.get("tokens", [])}
+            with self.lock:
+                self.routes, self.tokens, self.ready = routes, tokens, True
+            return {"ok": True, "tokens": len(tokens)}
+        if op == "add_token":
+            state = TokenState.from_row(msg["token"])
+            with self.lock:
+                self.tokens[state.credential_id] = state
+            return {"ok": True}
+        if op == "revoke":
+            with self.lock:
+                for cid in msg.get("credential_ids", []):
+                    if cid in self.tokens:
+                        self.tokens[cid].revoked = True
+            return {"ok": True}
+        if op == "flush":
+            return {"last_seq": self.reporter.flush(msg["credential_id"])}
+        return {"error": f"unknown op {op!r}"}
+
+    # -- the worker's side --------------------------------------------------------
+    def find(self, token: str) -> Optional[TokenState]:
+        cid = creds.credential_id_of(token)
+        with self.lock:
+            state = self.tokens.get(cid) if cid else None
+        if state is None or state.revoked or self.clock() >= state.expires_at:
+            return None
+        if not creds.verify_against(token, state.salt_hex, state.hash_hex):
+            return None
+        return state
+
+    def record(self, state: TokenState, kind: str, meter: Optional[UsageMeter] = None,
+               detail: str = "", cap: Optional[str] = None) -> None:
+        """Apply one response (or one refusal) to a token's record and report the change."""
+        route = self.routes.get(state.profile)
+        with self.lock:
+            delta = {"requests": 0, "successes": 0, "input_tokens": 0, "output_tokens": 0}
+            if kind != "cap":
+                state.requests += 1
+                delta["requests"] = 1
+            if meter is not None:
+                state.input_tokens += meter.input_tokens
+                state.output_tokens += meter.output_tokens
+                delta["input_tokens"], delta["output_tokens"] = meter.input_tokens, meter.output_tokens
+            report: Dict[str, Any] = {}
+            if kind == "success":
+                state.successes += 1
+                delta["successes"] = 1
+                if route is not None and route.tokens_unit and meter is not None \
+                        and not meter.saw_usage and not state.usage_missing:
+                    state.usage_missing = True
+                    report["usage_missing"] = True
+            elif kind == "limit" and state.first_limit is None:
+                state.first_limit = detail
+                report["first_limit"] = detail
+            elif kind == "failure" and state.first_failure is None:
+                state.first_failure = detail
+                report["first_failure"] = detail
+            elif kind == "cap" and state.cap_hit is None:
+                state.cap_hit = cap
+                report["cap_hit"] = cap
+            state.seq += 1
+            report.update(credential_id=state.credential_id, seq=state.seq, delta=delta)
+        if report.get("usage_missing"):
+            self.log(f"PAGE: profile {state.profile} reports tokens but a response for "
+                     f"{state.job_id}/{state.persona} carried no usage; that pair is failed closed")
+        self.reporter.enqueue(report)
+
+
+def _error_body(kind: str, message: str) -> bytes:
+    return json.dumps({"type": "error", "error": {"type": kind, "message": message}}).encode()
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    gateway: Gateway  # set on the subclass make_server builds
+    server_version = "claudebox-gateway"
+    sys_version = ""
+
+    def log_message(self, fmt, *args):  # no request lines with tokens in them
+        pass
+
+    def _send(self, status: int, body: bytes = b"", kind: str = "application/json") -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", kind)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def _refuse(self, status: int, kind: str, message: str) -> None:
+        self._send(status, _error_body(kind, f"claudebox gateway: {message}"))
+
+    def do_HEAD(self):
+        # Claude Code probes HEAD /api/hello at startup (spike S3). Answer it here
+        # without going upstream; nothing else is served to HEAD.
+        if urllib.parse.urlsplit(self.path).path == "/api/hello":
+            self._send(200)
+        else:
+            self._send(404)
+
+    def do_GET(self):
+        self._refuse(404, "not_found_error", "only POST /v1/messages and /v1/messages/count_tokens")
+
+    def do_POST(self):
+        gw = self.gateway
+        path = urllib.parse.urlsplit(self.path).path
+        if not gw.ready:
+            return self._refuse(503, "overloaded_error", "starting; no provider traffic yet")
+        if path not in ROUTES:
+            return self._refuse(404, "not_found_error",
+                                "only POST /v1/messages and /v1/messages/count_tokens")
+        auth = self.headers.get("Authorization", "")
+        token = auth[7:] if auth.startswith("Bearer ") else self.headers.get("x-api-key", "")
+        state = gw.find(token)
+        route = gw.routes.get(state.profile) if state else None
+        if state is None or route is None:
+            return self._refuse(401, "authentication_error", "unknown, expired or revoked token")
+        length = self.headers.get("Content-Length")
+        if length is None or not length.isdigit():
+            return self._refuse(411, "invalid_request_error", "a Content-Length is required")
+        if int(length) > BODY_MAX:
+            return self._refuse(413, "request_too_large", f"body over {BODY_MAX} bytes")
+        try:
+            body = json.loads(self.rfile.read(int(length)))
+            if not isinstance(body, dict):
+                raise ValueError
+        except ValueError:
+            return self._refuse(400, "invalid_request_error", "body is not a JSON object")
+
+        if state.usage_missing:
+            return self._refuse(400, "invalid_request_error",
+                                "this pair was failed closed: a response carried no usage")
+        if state.requests >= route.per_pair_requests:
+            gw.record(state, "cap", cap="requests")
+            return self._refuse(400, "invalid_request_error", "this pair reached its request cap")
+        body["model"] = state.model
+        if path == "/v1/messages":
+            ceiling = MAX_TOKENS_CEILING
+            if route.per_pair_tokens is not None:
+                remaining = route.per_pair_tokens - state.input_tokens - state.output_tokens
+                if remaining <= 0:
+                    gw.record(state, "cap", cap="tokens")
+                    return self._refuse(400, "invalid_request_error",
+                                        "this pair reached its token cap")
+                ceiling = remaining
+            requested = body.get("max_tokens")
+            if not isinstance(requested, int) or requested > ceiling:
+                body["max_tokens"] = ceiling
+        self._forward(state, route, path, json.dumps(body).encode("utf-8"))
+
+    def _forward(self, state: TokenState, route: Route, path: str, payload: bytes) -> None:
+        gw = self.gateway
+        target = urllib.parse.urlsplit(route.base_url)
+        query = urllib.parse.urlsplit(self.path).query
+        upstream_path = (target.path.rstrip("/") + path) + (f"?{query}" if query else "")
+        if target.scheme == "https":
+            conn = http.client.HTTPSConnection(target.hostname, target.port or 443,
+                                               timeout=600, context=ssl.create_default_context())
+        else:
+            conn = http.client.HTTPConnection(target.hostname, target.port or 80, timeout=600)
+        try:
+            conn.request("POST", upstream_path, body=payload,
+                         headers=upstream_headers(route, self.headers, len(payload)))
+            resp = conn.getresponse()
+        except (OSError, http.client.HTTPException, ssl.SSLError) as exc:
+            conn.close()
+            gw.record(state, "failure", detail=f"upstream transport: {type(exc).__name__}")
+            return self._refuse(502, "api_error", "the provider could not be reached")
+
+        meter = UsageMeter("text/event-stream" in (resp.getheader("Content-Type") or ""))
+        try:
+            self.send_response(resp.status)
+            for name in _PASS_DOWN:
+                value = resp.getheader(name)
+                if value is not None:
+                    self.send_header(name, value)
+            self.send_header("Connection", "close")
+            self.end_headers()
+            while True:
+                chunk = resp.read1(65536)
+                if not chunk:
+                    break
+                meter.feed(chunk)
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except OSError:
+            pass  # the worker went away mid-stream; count what was seen
+        finally:
+            conn.close()
+        meter.finish()
+        kind = classify(path, resp.status, meter)
+        detail = f"upstream {resp.status}" + (f" {meter.error_type}" if meter.error_type else "")
+        gw.record(state, kind, meter, detail=detail)
+
+
+def make_server(gateway: Gateway, host: str, port: int) -> http.server.ThreadingHTTPServer:
+    handler = type("BoundHandler", (Handler,), {"gateway": gateway})
+    server = http.server.ThreadingHTTPServer((host, port), handler)
+    server.daemon_threads = True
+    return server
+
+
+def main(env: Mapping[str, str] = os.environ) -> None:
+    """Run the gateway: GATEWAY_SECRET, GATEWAY_SOCKET, CONTROL_SOCKET, GATEWAY_LISTEN."""
+    secret = env["GATEWAY_SECRET"]
+    client = gwproto.Client(env["CONTROL_SOCKET"], secret)
+    reporter = Reporter(client.call).start()
+    gateway = Gateway(env, reporter)
+    control = gwproto.Server(env["GATEWAY_SOCKET"], secret, gateway.handle_control).start()
+    host, _, port = env.get("GATEWAY_LISTEN", "0.0.0.0:8090").rpartition(":")
+    server = make_server(gateway, host or "0.0.0.0", int(port))
+    bound_host, bound_port = server.server_address[:2]
+    print(f"gateway listening on {bound_host}:{bound_port}; waiting for the control plane's "
+          "hello", flush=True)
+    try:
+        server.serve_forever()
+    finally:
+        control.stop()
+        reporter.stop()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+- [ ] **Step 4: Run them to see them pass, then the whole suite**
+
+Run: `./test-python.sh -p 'test_hosted_gateway.py'`, then `./test-python.sh`
+Expected: PASS, 33 tests. The whole suite passes.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add hosted/gateway.py tests/test_hosted_gateway.py
+git commit -m "hosted: the gateway process, the author of every pair's provider outcome"
+```
+
+### Task 5: Documentation
+
+**Files:**
+- Modify: `CLAUDE.md` (a paragraph in "Hosted App libraries", after the 2a.1 paragraph)
+- Modify: `HISTORY.md` (one entry at the top of "Unreleased")
+
+**Interfaces:**
+- Consumes: Tasks 1–4.
+- Produces: nothing code depends on.
+
+- [ ] **Step 1: Describe the gateway**
+
+In `CLAUDE.md`'s "Hosted App libraries" subsection, after the paragraph about the 2a.1 libraries, add:
+
+```markdown
+Phase 2a.2 adds the gateway, the first hosted process. `gateway.py` is the worker's only route to a model provider. A worker's `claude` points `ANTHROPIC_BASE_URL` at it and presents a per-pair provider token. The gateway checks the token against rows the control plane handed it, overwrites the model, enforces the pair's request and token caps, swaps the token for the profile's real credential, and streams the response back unbuffered. It answers Claude Code's `HEAD /api/hello` itself, and refuses every path except `POST /v1/messages` and `/v1/messages/count_tokens`. It is the author of each pair's provider outcome: it counts successes, tokens, the first usage limit, the first failure and any cap hit, and reports each change to the control plane over a unix socket, numbered per token and buffered while the control plane is away. It serves nothing until the control plane's `hello` has handed it the live tokens and their committed counts, so a restart never resets a cap. `gwproto.py` is the socket protocol: line-delimited JSON with the per-deployment secret on every message in both directions. It serves `ollama`, `anthropic` (API key or OAuth token) and `custom` profiles. `cloudflare` and `workersai` follow in 2a.6. A hosted profile has no environment to infer from, so `deploy_config` gained `base_url` (required on `custom`) and `auth` (how the credential is presented).
+```
+
+- [ ] **Step 2: Add the history entry**
+
+At the top of "Unreleased" in `HISTORY.md`, add:
+
+```markdown
+* **Phase 2a.2 of the hosted GitHub App: the gateway.** The process a hosted worker reaches its model provider through, so no worker ever holds the provider credential. It checks each request's per-pair token, pins the model, enforces the pair's request and token caps, injects the real credential (an Anthropic API key or OAuth token, an Ollama key, or a custom upstream's bearer or `x-api-key`), and streams the response through unbuffered. It decides each pair's provider outcome from what it sees, and reports it to the control plane in order, buffering while the control plane is down. It serves nothing until the control plane has told it the live tokens and their counts so far. Deployment profiles gained `base_url` and `auth`, which a `custom` or OAuth-token profile needs. Local mode is unchanged.
+```
+
+- [ ] **Step 3: Run every suite**
+
+Run: `./test-python.sh && ./test-providers.sh && ./test-personas.sh && ./test-shim.sh && ./test-launcher.sh`
+Expected: all five pass.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add CLAUDE.md HISTORY.md
+git commit -m "docs: hosted phase 2a.2, the gateway"
+```
