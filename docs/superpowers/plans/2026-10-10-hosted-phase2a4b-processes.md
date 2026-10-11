@@ -33,10 +33,10 @@ The spec and the overview leave these open, and each one changes code. They are 
 
 1. **2a reviews in `auto` mode only.** A repo whose config asks for `trigger: requested` is shown as a config problem on its check runs ("arrives in phase 2b") rather than reviewed against its wishes.
 2. **The org file is `.github/claudebox.json` in `<owner>/.github`**, read at the default branch. A read that fails is "no org defaults". The org `.github` repo is never itself reviewed.
-3. **A poll per installation lists its repos.** A repo that is public is passed over, and one that turned public since the last poll is lost. A repo gone from the list is lost. An installation gone from `App.installations()`, or one carrying `suspended_at`, loses all its repos, and the control plane logs one `PAGE: installation N was uninstalled or suspended; M repo(s) stop being reviewed` for it: the spec pages this, and with no webhook receiver in 2a the poll is its only producer. Losing a repo ends its jobs (their started pairs `revoked`), calls 2a.4a's three deleters (`Outbox.drop_repo`, `Committer.forget_repo`, `CheckRuns.forget_repo`), and forgets its fingerprint cache. The jobs end with no scheduler lock held, since ending one calls into the committer, which calls `decider_for`, which takes that lock. After each poll, a sweep drops the outbox and withheld rows of any repo that no live installation's listing returned as private (one lost or made public while the control plane was down, which nothing in memory names). It keys on the listings, never on how far the poll's walk got before a drain stopped it, and runs only when every live installation's listing succeeded. A loss forgets the repo's last published config answer too, so a repo that comes back publishes its problem again. A completion in flight when its job ends commits nothing (2a.4a's `job_live`, wired to the job registry). Its rounds survive, as the spec's "Visibility" says ("Rounds and asks survive a public flip, since they hold no content"). A returning pair starts a fresh session at its next round, as one does after `MAX_PASSES_PER_SESSION` rotation. Its earlier rounds' findings are still on the PR, signed, and with no committed fingerprint its round line reads the local wording, which works from those comments.
-4. **Every non-fork candidate head gets a check run**, created once, whether or not anything is dispatched for it. The config follows the spec's fallback, which `repo_config.resolve` implements: an invalid repo file falls back to the org defaults, an invalid org file under a valid repo file is dropped, and only both invalid stops the review. The dropped file's problems show on each head's run as a notice beside a review that runs. A problem (both files invalid, `trigger: requested`, or a setting the deployment cannot serve) shows on every head's run and dispatches nothing, and the poll logs `PAGE: <repo>: not reviewed, because of a configuration problem` when a repo starts not being reviewed for one, and a plain line when it clears, so a problem held across polls pages once. The problem text is the repo's and stays on the check run, out of the log. A read of either file that fails is not a statement about the file: the repo is skipped for that poll and nothing is published. A head is published when its (problem, notice) differs from the one last set on it, a head with none included, so a new head shows a held problem, a fixed one clears without a push, and an unchanged answer costs no GitHub call. A pair at its round cap is painted `round-cap-unread` once on a head no job will run at, or a capped plan PR's new head would read "Queued" for good. It is never painted `round-cap`, which counts as clean: a green check on a commit no persona read would claim a review that did not happen.
+3. **A poll per installation lists its repos.** A repo that is public is passed over, and one that turned public since the last poll is lost. A repo gone from the list is lost. An installation gone from `App.installations()`, or one carrying `suspended_at`, loses all its repos, and the control plane logs one `PAGE: installation N was uninstalled or suspended; M repo(s) stop being reviewed` for it: the spec pages this, and with no webhook receiver in 2a the poll is its only producer. Losing a repo ends its jobs (their started pairs `revoked`), calls 2a.4a's three deleters (`Outbox.drop_repo`, `Committer.forget_repo`, `CheckRuns.forget_repo`), and forgets its fingerprint cache. The jobs end with no scheduler lock held, since ending one calls into the committer, which calls `decider_for`, which takes that lock. After each poll, a sweep drops the outbox and withheld rows of any repo that no live installation's listing returned as private (one lost or made public while the control plane was down, which nothing in memory names). It keys on the listings, never on how far the poll's walk got before a drain stopped it, and runs only when every live installation's listing succeeded. An installation gone while the control plane was down is never in memory, so `poll_once` cannot page it: the sweep finds it as an `installation_id` on outbox rows that is not live, logs the same `PAGE: installation N was uninstalled or suspended while the control plane was down; M repo(s) stop being reviewed`, and, for a repo listed again under a new installation, drops only the old installation's queued items (`Outbox.drop_installation`), which no drainer carries. Withheld rows carry no installation, so they go with the repo or stay with it. A loss forgets the repo's last published config answer too, so a repo that comes back publishes its problem again. A completion in flight when its job ends commits nothing (2a.4a's `job_live`, wired to the job registry). Its rounds survive, as the spec's "Visibility" says ("Rounds and asks survive a public flip, since they hold no content"). A returning pair starts a fresh session at its next round, as one does after `MAX_PASSES_PER_SESSION` rotation. Its earlier rounds' findings are still on the PR, signed, and with no committed fingerprint its round line reads the local wording, which works from those comments.
+4. **Every non-fork candidate head gets a check run**, created once, whether or not anything is dispatched for it. The config follows the spec's fallback, which `repo_config.resolve` implements: an invalid repo file falls back to the org defaults, an invalid org file under a valid repo file is dropped, and only both invalid stops the review. The dropped file's problems show on each head's run as a notice beside a review that runs. A problem (both files invalid, `trigger: requested`, or a setting the deployment cannot serve) shows on every head's run and dispatches nothing, and the poll logs `PAGE: <repo>: not reviewed, because of a configuration problem` when a repo starts not being reviewed for one, and a plain line when it clears, so a problem held across polls pages once. The problem text is the repo's and stays on the check run, out of the log. A read of either file that fails is not a statement about the file: the repo is skipped for that poll and nothing is published. A head is published when its (problem, notice) differs from the one last set on it, a head with none included, so a new head shows a held problem, a fixed one clears without a push, and an unchanged answer costs no GitHub call. A pair at its round cap is painted `round-cap-unread` once on a head no job will run at, or a capped plan PR's new head would read "Queued" for good. The paint needs no lookup, so it happens above the gate a full deployment closes, along with the check run and the config answer. It is never painted `round-cap`, which counts as clean: a green check on a commit no persona read would claim a review that did not happen.
 5. **The change gate is local mode's**, `signals.Tracker`, one per repo since a Tracker keys by PR number. A PR's fingerprint is its head, its mode and the newest unsigned comment, and comments, reviews and the 30 newest inline comments are read only when the PR's `updated_at` has moved. A failed lookup is cached against that `updated_at` too, so an outage costs one lookup per change, and the PR gates on `updated_at` through `signals.degraded`. A PR younger than the deployment's `settle_seconds` waits.
-6. **Dispatch bounds.** A PR with a live job is not dispatched again. A pair parked by the commit point waits while its siblings run, and a parked profile dispatches nothing. `max_concurrent_jobs` counts jobs, and a profile's `concurrency` counts pairs in flight (dispatched and not completed) across its jobs. A group larger than the room left dispatches in parts, phase order first: the pairs left out hold no session, so the gate runs them on a later poll once the job has ended, and a 7-persona plan group under a bound of 4 is never starved. A poll stops dispatching at the first refusal by `max_concurrent_jobs` and keeps walking: every later head and repo still gets its check run and its config answer (decision 4), and only the dispatch stages, which cost lookups, are skipped. The poll logs when the cap starts binding for an installation and when it stops, not on every poll.
+6. **Dispatch bounds.** A PR with a live job is not dispatched again. A pair parked by the commit point waits while its siblings run, and a parked profile dispatches nothing. `max_concurrent_jobs` counts jobs, and a profile's `concurrency` counts pairs in flight (dispatched and not completed) across its jobs. A group larger than the room left dispatches in parts, phase order first: the pairs left out hold no session, so the gate runs them on a later poll once the job has ended, and a 7-persona plan group under a bound of 4 is never starved. The pairs left for a later part are painted `queued` at dispatch with the rest, so the head cannot conclude `success` on the first part alone. A poll stops dispatching at the first refusal by `max_concurrent_jobs` and keeps walking: every later head and repo still gets its check run and its config answer (decision 4), and only the dispatch stages, which cost lookups, are skipped. The poll logs when the cap starts binding for an installation and when it stops, not on every poll.
 7. **Visibility is checked again at dispatch**, uncached, and a check that errors dispatches nothing.
 8. **A job's material is built once, at dispatch.** The prompts are `build_hosted`'s, with `WORKTREE_STANZA` exactly when `shared_worktree` is true, and `shared_worktree` is true when the job has more than one pair, whatever their phases or the cap: a phase-1 pass that writes to the clone is read by phase 2, and one-at-a-time passes read each other's writes the same way (PR #20 review). A pair with a session gets the followup prompt. A pair's round line names the head of its committed fingerprint (`Committer.last_reviewed_head`). When that head is no longer an ancestor of the new one, the round line is round 1's and the check run says the branch was rewritten. An ancestry check that errors counts as a rewrite, since a whole review beats a guess.
 9. **The reap ends a job** when runnerd lists its worker as gone or exited, when its 55-minute deadline has passed, or when its bootstrap token expired unused. Ending a job revokes its credentials, tells the gateway to revoke its unfinished pairs' tokens, marks each started pair `revoked` (`Committer.revoke`, and `checkruns.REVOKED` on the run), owes each unstarted pair, stops its worker, forgets its outbox keys and `settled` entries, and writes `ended_at` and `end_reason` on its row.
@@ -45,7 +45,7 @@ The spec and the overview leave these open, and each one changes code. They are 
 12. **The gateway link opens one connection per call** and waits up to 60 seconds, since a flush may be held for 50. A reply of "hello first" is answered with a `hello` and the call is sent again once. A `hello` carries every live provider token whose job is in memory, with that job's model and route and the token's committed counts. A live token with no job is revoked as the `hello` is built.
 13. **`SIGTERM` drains.** The control plane halts the scheduler's walk and waits for one already in progress to finish, so every job it dispatched is counted, then reaps until no job is left or `CLAUDEBOX_DRAIN_SECONDS` (default 600) has passed, and ends what is left as "the control plane is stopping". The supervisor gives it the deadline plus 15 seconds, then stops the gateway and runnerd and kills whatever is left. Reports a gateway sends after the control plane has gone concern revoked tokens only, and 2a has no budgets, so none of them is needed.
 14. **`/healthz` is its own server on port 8081.** It answers 200 with the state (`waiting for lock`, `not configured`, `serving` or `draining`) and, for `not configured`, its cause and the command that clears it (no App credentials, or no deployment config in the records store yet), and 503 when the poll or drain loop has died. The log names the cause once, on the poll it changes.
-15. **The supervisor's secrets split.** The control plane's are a closed list (`GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET`, `CLAUDEBOX_DEPLOYMENT_KEY`). A provider credential is a variable `CLAUDEBOX_CREDENTIALS` names (comma-separated), and nothing else. The deployment file names them too, but it lives in the records store, which only the control plane can read, so the operator's setup file repeats the list for the supervisor; 2a.5's `hosted deploy` writes it from the deployment file. A list naming a control-plane secret, a supervisor setting, a process variable or a reserved name stops the supervisor at startup, an unset list warns that the gateway holds no credentials, and a named credential the platform lacks is warned about. The gateway gets the provider credentials, the control plane gets each as a candidate `CLAUDEBOX_SCAN_<NAME>`, and runnerd gets none. The scanner uses only the candidates the applied deployment names (its profiles' credentials and `VOYAGE_API_KEY`), rebuilt when the deployment changes, so a platform's own variables (`FLY_REGION`, `K_SERVICE`) are never treated as secrets. A credential the deployment names that the platform lacks is warned about. The secrets between processes (`GATEWAY_SECRET`, `RUNNER_SECRET`) are random per container start. They, the socket paths, the gateway's listener and `CLAUDEBOX_DATA` are reserved: never a credential, and never taken from the platform. The control plane's own settings (`PERSONA_DIR`, `CHANNEL_LISTEN`, `HEALTH_LISTEN`) are forwarded to it alone. Nothing else from the platform environment crosses. A malformed App key or deployment key is named in the log, and the instance is not configured.
+15. **The supervisor's secrets split.** The control plane's are a closed list (`GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET`, `CLAUDEBOX_DEPLOYMENT_KEY`). A provider credential is a variable `CLAUDEBOX_CREDENTIALS` names (comma-separated), plus `VOYAGE_API_KEY` whenever the platform holds it: the spec gives the gateway "the provider and Voyage credentials", and the deployment file, from which the list is written, names only its profiles' credentials. The deployment file names them too, but it lives in the records store, which only the control plane can read, so the operator's setup file repeats the list for the supervisor; 2a.5's `hosted deploy` writes it from the deployment file. A list naming a control-plane secret, a supervisor setting, a process variable or a reserved name stops the supervisor at startup, an unset list warns that the gateway holds no credentials, and a named credential the platform lacks is warned about. The gateway gets the provider credentials, the control plane gets each as a candidate `CLAUDEBOX_SCAN_<NAME>`, and runnerd gets none. The scanner uses only the candidates the applied deployment names (its profiles' credentials and `VOYAGE_API_KEY`), rebuilt when the deployment changes, so a platform's own variables (`FLY_REGION`, `K_SERVICE`) are never treated as secrets. A credential the deployment names that `CLAUDEBOX_CREDENTIALS` did not hand the control plane is warned about, in those words, with the fix (name it there and restart): the control plane cannot see the platform environment, only the list. The secrets between processes (`GATEWAY_SECRET`, `RUNNER_SECRET`) are random per container start. They, the socket paths, the gateway's listener and `CLAUDEBOX_DATA` are reserved: never a credential, and never taken from the platform. The control plane's own settings (`PERSONA_DIR`, `CHANNEL_LISTEN`, `HEALTH_LISTEN`) are forwarded to it alone. Nothing else from the platform environment crosses. A malformed App key or deployment key is named in the log, and the instance is not configured.
 16. **The supervisor drops to uid 9004, keeping only `CAP_KILL`**, as the spec says ("then drops to an unprivileged uid itself"). It starts as root with `SETUID`, `SETGID` and `KILL`, starts its three children, then clears its groups, sets `PR_SET_KEEPCAPS`, changes gid and uid, and narrows its permitted and effective sets to `KILL` with `capset`. `CAP_KILL` is what lets it signal the children under their own uids during the drain. It can never become root again, and as uid 9004 in no group it can open neither the process sockets nor the Docker socket that shares its container (a root PID 1 could, as the owner of a `root:docker` socket).
 17. **One process exiting stops the container, and the restarts are bounded.** The supervisor logs a `PAGE:` line naming the process, stops the other two in the drain's order and exits 1. Every restart re-reviews every open PR (overview decision 1), so a child that dies on every start would re-review the whole installation each time Docker brought it back. `compose.json` therefore restarts on failure at most three times, and then the container stays down for a person. The cost is that a host reboot does not bring the control plane back by itself: `hosted deploy` (2a.5) starts it.
 18. **The image is `debian:bookworm-slim`** with `python3` and `python3-cryptography`, and the Docker CLI copied from `docker:27.3.1-cli`. Its code is root-owned. The three users and the shared group have pinned ids (9001 to 9003, and 9000), because `/data` is a volume that keeps its owner across rebuilds. `/data` is `control`'s, mode 0700. Each socket has its own directory, `/run/claudebox/<user>`, owned by the process that binds it, in the shared group, mode 2750: a peer can connect, and can neither unlink the socket nor bind its own in its place. The build runs `test_hosted_crypto.py` with no pipe between the run and the layer's status, so a failing test fails the build and prints its output, and a skip fails it too.
@@ -494,7 +494,11 @@ class GateTest(Base):
         self.assertEqual(self.poll(), 1)
         job = self.jobs.all()[0]
         self.assertEqual([p.persona for p in job.pairs], ["red_team"])   # Sage is phase 2
+        # PR #22 review: Sage, left for a later part, is painted queued, so the
+        # head cannot go green on red_team's review alone.
+        self.assertEqual(self.runs.view("acme/web", HEAD, "sage").state, checkruns.QUEUED)
         self.finish(job)
+        self.assertNotEqual(self.inst.updated[-1][4], "success")
         self.assertEqual(self.poll(), 1)
         job = self.jobs.all()[0]
         self.assertEqual([p.persona for p in job.pairs], ["sage"])
@@ -590,6 +594,22 @@ class GateTest(Base):
         before = len(self.inst.updated)
         self.poll()
         self.assertEqual(len(self.inst.updated), before)   # painted once
+
+    def test_a_capped_head_is_painted_even_past_the_job_cap(self):
+        # PR #22 review: the paint sat below the cap's gate, so with the cap
+        # binding a capped plan PR's new head read "Queued" for good.
+        self.inst.prs = [pr(2, labels=("plan",))]
+        self.inst.files[("acme/web", ".github/claudebox.json")] = json.dumps(
+            {"profile": "ollama", "code": {"personas": "sage"}, "plan": {"personas": "sage"},
+             "rounds": {"cap": 1}}).encode()
+        self.poll()
+        self.finish(self.jobs.all()[0])
+        self.deploy = deploy(max_concurrent_jobs=1)
+        self.inst.prs = [pr(1, head="1" * 40), pr(3, head="3" * 40),
+                         pr(2, head=NEW, labels=("plan",), updated="2025-10-09T08:10:00Z")]
+        self.assertEqual(self.poll(), 1)                # PR 1 fills the cap, PR 3 meets it
+        self.assertTrue(self.sched._full)
+        self.assertEqual(self.runs.view("acme/web", NEW, "sage").state, checkruns.CAP_UNREAD)
 
     def test_a_parked_profile_dispatches_nothing(self):
         from commit import _Profile
@@ -857,6 +877,23 @@ class AccessTest(Base):
         self.assertEqual(self.box.queued("gone/repo", HEAD), 0)
         self.assertEqual(self.records.conn().execute(
             "SELECT COUNT(*) FROM withheld WHERE repo = 'gone/repo'").fetchone()[0], 0)
+        # PR #22 review: the installation went while this process was down, so
+        # poll_once never knew it; the sweep pages it from the rows' id.
+        self.assertEqual([l for l in self.logs if l.startswith("PAGE:")],
+                         ["PAGE: installation 3 was uninstalled or suspended while the control "
+                          "plane was down; 1 repo(s) stop being reviewed"])
+
+    def test_a_repo_reinstalled_under_a_new_installation_loses_only_the_old_rows(self):
+        # PR #22 review: keyed on the repo alone, the old installation's rows
+        # were neither drained (no drainer has its id) nor swept.
+        from outbox import JobContext
+        self.box.accept(JobContext("old", 3, "acme/web", 1, HEAD), "sage", 1, "old finding")
+        self.poll()
+        self.box.accept(JobContext("new", 7, "acme/web", 1, HEAD), "sme", 1, "new finding")
+        self.sched.sweep_orphans({7})
+        self.assertEqual([tuple(r) for r in self.records.conn().execute(
+            "SELECT installation_id, body FROM outbox")], [(7, "new finding")])
+        self.assertTrue(any(l.startswith("PAGE: installation 3 ") for l in self.logs))
 
     def test_a_listed_repo_the_walk_did_not_reach_keeps_its_rows(self):
         # PR #22 review: a drain stops the walk, and the sweep must key on the
@@ -982,7 +1019,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import checkruns
 import creds as creds_mod
@@ -1207,22 +1244,15 @@ class Scheduler:
             if self.check_runs.config_answer(full, head) != answer:
                 self.check_runs.set_config_problem(full, head, problem, notice)
                 self._publish(full, head)
-            if problem or self._full:
-                # A full deployment stops the dispatch, never the walk: every
-                # head past the cap still gets its run and its config answer
-                # (decision 4), and the stages below cost lookups.
-                continue
-            if any(j.repo == full and j.pr == n for j in self.jobs.all()):
-                continue
-            if signals_mod.is_settling(pr.get("updated_at") or "", deploy.settle_seconds, now):
+            if problem:
                 continue
             decider = self._runtime(full, cfg, deploy)
-            signal = self._signal(inst, full, n, head, mode, pr.get("updated_at") or "")
             group = decider.build_groups([(n, mode)])[0]
             # A pair at its round cap will not run at this head or any later
             # one, so nothing else would ever set its view: it is painted here,
             # once, or a capped plan PR's new head would read "Queued" for good.
             # It is painted as unread, never as reviewed: no pass read this commit.
+            # Above the cap's gate, since it needs no lookup (PR #22 review).
             capped = [p for p in group.pairs if decider.capped(p)
                       and self.check_runs.view(full, head, p.persona) is None]
             for p in capped:
@@ -1230,6 +1260,17 @@ class Scheduler:
                                          checkruns.PairView(checkruns.CAP_UNREAD))
             if capped:
                 self._publish(full, head)
+            if self._full:
+                # A full deployment stops the dispatch, never the walk: every
+                # head past the cap still gets its run, its config answer and
+                # its round-cap paint (decision 4), and the stages below cost
+                # lookups.
+                continue
+            if any(j.repo == full and j.pr == n for j in self.jobs.all()):
+                continue
+            if signals_mod.is_settling(pr.get("updated_at") or "", deploy.settle_seconds, now):
+                continue
+            signal = self._signal(inst, full, n, head, mode, pr.get("updated_at") or "")
             pairs = [p for p in decider.pairs_to_run(group, signal)
                      if self.committer.parked(full, p, head) is None]
             if not pairs:
@@ -1249,9 +1290,10 @@ class Scheduler:
             # first, so a 7-persona plan group under a bound of 4 is not
             # starved: the pairs left out hold no session, so the gate runs
             # them on a later poll, once this job has ended (PR #22 review).
-            pairs = sorted(pairs, key=decider.phase_of)[:room]
+            ordered = sorted(pairs, key=decider.phase_of)
+            pairs, waiting = ordered[:room], ordered[room:]
             if self.dispatch(inst, installation_id, info, cfg, model, decider, n, head, mode,
-                             pairs, signal):
+                             pairs, signal, waiting=waiting):
                 dispatched += 1
         return dispatched
 
@@ -1279,7 +1321,7 @@ class Scheduler:
 
     # -- dispatch ----------------------------------------------------------------
     def dispatch(self, inst, installation_id, info, cfg, model, decider, n, head, mode,
-                 pairs: List[Pair], signal) -> bool:
+                 pairs: List[Pair], signal, waiting: Sequence[Pair] = ()) -> bool:
         full = info["full_name"]
         try:
             fresh = inst.repo(full)
@@ -1326,7 +1368,10 @@ class Scheduler:
                       (job_id, installation_id, full, n, head, mode, profile.name, model, now))
         self.jobs.add(job)
         boot = self.creds.mint("bootstrap", job_id, creds_mod.BOOTSTRAP_TTL)
-        for p in pairs:
+        # The pairs a split group left for a later part are painted queued too,
+        # or the head could conclude `success` on the first part alone while
+        # they have not read it (PR #22 review).
+        for p in list(pairs) + list(waiting):
             self.check_runs.set_pair(full, head, p.persona, checkruns.PairView(checkruns.QUEUED),
                                      rewritten=rewritten_any)
         self._publish(full, head)
@@ -1429,7 +1474,21 @@ class Scheduler:
             return 0
         known = set().union(*(self.listings.get(i, set()) for i in live))
         conn = self.records.conn()
-        rows = {r[0] for r in conn.execute("SELECT DISTINCT repo FROM outbox")}
+        queued = conn.execute("SELECT DISTINCT installation_id, repo FROM outbox").fetchall()
+        # An installation gone while this process was down is never in
+        # `installation_of`, so poll_once cannot page it: its outbox rows
+        # carry its id, and this is where it is found (PR #22 review).
+        gone = sorted({i for i, _ in queued if i not in live})
+        for inst_id in gone:
+            repos = sorted({r for i, r in queued if i == inst_id})
+            self.log(f"PAGE: installation {inst_id} was uninstalled or suspended while the "
+                     f"control plane was down; {len(repos)} repo(s) stop being reviewed")
+            for repo in repos:
+                if repo in known:
+                    # Listed again under a new installation: only the old
+                    # installation's rows go, since no drainer carries its id.
+                    self.outbox.drop_installation(inst_id, repo, "its installation is gone")
+        rows = {r for _, r in queued}
         rows |= {r[0] for r in conn.execute("SELECT DISTINCT repo FROM withheld")}
         orphans = sorted(rows - known)
         for repo in orphans:
@@ -1455,7 +1514,7 @@ class _Snapshot:
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_scheduler.py'`, then `./test-python.sh`
-Expected: PASS, 52 tests. The whole suite passes.
+Expected: PASS, 54 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
@@ -1666,7 +1725,10 @@ class StartupTest(Base):
         doc["profiles"]["ollama"]["credential"] = "MISSING_KEY"
         self.apply(doc)
         self.control.deploy()
-        self.assertTrue(any("MISSING_KEY" in l and "does not hold" in l for l in self.logs))
+        # PR #22 review: the control plane cannot see the platform; it says
+        # what it saw and what to edit.
+        self.assertTrue(any("MISSING_KEY" in l and "CLAUDEBOX_CREDENTIALS did not hand" in l
+                            and "restart the container" in l for l in self.logs))
 
     def test_not_configured_names_its_cause_once(self):
         self.control.take_lock()
@@ -2098,8 +2160,11 @@ class ControlPlane:
             self.log(f"WARN: secret {name} is shorter than the scan's minimum; findings are not "
                      f"checked for it")
         for name in sorted(n for n in names - set(self._candidates) if n != "VOYAGE_API_KEY"):
-            self.log(f"WARN: the deployment names credential {name}, which the platform "
-                     f"environment does not hold; its profile's tokens will be refused")
+            # What this process saw: the supervisor did not hand it over. The
+            # platform may hold it; only the list decides (PR #22 review).
+            self.log(f"WARN: the deployment names credential {name}, which CLAUDEBOX_CREDENTIALS "
+                     f"did not hand this process; name it there and restart the container, or "
+                     f"its profile's tokens will be refused")
         self.outbox.scanner = scanner
 
     def _not_configured(self, reason: str) -> None:
@@ -2456,7 +2521,7 @@ PLATFORM = {
     "OLLAMA_API_KEY": "olk-secret", "ANTHROPIC_API_KEY": "sk-ant-x", "VOYAGE_API_KEY": "vk",
     "WORKER_IMAGE": "claudebox-worker:1", "PATH": "/x", "HOSTNAME": "h", "LC_ALL": "C",
     "lowercase": "nope", "CLAUDEBOX_CHANNEL_URL": "http://cb:8080",
-    "CLAUDEBOX_CREDENTIALS": "OLLAMA_API_KEY, ANTHROPIC_API_KEY,VOYAGE_API_KEY",
+    "CLAUDEBOX_CREDENTIALS": "OLLAMA_API_KEY, ANTHROPIC_API_KEY",
     # What platforms inject. Credential-shaped, and never a provider credential.
     "FLY_API_TOKEN": "fly-token", "FLY_REGION": "iad", "K_SERVICE": "svc",
     "DATABASE_URL": "postgres://u:p@db/x", "KUBERNETES_SERVICE_HOST": "10.0.0.1",
@@ -2534,9 +2599,18 @@ class EnvSplitTest(unittest.TestCase):
                 self.assertNotIn(name, env)
                 self.assertNotIn("CLAUDEBOX_SCAN_" + name, env)
 
-    def test_with_no_list_the_gateway_holds_no_credential(self):
+    def test_with_no_list_the_gateway_holds_only_voyage(self):
         env = {k: v for k, v in PLATFORM.items() if k != "CLAUDEBOX_CREDENTIALS"}
-        self.assertEqual(provider_secrets(env), {})
+        self.assertEqual(provider_secrets(env), {"VOYAGE_API_KEY": "vk"})
+
+    def test_voyage_crosses_without_being_listed(self):
+        # PR #22 review: the list comes from the deployment file, which names
+        # only profile credentials, so Voyage's fixed name is never on it.
+        self.assertNotIn("VOYAGE_API_KEY", PLATFORM["CLAUDEBOX_CREDENTIALS"])
+        self.assertEqual(self.envs["gateway"]["VOYAGE_API_KEY"], "vk")
+        self.assertEqual(self.envs["control"]["CLAUDEBOX_SCAN_VOYAGE_API_KEY"], "vk")
+        env = {k: v for k, v in PLATFORM.items() if k != "VOYAGE_API_KEY"}
+        self.assertNotIn("VOYAGE_API_KEY", provider_secrets(env))
 
     def test_the_list_cannot_name_a_control_secret_or_a_supervisor_value(self):
         for name in ("GITHUB_APP_PRIVATE_KEY", "CLAUDEBOX_DEPLOYMENT_KEY", "GATEWAY_SECRET",
@@ -2808,8 +2882,16 @@ def credential_names(env: Mapping[str, str]) -> List[str]:
     return names
 
 
+# The spec gives the gateway "the provider and Voyage credentials". The
+# deployment file names only its profiles' credentials, so the list 2a.5
+# writes from it never holds Voyage's: it has one fixed name, and crosses
+# whenever the platform holds it (PR #22 review).
+VOYAGE = "VOYAGE_API_KEY"
+
+
 def provider_secrets(env: Mapping[str, str]) -> Dict[str, str]:
-    return {n: env[n] for n in credential_names(env) if env.get(n)}
+    names = credential_names(env) + ([VOYAGE] if env.get(VOYAGE) else [])
+    return {n: env[n] for n in names if env.get(n)}
 
 
 def split_env(env: Mapping[str, str], gateway_secret: str, runner_secret: str) -> Dict[str, Dict[str, str]]:
@@ -2960,7 +3042,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_supervisor.py'`, then `./test-python.sh`
-Expected: PASS, 20 tests. The whole suite passes.
+Expected: PASS, 21 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
