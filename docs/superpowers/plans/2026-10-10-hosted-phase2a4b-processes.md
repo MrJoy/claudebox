@@ -47,9 +47,9 @@ The spec and the overview leave these open, and each one changes code. They are 
 14. **`/healthz` is its own server on port 8081.** It answers 200 with the state (`waiting for lock`, `not configured`, `serving` or `draining`), and 503 when the poll or drain loop has died.
 15. **The supervisor's secrets split.** The control plane's are a closed list (`GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET`, `CLAUDEBOX_DEPLOYMENT_KEY`). A provider credential is anything else in the platform environment that is not a supervisor setting or an ordinary process variable, because the deployment file that names them lives in the records store, which only the control plane can read. The gateway gets the provider credentials, the control plane gets each as `CLAUDEBOX_SCAN_<NAME>` for the scanner, and runnerd gets none. The secrets between processes (`GATEWAY_SECRET`, `RUNNER_SECRET`) are random per container start. Nothing else from the platform environment crosses.
 16. **The supervisor stays root, with only `SETUID`, `SETGID` and `KILL`.** The spec says it "then drops to an unprivileged uid itself". A process that changes uid can no longer signal processes under other uids, and the drain depends on signalling the control plane, so it does not drop. It parses no input, opens no socket, and runs nothing after its three children start.
-17. **One process exiting stops the container.** The supervisor stops the other two in the drain's order and exits 1, for the platform's restart policy.
+17. **One process exiting stops the container, and the restarts are bounded.** The supervisor logs a `PAGE:` line naming the process, stops the other two in the drain's order and exits 1. Every restart re-reviews every open PR (overview decision 1), so a child that dies on every start would re-review the whole installation each time Docker brought it back. `compose.json` therefore restarts on failure at most three times, and then the container stays down for a person. The cost is that a host reboot does not bring the control plane back by itself: `hosted deploy` (2a.5) starts it.
 18. **The image is `debian:bookworm-slim`** with `python3` and `python3-cryptography`, and the Docker CLI copied from `docker:27.3.1-cli`. Its code is root-owned. `/data` is `control`'s, mode 0700. The sockets live in `/run/claudebox`, owned by `root:claudebox` with mode 2770, so each socket takes the shared group. The build runs `test_hosted_crypto.py` and fails if any test skips.
-19. **`hosted/compose.json`** runs the container with `cap_drop: ALL` and the supervisor's three capabilities, `no-new-privileges`, a named volume at `/data`, the Docker socket for runnerd, a `claudebox` network the workers join, a 10-minute stop grace period, and only `/healthz` published, on loopback. The worker image is built by `docker compose --profile build build`.
+19. **`hosted/compose.json`** runs the container with `cap_drop: ALL` and the supervisor's three capabilities, `no-new-privileges`, a named volume at `/data`, the Docker socket for runnerd, `restart: on-failure:3` (decision 17), a `claudebox` network the workers join, an 11-minute stop grace period (the drain's 600 seconds plus both 15-second graces fit inside it), and only `/healthz` published, on loopback. The worker image is built by `docker compose --profile build build`.
 20. **The App key may arrive on one line**, with its newlines written as the two characters `\n`, because `docker run --env-file` holds one line per variable. Only that pair is translated, and only in a value with no real newline.
 21. **Phase 1 finding F5:** `plan.label` refuses any whitespace inside the label other than a plain space, in the loader and in the schema's pattern. **F6:** an empty persona selector in a repo file is reported against its key (`code.personas` or `plan.personas`), never as an environment variable to unset.
 22. **The `rounds.cap` default stays 4.** The founder kept 4 for Phase 1 and recorded an objection. This plan builds a `Decider` per repo from the repo's `rounds.cap`, so the default becomes the hosted default here. The founder rules on it in this run's Phase 1.
@@ -61,6 +61,7 @@ The spec and the overview leave these open, and each one changes code. They are 
 - **A gateway that restarted alone.** Expected: the next call gets "hello first", the control plane sends a `hello` with the live tokens, and the call goes through. Pinned in Task 3.
 - **A worker that never fetches its job.** Expected: the job ends when its bootstrap token expires, and its pairs stay owed. Pinned in Task 2.
 - **The gateway reading the App key.** Expected: impossible, since the gateway's environment never holds it. Pinned in Task 4.
+- **A secrets file committed by accident.** Expected: `hosted/claudebox.env` is in both `.gitignore` and `.dockerignore`. Pinned in Task 5.
 - **A stored deployment config that will not load.** Expected: the last good one keeps serving, with a warning. Pinned in Task 3.
 
 ## Not run here
@@ -1969,6 +1970,15 @@ class SupervisorTest(unittest.TestCase):
         self.assertIn(("control", signal.SIGTERM), self.signals)
         self.assertNotIn(("gateway", signal.SIGTERM), self.signals)
 
+    def test_a_child_exiting_pages(self):
+        logs = []
+        self.sup.log = logs.append
+        self.sup.start()
+        self.procs["runnerd"].rc = 1
+        self.sup.start = lambda: None
+        self.sup.run()
+        self.assertTrue(any(l.startswith("PAGE: runnerd exited") for l in logs))
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -2139,7 +2149,8 @@ class Supervisor:
                 return 0
             gone = self.exited()
             if gone is not None:
-                self.log(f"{gone} exited with status {self.procs[gone].poll()}; stopping the rest")
+                self.log(f"PAGE: {gone} exited with status {self.procs[gone].poll()}; stopping "
+                         f"the rest")
                 self.stop()
                 return 1
             self.sleep(0.5)
@@ -2164,7 +2175,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_supervisor.py'`, then `./test-python.sh`
-Expected: PASS, 11 tests. The whole suite passes.
+Expected: PASS, 12 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
@@ -2177,7 +2188,7 @@ git commit -m "hosted: the supervisor, three uids and split secrets"
 
 **Files:**
 - Create: `hosted/Dockerfile`, `hosted/compose.json`
-- Modify: `.dockerignore`
+- Modify: `.dockerignore`, `.gitignore`
 - Test: `tests/test_hosted_image.py`
 
 **Interfaces:**
@@ -2220,9 +2231,17 @@ class ComposeTest(unittest.TestCase):
         self.assertEqual(sorted(self.svc["cap_add"]), ["KILL", "SETGID", "SETUID"])
         self.assertIn("no-new-privileges:true", self.svc["security_opt"])
 
-    def test_the_grace_period_covers_the_drain_deadline(self):
+    def test_the_grace_period_covers_the_whole_ordered_stop(self):
+        # The control plane's drain plus its grace, then the other two's grace,
+        # all before the platform's SIGKILL (PR #22 review).
         m = re.fullmatch(r"(\d+)m", self.svc["stop_grace_period"])
-        self.assertGreaterEqual(int(m.group(1)) * 60, control.DRAIN_SECONDS)
+        self.assertGreater(int(m.group(1)) * 60,
+                           control.DRAIN_SECONDS + 2 * supervisor.GRACE_SECONDS)
+
+    def test_a_crash_loop_stops_rather_than_re_reviewing_every_minute(self):
+        # Every restart re-reviews every open PR (overview decision 1), so the
+        # restarts are bounded (PR #22 review).
+        self.assertRegex(self.svc["restart"], r"^on-failure:\d+$")
 
     def test_data_is_a_volume_and_runnerd_has_the_docker_socket(self):
         self.assertIn("claudebox-data:/data", self.svc["volumes"])
@@ -2265,6 +2284,9 @@ class DockerfileTest(unittest.TestCase):
         self.assertIn("!tests/_path.py", ignore)
         self.assertIn("!tests/test_hosted_crypto.py", ignore)
         self.assertIn("hosted/claudebox.env", ignore)
+
+    def test_the_secrets_file_is_never_committed(self):
+        self.assertIn("hosted/claudebox.env", read(".gitignore").splitlines())
 
 
 if __name__ == "__main__":
@@ -2352,8 +2374,8 @@ ENTRYPOINT ["python3", "/opt/claudebox/hosted/supervisor.py"]
       "security_opt": ["no-new-privileges:true"],
       "pids_limit": 512,
       "mem_limit": "2g",
-      "stop_grace_period": "10m",
-      "restart": "unless-stopped"
+      "stop_grace_period": "11m",
+      "restart": "on-failure:3"
     },
     "worker": {
       "build": {"context": "..", "dockerfile": "Dockerfile"},
@@ -2366,7 +2388,7 @@ ENTRYPOINT ["python3", "/opt/claudebox/hosted/supervisor.py"]
 }
 ```
 
-Apply this change to `.dockerignore`:
+Apply this change to `.dockerignore` and `.gitignore`:
 
 ```diff
 diff --git a/.dockerignore b/.dockerignore
@@ -2386,12 +2408,23 @@ index 077abe2..d53f170 100644
  # Host-built bytecode, for a Python that need not match the image's. The `**/`
  # is load-bearing: docker matches ignore patterns against the whole relative
  # path and `*` does not cross a `/`, so a bare `__pycache__/` would exclude only
+diff --git a/.gitignore b/.gitignore
+index 27d9749..92f24bb 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,4 +1,6 @@
+ .env
++# The control plane's secrets, written by setup beside hosted/compose.json.
++hosted/claudebox.env
+ .env.*
+ !.env.example
+ __pycache__/
 ```
 
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_image.py'`, then `./test-python.sh`
-Expected: PASS, 10 tests. The whole suite passes.
+Expected: PASS, 12 tests. The whole suite passes.
 
 - [ ] **Step 5: Build the image and run it**
 
@@ -2430,7 +2463,7 @@ Then the configured path. Make an env file holding a throwaway RSA key in one li
 - [ ] **Step 6: Commit**
 
 ```bash
-git add hosted/Dockerfile hosted/compose.json .dockerignore tests/test_hosted_image.py
+git add hosted/Dockerfile hosted/compose.json .dockerignore .gitignore tests/test_hosted_image.py
 git commit -m "hosted: the control-plane image and its compose file"
 ```
 
