@@ -1036,7 +1036,7 @@ git commit -m "hosted: the per-PR check run and its wording"
   - `Installation.pull(full_name, pr) -> Optional[dict]`, and `is_public(repo) -> bool`, which reads `visibility` before `private` and fails closed.
   - `QUEUED`, `WITHHELD`, `TOO_LONG`, `ENOUGH`, `MESSAGES`, `MIN_INTERVAL = 1.0`, `PER_HOUR = 400`, `BACKOFF_BASE = 30`, `BACKOFF_MAX = 1800`.
   - `JobContext(job_id, installation_id, repo, pr, head)` (frozen).
-  - `Outbox(records, scanner, check_runs, comment_bytes, comments_per_pass, clock=time.time, log=print)` with `accept(job, persona, seq, body) -> (result, message)`, `queued(repo, head) -> int`, `forget_job(job_id)` and `drop_repo(repo, reason) -> int`, which also deletes the repo's `withheld` rows.
+  - `Outbox(records, scanner, check_runs, comment_bytes, comments_per_pass, clock=time.time, log=print)` with `accept(job, persona, seq, body) -> (result, message)`, `queued(repo, head) -> int`, `forget_job(job_id)` and `drop_repo(repo, reason) -> int`, which also deletes the repo's `withheld` rows, and `drop_installation(installation_id, repo, reason) -> int`, which drops only that installation's queued items for the repo and keeps its `withheld` rows (2a.4b's sweep, for a repo listed again under a new installation).
   - `Drainer(outbox, installation, installation_id, clock=time.time, min_interval=MIN_INTERVAL, per_hour=PER_HOUR)` with `step() -> float`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -1630,6 +1630,26 @@ class Outbox:
             rows = c.execute("SELECT key, head FROM outbox WHERE repo = ?", (repo,)).fetchall()
             c.execute("DELETE FROM outbox WHERE repo = ?", (repo,))
             c.execute("DELETE FROM withheld WHERE repo = ?", (repo,))
+            heads: Dict[str, int] = {}
+            for key, head in rows:
+                self._audit_drop(c, repo, key, reason)
+                heads[head] = heads.get(head, 0) + 1
+            for head, n in heads.items():
+                self.check_runs.add(repo, head, conn=c, dropped=n)
+        return len(rows)
+
+    def drop_installation(self, installation_id: int, repo: str, reason: str) -> int:
+        """Drop one repo's queued items that belong to an installation that is gone.
+
+        For a repo listed again under a new installation: no drainer carries
+        the old id, so its items would never post or drop. Its withheld
+        records stay, since access to the repo was not lost.
+        """
+        with self.records.tx() as c:
+            rows = c.execute("SELECT key, head FROM outbox WHERE installation_id = ? AND repo = ?",
+                             (installation_id, repo)).fetchall()
+            c.execute("DELETE FROM outbox WHERE installation_id = ? AND repo = ?",
+                      (installation_id, repo))
             heads: Dict[str, int] = {}
             for key, head in rows:
                 self._audit_drop(c, repo, key, reason)
