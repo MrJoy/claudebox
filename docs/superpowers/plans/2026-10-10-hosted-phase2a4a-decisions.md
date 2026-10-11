@@ -46,7 +46,7 @@ The spec and the overview leave these open, and each one changes code. They are 
 10. **A pass with no transcript and an empty record is `deferred`**, ahead of the spec's transcript check. Nothing parsed badly: the pass never started `claude`. A missing transcript with real traffic is `failing`. A transcript parses when every non-empty line is a JSON object and its first `sessionId` is a plausible id. `decide` never returns `revoked`: the spec decides it "elsewhere, without a `complete pair`", and that is decision 18. A dead capability never reaches `decide`, because the channel answers it `401`.
 11. **Reports commit only in order.** A report whose seq is not the committed one plus one changes nothing, and the ack names the committed seq, so a resend is harmless and a gap is visible. A `first_*` marker is never overwritten, and its text is cut at 500 characters. A report for a token the control plane never minted is refused.
 12. **The commit point is in memory, under one lock, and never calls `decider_for` while holding it.** The decider is resolved first, because 2a.4b's `decider_for` takes the scheduler's lock and the scheduler calls into the committer; a call under the lock would deadlock the two (2a.4b's review). The transcript blob is written first and the pair pointed at it second, so a crash between them leaves an unreferenced blob for 2b's sweep, and 2a.4b's startup deletes every transcript blob anyway (overview decision 1). A job does not outlive the control plane that started it because 2a.4b's startup makes it so: 2a.1's rule, "the successor revokes every outstanding row before it serves anything", revokes every capability and provider token (`Creds.revoke_all`), the restarted `hello` carries no live token so the gateway drops them all, and the runner's orphans are stopped. An in-flight pass is lost on a restart, and its pair stays owed. A newer transcript deletes the blob it replaces.
-13. **Parks live beside the pair state, keyed by repo.** The profile's two-PR limit rule counts `(repo, pr)`, since a profile spans repos and every repo has a #1. A head park lifts when the PR's head differs. A timed park lifts at its time. A profile park stops `start-pair`, and its scheduling consequence is 2a.4b's. A page is one `PAGE:` line (overview decision 14). The commit point emits the pair outcomes that page (`capped`, `failing`), a repo deferred three times in a row, and both profile parks (three failed pairs, limits on two PRs), since "a profile parked for failures" is on the spec's paging list and a profile park stops every repo on it.
+13. **Parks live beside the pair state, keyed by repo.** The profile's two-PR limit rule counts `(repo, pr)`, since a profile spans repos and every repo has a #1. A head park lifts when the PR's head differs. A timed park lifts at its time. A profile park stops `start-pair`, and its scheduling consequence is 2a.4b's. A page is one `PAGE:` line (overview decision 14). The commit point emits the pair outcomes that page (`capped`, `failing`), a repo deferred three times in a row, and both profile parks (three failed pairs, limits on two PRs), since "a profile parked for failures" is on the spec's paging list and a profile park stops every repo on it. Acceptance emits the spec's first page, a withheld finding, as `PAGE: <repo>#<pr>: a finding from <persona> was withheld (<detector>)`, naming the detector and never the body; the per-pass cap bounds how many one pass can raise.
 14. **`fetch-job` mints the read token and starts the 55-minute deadline in the same call**, so the token outlives the job, and a read token GitHub refuses revokes the new capability at once. A pair's committed transcript travels in the job spec with its session id, and a pair without one gets neither.
 15. **`start-pair` fails closed, and reserves the pair before any network call.** A visibility check that errors, a repo that is public or out of reach, a parked profile, a pair already started or starting, and a gateway that refuses the token all answer `409`. The check and the reservation happen under the job's lock, so two concurrent starts for one persona mint one token, and a refusal clears the reservation so the pair stays startable. The provider token lives until the job's deadline, and its `token_records` row exists before the gateway hears of it.
 16. **`complete-pair` records the pair completed as soon as the commit point returns**, with its outcome, in the same critical section that ends its reservation, and answers a resend `200 {}`, the way `post-finding` answers one. After the record, the pair's check-run view is set (in memory, and published), and only then is the token revoked, so a fault in the revocation leaves the run showing the true outcome and the token for the job's end to revoke. A fault before the commit point leaves the pair started, which a retry re-enters. A concurrent duplicate is `409`. The resend's sender is 2a.3's worker, which retries `complete-pair` on a `503` or a connection that dropped, and a fault on this side reaches it as a dropped connection. A resend runs the settle step again from the recorded outcome, since every part of it is idempotent. The view is set in memory before anything in that step can fail, so the run shows the true outcome at its next publish either way, and the resend is what gives a lost publish a next time without waiting for the job's end. `job.completed` is the one record that a pair is done. A fault inside `apply` itself, before the record, is re-entered and may spend its round twice: the window is accepted, and closing it needs a durable commit, which 2b's SQL state brings. A completion whose job is no longer registered (`job_live`, checked under the commit point's lock) commits nothing and answers `revoked`: the job's end already revoked and showed the pair, and a loss of access may already have deleted what it would write back (2a.4b's review). It turns a bad transcript into one that will not parse. That covers bad base64, a transcript over 64 MiB, and the worker's own `over-cap` note, so all three are `failing`. A flush the gateway cannot answer is no flush, so the pair is `deferred`. The pair's token is revoked in the records store and then at the gateway, and a gateway that misses the revoke drops the token at its next `hello`.
@@ -1036,7 +1036,7 @@ git commit -m "hosted: the per-PR check run and its wording"
   - `Installation.pull(full_name, pr) -> Optional[dict]`, and `is_public(repo) -> bool`, which reads `visibility` before `private` and fails closed.
   - `QUEUED`, `WITHHELD`, `TOO_LONG`, `ENOUGH`, `MESSAGES`, `MIN_INTERVAL = 1.0`, `PER_HOUR = 400`, `BACKOFF_BASE = 30`, `BACKOFF_MAX = 1800`.
   - `JobContext(job_id, installation_id, repo, pr, head)` (frozen).
-  - `Outbox(records, scanner, check_runs, comment_bytes, comments_per_pass, clock=time.time)` with `accept(job, persona, seq, body) -> (result, message)`, `queued(repo, head) -> int`, `forget_job(job_id)` and `drop_repo(repo, reason) -> int`, which also deletes the repo's `withheld` rows.
+  - `Outbox(records, scanner, check_runs, comment_bytes, comments_per_pass, clock=time.time, log=print)` with `accept(job, persona, seq, body) -> (result, message)`, `queued(repo, head) -> int`, `forget_job(job_id)` and `drop_repo(repo, reason) -> int`, which also deletes the repo's `withheld` rows.
   - `Drainer(outbox, installation, installation_id, clock=time.time, min_interval=MIN_INTERVAL, per_hour=PER_HOUR)` with `step() -> float`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -1109,8 +1109,10 @@ class Base(unittest.TestCase):
         self.addCleanup(self.records.close)
         self.now = [1000.0]
         self.runs = FakeRuns()
+        self.logs = []
         self.box = Outbox(self.records, Scanner({"OLLAMA_API_KEY": "olk-secret-value"}), self.runs,
-                          comment_bytes=100, comments_per_pass=2, clock=lambda: self.now[0])
+                          comment_bytes=100, comments_per_pass=2, clock=lambda: self.now[0],
+                          log=self.logs.append)
 
     def rows(self, table, cols="*"):
         return [tuple(r) for r in self.records.conn().execute(f"SELECT {cols} FROM {table}")]
@@ -1147,6 +1149,13 @@ class AcceptTest(Base):
         self.assertEqual(len(self.rows("withheld")), 2)
         self.assertEqual(self.box.accept(JOB, "sage", 9, "a plain finding")[0], "enough")
         self.assertEqual(self.rows("outbox"), [])
+
+    def test_a_withheld_finding_pages_naming_the_detector_and_never_the_body(self):
+        # PR #18 review: the spec's first page, and 2a emitted nothing.
+        self.box.accept(JOB, "sage", 1, "the key is olk-secret-value")
+        self.assertEqual(self.logs, ["PAGE: acme/web#12: a finding from sage was withheld "
+                                     "(literal:OLLAMA_API_KEY)"])
+        self.assertNotIn("olk-secret-value", "\n".join(self.logs))
 
     def test_a_deployment_literal_is_withheld_by_name(self):
         self.box.accept(JOB, "sage", 1, "found olk-secret-value in config")
@@ -1518,8 +1527,10 @@ class JobContext:
 
 class Outbox:
     def __init__(self, records, scanner: scan.Scanner, check_runs, comment_bytes: int,
-                 comments_per_pass: int, clock: Callable[[], float] = time.time):
+                 comments_per_pass: int, clock: Callable[[], float] = time.time,
+                 log: Callable[[str], None] = print):
         self.records = records
+        self.log = log
         self.scanner = scanner
         self.check_runs = check_runs
         self.comment_bytes = comment_bytes
@@ -1565,6 +1576,10 @@ class Outbox:
                 self._withhold(job.repo, job.pr, job.job_id, persona, detector, body, now, c)
                 self.check_runs.add(job.repo, job.head, conn=c, withheld=1)
             self._accepted[pair] = self._accepted.get(pair, 0) + 1
+            # The spec's first page: the earliest sign of a credential leaking
+            # through a comment. The detector is named; the body never is.
+            self.log(f"PAGE: {job.repo}#{job.pr}: a finding from {persona} was withheld "
+                     f"({detector})")
             return WITHHELD
         if len(body.encode("utf-8")) > self.comment_bytes:
             return TOO_LONG
@@ -1757,7 +1772,7 @@ class Drainer:
 - [ ] **Step 4: Run them to see them pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_outbox.py'`, `./test-python.sh -p 'test_hosted_github_app.py'`, then `./test-python.sh`
-Expected: PASS, 27 and 34 tests. The whole suite passes.
+Expected: PASS, 28 and 34 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
