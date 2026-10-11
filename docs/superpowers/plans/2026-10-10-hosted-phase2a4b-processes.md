@@ -36,7 +36,7 @@ The spec and the overview leave these open, and each one changes code. They are 
 3. **A poll per installation lists its repos.** A repo that is public is passed over, and one that turned public since the last poll is lost. A repo gone from the list is lost. An installation gone from `App.installations()`, or one carrying `suspended_at`, loses all its repos, and the control plane logs one `PAGE: installation N was uninstalled or suspended; M repo(s) stop being reviewed` for it: the spec pages this, and with no webhook receiver in 2a the poll is its only producer. Losing a repo ends its jobs (their started pairs `revoked`), calls 2a.4a's three deleters (`Outbox.drop_repo`, `Committer.forget_repo`, `CheckRuns.forget_repo`), and forgets its fingerprint cache. The jobs end with no scheduler lock held, since ending one calls into the committer, which calls `decider_for`, which takes that lock. After each poll, a sweep drops the outbox and withheld rows of any repo that no live installation's listing returned as private (one lost or made public while the control plane was down, which nothing in memory names). It keys on the listings, never on how far the poll's walk got before a drain stopped it, and runs only when every live installation's listing succeeded. An installation gone while the control plane was down is never in memory, so `poll_once` cannot page it: the sweep finds it in `jobs`, the durable record of every installation that ran work here, as an `installation_id` that is not live, and logs the same `PAGE: installation N was uninstalled or suspended while the control plane was down; M repo(s) stop being reviewed`. Outbox rows are a queue, empty in the steady state, so they decide only what to drop: for a repo listed again under a new installation, the old installation's queued items (`Outbox.drop_installation`), which no drainer carries. Either path pages a lost installation once, marked by an `installation_lost` audit row, since `jobs` keeps its rows for the life of the volume and a restart would otherwise page it again; a job dispatched after the mark (an installation unsuspended) lets a later loss page again. Withheld rows carry no installation, so they go with the repo or stay with it. A loss forgets the repo's last published config answer too, so a repo that comes back publishes its problem again. A completion in flight when its job ends commits nothing (2a.4a's `job_live`, wired to the job registry). Its rounds survive, as the spec's "Visibility" says ("Rounds and asks survive a public flip, since they hold no content"). A returning pair starts a fresh session at its next round, as one does after `MAX_PASSES_PER_SESSION` rotation. Its earlier rounds' findings are still on the PR, signed, and with no committed fingerprint its round line reads the local wording, which works from those comments.
 4. **Every non-fork candidate head gets a check run**, created once, whether or not anything is dispatched for it. The config follows the spec's fallback, which `repo_config.resolve` implements: an invalid repo file falls back to the org defaults, an invalid org file under a valid repo file is dropped, and only both invalid stops the review. The dropped file's problems show on each head's run as a notice beside a review that runs. A problem (both files invalid, `trigger: requested`, or a setting the deployment cannot serve) shows on every head's run and dispatches nothing, and the poll logs `PAGE: <repo>: not reviewed, because of a configuration problem` when a repo starts not being reviewed for one, and a plain line when it clears, so a problem held across polls pages once. The problem text is the repo's and stays on the check run, out of the log. A read of either file that fails is not a statement about the file: the repo is skipped for that poll and nothing is published. A head is published when its (problem, notice) differs from the one last set on it, a head with none included, so a new head shows a held problem, a fixed one clears without a push, and an unchanged answer costs no GitHub call. A pair at its round cap is painted `round-cap-unread` once on a head no job will run at, or a capped plan PR's new head would read "Queued" for good. The paint needs no lookup, so it happens above the gate a full deployment closes, along with the check run and the config answer. It is never painted `round-cap`, which counts as clean: a green check on a commit no persona read would claim a review that did not happen.
 5. **The change gate is local mode's**, `signals.Tracker`, one per repo since a Tracker keys by PR number. A PR's fingerprint is its head, its mode and the newest unsigned comment, and comments, reviews and the 30 newest inline comments are read only when the PR's `updated_at` has moved. A failed lookup is cached against that `updated_at` too, so an outage costs one lookup per change, and the PR gates on `updated_at` through `signals.degraded`. A PR younger than the deployment's `settle_seconds` waits.
-6. **Dispatch bounds.** A PR with a live job is not dispatched again. A pair parked by the commit point waits while its siblings run, and a parked profile dispatches nothing. `max_concurrent_jobs` counts jobs, and a profile's `concurrency` counts pairs in flight (dispatched and not completed) across its jobs. A group larger than the room left dispatches in parts, phase order first: the pairs left out hold no session, so the gate runs them on a later poll once the job has ended, and a 7-persona plan group under a bound of 4 is never starved. Every pair of the group with no view at the head is painted `queued` above every gate, beside the round-cap paint, since it needs no lookup either: a split's later part, the siblings `pairs_to_run` leaves out while the group owes a pair, and a pair that joined the group at a head that already has views (a `plan` label added while a code job runs, a persona added to the repo file). The head cannot then conclude `success` on the pairs that ran. A pair the commit point has parked on a timer holds across a push, while its view was set at the head it ran at, so a parked pair whose view at this head is missing or `queued` is painted with the park's own state (`deferred`, `usage-limited`, `failed`), which is never clean. A poll stops dispatching at the first refusal by `max_concurrent_jobs` and keeps walking: every later head and repo still gets its check run and its config answer (decision 4), and only the dispatch stages, which cost lookups, are skipped. The poll logs when the cap starts binding for an installation and when it stops, not on every poll.
+6. **Dispatch bounds.** A PR with a live job is not dispatched again. A pair parked by the commit point waits while its siblings run, and a parked profile dispatches nothing. `max_concurrent_jobs` counts jobs, and a profile's `concurrency` counts pairs in flight (dispatched and not completed) across its jobs. A group larger than the room left dispatches in parts, phase order first: the pairs left out hold no session, so the gate runs them on a later poll once the job has ended, and a 7-persona plan group under a bound of 4 is never starved. Every pair of the group with no view at the head is painted `queued` above every gate, beside the round-cap paint, since it needs no lookup either: a split's later part, the siblings `pairs_to_run` leaves out while the group owes a pair, and a pair that joined the group at a head that already has views (a `plan` label added while a code job runs, a persona added to the repo file). The head cannot then conclude `success` on the pairs that ran. In the same place the poll drops the view of a persona that has left the group, unless a job at that head is still running it, so a departed persona's state cannot decide the run either. A pair the commit point has parked on a timer holds across a push, while its view was set at the head it ran at, so a parked pair whose view at this head is missing or `queued` is painted with the park's own state (`deferred`, `usage-limited`, `failed`), which is never clean. A poll stops dispatching at the first refusal by `max_concurrent_jobs` and keeps walking: every later head and repo still gets its check run and its config answer (decision 4), and only the dispatch stages, which cost lookups, are skipped. The poll logs when the cap starts binding for an installation and when it stops, not on every poll.
 7. **Visibility is checked again at dispatch**, uncached, and a check that errors dispatches nothing.
 8. **A job's material is built once, at dispatch.** The prompts are `build_hosted`'s, with `WORKTREE_STANZA` exactly when `shared_worktree` is true, and `shared_worktree` is true when the job has more than one pair, whatever their phases or the cap: a phase-1 pass that writes to the clone is read by phase 2, and one-at-a-time passes read each other's writes the same way (PR #20 review). A pair with a session gets the followup prompt. A pair's round line names the head of its committed fingerprint (`Committer.last_reviewed_head`). When that head is no longer an ancestor of the new one, the round line is round 1's and the check run says the branch was rewritten. An ancestry check that errors counts as a rewrite, since a whole review beats a guess.
 9. **The reap ends a job** when runnerd lists its worker as gone or exited, when its 55-minute deadline has passed, or when its bootstrap token expired unused. Ending a job revokes its credentials, tells the gateway to revoke its unfinished pairs' tokens, marks each started pair `revoked` (`Committer.revoke`, and `checkruns.REVOKED` on the run), owes each unstarted pair, stops its worker, forgets its outbox keys and `settled` entries, and writes `ended_at` and `end_reason` on its row.
@@ -621,6 +621,32 @@ class GateTest(Base):
         self.assertEqual(self.runs.view("acme/web", HEAD, "sme").state, checkruns.QUEUED)
         self.finish(job)
         self.assertNotEqual(self.inst.updated[-1][4], "success")
+
+    def test_a_persona_leaving_the_group_loses_its_view(self):
+        # PR #21 review: views were never dropped, so a departed persona's
+        # state decided the run for good.
+        self.inst.files[("acme/web", ".github/claudebox.json")] = json.dumps(
+            {"profile": "ollama", "code": {"personas": "red_team,sage,sme"}}).encode()
+        self.poll()
+        job = self.jobs.all()[0]
+        self.runs.set_pair("acme/web", HEAD, "sme", checkruns.PairView(checkruns.USAGE_LIMITED,
+                                                                       int(T) - 60))
+        self.finish(job)
+        self.inst.files[("acme/web", ".github/claudebox.json")] = json.dumps(
+            {"profile": "ollama", "code": {"personas": "red_team,sage"}}).encode()
+        self.poll()
+        self.assertIsNone(self.runs.view("acme/web", HEAD, "sme"))
+        self.assertNotIn("sme", self.inst.updated[-1][3])     # republished without it
+
+    def test_a_departed_persona_still_running_keeps_its_view(self):
+        self.inst.files[("acme/web", ".github/claudebox.json")] = json.dumps(
+            {"profile": "ollama", "code": {"personas": "red_team,sage,sme"}}).encode()
+        self.poll()
+        self.runs.set_pair("acme/web", HEAD, "sme", checkruns.PairView(checkruns.RUNNING))
+        self.inst.files[("acme/web", ".github/claudebox.json")] = json.dumps(
+            {"profile": "ollama", "code": {"personas": "red_team,sage"}}).encode()
+        self.poll()
+        self.assertEqual(self.runs.view("acme/web", HEAD, "sme").state, checkruns.RUNNING)
 
     def test_a_capped_plan_prs_new_head_shows_round_cap_not_queued(self):
         # PR #21 review: nothing dispatches at it, so nothing else would paint it.
@@ -1348,11 +1374,18 @@ class Scheduler:
             # `plan` label added while a code job runs, a persona added to the
             # repo file), and render cannot see a persona with none (PR #22
             # review). A parked pair's own state overwrites it further down.
+            # The converse: a persona that left the group (a label removed, a
+            # persona dropped from the repo file) loses its view, unless a job
+            # at this head is still running it (PR #21 review).
+            keep = {p.persona for p in group.pairs} | {
+                p.persona for j in self.jobs.all() if j.repo == full and j.pr == n
+                and j.head == head for p in j.pairs}
+            pruned = self.check_runs.retain(full, head, keep)
             unseen = [p for p in group.pairs if p not in capped
                       and self.check_runs.view(full, head, p.persona) is None]
             for p in unseen:
                 self.check_runs.set_pair(full, head, p.persona, checkruns.PairView(checkruns.QUEUED))
-            if capped or unseen:
+            if capped or unseen or pruned:
                 self._publish(full, head)
             if self._full:
                 # A full deployment stops the dispatch, never the walk: every
@@ -1655,7 +1688,7 @@ class _Snapshot:
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_scheduler.py'`, then `./test-python.sh`
-Expected: PASS, 59 tests. The whole suite passes.
+Expected: PASS, 61 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
