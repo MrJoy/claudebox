@@ -223,8 +223,9 @@ lane's kindex tools reach one graph. A lane that goes looking can `capture-pane`
 lane's window, `send-keys` into it, `cat` its log, or `search` the graph for what the other
 lane captured, and nothing prevents it. The graph is the one of these a lane is *told* to
 use, so the lane shims narrow it for the run: the Coder searches but does not add, the
-Tester neither searches the area under test nor adds, and the Validator adds nothing
-while the lanes are live. The axis that is
+Tester neither searches the area under test nor adds, the Validator adds nothing
+while the lanes are live, and neither do you: you read every lane's window and log, and
+the Coder's brief makes it search the graph. The axis that is
 NOT a leak, named so the prohibition does not swallow the mechanism: you and the
 Validator both address lanes and both read their windows and logs — that is how relaying
 and Phase 4 work. What is forbidden is the Coder obtaining the tests, or anything
@@ -296,8 +297,10 @@ This is your independent alignment check, not a repeat of the Validator's verdic
 ## Kindex
 
 Search before dispatching anything (prior work, constraints, watches on every surface
-the run touches), and capture your own routing decisions and incidents with provenance
-as they happen. Kindex is context, never authority — a node ratifies nothing, and you
+the run touches). Record your routing decisions and incidents with provenance as they
+happen, in the run directory, and capture them in the graph once the verdict is signed:
+while the lanes are live, a node is a route into the Coder's required search, and an
+`ORACLE_DEFECT` or `BASELINE_CONFLICT` note is about the suites themselves. Kindex is context, never authority — a node ratifies nothing, and you
 never cite one as a founder ruling.
 
 ## What done looks like

@@ -200,7 +200,9 @@ Activate when the approach has failed after three genuine attempts, scope is exp
 signed boundaries, a blocking dependency appears, or the budget is spent.
 
 1. **Stop.** Do not continue down the failing path.
-2. **Record** what was tried and why it failed (`add` as a decision).
+2. **Record** what was tried and why it failed, in your report to the Validator (step 5)
+   and in your hand-over's held captures. Not in the graph: no verdict is signed yet, so the
+   rule in *The boundary is yours to hold* still applies.
 3. **Re-read the signed artifacts** and name the assumption that was wrong.
 4. **Fall back** to a reduced implementation preserving **every** hard constraint and owed
    control — a Plan B that drops a control is not a Plan B, it is a breach with a schedule.
