@@ -684,8 +684,9 @@ class ConfigTest(Base):
         self.assertEqual((self.inst.created, self.inst.updated), ([], []))
         self.assertTrue(any("trying again next poll" in l for l in self.logs))
 
-    def test_a_failed_paint_is_retried_on_the_next_poll(self):
-        # PR #21 review: the gate compares against what the run shows.
+    def test_a_failed_paint_is_retried_on_the_first_poll_past_its_hold(self):
+        # PR #21 review: the gate compares against what the run shows, and a
+        # failed write is held for 30 seconds rather than rewritten every poll.
         self.inst.files[("acme/web", ".github/claudebox.json")] = b'{"profile": "nope"}'
         real = self.inst.update_check_run
 
@@ -695,6 +696,10 @@ class ConfigTest(Base):
         self.poll()
         self.inst.update_check_run = real
         before = len(self.inst.updated)
+        self.now[0] += 29
+        self.poll()
+        self.assertEqual(len(self.inst.updated), before)
+        self.now[0] += 1
         self.poll()
         self.assertEqual(len(self.inst.updated), before + 1)
         self.assertEqual(self.inst.updated[-1][2], "Not reviewed: configuration")
