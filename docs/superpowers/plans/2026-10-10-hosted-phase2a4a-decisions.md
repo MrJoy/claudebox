@@ -50,7 +50,7 @@ The spec and the overview leave these open, and each one changes code. They are 
 14. **`fetch-job` mints the read token and starts the 55-minute deadline in the same call**, so the token outlives the job, and a read token GitHub refuses revokes the new capability at once. A pair's committed transcript travels in the job spec with its session id, and a pair without one gets neither.
 15. **`start-pair` fails closed, and reserves the pair before any network call.** A visibility check that errors, a repo that is public or out of reach, a parked profile, a pair already started or starting, and a gateway that refuses the token all answer `409`. The check and the reservation happen under the job's lock, so two concurrent starts for one persona mint one token, and a refusal clears the reservation so the pair stays startable. The provider token lives until the job's deadline, and its `token_records` row exists before the gateway hears of it.
 16. **`complete-pair` records the pair completed as soon as the commit point returns**, with its outcome, in the same critical section that ends its reservation, and answers a resend `200 {}`, the way `post-finding` answers one. After the record, the pair's check-run view is set (in memory, and published), and only then is the token revoked, so a fault in the revocation leaves the run showing the true outcome and the token for the job's end to revoke. A fault before the commit point leaves the pair started, which a retry re-enters. A concurrent duplicate is `409`. A resend runs the settle step again from the recorded outcome, since every part of it is idempotent, so a fault in that step the first time cannot leave the run showing the pair as running. `job.completed` is the one record that a pair is done. A fault inside `apply` itself, before the record, is re-entered and may spend its round twice: the window is accepted, and closing it needs a durable commit, which 2b's SQL state brings. A completion whose job is no longer registered (`job_live`, checked under the commit point's lock) commits nothing and answers `revoked`: the job's end already revoked and showed the pair, and a loss of access may already have deleted what it would write back (2a.4b's review). It turns a bad transcript into one that will not parse. That covers bad base64, a transcript over 64 MiB, and the worker's own `over-cap` note, so all three are `failing`. A flush the gateway cannot answer is no flush, so the pair is `deferred`. The pair's token is revoked in the records store and then at the gateway, and a gateway that misses the revoke drops the token at its next `hello`.
-17. **Body caps and the credential are checked before reading.** A missing length is `411`, and a body over the cap is `413`. The token is in a header, so a request with no live credential for its call (a bootstrap for `fetch-job`, a capability with a registered job for the rest), or to no known call, is answered `401` or `404` without reading its body: the bodies run to 96 MiB, and the worker network is the untrusted side. A body that does not parse, a deeply nested one included, is `400`. An oversized `complete-pair` is refused unread, so its pair is revoked when the job ends (the overview, as revised).
+17. **Body caps and the credential are checked before reading.** A missing length is `411`, and a body over the cap is `413`. The token is in a header, so a request with no live credential for its call (a bootstrap for `fetch-job`, a capability with a registered job for the rest), or to no known call, is answered `401` or `404` without reading its body: the bodies run to 96 MiB, and the worker network is the untrusted side. A body that does not parse, a deeply nested one included, is `400`. What the channel holds at once is bounded too, since a connection is a thread before anything is read and a large body is held whole: at most `MAX_CONNECTIONS` (64) connections, a connection past it closed before a thread exists, and an idle one dropped after 30 seconds; at most `LARGE_BODIES_AT_ONCE` (2) bodies over 1 MiB read at once, a third waiting up to 30 seconds and then refused `503` unread, which 2a.3's worker retries. Both are sized to the control plane's 512 pids and 2 GiB. An oversized `complete-pair` is refused unread, so its pair is revoked when the job ends (the overview, as revised).
 18. **`revoked` is `Committer.revoke`.** A started pair whose job ended without `complete-pair` (the deadline, an access change, a restart) has its transcript discarded and its failure recorded, and stays owed. `revoke` returns `REVOKED` for the job-end handler, which knows the head, to show as `checkruns.REVOKED`. 2a.4b's job end is that handler.
 19. **Loss of access has two deleters, both here.** `Committer.forget_repo` deletes the repo's transcripts and parks and calls `StateStore.forget`, which drops sessions, fingerprints, pass counts, owed pairs and the cut, and keeps rounds, since they hold no content and survive a public flip, as the spec says. The policy lives in the store, beside the fields it names, so a field added later is forgotten or kept on purpose. `Outbox.drop_repo` deletes the repo's queued items and its `withheld` rows in one transaction, and keeps the per-detector day counts. 2a.4b's loss-of-access path calls both, plus `CheckRuns.forget_repo`, and revokes the repo's jobs.
 20. **The head a round line names is the committed fingerprint's**, read by `Committer.last_reviewed_head` from `state.reviewed`. There is no second record of it to drift.
@@ -2509,7 +2509,9 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 import unittest
+from unittest import mock
 
 import channel
 import checkruns
@@ -2969,6 +2971,37 @@ class HttpTest(Base):
         self.assertEqual(self.post("/channel/start-pair", cap, body=b"nope")[0], 400)
         self.assertEqual(self.post("/channel/start-pair", cap, body=b"[" * 100000)[0], 400)
 
+    def test_connections_past_the_cap_are_closed_without_a_thread(self):
+        # PR #21 review: a connection is a thread before anything is read.
+        import socket
+        socks = []
+        try:
+            for _ in range(channel.MAX_CONNECTIONS):
+                socks.append(socket.create_connection(("127.0.0.1", self.server.server_port)))
+            time.sleep(0.2)
+            extra = socket.create_connection(("127.0.0.1", self.server.server_port))
+            extra.settimeout(2)
+            self.assertEqual(extra.recv(1), b"")   # closed by the server, unanswered
+            extra.close()
+        finally:
+            for s in socks:
+                s.close()
+        time.sleep(0.2)
+        self.assertEqual(self.post("/channel/fetch-job", self.boot)[0], 200)   # slots come back
+
+    def test_large_bodies_past_the_bound_wait_then_are_refused_unread(self):
+        cap = self.capability()
+        for _ in range(channel.LARGE_BODIES_AT_ONCE):
+            self.assertTrue(self.server.RequestHandlerClass.large.acquire(blocking=False))
+        try:
+            with mock.patch.object(channel, "LARGE_BODY_WAIT", 0.1):
+                status = self.post("/channel/complete-pair", cap, body=b"{}",
+                                   length=channel.BODY_MAX + 1)[0]
+            self.assertEqual(status, 503)
+        finally:
+            for _ in range(channel.LARGE_BODIES_AT_ONCE):
+                self.server.RequestHandlerClass.large.release()
+
     def test_no_credential_is_refused_before_the_body_is_read(self):
         # PR #21 review: a declared 90 MiB body from a caller with no live
         # credential is answered from its headers, and the body never sent.
@@ -3029,6 +3062,14 @@ from outbox import JobContext
 JOB_DEADLINE = 55 * 60          # the spec's job deadline, under the read token's hour
 BODY_MAX = 1024 * 1024          # every channel request but complete-pair
 COMPLETE_BODY_MAX = 96 * 1024 * 1024
+# What the channel holds at once, whatever its callers do: a connection is a
+# thread before anything is read, and a large body is held whole while it is
+# parsed, decoded and sealed. Sized so two large bodies, each several copies of
+# 96 MiB, stay well under the control plane's 2 GiB, and the connections well
+# under its 512 pids.
+MAX_CONNECTIONS = 64
+LARGE_BODIES_AT_ONCE = 2
+LARGE_BODY_WAIT = 30
 TRANSCRIPT_MAX = 64 * 1024 * 1024
 
 _VIEW = {
@@ -3357,7 +3398,8 @@ class Channel:
 
 class Handler(http.server.BaseHTTPRequestHandler):
     channel: Channel = None   # set on the subclass make_server builds
-    timeout = 120
+    large: threading.BoundedSemaphore = None
+    timeout = 30   # an idle connection holds a thread; it gets 30 seconds, not 120
 
     def log_message(self, fmt, *args):
         pass
@@ -3388,27 +3430,60 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if refused is not None:
             self.close_connection = True   # the body is never read
             return self._send(*refused)
+        big = length > BODY_MAX
+        if big and not self.large.acquire(timeout=LARGE_BODY_WAIT):
+            self.close_connection = True   # unread: the worker retries the call
+            return self._send(503, {"reason": "too many large bodies at once; retry"})
         try:
-            body = json.loads(self.rfile.read(length) or b"{}")
-        except (ValueError, RecursionError, MemoryError):
-            return self._send(400, {"reason": "the body is not JSON"})
-        if not isinstance(body, dict):
-            return self._send(400, {"reason": "the body is not a JSON object"})
-        status, payload = self.channel.handle(path, token, body)
-        self._send(status, payload)
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except (ValueError, RecursionError, MemoryError):
+                return self._send(400, {"reason": "the body is not JSON"})
+            if not isinstance(body, dict):
+                return self._send(400, {"reason": "the body is not a JSON object"})
+            status, payload = self.channel.handle(path, token, body)
+            self._send(status, payload)
+        finally:
+            if big:
+                self.large.release()
+
+
+class _BoundedServer(http.server.ThreadingHTTPServer):
+    """A threading server that refuses a connection past MAX_CONNECTIONS."""
+
+    daemon_threads = True
+
+    def __init__(self, *a, **k):
+        self.slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+        super().__init__(*a, **k)
+
+    def process_request(self, request, client_address):
+        if not self.slots.acquire(blocking=False):
+            self.shutdown_request(request)   # closed before a thread exists
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
 
 
 def make_server(channel: Channel, host: str, port: int) -> http.server.ThreadingHTTPServer:
-    handler = type("BoundHandler", (Handler,), {"channel": channel})
-    server = http.server.ThreadingHTTPServer((host, port), handler)
-    server.daemon_threads = True
-    return server
+    handler = type("BoundHandler", (Handler,), {
+        "channel": channel, "large": threading.BoundedSemaphore(LARGE_BODIES_AT_ONCE)})
+    return _BoundedServer((host, port), handler)
 ```
 
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_channel.py'`, then `./test-python.sh`
-Expected: PASS, 29 tests. The whole suite passes.
+Expected: PASS, 31 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
