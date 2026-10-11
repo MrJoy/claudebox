@@ -34,7 +34,7 @@ The spec and the overview leave these open, and each one changes code. They are 
 1. **2a reviews in `auto` mode only.** A repo whose config asks for `trigger: requested` is shown as a config problem on its check runs ("arrives in phase 2b") rather than reviewed against its wishes.
 2. **The org file is `.github/claudebox.json` in `<owner>/.github`**, read at the default branch. A read that fails is "no org defaults". The org `.github` repo is never itself reviewed.
 3. **A poll per installation lists its repos.** A repo that is public is passed over, and one that turned public since the last poll is lost. A repo gone from the list is lost. An installation gone from `App.installations()`, or one carrying `suspended_at`, loses all its repos, and the control plane logs one `PAGE: installation N was uninstalled or suspended; M repo(s) stop being reviewed` for it: the spec pages this, and with no webhook receiver in 2a the poll is its only producer. Losing a repo ends its jobs (their started pairs `revoked`), calls 2a.4a's three deleters (`Outbox.drop_repo`, `Committer.forget_repo`, `CheckRuns.forget_repo`), and forgets its fingerprint cache. The jobs end with no scheduler lock held, since ending one calls into the committer, which calls `decider_for`, which takes that lock. After each poll, a sweep drops the outbox and withheld rows of any repo that no live installation's listing returned as private (one lost or made public while the control plane was down, which nothing in memory names). It keys on the listings, never on how far the poll's walk got before a drain stopped it, and runs only when every live installation's listing succeeded. A loss forgets the repo's last published config answer too, so a repo that comes back publishes its problem again. A completion in flight when its job ends commits nothing (2a.4a's `job_live`, wired to the job registry). Its rounds survive, as the spec's "Visibility" says ("Rounds and asks survive a public flip, since they hold no content"). A returning pair starts a fresh session at its next round, as one does after `MAX_PASSES_PER_SESSION` rotation. Its earlier rounds' findings are still on the PR, signed, and with no committed fingerprint its round line reads the local wording, which works from those comments.
-4. **Every non-fork candidate head gets a check run**, created once, whether or not anything is dispatched for it. The config follows the spec's fallback, which `repo_config.resolve` implements: an invalid repo file falls back to the org defaults, an invalid org file under a valid repo file is dropped, and only both invalid stops the review. The dropped file's problems show on each head's run as a notice beside a review that runs. A problem (both files invalid, `trigger: requested`, or a setting the deployment cannot serve) shows on every head's run and dispatches nothing. A read of either file that fails is not a statement about the file: the repo is skipped for that poll and nothing is published. A head is published when its (problem, notice) differs from the one last set on it, a head with none included, so a new head shows a held problem, a fixed one clears without a push, and an unchanged answer costs no GitHub call. A pair at its round cap is painted `round-cap-unread` once on a head no job will run at, or a capped plan PR's new head would read "Queued" for good. It is never painted `round-cap`, which counts as clean: a green check on a commit no persona read would claim a review that did not happen.
+4. **Every non-fork candidate head gets a check run**, created once, whether or not anything is dispatched for it. The config follows the spec's fallback, which `repo_config.resolve` implements: an invalid repo file falls back to the org defaults, an invalid org file under a valid repo file is dropped, and only both invalid stops the review. The dropped file's problems show on each head's run as a notice beside a review that runs. A problem (both files invalid, `trigger: requested`, or a setting the deployment cannot serve) shows on every head's run and dispatches nothing, and the poll logs `PAGE: <repo>: not reviewed, because of a configuration problem` when a repo starts not being reviewed for one, and a plain line when it clears, so a problem held across polls pages once. The problem text is the repo's and stays on the check run, out of the log. A read of either file that fails is not a statement about the file: the repo is skipped for that poll and nothing is published. A head is published when its (problem, notice) differs from the one last set on it, a head with none included, so a new head shows a held problem, a fixed one clears without a push, and an unchanged answer costs no GitHub call. A pair at its round cap is painted `round-cap-unread` once on a head no job will run at, or a capped plan PR's new head would read "Queued" for good. It is never painted `round-cap`, which counts as clean: a green check on a commit no persona read would claim a review that did not happen.
 5. **The change gate is local mode's**, `signals.Tracker`, one per repo since a Tracker keys by PR number. A PR's fingerprint is its head, its mode and the newest unsigned comment, and comments, reviews and the 30 newest inline comments are read only when the PR's `updated_at` has moved. A failed lookup is cached against that `updated_at` too, so an outage costs one lookup per change, and the PR gates on `updated_at` through `signals.degraded`. A PR younger than the deployment's `settle_seconds` waits.
 6. **Dispatch bounds.** A PR with a live job is not dispatched again. A pair parked by the commit point waits while its siblings run, and a parked profile dispatches nothing. `max_concurrent_jobs` counts jobs, and a profile's `concurrency` counts pairs in flight (dispatched and not completed) across its jobs. A group larger than the room left dispatches in parts, phase order first: the pairs left out hold no session, so the gate runs them on a later poll once the job has ended, and a 7-persona plan group under a bound of 4 is never starved. A poll stops dispatching at the first refusal by `max_concurrent_jobs` and keeps walking: every later head and repo still gets its check run and its config answer (decision 4), and only the dispatch stages, which cost lookups, are skipped. The poll logs when the cap starts binding for an installation and when it stops, not on every poll.
 7. **Visibility is checked again at dispatch**, uncached, and a check that errors dispatches nothing.
@@ -240,7 +240,7 @@ git commit -m "repo config: plan.label whitespace and the empty selector's wordi
 - Consumes: `repo_config.resolve`, `deploy_config.against_deploy`, `personas.resolve`, `signals`, `prompts.build_hosted`, `decisions.Decider`, `state.MemoryStateStore` (`reviewer/`); `creds.Creds` and `BOOTSTRAP_TTL`, `github_app.GitHubError`, `is_fork_pr` and `is_public` (2a.1); `runner.RunnerError` (2a.3); `channel.Jobs`, `JobMaterial` and `PairMaterial`, `checkruns`, `outbox.Outbox`, `commit.Committer` (2a.4a).
 - Produces:
   - `ORG_REPO = ".github"`; `shared_worktree(n_pairs: int) -> bool`.
-  - `Scheduler(records, creds, jobs, committer, check_runs, outbox, runner, installation_for, deploy_for, gateway_call, persona_dir, gateway_url, channel_url, clock=time.time, log=print, new_job_id=...)` with `poll(installation_id) -> int`, `poll_repo(inst, installation_id, info, deploy) -> int`, `load_config(inst, full_name, deploy) -> (config, model, problem, notice)` (a failed read raises `GitHubError`), `dispatch(...) -> bool`, `reap() -> int`, `end_job(job, reason)`, `lose_repo(repo, reason)`, `sweep_orphans(live) -> int` and `decider_for(repo) -> Decider`, and the attributes `installation_of` (repo to installation id), `listings` (installation id to the private repos its last successful listing returned), `states`, `runtimes`, `trackers`, `full_installations` (the installations whose last poll met `max_concurrent_jobs`), `halted` (an event the drain sets) and `walk` (a lock the poll's walk holds). `committer` may be set after construction, since the `Committer` takes `decider_for`.
+  - `Scheduler(records, creds, jobs, committer, check_runs, outbox, runner, installation_for, deploy_for, gateway_call, persona_dir, gateway_url, channel_url, clock=time.time, log=print, new_job_id=...)` with `poll(installation_id) -> int`, `poll_repo(inst, installation_id, info, deploy) -> int`, `load_config(inst, full_name, deploy) -> (config, model, problem, notice)` (a failed read raises `GitHubError`), `dispatch(...) -> bool`, `reap() -> int`, `end_job(job, reason)`, `lose_repo(repo, reason)`, `sweep_orphans(live) -> int` and `decider_for(repo) -> Decider`, and the attributes `installation_of` (repo to installation id), `listings` (installation id to the private repos its last successful listing returned), `states`, `runtimes`, `trackers`, `full_installations` (the installations whose last poll met `max_concurrent_jobs`), `config_paged` (the repos whose config problem has been paged), `halted` (an event the drain sets) and `walk` (a lock the poll's walk holds). `committer` may be set after construction, since the `Committer` takes `decider_for`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -717,6 +717,22 @@ class ConfigTest(Base):
         self.poll()
         self.assertEqual(len(self.inst.updated), before + 1)   # then quiet again
 
+    def test_a_config_problem_pages_once_until_it_clears(self):
+        # PR #18 review: the spec pages a repo whose config is invalid.
+        good = self.inst.files[("acme/web", ".github/claudebox.json")]
+        self.inst.files[("acme/web", ".github/claudebox.json")] = b'{"profile": "nope"}'
+        self.poll()
+        self.poll()
+        pages = [l for l in self.logs if l.startswith("PAGE: acme/web: not reviewed")]
+        self.assertEqual(len(pages), 1)
+        self.assertNotIn("nope", pages[0])
+        self.inst.files[("acme/web", ".github/claudebox.json")] = good
+        self.poll()
+        self.assertIn("acme/web: its configuration is usable again", self.logs)
+        self.inst.files[("acme/web", ".github/claudebox.json")] = b'{"profile": "nope"}'
+        self.poll()
+        self.assertEqual(sum(l.startswith("PAGE: acme/web: not reviewed") for l in self.logs), 2)
+
     def test_a_held_problem_writes_to_github_once_per_head(self):
         # PR #22 review: not once per head per poll.
         self.inst.files[("acme/web", ".github/claudebox.json")] = b'{"profile": "nope"}'
@@ -1034,6 +1050,7 @@ class Scheduler:
         self.trackers: Dict[str, signals_mod.Tracker] = {}   # one per repo: a Tracker keys by PR number
         self._full = False
         self.full_installations: Set[int] = set()   # whose last poll met max_concurrent_jobs
+        self.config_paged: Set[str] = set()   # repos whose config problem has been paged
         self.halted = threading.Event()   # set by the drain: dispatch nothing more
         self.walk = threading.Lock()
         # installation id -> the private repos its last successful listing
@@ -1160,6 +1177,16 @@ class Scheduler:
         with self.lock:
             self.installation_of[full] = installation_id
         cfg, model, problem, notice = self.load_config(inst, full, deploy)
+        # The spec pages a repo whose config is invalid; paged when the repo
+        # starts not being reviewed for it, and said again only after it has
+        # cleared. The problem text is the repo's and stays on the check run.
+        if problem and full not in self.config_paged:
+            self.config_paged.add(full)
+            self.log(f"PAGE: {full}: not reviewed, because of a configuration problem; each "
+                     f"open PR's check run shows it")
+        elif not problem and full in self.config_paged:
+            self.config_paged.discard(full)
+            self.log(f"{full}: its configuration is usable again")
         label = cfg.plan_label if cfg is not None else repo_config.RepoConfig().plan_label
         dispatched = 0
         now = self.clock()
@@ -1388,6 +1415,7 @@ class Scheduler:
             self.runtimes.pop(repo, None)
             self.installation_of.pop(repo, None)
             self.trackers.pop(repo, None)
+            self.config_paged.discard(repo)
         self.log(f"{repo}: not reviewed, because {reason}; dropped {dropped} queued finding(s)")
 
     def sweep_orphans(self, live: Set[int]) -> int:
@@ -1427,7 +1455,7 @@ class _Snapshot:
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_scheduler.py'`, then `./test-python.sh`
-Expected: PASS, 51 tests. The whole suite passes.
+Expected: PASS, 52 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
@@ -2012,7 +2040,7 @@ class ControlPlane:
         self.reason = ""   # why the state is what it is, for /healthz and the log
         self.jobs = Jobs()
         self.check_runs = CheckRuns(records, self.installation_for_repo, clock=clock)
-        self.outbox = Outbox(records, scanner, self.check_runs, 60000, 25, clock=clock)
+        self.outbox = Outbox(records, scanner, self.check_runs, 60000, 25, clock=clock, log=log)
         self.gateway_call = gateway_call
         self.scheduler = Scheduler(
             records, creds, self.jobs, None, self.check_runs, self.outbox, runner,
