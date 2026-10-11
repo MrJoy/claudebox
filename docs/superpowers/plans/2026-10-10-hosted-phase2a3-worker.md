@@ -16,7 +16,7 @@
 
 - **Standard library only**, and **Python 3.9 syntax** (overview decision 15). Flat modules, imported by plain name. `worker/worker.py` puts `reviewer/` on `sys.path` itself, and `tests/_path.py` adds `worker/` (overview decision 19).
 - **Overview decision 5:** the Docker socket belongs to `runnerd`, never to the control plane. A compromised control plane can make `runnerd` start a worker from the fixed template, list workers and stop them, and nothing else.
-- **Overview decision 6:** a worker starts as root on every target. On local Docker the runner passes `--cap-drop ALL --cap-add SETUID --cap-add SETGID --cap-add SETPCAP --security-opt no-new-privileges --pids-limit 512 --memory 4g --user 0`, and `setpriv` spends those three capabilities before the reviewer runs.
+- **Overview decision 6:** a worker starts as root on every target. On local Docker the runner passes `--cap-drop ALL --cap-add SETUID --cap-add SETGID --cap-add SETPCAP --security-opt no-new-privileges --pids-limit 512 --memory 4g --user 0`, and `setpriv` spends those three capabilities before the reviewer runs. The runner also bounds the worker's bulk writes with two tmpfs mounts (decision 17).
 - **Overview decision 7:** the worker image is today's `claudebox` image with `worker/` added, started with `--entrypoint /opt/claudebox/worker/entrypoint.sh`. `worker/` is root-owned in the image, like `reviewer/`.
 - The spec's `setpriv` line: `setpriv --no-new-privs --bounding-set=-all --inh-caps=-all --reuid=reviewer --regid=reviewer --init-groups --reset-env`.
 - The spec's job spec handling: "the single-use token never reaches the worker's environment or its argv. After the change a fixed wrapper sets exactly `HOME=/home/reviewer` and a `PATH` that puts the `gh` shim's directory first, and execs the worker." The spec has root write the spec to a mode-600 file in the reviewer's home; this plan hands it over on stdin instead (decision 2), because root holding only overview decision 6's three capabilities cannot write that file.
@@ -42,15 +42,16 @@ The spec and the overview leave these open, and each one changes code. They are 
 5. **`stop` is `docker rm -f`**, and a container that is already gone is a success, so `stop_all` after a crash is idempotent.
 6. **The clone authenticates with an `http.extraheader` scoped to `https://github.com/`** and kept in the clone's config, because a blobless clone fetches history lazily whenever a persona asks for it. The read token sits in the reviewer's reach anyway in 2a (the spec's "in 2a only, the worker holds a GitHub read token"). A clone URL off `https://github.com/` and a head that is not a full commit id are refused before `git` runs, and a checkout that lands anywhere but the job's head is an error.
 7. **`claude` gets a built environment, never an inherited one**: `HOME`, `PATH`, `DISABLE_AUTOUPDATER=1`, `ANTHROPIC_BASE_URL` (the gateway), the pair's provider token under `auth_env`, `GH_TOKEN` (the read token), the channel URL, the capability, the persona and the PR number for the shim, and the job's model in every model-tier variable the local entrypoint pins. `ANTHROPIC_API_KEY` is never set. Every pass carries `--strict-mcp-config` and no other MCP flag, since hosted Linear is deferred and kindex is 3a.
-8. **Whether the personas share the worktree is decided once, by the control plane, and carried in the job spec as `shared_worktree`.** The control plane puts `WORKTREE_STANZA` in the prompts by that answer (2a.4), and the worker locks `.git` with `review_loop.lock_git_dir`, unchanged, exactly when it is true. The worker never recomputes it, so the stanza and the lock cannot disagree. A job spec without a boolean `shared_worktree` is refused at `fetch-job`.
+8. **Whether the personas share the worktree is decided once, by the control plane, and carried in the job spec as `shared_worktree`.** The control plane puts `WORKTREE_STANZA` in the prompts by that answer (2a.4), and the worker locks `.git` with `review_loop.lock_git_dir`, unchanged, exactly when it is true. The worker never recomputes it, so the stanza and the lock cannot disagree. The answer it must carry is whether more than one persona reads the clone, whatever their phases or the cap: Sage's phase-2 pass reads whatever a phase-1 pass left in the clone, so `red_team,sage` is a shared clone (overview, the job spec). A job spec without a boolean `shared_worktree` is refused at `fetch-job`.
 9. **The session id is read from the transcript.** The first line whose `sessionId` is a plausible id wins, and a session id that could escape the projects directory is refused. A transcript with no id starts a fresh session with a `WARN`. When the job's `session_id` disagrees with the transcript's, the transcript's resumes, with a `WARN`. A `session_id` with no transcript starts fresh.
 10. **A pass that cannot start is an ordinary failed pass**, as in local mode's `_run_one`: any exception from spawning `claude` (`EAGAIN` at the PID limit, `ENOMEM`, no `claude` on `PATH`) becomes a failed `PassResult`, and the pair still sends `complete-pair`. Letting it out would abort the pool, and the started pair, its siblings and the next phase would never complete.
 11. **A refused `start-pair` runs nothing and completes nothing**: the pair stays owed, and the log names the refusal's reason. A usage limit in phase 1 withholds phase 2, as `run_group` does, and those pairs are never started, so the control plane still owes them.
 12. **`complete-pair` notes are `{rc, limited, transcript}`**, where `transcript` is `ok`, `missing` or `over-cap`. They are evidence for the control plane, never an outcome. `complete-pair` is retried up to `COMPLETE_ATTEMPTS` (4) times, with a growing pause, when the channel answers `503` or cannot be reached: the channel bounds the large bodies it holds at once (2a.4a), and a burst of one job's own completions can meet that bound. Any other answer is final.
 13. **The shim allows a fixed set of reads** (`pr view|diff|list`, `issue view|list`, `repo view`, `search`, and `api`) and refuses everything else with one message that names `gh pr comment` as the only way to post. `gh api` is checked by allowlist, because `gh` parses flags with pflag, which accepts attached short values (`-XPOST`, `-fbody=x`) and combined flags, so no list of write spellings is complete. It takes exactly one REST path, and only `--paginate`, `--slurp`, `-i`/`--include`, `--silent`, `--verbose`, `-q`/`--jq`, `-t`/`--template` and `--cache`. Every other flag is refused, `--hostname`, `-H` and `--method` included, and so are `graphql` (always a `POST`) and a full URL. Reads the worker's token can never answer are refused with their own message, which tells the persona to carry on with the review: `pr checks` and `pr status` (check status, which `GH_STANZA` already says the token cannot read, and which `pr status` fetches with no flag to leave it out), `run view|list` (the App asks for no Actions permission), and `auth status` (it needs a user). GitHub's 403 for them would read as a refused read, which the hosted prompt tells a persona to stop the review over. That list is the readable message for the common cases, not the boundary: `gh api` takes any path, so the shim runs the real `gh` as a child, passes its output through, and adds the same "carry on" message whenever GitHub answers that the token has no permission ("Resource not accessible by integration" or "Must have admin rights", in REST and GraphQL alike). GitHub's answer is the one owner of which reads this token can make. A bare 403 is not that answer, since GitHub rate-limits with 403 too: a rate-limited read gets its own note, to wait and run it again, never to carry on past a read that has not succeeded.
 14. **`gh pr comment` takes `--body`, `-b`, `--body=`, and `--body-file`/`-F` (with `-` for stdin)**, and one PR number, which must be the job's. Any other flag is refused with a message naming the two that work. The finding number `seq` is counted per persona in a mode-600 file under the reviewer's home, under `flock`, so a pair's concurrent shells never reuse one.
-15. **A refused finding exits 1 and prints the control plane's `message`** on stderr. An unreachable channel exits 1 and says the finding was not posted.
+15. **A refused finding exits 1 and prints the control plane's `message`** on stderr. An unreachable channel exits 1 and says the finding was not posted. The post follows no redirect, as `worker.Channel` does not: urllib would replay the capability's `Authorization` header to whatever host a 30x named, so a 30x is reported as a refusal and the finding as not posted.
 16. **The channel capability is authority over the whole job, and a pass can name any persona of it.** `start-pair`, `post-finding` and `complete-pair` take the pair from the body, so a prompt-injected pass can start a sibling before it does, complete a started one with its own transcript, or spend a sibling's finding quota. A per-pair channel token would not change that: the worker is one uid, so a pass can read a sibling's token from `/proc/<pid>/environ`, and it can already kill a sibling's `claude` outright. Every pair of a job reviews the same PR, so what this reaches is how that one PR is reviewed, and the person who can inject is that PR's author. It reaches nothing outside the job: no other PR's state, no other repo's, and no outcome the gateway did not see. This is the spec's "What a prompt-injected reviewer holds" ("Everything in the worker: the capability, …"), stated at the precision the channel needs. Its "cannot misreport how its pairs ended" holds for the outcome the gateway records, and not for which transcript a sibling's session keeps. Closing it takes a uid per pair, which is not in 2a.
+17. **A worker's bulk writes are bounded.** The runner mounts the clone directory `/home/reviewer/work` as a 2 GB tmpfs owned by the reviewer (`uid=1001`, which the Dockerfile now pins, since root in the worker holds no `CAP_CHOWN` to hand a mount over) and `/tmp` as a 512 MB tmpfs. tmpfs pages count against `--memory 4g`, so the memory limit bounds them too. An oversized clone then fails its own job instead of filling the disk the control plane, the gateway and every other installation's jobs share. This is only the blast radius: 2b's clone-byte cap and its `too large` outcome are the product behaviour, and the rest of the writable layer stays bounded by the host until then.
 
 ## Review Focus
 
@@ -102,10 +103,12 @@ from types import SimpleNamespace
 
 import gwproto
 import runnerd
-from runner import (CONTAINER_PREFIX, ENTRYPOINT, HARDENING, LocalDockerRunner, RunnerClient,
+from runner import (CONTAINER_PREFIX, ENTRYPOINT, HARDENING, WORKER_DISK, LocalDockerRunner, RunnerClient,
                     RunnerError, check_start)
 
 BOOT = "cbx_b_0123456789abcdef_" + "A" * 43
+
+ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 
 
 class FakeRun:
@@ -153,7 +156,7 @@ class LocalDockerRunnerTest(unittest.TestCase):
         self.assertEqual(call["argv"], [
             "docker", "run", "-d", "--name", CONTAINER_PREFIX + "job-1",
             "--label", "claudebox.job=job-1", "--network", "claudebox-hosted", *HARDENING,
-            "--entrypoint", ENTRYPOINT, "-e", "CLAUDEBOX_JOB", "claudebox:latest"])
+            *WORKER_DISK, "--entrypoint", ENTRYPOINT, "-e", "CLAUDEBOX_JOB", "claudebox:latest"])
         self.assertNotIn(BOOT, " ".join(call["argv"]))
         self.assertEqual(json.loads(call["env"]["CLAUDEBOX_JOB"]),
                          {"job_id": "job-1", "bootstrap_token": BOOT,
@@ -165,6 +168,14 @@ class LocalDockerRunnerTest(unittest.TestCase):
                                      "--cap-add", "SETGID", "--cap-add", "SETPCAP",
                                      "--security-opt", "no-new-privileges",
                                      "--pids-limit", "512", "--memory", "4g"))
+
+    def test_the_clone_and_tmp_are_bounded_and_the_clone_is_the_reviewers(self):
+        # PR #20 review: an oversized clone filled the shared host's disk.
+        self.assertEqual(WORKER_DISK, (
+            "--tmpfs", "/home/reviewer/work:size=2g,uid=1001,gid=1001,mode=0700",
+            "--tmpfs", "/tmp:size=512m"))
+        with open(os.path.join(ROOT, "Dockerfile")) as f:
+            self.assertIn("useradd --uid 1001 --create-home", f.read())
 
     def test_a_bad_start_never_reaches_docker(self):
         r, run = self.runner()
@@ -285,6 +296,14 @@ ENTRYPOINT = "/opt/claudebox/worker/entrypoint.sh"
 HARDENING = ("--user", "0", "--cap-drop", "ALL", "--cap-add", "SETUID", "--cap-add", "SETGID",
              "--cap-add", "SETPCAP", "--security-opt", "no-new-privileges",
              "--pids-limit", "512", "--memory", "4g")
+# Where a worker may write in bulk, bounded. The clone gets a tmpfs owned by
+# the reviewer (uid 1001, pinned in the Dockerfile): an oversized repo then
+# fails its own job instead of filling the disk the control plane records on
+# (PR #20 review). tmpfs pages count against --memory, so 4g bounds them too.
+# 2b's clone-byte cap and `too large` outcome are the product behaviour; this
+# is only the blast radius.
+WORKER_DISK = ("--tmpfs", "/home/reviewer/work:size=2g,uid=1001,gid=1001,mode=0700",
+               "--tmpfs", "/tmp:size=512m")
 
 
 class RunnerError(Exception):
@@ -345,7 +364,7 @@ class LocalDockerRunner(JobRunner):
 
     def start_argv(self, job_id: str) -> List[str]:
         return (["run", "-d", "--name", CONTAINER_PREFIX + job_id, "--label", f"{LABEL}={job_id}",
-                 "--network", self.network] + list(HARDENING)
+                 "--network", self.network] + list(HARDENING) + list(WORKER_DISK)
                 + ["--entrypoint", ENTRYPOINT, "-e", "CLAUDEBOX_JOB", self.image])
 
     def start(self, job_id: str, bootstrap_token: str, channel_url: str, gateway_url: str) -> None:
@@ -463,7 +482,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_runner.py'`, then `./test-python.sh`
-Expected: PASS, 14 tests. The whole suite passes.
+Expected: PASS, 15 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
@@ -712,7 +731,7 @@ git commit -m "worker: the root entrypoint that drops to the reviewer with setpr
   - `api_problem(args) -> Optional[str]`: why `gh api <args>` is refused, or None.
   - `parse_comment(args) -> (pr, body)`, raising `ValueError` naming what is wrong.
   - `next_seq(home, persona) -> int`, and `post_finding(args) -> int`.
-  - `main(argv) -> int`, which `os.execv`s the real `gh` for an allowed read.
+  - `main(argv) -> int`, which runs the real `gh` as a child for an allowed read and passes its output through (decision 13).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -773,7 +792,7 @@ class ShimParseTest(unittest.TestCase):
                 self.gh.parse_comment(args)
 
     def test_writes_are_refused_before_the_real_gh(self):
-        with mock.patch.object(self.gh.subprocess, "run") as execv, \
+        with mock.patch.object(self.gh.subprocess, "run") as run_real, \
                 mock.patch.object(sys, "stderr", io.StringIO()):
             for argv in (["pr", "review", "7", "--approve"], ["pr", "merge", "7"],
                          ["issue", "comment", "7", "-b", "x"],
@@ -797,7 +816,7 @@ class ShimParseTest(unittest.TestCase):
                          ["run", "view", "1"], ["auth", "status"]):
                 with self.subTest(argv=argv):
                     self.assertEqual(self.gh.main(argv), 1)
-            execv.assert_not_called()
+            run_real.assert_not_called()
 
     def test_a_read_the_token_cannot_answer_says_so_and_does_not_stop_the_review(self):
         # PR #20 review: GitHub's 403 here would read as a refused read.
@@ -808,14 +827,14 @@ class ShimParseTest(unittest.TestCase):
 
     def test_reads_go_to_the_real_gh(self):
         ok = subprocess.CompletedProcess([], 0, stderr=b"")
-        with mock.patch.object(self.gh.subprocess, "run", return_value=ok) as execv:
+        with mock.patch.object(self.gh.subprocess, "run", return_value=ok) as run_real:
             for argv in (["pr", "diff", "7"], ["pr", "view", "7", "--json", "title"],
                          ["api", "repos/a/b/pulls/7/comments"], ["search", "prs", "x"],
                          ["api", "--paginate", "-q", ".[].body", "repos/a/b/pulls/7/comments"],
                          ["api", "--jq=.title", "repos/a/b/pulls/7"], ["api", "-q.title", "x"]):
                 with self.subTest(argv=argv):
                     self.gh.main(argv)
-                    self.assertEqual(execv.call_args.args[0][1:], argv)
+                    self.assertEqual(run_real.call_args.args[0][1:], argv)
 
     def test_a_403_from_github_says_carry_on(self):
         # PR #20 review: `gh api` takes any path, so GitHub's 403 is what says
@@ -842,6 +861,19 @@ class Channel(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         self.server.seen.append((self.headers["Authorization"], body))
+        self._answer()
+
+    def do_GET(self):
+        self.server.seen.append((self.headers["Authorization"], None))
+        self._answer()
+
+    def _answer(self):
+        if getattr(self.server, "location", None):
+            self.send_response(302)
+            self.send_header("Location", self.server.location)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         status, reply = self.server.reply
         data = json.dumps(reply).encode()
         self.send_response(status)
@@ -883,6 +915,20 @@ class ShimPostTest(unittest.TestCase):
         rc, out, err = self.call(["pr", "comment", "7", "--body", "ghp_x"])
         self.assertEqual((rc, out), (1, ""))
         self.assertIn("contained a credential", err)
+
+    def test_a_redirect_is_not_followed_and_the_capability_stays_home(self):
+        # PR #20 review: urlopen followed a 302 and replayed the capability's
+        # Authorization header to the host it named.
+        other = http.server.HTTPServer(("127.0.0.1", 0), Channel)
+        other.seen, other.reply, other.location = [], (200, {"result": "queued"}), None
+        threading.Thread(target=other.serve_forever, args=(0.01,), daemon=True).start()
+        self.addCleanup(other.server_close)
+        self.addCleanup(other.shutdown)
+        self.server.location = f"http://127.0.0.1:{other.server_port}/channel/post-finding"
+        rc, out, err = self.call(["pr", "comment", "7", "--body", "x"])
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("not posted", err)
+        self.assertEqual(other.seen, [])
 
     def test_another_pr_is_refused_without_a_request(self):
         rc, _, err = self.call(["pr", "comment", "8", "--body", "x"])
@@ -1008,6 +1054,15 @@ def next_seq(home: str, persona: str) -> int:
     return current
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """worker.py's rule, repeated here because the shim runs alone on PATH:
+    urllib would replay the capability's Authorization header to wherever a
+    30x pointed, so a redirect comes back as the 30x it is (PR #20 review)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def post_finding(args) -> int:
     env = os.environ
     try:
@@ -1025,7 +1080,7 @@ def post_finding(args) -> int:
         headers={"Authorization": f"Bearer {env['CLAUDEBOX_CAPABILITY']}",
                  "Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=60) as resp:
             data = json.loads(resp.read() or b"{}")
             status = resp.status
     except urllib.error.HTTPError as exc:
@@ -1135,7 +1190,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `chmod 755 worker/bin/gh`, then `./test-python.sh -p 'test_worker_gh.py'`, then `./test-python.sh`
-Expected: PASS, 10 tests. The whole suite passes, and no `__pycache__` appears under `worker/bin/`.
+Expected: PASS, 11 tests. The whole suite passes, and no `__pycache__` appears under `worker/bin/`.
 
 - [ ] **Step 5: Commit**
 
@@ -1981,10 +2036,22 @@ Apply this change to `Dockerfile`:
 
 ```diff
 diff --git a/Dockerfile b/Dockerfile
-index 428e0ee..4591dc2 100644
+index 428e0ee..e252f8b 100644
 --- a/Dockerfile
 +++ b/Dockerfile
-@@ -164,6 +164,17 @@ RUN python3 -c 'import sys; sys.path.insert(0, "/opt/claudebox/reviewer"); impor
+@@ -122,7 +122,10 @@ ENV KINDEX_PYTHON=/opt/kindex/bin/python \
+ # --- Non-root user ---------------------------------------------------------
+ # Claude Code refuses --dangerously-skip-permissions when running as root, so
+ # the loop must run unprivileged. This is also a defense-in-depth boundary.
+-RUN useradd --create-home --shell /bin/bash reviewer
++# The uid is pinned because the hosted job runner mounts the worker's clone
++# directory as a tmpfs owned by it (hosted/runner.py's WORKER_DISK), and root
++# in the worker holds no CAP_CHOWN to hand the mount over afterwards.
++RUN useradd --uid 1001 --create-home --shell /bin/bash reviewer
+ 
+ # Pre-create the top-level roots that host repo paths live under, owned by
+ # `reviewer`, so `--export-sessions` can clone the working copy at the *host*
+@@ -164,6 +167,17 @@ RUN python3 -c 'import sys; sys.path.insert(0, "/opt/claudebox/reviewer"); impor
  # installed above with no venv of its own. See the file header for why it exists.
  COPY --chown=reviewer:reviewer workersai-shim.py /usr/local/bin/workersai-shim.py
  RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/workersai-shim.py
