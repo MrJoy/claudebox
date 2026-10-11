@@ -83,6 +83,21 @@ class LoadTest(unittest.TestCase):
         self.assertIn("timeing: unknown key (did you mean 'timing'?)",
                       problems({"profiles": {"o": profile()}, "timeing": {}}))
 
+    def test_malformed_shapes_are_problems_not_tracebacks(self):
+        # PR #17 review: each guard below survived its own deletion.
+        # Mutation: Drop any one of the section, name, body or override guards.
+        for doc, line in (
+                ({"profiles": {"o": profile()}, "timing": 5}, "timing: must be an object"),
+                ({"profiles": {"o/../x": profile()}},
+                 "profiles.o/../x: profile names use letters, digits"),
+                ({"profiles": {"o\n": profile()}}, "profile names use letters, digits"),
+                ({"profiles": {"o": 5}}, "profiles.o: must be an object"),
+                ({"profiles": {"o": profile()},
+                  "caps": {"clone_bytes": {"overrides": {"api": "big"}}}},
+                 "caps.clone_bytes.overrides.api: must be a positive integer")):
+            with self.subTest(line=line):
+                self.assertIn(line, problems(doc))
+
     def test_an_unknown_key_inside_a_profile_is_an_error(self):
         # PR #17 review: profiles are the one tree reached through "*", so only
         # this case pins the descent into a member's body.
