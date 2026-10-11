@@ -47,7 +47,7 @@ The spec and the overview leave these open, and each one changes code. They are 
 10. **A pass that cannot start is an ordinary failed pass**, as in local mode's `_run_one`: any exception from spawning `claude` (`EAGAIN` at the PID limit, `ENOMEM`, no `claude` on `PATH`) becomes a failed `PassResult`, and the pair still sends `complete-pair`. Letting it out would abort the pool, and the started pair, its siblings and the next phase would never complete.
 11. **A refused `start-pair` runs nothing and completes nothing**: the pair stays owed, and the log names the refusal's reason. A usage limit in phase 1 withholds phase 2, as `run_group` does, and those pairs are never started, so the control plane still owes them.
 12. **`complete-pair` notes are `{rc, limited, transcript}`**, where `transcript` is `ok`, `missing` or `over-cap`. They are evidence for the control plane, never an outcome.
-13. **The shim allows a fixed set of reads** (`pr view|diff|list|status`, `issue view|list`, `repo view`, `auth status`, `run view|list`, `search`, and `api`) and refuses everything else with one message that names `gh pr comment` as the only way to post. `gh api` is checked by allowlist, because `gh` parses flags with pflag, which accepts attached short values (`-XPOST`, `-fbody=x`) and combined flags, so no list of write spellings is complete. It takes exactly one REST path, and only `--paginate`, `--slurp`, `-i`/`--include`, `--silent`, `--verbose`, `-q`/`--jq`, `-t`/`--template` and `--cache`. Every other flag is refused, `--hostname`, `-H` and `--method` included, and so are `graphql` (always a `POST`) and a full URL. `pr checks` is left out because the token cannot read check status (`GH_STANZA` already says so).
+13. **The shim allows a fixed set of reads** (`pr view|diff|list`, `issue view|list`, `repo view`, `auth status`, `run view|list`, `search`, and `api`) and refuses everything else with one message that names `gh pr comment` as the only way to post. `gh api` is checked by allowlist, because `gh` parses flags with pflag, which accepts attached short values (`-XPOST`, `-fbody=x`) and combined flags, so no list of write spellings is complete. It takes exactly one REST path, and only `--paginate`, `--slurp`, `-i`/`--include`, `--silent`, `--verbose`, `-q`/`--jq`, `-t`/`--template` and `--cache`. Every other flag is refused, `--hostname`, `-H` and `--method` included, and so are `graphql` (always a `POST`) and a full URL. `pr checks` and `pr status` are left out because the token cannot read check status (`GH_STANZA` already says so), and `pr status` fetches it with no flag to leave it out.
 14. **`gh pr comment` takes `--body`, `-b`, `--body=`, and `--body-file`/`-F` (with `-` for stdin)**, and one PR number, which must be the job's. Any other flag is refused with a message naming the two that work. The finding number `seq` is counted per persona in a mode-600 file under the reviewer's home, under `flock`, so a pair's concurrent shells never reuse one.
 15. **A refused finding exits 1 and prints the control plane's `message`** on stderr. An unreachable channel exits 1 and says the finding was not posted.
 
@@ -790,7 +790,8 @@ class ShimParseTest(unittest.TestCase):
                          ["api", "https://evil.example/x"],
                          ["api", "--hostname", "evil.example", "user"],
                          ["api", "-H", "X-HTTP-Method-Override: POST", "x"],
-                         ["api", "a", "b"]):
+                         ["api", "a", "b"],
+                         ["pr", "status"], ["pr", "checks", "7"]):
                 with self.subTest(argv=argv):
                     self.assertEqual(self.gh.main(argv), 1)
             execv.assert_not_called()
@@ -906,7 +907,9 @@ REAL_GH = "/usr/bin/gh"
 
 # Reads the reviewer may make. Everything else is refused. `gh api` is checked
 # separately, by api_problem.
-READS = {("pr", "view"), ("pr", "diff"), ("pr", "list"), ("pr", "status"),
+# Not `pr checks` or `pr status`: both read check status, which the token
+# cannot, and `pr status` has no flag to leave it out.
+READS = {("pr", "view"), ("pr", "diff"), ("pr", "list"),
          ("issue", "view"), ("issue", "list"), ("repo", "view"), ("auth", "status"),
          ("search", None), ("run", "view"), ("run", "list")}
 # `gh api` flags allowed, by allowlist rather than by spotting writes: pflag
