@@ -30,3 +30,8 @@ to the Validator.
 `docs/superpowers/plans/` hold each task's implementation code and its test code side by
 side, so opening one shows you the tests you are judged by. The Validator derives a
 brief for your lane and hands you its path; if you open a plan anyway, say so and stop.
+
+**The kindex graph is shared with the Tester.** Search it as your skill says, but do not
+`add` to it until the verdict is signed: a note about how your implementation behaves is
+a statement of what to assert about it, and the Tester can read it. List your captures in
+your hand-over instead.

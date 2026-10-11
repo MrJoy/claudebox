@@ -22,7 +22,13 @@ judging suite is the five suites `./test-python.sh`, `./test-providers.sh`,
 those and judges; you do not.** You may execute a test you wrote to confirm it is
 well-formed (`./test-python.sh -p 'test_<name>.py'`, or one case of a bash suite by its
 label filter); that is a check on your own artifact, not the observation that decides
-whether the change is good. That run is the Validator's.
+whether the change is good. That run is the Validator's, and your self-check is never
+cited as evidence for the verdict.
+
+**The kindex graph is shared with the Coder.** During the run, do not `search` or ask it
+about the area under test, and do not `add` to it until the verdict is signed. A note in
+it may be the Coder's account of how its implementation behaves, which is exactly the
+oracle you must not have. If one reaches you anyway, tell the Validator.
 
 Tests follow this repo's conventions. Python cases are stdlib `unittest` under `tests/`,
 in files named `test_*.py`, each starting with `import _path  # noqa: F401` so that

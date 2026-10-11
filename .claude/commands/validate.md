@@ -16,9 +16,12 @@ If your harness has no Skill tool (Codex is one), read
 `$ARGUMENTS` was not substituted, your arguments are the text after "Arguments:" in
 your launch prompt.
 
-Project-specific gates this repo requires before you render any verdict. They are
-yours: the Coder and Tester are forbidden from running them, so if no line in your own
-record shows you ran them, they were not run.
+Project-specific gates this repo requires before you render any verdict. The judging
+run of them is yours, and only your own record counts as one: if no line in your record
+shows you ran them, they were not run. The Coder runs none of them. The Tester may run a
+filtered case of the tests it wrote, to check its own artifact is well-formed (`/test`
+says so); that run is in the Tester's log, it judges nothing, and it is never evidence
+for the verdict.
 
 - `./test-python.sh`: the `unittest` suite under `tests/`.
 - `./test-providers.sh`, `./test-personas.sh`, `./test-shim.sh`, `./test-launcher.sh`:
@@ -64,24 +67,29 @@ session gives you.
   it launched sit holding no spec. Everything else in Phase 4 stands — both lanes get
   the same spec, neither receives the other's output, and the Coder's upward paths
   (question, failure report, specification defect) stay open.
-- **The channel-security section** — encrypted spoke channels, per-lane passphrases,
-  the channel probe. There is no channel abstraction here to encrypt: coordination is
-  `tmux send-keys` into a named window. Do not stand up a spoke helper and do not run the
-  channel probe — a probe that cannot pass is worse than an absent one, because a skipped
-  check reads as a satisfied one. What replaces it is the boundary stated in
-  `/orchestrate`'s tmux section, and you report that boundary verbatim in your verdict
-  rather than a channel-isolation claim: no notification path and no addressing path
-  between the Coder and the Tester; no filesystem, lane-log, or process-table isolation.
+- **The verdict's isolation line.** This copy of the skill carries no spoke channels and
+  no channel probe: coordination is `tmux send-keys` into a named window, and there is
+  nothing to encrypt. Report the boundary stated in `/orchestrate`'s tmux section, in
+  these words: *no relay or notification path between the lanes, and separate worktrees;
+  lanes can still address and read each other through the shared `tmux` server, the run
+  directory, the process table and the kindex graph, and nothing prevents it.*
+- **Phase 4's assembly.** The Coder and the Tester work in their own detached worktrees,
+  which `/orchestrate` created. Before you run the gates, create an assembly worktree at
+  the run's base commit (`.orchestrator-runs/<run>/base-sha.txt`), copy each lane's changed
+  and new files into it, and run every gate there. Record a digest of every assembled file.
+  On the human's signature, commit exactly those files on the feature branch, and check
+  their digests match before you do. Leave the worktrees for `/orchestrate` to remove.
 
 ## Who may send, and how a lane answers
 
 Two parties send into a lane window: the orchestrator, which relays, and you, which is
-how Phase 4 works at all. The Coder and the Tester send to nobody — they have no
-addressing path to each other and none to you.
+how Phase 4 works at all. The Coder and the Tester are told to send to nobody. Nothing
+technical stops a lane from addressing another through the shared `tmux` server; a lane
+that does is an incident to record, not a channel.
 
 So a lane's upward path is its own window. You ask by `send-keys` into that lane's
 window; the answer comes back in that lane's pane and in its
-`.orchestrator-runs/<run>/<lane>.log`, and you read it with `capture-pane` or by reading
+`.orchestrator-runs/<run>/<lane>/<lane>.log`, and you read it with `capture-pane` or by reading
 the log. **That axis is the intended channel, not a leak.** The leak the boundary text
 forbids is the Coder obtaining the tests, or anything else the Tester wrote, by any
 route — including a quotation of them in your own lane's log. Reading the window of a lane you are judging is your job.
@@ -100,7 +108,8 @@ the Coder would read the tests it is judged by, and the Tester would read the
 implementation its oracle must not come from.
 
 So before Phase 4, derive two briefs from the plan, write each into this run's
-directory (`.orchestrator-runs/<run>/`), and hand each lane only the path to its own:
+directory, the Coder's as `.orchestrator-runs/<run>/coder/brief.md` and the Tester's as
+`.orchestrator-runs/<run>/tester/brief.md`, and hand each lane only the path to its own:
 
 - **Coder brief**: the plan with every test file's contents and every
   "Write the failing test" and "Run ... test" step removed. Keep the header, Global

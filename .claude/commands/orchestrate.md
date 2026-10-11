@@ -102,13 +102,15 @@ exists to prevent.
 
 ## The tmux layout
 
-One tmux session per run. You live in window 0 (`ctl`); each lane gets its own window,
-launched through `lane_env` with that lane's manifest once the harness ships — until
-then, launched plainly, with no per-lane worktree and no shared scratch space. Say what
-that means rather than implying otherwise: **every lane inherits this seat's `$PWD`,
-which is the main checkout.** Three Bash-holding agent processes write to one working
-tree, on the run's feature branch. Per-lane worktrees need `lane_env`, the manifest, and an integration
-story for how one lane's commits reach another's tree — none of which exists yet here.
+One tmux session per run. You live in window 0 (`ctl`); each lane gets its own window.
+The Validator runs in the main checkout, on the run's feature branch. **The Coder and the
+Tester each get a detached worktree at the run's base commit**, beside the checkout, so
+neither lane's uncommitted files ever appear in the other's tree. Neither lane commits.
+Integration is the Validator's: it creates an assembly worktree at the same base, copies
+each lane's changed files into it, runs the judging suites there, and on the human's
+signature commits the assembled files on the feature branch, recording a digest of each
+so the commit is provably what was judged. You remove the three worktrees when the run
+closes, after checking that the committed files match them.
 
     # Substitute the run id, the lane brief, and one launcher per lane before running
     # this. It is written to fail loudly rather than create a session literally named
@@ -122,7 +124,15 @@ story for how one lane's commits reach another's tree — none of which exists y
     # it happened to be when the server started — so a relative base resolves against a
     # directory nobody chose, and the receipts land elsewhere or the `cat` fails on a
     # missing directory.
-    LOGS="$PWD/.orchestrator-runs/$RUN"; mkdir -p "$LOGS"
+    LOGS="$PWD/.orchestrator-runs/$RUN"
+    # One subdirectory per lane, holding that lane's brief (written by the Validator)
+    # and its log, so opening its own brief's directory never shows a lane the other
+    # lane's brief or transcript.
+    mkdir -p "$LOGS/validator" "$LOGS/coder" "$LOGS/tester"
+    BASE="$(git rev-parse HEAD)"; printf '%s\n' "$BASE" > "$LOGS/base-sha.txt"
+    for lane in coder tester; do
+      git worktree add --detach "$PWD/../$(basename "$PWD")-$RUN-$lane" "$BASE"
+    done
     # The brief goes through a file so no lane's command line has to survive a second
     # round of shell quoting. Each pane's shell reads it with `$(cat ...)` inside double
     # quotes, so a `$` or a quote in the brief is passed through, never expanded.
@@ -134,10 +144,12 @@ story for how one lane's commits reach another's tree — none of which exists y
     P="and follow it. Arguments: $B"
     tmux new-window -t "$RUN" -n validator \
       "$VALIDATOR_LAUNCH \"Read .claude/commands/validate.md $P\""
-    tmux new-window -t "$RUN" -n coder "$CODER_LAUNCH \"Read .claude/commands/engineer.md $P\""
-    tmux new-window -t "$RUN" -n tester "$TESTER_LAUNCH \"Read .claude/commands/test.md $P\""
+    tmux new-window -t "$RUN" -n coder -c "$PWD/../$(basename "$PWD")-$RUN-coder" \
+      "$CODER_LAUNCH \"Read .claude/commands/engineer.md $P\""
+    tmux new-window -t "$RUN" -n tester -c "$PWD/../$(basename "$PWD")-$RUN-tester" \
+      "$TESTER_LAUNCH \"Read .claude/commands/test.md $P\""
     for win in validator coder tester; do
-      tmux pipe-pane -o -t "$RUN:$win" "cat >> $LOGS/$win.log"
+      tmux pipe-pane -o -t "$RUN:$win" "cat >> $LOGS/$win/$win.log"
     done
 
 **Which model holds which lane is a per-run choice, and the human makes it.** Budget,
@@ -176,15 +188,19 @@ It removes the notification path and the casual path: neither lane is told about
 other, neither is addressed by it, and there is no conversation for one to "just check
 something" in. In the normal course, each lane hears about the other only through you.
 
-Every window is `pipe-pane`'d to `.orchestrator-runs/<run>/<lane>.log`, and those logs
+Every window is `pipe-pane`'d to `.orchestrator-runs/<run>/<lane>/<lane>.log`, and those logs
 are the run's receipts. A claim with no line in a lane log is testimony, not evidence.
 
 **The accepted limit, stated because an unstated one is the defect.** This is not
-structural isolation and you never describe it as such. The filesystem, the lane logs,
-and the process table are shared: lanes are same-user agent processes that hold a shell,
-`tmux` is on their PATH, and every lane's transcript sits in the shared checkout under
-`.orchestrator-runs/`. A lane that goes looking can `capture-pane` another lane's
-window, `send-keys` into it, or `cat` its log, and nothing prevents it. The axis that is
+structural isolation and you never describe it as such. The filesystem outside each
+worktree, the lane logs, the process table, the `tmux` server and the kindex graph are
+shared: lanes are same-user agent processes that hold a shell, `tmux` is on their PATH,
+every lane's transcript sits in the main checkout under `.orchestrator-runs/`, and every
+lane's kindex tools reach one graph. A lane that goes looking can `capture-pane` another
+lane's window, `send-keys` into it, `cat` its log, or `search` the graph for what the other
+lane captured, and nothing prevents it. The graph is the one of these a lane is *told* to
+use, so the lane shims narrow it for the run: the Coder searches but does not add, and the
+Tester neither searches the area under test nor adds. The axis that is
 NOT a leak, named so the prohibition does not swallow the mechanism: you and the
 Validator both address lanes and both read their windows and logs — that is how relaying
 and Phase 4 work. What is forbidden is the Coder obtaining the tests, or anything
@@ -193,11 +209,9 @@ either in a log the Coder can read.
 Real separation
 needs different users at minimum, and properly different containers or hosts — not
 different wording. So: **this separation is a discipline, and a cross-lane leak is an
-incident to disclose, not a convenience to absorb.** Upstream mitigates the most casual
-version of the leak with a per-lane worktree; that is not in force here, because lanes
-share the main checkout (see the launch block above). So the sharing is wider
-than upstream's: a lane can also read and write the other lanes' source files directly,
-not only their logs and windows.
+incident to disclose, not a convenience to absorb.** Per-lane worktrees remove the most
+casual version of the leak, the Coder tripping over test files in its own checkout. They
+do not stop a lane from reading another worktree's files by path.
 
 ## The monitoring loop
 
@@ -265,6 +279,7 @@ never cite one as a founder ruling.
 ## What done looks like
 
 A run closes when: every objective's verdict is rendered and receipted, every lease is
-dead, every lane's window is closed, no durable timer, cron entry, or `launchd` agent
+dead, every lane's window is closed, every worktree the run created is removed (after its
+files are checked against the commit), no durable timer, cron entry, or `launchd` agent
 exists that this run created, and the human has the decidable package — anomalies
 first. If any of those is not true, the run is not done; say which one and why.
