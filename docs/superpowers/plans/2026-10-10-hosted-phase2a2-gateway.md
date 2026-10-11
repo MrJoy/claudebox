@@ -39,12 +39,12 @@ The spec and the overview leave these open, and each one changes code. They are 
 1. **Two sockets, each with one direction of request and reply.** The gateway listens on `GATEWAY_SOCKET` for the control plane's `hello`, `add_token`, `revoke` and `flush`. The control plane listens on `CONTROL_SOCKET` for the gateway's `report`. Each side is a plain client of the other's server, so no connection ever carries requests both ways. Both socket files are mode 0660.
 2. **A token carries its profile.** A token row is `{credential_id, hash_hex, salt_hex, job_id, persona, model, expires_at, route: {name, provider, base_url, auth, credential, per_pair_requests, per_pair_tokens, budget_unit}, counts}`. `credential` is the secret's name, and the gateway reads its value from its own environment at request time. A token whose route cannot be served (an unserved provider, or a credential the gateway's environment lacks) is refused on its own, with a `WARN` line and an entry in the `hello` reply's `refused` list, using `served_problems`'s wording. Every other token is still served.
 3. **`hello` is a full, non-regressing snapshot.** A token the gateway already holds keeps whichever copy has the higher `seq`, and a token the snapshot leaves out is dropped (the control plane revoked it). Before its first `hello` the gateway answers every other op with `{error: "hello first", ready: false}`, and the control plane (2a.4) answers that with a `hello`. That is how a gateway that restarted alone gets its tokens back. `add_token` for a token already held changes nothing.
-4. **Admission is atomic per token, and bounded.** Under the lock, a request is refused if a cap was already hit, if the token has used its request cap, or if its counted tokens have reached the token cap. Those three are cap refusals. It is paced instead (HTTP 429, nothing recorded, nothing concluded) if the token has `IN_FLIGHT_MAX` (8) requests in flight, or if what is left of the token cap is all reserved by requests still running. Otherwise one request is counted and `max_tokens` is reserved, both before the forward. Concurrent requests serialize on the check, so the request cap holds against a client that is not Claude Code. Input is counted when the provider reports it, so the token cap can be passed by at most `IN_FLIGHT_MAX` requests' worth of input. The reservation is released on every path from admission to the reply, an unlisted exception included: `do_POST` wraps the forward in a `finally` that completes the request as `abandoned` with `gateway fault: <type>` and logs a `WARN` when nothing else did.
+4. **Admission is atomic per token, and bounded.** Under the lock, a request is refused if a cap was already hit, if the token has used its request cap, or if its counted tokens have reached the token cap. Those three are cap refusals. It is paced instead (HTTP 429, nothing counted) if the token has `IN_FLIGHT_MAX` (8) requests in flight, or if what is left of the token cap is all reserved by requests still running. The first pacing on a token is reported as `first_abandoned` ("the gateway paced this pair's requests"), which replaces `ok` and nothing else: a pass whose retries ran out against pacing stopped because of the gateway, and a record silent about it could commit `ok`. Otherwise one request is counted and `max_tokens` is reserved, both before the forward. Concurrent requests serialize on the check, so the request cap holds against a client that is not Claude Code. Input is counted when the provider reports it, so the token cap can be passed by at most `IN_FLIGHT_MAX` requests' worth of input. The reservation is released on every path from admission to the reply, an unlisted exception included: `do_POST` wraps the forward in a `finally` that completes the request as `abandoned` with `gateway fault: <type>` and logs a `WARN` when nothing else did.
 5. **A cap refusal is HTTP 400 with an `invalid_request_error` body** naming the cap. Claude Code retries a 429 or a 5xx, and a 429 would also read as a usage limit. A cap hit is terminal: every later request on that token is refused with a 400 that says the pair is done, and reports nothing. A cap hit therefore means counted use reached a cap, never a shortfall caused by reservations, which is pacing.
 6. **The body cap refuses the request, and is not a pair outcome**, as the spec's cap table has it: "provider request body | 4 MB | fixed | request refused". The 413 is sent on the declared `Content-Length`, before the body is read.
 7. **A starting gateway answers 503**, and that refusal is in no record: the spec's "a request ... a starting gateway turned away" is a claudebox fault.
 8. **Tokens are counted as every kind of input the provider reports** (`input_tokens`, `cache_creation_input_tokens` and `cache_read_input_tokens`) plus the largest `output_tokens` seen. Output is cumulative across `message_delta`s, and summing it would double-count.
-9. **Classification.** HTTP 429 or 529, or an error event of type `rate_limit_error` or `overloaded_error`, is a usage limit. A 401 or 403 is a failure: the provider refused the deployment's credential, which the operator must hear about. A 5xx is a failure. Any other 4xx is `rejected`. The request body is the worker's, so a rejected request is reported as `first_rejected` and never moves the profile's failure counter, which a worker could otherwise drive to park the profile for every repo on it. A transport error reaching upstream, or a read that breaks mid-response, is a failure named `upstream transport: <exception type>`. A 2xx stream that ends without `message_stop` is a failure (`the stream ended before message_stop`). A 2xx on `/v1/messages` is a success. A 2xx on `count_tokens` is neutral: it counts as a request, never as a pass.
+9. **Classification.** HTTP 429 or 529, or an error event of type `rate_limit_error` or `overloaded_error`, is a usage limit. A 401 or 403 is a failure: the provider refused the deployment's credential, which the operator must hear about. A 5xx is a failure. Any other 4xx is `rejected`. The request body is the worker's, so a rejected request is reported as `first_rejected` and never moves the profile's failure counter, which a worker could otherwise drive to park the profile for every repo on it. The request line is the worker's too: the query is forwarded, so a request target carrying a byte `http.client` will not put on a request line (a control byte, or anything outside printable ASCII) is refused 400 at the door, recorded nowhere. Should one get past, the `InvalidURL` or `UnicodeError` that `putrequest` raises before any connection is reported as `abandoned`, the gateway's fault, never as `upstream transport`. A transport error reaching upstream, or a read that breaks mid-response, is a failure named `upstream transport: <exception type>`. A 2xx stream that ends without `message_stop` is a failure (`the stream ended before message_stop`). A 2xx on `/v1/messages` is a success. A 2xx on `count_tokens` is neutral: it counts as a request, never as a pass.
 10. **A worker that hangs up mid-response** stops the relay. The request and the tokens seen so far are counted, and the report carries `first_abandoned`, which takes the place of `ok` and nothing else (overview decision 2): a record that would otherwise decide `ok` decides `deferred`, and every other outcome, a cap hit's `capped` included, stands over it. The worker chooses when to hang up, so the marker must never turn a cap into a retry, nor hide what upstream answered: a hang-up after a non-2xx status line is recorded as that status's outcome (a limit, a failure, a rejection), since the status alone decides it. So is any answer on a path that is never a pass: a lost `count_tokens` is `neutral`, and its body, which carries no `usage`, never fails a tokens profile closed. Only a lost 2xx on `/v1/messages`, whose outcome needs the body, is abandoned. On a tokens profile, an abandoned request whose usage was never seen is also `usage_missing` (decision 12): a non-streamed response is generated whole before it is sent, so hanging up cannot un-spend it, and the record decides `capped`, with the pair parked and paged rather than left to spend unmeasured.
 11. **A passes profile clamps `max_tokens` to 64,000** (`MAX_TOKENS_CEILING`), the spec's "caps ... `max_tokens`" for a provider that cannot report usage. A tokens profile clamps to whatever its pair has left after in-flight reservations.
 12. **A response without usage on a tokens profile** is passed through to the worker. The pair is marked `usage_missing`, reported, and paged (`PAGE:` on stdout, overview decision 14), and every later request on that token is refused. The control plane commits that record as `capped` (overview decision 2).
@@ -53,7 +53,7 @@ The spec and the overview leave these open, and each one changes code. They are 
 15. **The listener is bounded, overall and per peer.** A connection idle for 60 seconds (`IDLE_SECONDS`) is closed. Past 256 open connections (`MAX_CONNECTIONS`), or past 16 from one peer address (`MAX_CONNECTIONS_PER_PEER`, twice `IN_FLIGHT_MAX`), a new one is closed at once. Both are charged at accept, before a byte is read, so a client that never sends a token is bounded too. Each worker is its own container with its own address, so one prompt-injected worker cannot take the listener from every other job.
 16. **A clean stop drains.** On `SIGTERM` the gateway stops accepting requests and gives queued reports up to 10 seconds to reach the control plane, then logs whether they drained. A crash loses what was queued, within the spec's stated bound.
 17. **`TOKEN_REPORTING` stays provisional** (Phase 1 decision 6). Narrowing it needs a live response from each provider type, which is a check the human runs by hand (below).
-18. **A cleartext `base_url` is refused unless its host is loopback, and a `base_url` whose port is not a number is refused at load.** The gateway sends the profile's credential there, and `workersai-shim.py` applies the same rule to its upstream.
+18. **A cleartext `base_url` is refused unless its host is loopback, and a `base_url` whose port is not a number is refused at load.** The gateway sends the profile's credential there, and `workersai-shim.py` applies the same rule to its upstream. A `base_url` is the provider's base URL only: the gateway appends `/v1/messages` itself, so one ending in `/v1` is refused at load with the spelling to use (`https://llm.example/v1` → "use https://llm.example instead"). `providers.check_url` lets a bare `/v1` through because Claude Code completes the Vertex base URL itself, and this key has a different consumer.
 
 ## Review Focus
 
@@ -92,7 +92,7 @@ Apply this change to `tests/test_deploy_config.py`. The existing custom-profile 
 
 ```diff
 diff --git a/tests/test_deploy_config.py b/tests/test_deploy_config.py
-index 657ed43..a69d0f2 100644
+index 657ed43..d36ecff 100644
 --- a/tests/test_deploy_config.py
 +++ b/tests/test_deploy_config.py
 @@ -24,6 +24,13 @@ def profile(**over):
@@ -145,7 +145,7 @@ index 657ed43..a69d0f2 100644
                      concrete = path.replace("profiles.*.", "profiles.o.")
                      concrete = concrete.replace("overrides.*", "overrides.api")
                      keys = concrete.split(".")
-@@ -464,3 +478,67 @@ class DeployLeafCoverageTest(unittest.TestCase):
+@@ -464,3 +478,78 @@ class DeployLeafCoverageTest(unittest.TestCase):
                      observed.append(getattr(target, field))
                  self.assertEqual(observed, [expected_before, expected_after])
                  self.assertNotEqual(observed[0], observed[1], "declared leaf has no observable effect")
@@ -174,6 +174,17 @@ index 657ed43..a69d0f2 100644
 +        self.assertIn("ends with an endpoint path",
 +                      problems({"profiles": {"c": custom(base_url="https://llm.example/v1/messages",
 +                                                         usage="reported")}}))
++
++    def test_a_base_url_ending_in_v1_is_refused_with_the_spelling_to_use(self):
++        # PR #19 review: the gateway appends /v1/messages, so /v1 doubled it.
++        for url in ("https://llm.example/v1", "https://llm.example/v1/"):
++            with self.subTest(url=url):
++                self.assertIn("profiles.c.base_url: must be the base URL only, without /v1; the "
++                              "gateway appends /v1/messages itself (use https://llm.example "
++                              "instead)",
++                              problems({"profiles": {"c": custom(base_url=url, usage="reported")}}))
++        d = load({"profiles": {"c": custom(base_url="https://llm.example/api/", usage="reported")}})
++        self.assertEqual(d.profiles["c"].base_url, "https://llm.example/api/")
 +
 +    def test_a_port_that_is_not_a_number_is_refused(self):
 +        for url in ("http://127.0.0.1:notaport", "https://llm.example:99999"):
@@ -226,7 +237,7 @@ Apply this change to `reviewer/deploy_config.py`:
 
 ```diff
 diff --git a/reviewer/deploy_config.py b/reviewer/deploy_config.py
-index c748e1e..a547d13 100644
+index c748e1e..e1ca192 100644
 --- a/reviewer/deploy_config.py
 +++ b/reviewer/deploy_config.py
 @@ -9,12 +9,13 @@ YAML, by founder ruling (2026-10-09).
@@ -278,7 +289,7 @@ index c748e1e..a547d13 100644
  
  
  @dataclass(frozen=True)
-@@ -116,6 +130,31 @@ def _int(problems, raw, key, path, default, minimum=0) -> int:
+@@ -116,6 +130,37 @@ def _int(problems, raw, key, path, default, minimum=0) -> int:
      return default
  
  
@@ -296,6 +307,12 @@ index c748e1e..a547d13 100644
 +        check_url("base_url", value)
 +    except ConfigError as exc:
 +        return str(exc)[len("base_url "):]
++    # check_url lets a bare /v1 through for the Vertex base URL, which Claude
++    # Code completes itself. The gateway appends /v1/messages to this one, so
++    # /v1 here doubles the path and every request 404s (PR #19 review).
++    if urllib.parse.urlsplit(value).path.rstrip("/").lower() == "/v1":
++        return ("must be the base URL only, without /v1; the gateway appends /v1/messages "
++                "itself (use " + value.rstrip("/")[:-len("/v1")] + " instead)")
 +    try:
 +        urllib.parse.urlsplit(value).port
 +    except ValueError:
@@ -310,7 +327,7 @@ index c748e1e..a547d13 100644
  def _profile(problems: Problems, name: str, raw) -> Optional[Profile]:
      path = join("profiles", name)
      before = len(problems.lines())
-@@ -153,6 +192,30 @@ def _profile(problems: Problems, name: str, raw) -> Optional[Profile]:
+@@ -153,6 +198,30 @@ def _profile(problems: Problems, name: str, raw) -> Optional[Profile]:
          problems.add(join(path, "usage"), "only 'reported', and only on a custom profile")
      usage_reported = usage == "reported" and provider == "custom"
  
@@ -341,7 +358,7 @@ index c748e1e..a547d13 100644
      budget = _section(problems, raw, "budget", path)
      bpath = join(path, "budget")
      unit = budget.get("unit")
-@@ -191,7 +254,8 @@ def _profile(problems: Problems, name: str, raw) -> Optional[Profile]:
+@@ -191,7 +260,8 @@ def _profile(problems: Problems, name: str, raw) -> Optional[Profile]:
      if len(problems.lines()) > before:
          return None
      return Profile(name, provider, tuple(models), default_model, credential, concurrency,
@@ -356,7 +373,7 @@ index c748e1e..a547d13 100644
 - [ ] **Step 4: Run them to see them pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_deploy_config.py'`, then `./test-python.sh`
-Expected: PASS, 50 tests. The whole suite passes.
+Expected: PASS, 51 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
@@ -2473,7 +2490,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run them to see them pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_gateway.py'`, then `./test-python.sh`
-Expected: PASS, 64 tests. The whole suite passes.
+Expected: PASS, 65 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
