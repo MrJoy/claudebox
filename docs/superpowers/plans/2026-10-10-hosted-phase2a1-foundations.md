@@ -39,7 +39,7 @@ The spec leaves these open, and each one changes code. They are this plan's answ
 4. **A redacted body** replaces every matched span with `[withheld:<detector>]`, and a literal's detector is `literal:<SECRET NAME>`. A value is never echoed.
 5. **The fork rule fails closed.** A head repository GitHub reports as `null`, which is a deleted fork, counts as a fork.
 6. **No credential leaves the API host by any route GitHub's answers control.** An installation client refreshes its token five minutes before expiry. A `Link: rel="next"` page off the API host is refused before any request is sent. The real transport follows no redirect at all: urllib would replay the `Authorization` header to wherever a 30x pointed, so a redirect comes back as the 30x it is and the caller treats it as an error. A repository name with a `.` or `..` segment is refused before it reaches a URL.
-7. **Only `Retry-After`, an exhausted rate limit, a 5xx and an unreachable GitHub count as retryable.** That is the spec's "Only `Retry-After` and 5xx answers are retried". An exhausted primary rate limit (`x-ratelimit-remaining: 0`) is the same wait, timed from `x-ratelimit-reset`.
+7. **Only `Retry-After`, an exhausted rate limit, a 5xx and an unreachable GitHub count as retryable.** That is the spec's "Only `Retry-After` and 5xx answers are retried". An exhausted primary rate limit (`x-ratelimit-remaining: 0`) is the same wait, timed from `x-ratelimit-reset`. A secondary rate limit may carry neither header, so a 429, or a 403 whose message names a rate limit, waits the minute GitHub asks for. Only the message tells it from a 403 for a missing permission, which stays terminal (the spec's "a 403 that is not a rate limit").
 8. **Config files are read through the contents API with no `ref`**, which GitHub reads as the default branch. A file the API will not inline (over 1 MB) is an error that names its size. Phase 1's caps (64 KB and 256 KB) refuse it long before that.
 9. **Every blob directory is 0700**, intermediate ones included, and a directory that already exists with looser permissions is tightened. `os.makedirs` applies its mode to the leaf alone, and a blob's directories name its repo.
 10. **The rewrite test belongs to the control plane, through `Installation.is_ancestor`** (overview decision 16). It is the compare API's `ahead` or `identical` status, and a 404 counts as not an ancestor, so a rewrite that also dropped the old head still widens the scope.
@@ -1940,6 +1940,18 @@ class ErrorTest(unittest.TestCase):
         self.assertTrue(self.fail(Response(502, {}, b"bad gateway")).retryable)
         self.assertFalse(self.fail(Response(422, {}, b'{"message":"locked"}')).retryable)
 
+    def test_a_secondary_limit_with_no_header_is_retried_after_a_minute(self):
+        # PR #21 review: only the message tells a secondary limit from a
+        # missing permission, and dropping it deleted a paid-for finding.
+        for status, body in ((403, b'{"message":"You have exceeded a secondary rate limit."}'),
+                             (429, b'{"message":"Too many requests"}')):
+            with self.subTest(status=status):
+                e = self.fail(Response(status, {"x-ratelimit-remaining": "4000"}, body))
+                self.assertTrue(e.retryable)
+                self.assertEqual(e.retry_after, 60)
+        e = self.fail(Response(403, {}, b'{"message":"Resource not accessible by integration"}'))
+        self.assertFalse(e.retryable)
+
     def test_a_plain_403_is_not_retryable(self):
         e = self.fail(Response(403, {"x-ratelimit-remaining": "10"}, b'{"message":"no"}'))
         self.assertFalse(e.retryable)
@@ -2150,13 +2162,17 @@ def parse_time(stamp: str) -> int:
     return calendar.timegm(time.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ"))
 
 
-def _retry_after(resp: Response, now: float) -> Optional[int]:
+def _retry_after(resp: Response, now: float, message: str = "") -> Optional[int]:
     value = resp.headers.get("retry-after")
     if value is not None and value.strip().isdigit():
         return max(1, int(value))
     if resp.status in (403, 429) and resp.headers.get("x-ratelimit-remaining") == "0":
         reset = resp.headers.get("x-ratelimit-reset", "")
         return max(1, int(reset) - int(now)) if reset.isdigit() else 60
+    # A secondary rate limit may carry neither header, and only its message
+    # tells it from a missing permission. GitHub asks for at least a minute.
+    if resp.status == 429 or (resp.status == 403 and "rate limit" in message.lower()):
+        return 60
     return None
 
 
@@ -2215,7 +2231,8 @@ class _Client:
             message = json.loads(resp.body).get("message", "")
         except (ValueError, AttributeError):
             message = resp.body[:200].decode("utf-8", "replace")
-        raise GitHubError(resp.status, message or "no message", _retry_after(resp, self.clock()))
+        raise GitHubError(resp.status, message or "no message",
+                          _retry_after(resp, self.clock(), message))
 
     def _pages(self, url: str, key: Optional[str] = None) -> List[Any]:
         items: List[Any] = []
@@ -2408,7 +2425,7 @@ def public_user(login: str, transport: Transport = urllib_transport, api: str = 
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_github_app.py'`, then `./test-python.sh`
-Expected: PASS, 31 tests. The whole suite passes.
+Expected: PASS, 32 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
