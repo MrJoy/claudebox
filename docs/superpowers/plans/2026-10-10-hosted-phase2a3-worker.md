@@ -47,7 +47,7 @@ The spec and the overview leave these open, and each one changes code. They are 
 10. **A pass that cannot start is an ordinary failed pass**, as in local mode's `_run_one`: any exception from spawning `claude` (`EAGAIN` at the PID limit, `ENOMEM`, no `claude` on `PATH`) becomes a failed `PassResult`, and the pair still sends `complete-pair`. Letting it out would abort the pool, and the started pair, its siblings and the next phase would never complete.
 11. **A refused `start-pair` runs nothing and completes nothing**: the pair stays owed, and the log names the refusal's reason. A usage limit in phase 1 withholds phase 2, as `run_group` does, and those pairs are never started, so the control plane still owes them.
 12. **`complete-pair` notes are `{rc, limited, transcript}`**, where `transcript` is `ok`, `missing` or `over-cap`. They are evidence for the control plane, never an outcome.
-13. **The shim allows a fixed set of reads** (`pr view|diff|list`, `issue view|list`, `repo view`, `auth status`, `run view|list`, `search`, and `api`) and refuses everything else with one message that names `gh pr comment` as the only way to post. `gh api` is checked by allowlist, because `gh` parses flags with pflag, which accepts attached short values (`-XPOST`, `-fbody=x`) and combined flags, so no list of write spellings is complete. It takes exactly one REST path, and only `--paginate`, `--slurp`, `-i`/`--include`, `--silent`, `--verbose`, `-q`/`--jq`, `-t`/`--template` and `--cache`. Every other flag is refused, `--hostname`, `-H` and `--method` included, and so are `graphql` (always a `POST`) and a full URL. `pr checks` and `pr status` are left out because the token cannot read check status (`GH_STANZA` already says so), and `pr status` fetches it with no flag to leave it out.
+13. **The shim allows a fixed set of reads** (`pr view|diff|list`, `issue view|list`, `repo view`, `search`, and `api`) and refuses everything else with one message that names `gh pr comment` as the only way to post. `gh api` is checked by allowlist, because `gh` parses flags with pflag, which accepts attached short values (`-XPOST`, `-fbody=x`) and combined flags, so no list of write spellings is complete. It takes exactly one REST path, and only `--paginate`, `--slurp`, `-i`/`--include`, `--silent`, `--verbose`, `-q`/`--jq`, `-t`/`--template` and `--cache`. Every other flag is refused, `--hostname`, `-H` and `--method` included, and so are `graphql` (always a `POST`) and a full URL. Reads the worker's token can never answer are refused with their own message, which tells the persona to carry on with the review: `pr checks` and `pr status` (check status, which `GH_STANZA` already says the token cannot read, and which `pr status` fetches with no flag to leave it out), `run view|list` (the App asks for no Actions permission), and `auth status` (it needs a user). GitHub's 403 for them would read as a refused read, which the hosted prompt tells a persona to stop the review over.
 14. **`gh pr comment` takes `--body`, `-b`, `--body=`, and `--body-file`/`-F` (with `-` for stdin)**, and one PR number, which must be the job's. Any other flag is refused with a message naming the two that work. The finding number `seq` is counted per persona in a mode-600 file under the reviewer's home, under `flock`, so a pair's concurrent shells never reuse one.
 15. **A refused finding exits 1 and prints the control plane's `message`** on stderr. An unreachable channel exits 1 and says the finding was not posted.
 
@@ -791,10 +791,18 @@ class ShimParseTest(unittest.TestCase):
                          ["api", "--hostname", "evil.example", "user"],
                          ["api", "-H", "X-HTTP-Method-Override: POST", "x"],
                          ["api", "a", "b"],
-                         ["pr", "status"], ["pr", "checks", "7"]):
+                         ["pr", "status"], ["pr", "checks", "7"], ["run", "list"],
+                         ["run", "view", "1"], ["auth", "status"]):
                 with self.subTest(argv=argv):
                     self.assertEqual(self.gh.main(argv), 1)
             execv.assert_not_called()
+
+    def test_a_read_the_token_cannot_answer_says_so_and_does_not_stop_the_review(self):
+        # PR #20 review: GitHub's 403 here would read as a refused read.
+        for argv in (["pr", "status"], ["run", "list"], ["auth", "status"]):
+            with self.subTest(argv=argv), mock.patch.object(sys, "stderr", io.StringIO()) as err:
+                self.assertEqual(self.gh.main(argv), 1)
+                self.assertIn("carry on with the review", err.getvalue())
 
     def test_reads_go_to_the_real_gh(self):
         with mock.patch.object(self.gh.os, "execv") as execv:
@@ -907,11 +915,15 @@ REAL_GH = "/usr/bin/gh"
 
 # Reads the reviewer may make. Everything else is refused. `gh api` is checked
 # separately, by api_problem.
-# Not `pr checks` or `pr status`: both read check status, which the token
-# cannot, and `pr status` has no flag to leave it out.
 READS = {("pr", "view"), ("pr", "diff"), ("pr", "list"),
-         ("issue", "view"), ("issue", "list"), ("repo", "view"), ("auth", "status"),
-         ("search", None), ("run", "view"), ("run", "list")}
+         ("issue", "view"), ("issue", "list"), ("repo", "view"), ("search", None)}
+# Reads the worker's token can never answer: check status (`pr status` has no
+# flag to leave it out), Actions runs (the App asks for no Actions
+# permission), and anything that needs a user. Refused here with words that
+# say so, because GitHub's 403 would read as "the deployment refused a read",
+# which the hosted prompt tells a persona to stop the review over.
+UNREADABLE = {("pr", "checks"), ("pr", "status"), ("run", "view"), ("run", "list"),
+              ("auth", "status")}
 # `gh api` flags allowed, by allowlist rather than by spotting writes: pflag
 # accepts attached short values (-XPOST, -fbody=x) and combined flags, so a
 # list of forbidden spellings is never complete. None of these changes the
@@ -1052,6 +1064,11 @@ def main(argv) -> int:
         if problem:
             return fail(f"gh api: {problem}; only a plain GET of one REST path is allowed. {REFUSED}")
         allowed = True
+    if verb in UNREADABLE:
+        return fail(f"gh {' '.join(argv[:2])}: this deployment's token cannot read check status, "
+                    f"Actions runs or anything that needs a user. That is expected and not a "
+                    f"refused read: carry on with the review, from `gh pr view <number> --json "
+                    f"...` and `gh pr diff <number>`.")
     if not allowed:
         return fail(f"gh {' '.join(argv[:2])}: not available. {REFUSED}")
     os.execv(REAL_GH, [REAL_GH] + argv)
@@ -1065,7 +1082,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `chmod 755 worker/bin/gh`, then `./test-python.sh -p 'test_worker_gh.py'`, then `./test-python.sh`
-Expected: PASS, 8 tests. The whole suite passes, and no `__pycache__` appears under `worker/bin/`.
+Expected: PASS, 9 tests. The whole suite passes, and no `__pycache__` appears under `worker/bin/`.
 
 - [ ] **Step 5: Commit**
 
