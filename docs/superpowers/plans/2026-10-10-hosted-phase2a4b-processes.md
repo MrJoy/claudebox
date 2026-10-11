@@ -34,7 +34,7 @@ The spec and the overview leave these open, and each one changes code. They are 
 1. **2a reviews in `auto` mode only.** A repo whose config asks for `trigger: requested` is shown as a config problem on its check runs ("arrives in phase 2b") rather than reviewed against its wishes.
 2. **The org file is `.github/claudebox.json` in `<owner>/.github`**, read at the default branch. A read that fails is "no org defaults". The org `.github` repo is never itself reviewed.
 3. **A poll per installation lists its repos.** A repo that is public is passed over, and one that turned public since the last poll is lost. A repo gone from the list is lost. An installation gone from `App.installations()`, or one carrying `suspended_at`, loses all its repos. Losing a repo ends its jobs (their started pairs `revoked`), calls 2a.4a's three deleters (`Outbox.drop_repo`, `Committer.forget_repo`, `CheckRuns.forget_repo`), and forgets its fingerprint cache. The jobs end with no scheduler lock held, since ending one calls into the committer, which calls `decider_for`, which takes that lock. After each poll, a sweep drops the outbox and withheld rows of any repo that no live installation's listing returned as private (one lost or made public while the control plane was down, which nothing in memory names). It keys on the listings, never on how far the poll's walk got before `max_concurrent_jobs` stopped it, and runs only when every live installation's listing succeeded. A loss forgets the repo's last published config answer too, so a repo that comes back publishes its problem again. A completion in flight when its job ends commits nothing (2a.4a's `job_live`, wired to the job registry). Its rounds survive, as the spec's "Visibility" says ("Rounds and asks survive a public flip, since they hold no content"). A returning pair starts a fresh session at its next round, as one does after `MAX_PASSES_PER_SESSION` rotation. Its earlier rounds' findings are still on the PR, signed, and with no committed fingerprint its round line reads the local wording, which works from those comments.
-4. **Every non-fork candidate head gets a check run**, created once, whether or not anything is dispatched for it. A repo with a config problem shows it on every head's run and dispatches nothing. A problem in either file is a config problem, even when the other file is valid: `repo_config.resolve` would fall back to the other's config, and a broken file must never be replaced in silence. Each poll writes its answer onto the head and publishes it while the problem holds and on the poll it changes, so a problem fixed since (a `config apply`, an edit on the default branch) stops showing without a push, and an unchanged answer costs no GitHub call.
+4. **Every non-fork candidate head gets a check run**, created once, whether or not anything is dispatched for it. The config follows the spec's fallback, which `repo_config.resolve` implements: an invalid repo file falls back to the org defaults, an invalid org file under a valid repo file is dropped, and only both invalid stops the review. The dropped file's problems show on each head's run as a notice beside a review that runs. A problem (both files invalid, `trigger: requested`, or a setting the deployment cannot serve) shows on every head's run and dispatches nothing. A read of either file that fails is not a statement about the file: the repo is skipped for that poll and nothing is published. A head is published when its (problem, notice) differs from the one last set on it, a head with none included, so a new head shows a held problem, a fixed one clears without a push, and an unchanged answer costs no GitHub call. A pair at its round cap is painted `round-cap` once on a head no job will run at, or a capped plan PR's new head would read "Queued" for good.
 5. **The change gate is local mode's**, `signals.Tracker`, one per repo since a Tracker keys by PR number. A PR's fingerprint is its head, its mode and the newest unsigned comment, and comments, reviews and the 30 newest inline comments are read only when the PR's `updated_at` has moved. A failed lookup is cached against that `updated_at` too, so an outage costs one lookup per change, and the PR gates on `updated_at` through `signals.degraded`. A PR younger than the deployment's `settle_seconds` waits.
 6. **Dispatch bounds.** A PR with a live job is not dispatched again. A pair parked by the commit point waits while its siblings run, and a parked profile dispatches nothing. `max_concurrent_jobs` counts jobs, and a profile's `concurrency` counts pairs in flight (dispatched and not completed) across its jobs. A poll stops dispatching at the first refusal by `max_concurrent_jobs`.
 7. **Visibility is checked again at dispatch**, uncached, and a check that errors dispatches nothing.
@@ -43,12 +43,12 @@ The spec and the overview leave these open, and each one changes code. They are 
 10. **The deployment config is the records store's `deploy_config` row**, re-read on each poll when its `applied_at` moves. A stored config that does not load (one written by another version) keeps the last good one and warns. The outbox's two caps follow it.
 11. **The control plane's startup.** A not-configured instance touches nothing on the volume. Otherwise it takes the lock on `<data>/control.lock` (overview decision 13) before it opens the records store, answering `/healthz` "waiting for lock" meanwhile. On taking it: `Creds.revoke_all`, runnerd's `stop_all` (a failure warns, since every credential is already revoked), every transcript blob deleted, and an empty `hello` (a gateway not yet answering gets its hello on its first reply). The gateway's reports are refused until the lock is held, and its Reporter retries them.
 12. **The gateway link opens one connection per call** and waits up to 60 seconds, since a flush may be held for 50. A reply of "hello first" is answered with a `hello` and the call is sent again once. A `hello` carries every live provider token whose job is in memory, with that job's model and route and the token's committed counts. A live token with no job is revoked as the `hello` is built.
-13. **`SIGTERM` drains.** The control plane stops dispatching, reaps until no job is left or `CLAUDEBOX_DRAIN_SECONDS` (default 600) has passed, and ends what is left as "the control plane is stopping". The supervisor gives it the deadline plus 15 seconds, then stops the gateway and runnerd and kills whatever is left. Reports a gateway sends after the control plane has gone concern revoked tokens only, and 2a has no budgets, so none of them is needed.
-14. **`/healthz` is its own server on port 8081.** It answers 200 with the state (`waiting for lock`, `not configured`, `serving` or `draining`), and 503 when the poll or drain loop has died.
-15. **The supervisor's secrets split.** The control plane's are a closed list (`GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET`, `CLAUDEBOX_DEPLOYMENT_KEY`). A provider credential is anything else in the platform environment that is not a supervisor setting or an ordinary process variable, because the deployment file that names them lives in the records store, which only the control plane can read. The gateway gets the provider credentials, the control plane gets each as `CLAUDEBOX_SCAN_<NAME>` for the scanner, and runnerd gets none. The secrets between processes (`GATEWAY_SECRET`, `RUNNER_SECRET`) are random per container start. They, the socket paths, the gateway's listener and `CLAUDEBOX_DATA` are reserved: never a credential, and never taken from the platform. The control plane's own settings (`PERSONA_DIR`, `CHANNEL_LISTEN`, `HEALTH_LISTEN`) are forwarded to it alone. Nothing else from the platform environment crosses. A malformed App key or deployment key is named in the log, and the instance is not configured.
-16. **The supervisor stays root, with only `SETUID`, `SETGID` and `KILL`.** The spec says it "then drops to an unprivileged uid itself". A process that changes uid can no longer signal processes under other uids, and the drain depends on signalling the control plane, so it does not drop. It parses no input, opens no socket, and runs nothing after its three children start.
+13. **`SIGTERM` drains.** The control plane halts the scheduler's walk and waits for one already in progress to finish, so every job it dispatched is counted, then reaps until no job is left or `CLAUDEBOX_DRAIN_SECONDS` (default 600) has passed, and ends what is left as "the control plane is stopping". The supervisor gives it the deadline plus 15 seconds, then stops the gateway and runnerd and kills whatever is left. Reports a gateway sends after the control plane has gone concern revoked tokens only, and 2a has no budgets, so none of them is needed.
+14. **`/healthz` is its own server on port 8081.** It answers 200 with the state (`waiting for lock`, `not configured`, `serving` or `draining`) and, for `not configured`, its cause and the command that clears it (no App credentials, or no deployment config in the records store yet), and 503 when the poll or drain loop has died. The log names the cause once, on the poll it changes.
+15. **The supervisor's secrets split.** The control plane's are a closed list (`GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET`, `CLAUDEBOX_DEPLOYMENT_KEY`). A provider credential is anything else in the platform environment that is not a supervisor setting or an ordinary process variable, because the deployment file that names them lives in the records store, which only the control plane can read. The gateway gets the provider credentials, the control plane gets each as a candidate `CLAUDEBOX_SCAN_<NAME>`, and runnerd gets none. The scanner uses only the candidates the applied deployment names (its profiles' credentials and `VOYAGE_API_KEY`), rebuilt when the deployment changes, so a platform's own variables (`FLY_REGION`, `K_SERVICE`) are never treated as secrets. A credential the deployment names that the platform lacks is warned about. The secrets between processes (`GATEWAY_SECRET`, `RUNNER_SECRET`) are random per container start. They, the socket paths, the gateway's listener and `CLAUDEBOX_DATA` are reserved: never a credential, and never taken from the platform. The control plane's own settings (`PERSONA_DIR`, `CHANNEL_LISTEN`, `HEALTH_LISTEN`) are forwarded to it alone. Nothing else from the platform environment crosses. A malformed App key or deployment key is named in the log, and the instance is not configured.
+16. **The supervisor drops to uid 9004, keeping only `CAP_KILL`**, as the spec says ("then drops to an unprivileged uid itself"). It starts as root with `SETUID`, `SETGID` and `KILL`, starts its three children, then clears its groups, sets `PR_SET_KEEPCAPS`, changes gid and uid, and narrows its permitted and effective sets to `KILL` with `capset`. `CAP_KILL` is what lets it signal the children under their own uids during the drain. It can never become root again, and as uid 9004 in no group it can open neither the process sockets nor the Docker socket that shares its container (a root PID 1 could, as the owner of a `root:docker` socket).
 17. **One process exiting stops the container, and the restarts are bounded.** The supervisor logs a `PAGE:` line naming the process, stops the other two in the drain's order and exits 1. Every restart re-reviews every open PR (overview decision 1), so a child that dies on every start would re-review the whole installation each time Docker brought it back. `compose.json` therefore restarts on failure at most three times, and then the container stays down for a person. The cost is that a host reboot does not bring the control plane back by itself: `hosted deploy` (2a.5) starts it.
-18. **The image is `debian:bookworm-slim`** with `python3` and `python3-cryptography`, and the Docker CLI copied from `docker:27.3.1-cli`. Its code is root-owned. The three users and the shared group have pinned ids (9001 to 9003, and 9000), because `/data` is a volume that keeps its owner across rebuilds. `/data` is `control`'s, mode 0700. Each socket has its own directory, `/run/claudebox/<user>`, owned by the process that binds it, in the shared group, mode 2750: a peer can connect, and can neither unlink the socket nor bind its own in its place. The build runs `test_hosted_crypto.py` and fails if any test skips.
+18. **The image is `debian:bookworm-slim`** with `python3` and `python3-cryptography`, and the Docker CLI copied from `docker:27.3.1-cli`. Its code is root-owned. The three users and the shared group have pinned ids (9001 to 9003, and 9000), because `/data` is a volume that keeps its owner across rebuilds. `/data` is `control`'s, mode 0700. Each socket has its own directory, `/run/claudebox/<user>`, owned by the process that binds it, in the shared group, mode 2750: a peer can connect, and can neither unlink the socket nor bind its own in its place. The build runs `test_hosted_crypto.py` with no pipe between the run and the layer's status, so a failing test fails the build and prints its output, and a skip fails it too.
 19. **`hosted/compose.json`** runs the container with `cap_drop: ALL` and the supervisor's three capabilities, `no-new-privileges`, a named volume at `/data`, the Docker socket for runnerd, `restart: on-failure:3` (decision 17), a `claudebox` network the workers join, an 11-minute stop grace period (the drain's 600 seconds plus both 15-second graces fit inside it), and only `/healthz` published, on loopback. The worker image is built by `docker compose --profile build build`.
 20. **The App key may arrive on one line**, with its newlines written as the two characters `\n`, because `docker run --env-file` holds one line per variable. Only that pair is translated, and only in a value with no real newline.
 21. **Phase 1 finding F5:** `plan.label` refuses any whitespace inside the label other than a plain space, in the loader and in the schema's pattern. **F6:** an empty persona selector in a repo file is reported against its key (`code.personas` or `plan.personas`), never as an environment variable to unset.
@@ -63,6 +63,10 @@ The spec and the overview leave these open, and each one changes code. They are 
 - **The gateway reading the App key.** Expected: impossible, since the gateway's environment never holds it. Pinned in Task 4.
 - **A secrets file committed by accident.** Expected: `hosted/claudebox.env` is in both `.gitignore` and `.dockerignore`. Pinned in Task 5.
 - **A stored deployment config that will not load.** Expected: the last good one keeps serving, with a warning. Pinned in Task 3.
+
+## Not in this plan
+
+- **Checking the config file a PR proposes, and printing the deployment's catalog on the check run** (the spec's "Discovery, for authors who are not operators"). The spec's Phase 2a list does not name them, so they are deferred to 2b, which needs a ref-addressed content read 2a.1's client does not have.
 
 ## Not run here
 
@@ -236,7 +240,7 @@ git commit -m "repo config: plan.label whitespace and the empty selector's wordi
 - Consumes: `repo_config.resolve`, `deploy_config.against_deploy`, `personas.resolve`, `signals`, `prompts.build_hosted`, `decisions.Decider`, `state.MemoryStateStore` (`reviewer/`); `creds.Creds` and `BOOTSTRAP_TTL`, `github_app.GitHubError`, `is_fork_pr` and `is_public` (2a.1); `runner.RunnerError` (2a.3); `channel.Jobs`, `JobMaterial` and `PairMaterial`, `checkruns`, `outbox.Outbox`, `commit.Committer` (2a.4a).
 - Produces:
   - `ORG_REPO = ".github"`; `shared_worktree(pairs_by_phase: Dict[int, int], cap: int) -> bool`.
-  - `Scheduler(records, creds, jobs, committer, check_runs, outbox, runner, installation_for, deploy_for, gateway_call, persona_dir, gateway_url, channel_url, clock=time.time, log=print, new_job_id=...)` with `poll(installation_id) -> int`, `poll_repo(inst, installation_id, info, deploy) -> int`, `load_config(inst, full_name, deploy) -> (config, model, problem)`, `dispatch(...) -> bool`, `reap() -> int`, `end_job(job, reason)`, `lose_repo(repo, reason)` and `decider_for(repo) -> Decider`, and the attributes `installation_of` (repo to installation id), `states`, `runtimes` and `config_problems`. `committer` may be set after construction, since the `Committer` takes `decider_for`.
+  - `Scheduler(records, creds, jobs, committer, check_runs, outbox, runner, installation_for, deploy_for, gateway_call, persona_dir, gateway_url, channel_url, clock=time.time, log=print, new_job_id=...)` with `poll(installation_id) -> int`, `poll_repo(inst, installation_id, info, deploy) -> int`, `load_config(inst, full_name, deploy) -> (config, model, problem, notice)` (a failed read raises `GitHubError`), `dispatch(...) -> bool`, `reap() -> int`, `end_job(job, reason)`, `lose_repo(repo, reason)`, `sweep_orphans(live) -> int` and `decider_for(repo) -> Decider`, and the attributes `installation_of` (repo to installation id), `listings` (installation id to the private repos its last successful listing returned), `states`, `runtimes`, `trackers`, `config_problems`, `halted` (an event the drain sets) and `walk` (a lock the poll's walk holds). `committer` may be set after construction, since the `Committer` takes `decider_for`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -540,6 +544,21 @@ class GateTest(Base):
         self.poll()
         self.assertEqual([p.persona for p in self.jobs.all()[0].pairs], ["red_team"])
 
+    def test_a_capped_plan_prs_new_head_shows_round_cap_not_queued(self):
+        # PR #21 review: nothing dispatches at it, so nothing else would paint it.
+        self.inst.prs = [pr(labels=("plan",))]
+        self.inst.files[("acme/web", ".github/claudebox.json")] = json.dumps(
+            {"profile": "ollama", "plan": {"personas": "sage"}, "rounds": {"cap": 1}}).encode()
+        self.poll()
+        self.finish(self.jobs.all()[0])
+        self.inst.prs = [pr(head=NEW, labels=("plan",), updated="2025-10-09T08:10:00Z")]
+        self.assertEqual(self.poll(), 0)
+        status, title = self.inst.updated[-1][1:3]
+        self.assertEqual((status, title), ("completed", "Reviewed; round cap reached"))
+        before = len(self.inst.updated)
+        self.poll()
+        self.assertEqual(len(self.inst.updated), before)   # painted once
+
     def test_a_parked_profile_dispatches_nothing(self):
         from commit import _Profile
         self.committer.profiles["ollama"] = _Profile(parked_until=int(T) + 100)
@@ -573,7 +592,7 @@ class ConfigTest(Base):
         self.inst.files[("acme/web", ".github/claudebox.json")] = b'{"profile": "nope"}'
         self.assertEqual(self.poll(), 0)
         status, title, summary = self.inst.updated[-1][1:]
-        self.assertEqual((status, title), ("completed", "Configuration invalid"))
+        self.assertEqual((status, title), ("completed", "Not reviewed: configuration"))
         self.assertIn("'nope' is not a profile of this deployment", summary)
 
     def test_the_org_defaults_apply_under_the_repo_file(self):
@@ -590,18 +609,47 @@ class ConfigTest(Base):
         self.inst.files[("acme/web", ".github/claudebox.json")] = json.dumps(
             {"profile": "ollama"}).encode()
         self.assertEqual(self.poll(), 1)
-        self.assertNotEqual(self.inst.updated[-1][2], "Configuration invalid")
+        self.assertNotEqual(self.inst.updated[-1][2], "Not reviewed: configuration")
 
-    def test_a_broken_file_is_never_replaced_by_the_others_config_in_silence(self):
-        # PR #22 review: either file invalid means not reviewed, and the run says why.
+    def test_one_broken_file_falls_back_to_the_other_and_the_run_says_so(self):
+        # The spec's fallback (PR #22 review, reversing round 2): the broken file
+        # is dropped, the other applies, and the problem shows on the run.
         for repo_file, org_file, words in (
                 (b'{"plan": {"label": ""}}', b'{"profile": "ollama"}', "repo file"),
                 (b'{"profile": "ollama"}', b'{"plan": {"label": ""}}', "org file")):
             with self.subTest(words=words):
+                for job in self.jobs.all():
+                    self.sched.end_job(job, "test")
+                self.sched.lose_repo("acme/web", "test")
                 self.inst.files[("acme/web", ".github/claudebox.json")] = repo_file
                 self.inst.files[("acme/.github", ".github/claudebox.json")] = org_file
-                self.assertEqual(self.poll(), 0)
-                self.assertIn(words, self.inst.updated[-1][3])
+                self.assertEqual(self.poll(), 1)
+                summary = next(u[3] for u in reversed(self.inst.updated) if words in u[3])
+                self.assertIn("one file was ignored", summary)
+
+    def test_both_files_broken_is_not_reviewed(self):
+        self.inst.files[("acme/web", ".github/claudebox.json")] = b'{"plan": {"label": ""}}'
+        self.inst.files[("acme/.github", ".github/claudebox.json")] = b'{"plan": {"label": ""}}'
+        self.assertEqual(self.poll(), 0)
+        self.assertEqual(self.inst.updated[-1][2], "Not reviewed: configuration")
+
+    def test_a_failed_read_skips_the_poll_and_publishes_nothing(self):
+        # A failed read says nothing about the file (PR #22 review).
+        def broken(repo, path):
+            raise GitHubError(502, "x")
+        self.inst.file_at_default = broken
+        self.assertEqual(self.poll(), 0)
+        self.assertEqual((self.inst.created, self.inst.updated), ([], []))
+        self.assertTrue(any("trying again next poll" in l for l in self.logs))
+
+    def test_a_held_problem_writes_to_github_once_per_head(self):
+        # PR #22 review: not once per head per poll.
+        self.inst.files[("acme/web", ".github/claudebox.json")] = b'{"profile": "nope"}'
+        self.poll()
+        before = len(self.inst.updated)
+        self.poll()
+        self.poll()
+        self.assertEqual(len(self.inst.updated), before)
 
     def test_a_cleared_problem_is_published_on_a_head_the_gate_holds(self):
         # PR #22 review: nothing else would publish a reviewed, unchanged head.
@@ -609,11 +657,11 @@ class ConfigTest(Base):
         GateTest.finish(self, self.jobs.all()[0])
         self.inst.files[("acme/web", ".github/claudebox.json")] = b'{"profile": "nope"}'
         self.poll()
-        self.assertEqual(self.inst.updated[-1][2], "Configuration invalid")
+        self.assertEqual(self.inst.updated[-1][2], "Not reviewed: configuration")
         self.inst.files[("acme/web", ".github/claudebox.json")] = json.dumps(
             {"profile": "ollama", "code": {"personas": "red_team,sage"}}).encode()
         self.assertEqual(self.poll(), 0)
-        self.assertNotEqual(self.inst.updated[-1][2], "Configuration invalid")
+        self.assertNotEqual(self.inst.updated[-1][2], "Not reviewed: configuration")
         before = len(self.inst.updated)
         self.poll()
         self.assertEqual(len(self.inst.updated), before)   # unchanged: no extra GitHub call
@@ -626,7 +674,7 @@ class ConfigTest(Base):
         before = len(self.inst.updated)
         self.poll()
         self.assertGreater(len(self.inst.updated), before)
-        self.assertEqual(self.inst.updated[-1][2], "Configuration invalid")
+        self.assertEqual(self.inst.updated[-1][2], "Not reviewed: configuration")
 
     def test_requested_mode_is_shown_as_not_yet_supported(self):
         self.inst.files[("acme/web", ".github/claudebox.json")] = json.dumps(
@@ -773,9 +821,21 @@ class AccessTest(Base):
         self.assertEqual(self.logs[before:], [])   # a repo already lost is passed over quietly
 
     def test_a_repo_removed_from_the_installation_is_lost(self):
+        import threading
         self.poll()
+        free = []
+        real = self.sched.end_job
+
+        def probe(job, reason):
+            t = threading.Thread(target=lambda: free.append(self.sched.lock.acquire(timeout=0.5)
+                                                            and (self.sched.lock.release() or True)))
+            t.start()
+            t.join()
+            return real(job, reason)
+        self.sched.end_job = probe
         self.inst.repo_list = []
         self.poll()
+        self.assertEqual(free, [True])   # decision 3: jobs end with no scheduler lock held
         self.assertEqual(self.jobs.all(), [])
         self.assertTrue(any("removed from the installation" in l for l in self.logs))
 
@@ -899,6 +959,8 @@ class Scheduler:
         self.config_problems: Dict[str, str] = {}
         self.trackers: Dict[str, signals_mod.Tracker] = {}   # one per repo: a Tracker keys by PR number
         self._full = False
+        self.halted = threading.Event()   # set by the drain: dispatch nothing more
+        self.walk = threading.Lock()
         # installation id -> the private repos its last successful listing
         # returned; an installation whose last listing failed has no entry. The
         # sweep keys on these, never on how far a poll's walk got, and runs only
@@ -938,30 +1000,33 @@ class Scheduler:
 
     # -- config ----------------------------------------------------------------------
     def load_config(self, inst, full_name: str, deploy):
-        """(config, model, problem). A problem means the repo is not reviewed."""
+        """(config, model, problem, notice). A problem means the repo is not reviewed.
+
+        The spec's fallback, which repo_config.resolve implements: an invalid
+        repo file falls back to the org defaults, an invalid org file under a
+        valid repo file is dropped, and only both invalid means not reviewed.
+        The dropped file's problems come back as the notice, shown on the run
+        beside a review that runs. A read that fails is not a statement about
+        either file: the GitHubError goes to `poll`, which skips the repo for
+        this poll. A file that does not exist (404) is None, and an org
+        `.github` repo the App cannot see reads as one.
+        """
         owner = full_name.split("/", 1)[0]
-        try:
-            repo_data = inst.file_at_default(full_name, repo_config.REPO_FILE)
-        except GitHubError as exc:
-            return None, None, f"could not read {repo_config.REPO_FILE}: {exc}"
-        try:
-            org_data = inst.file_at_default(f"{owner}/{ORG_REPO}", repo_config.REPO_FILE)
-        except GitHubError:
-            org_data = None   # an unreadable org .github repo is "no org defaults"
+        repo_data = inst.file_at_default(full_name, repo_config.REPO_FILE)
+        org_data = inst.file_at_default(f"{owner}/{ORG_REPO}", repo_config.REPO_FILE)
         res = repo_config.resolve(org_data, repo_data, self.persona_dir)
         problems = res.repo_problems + res.org_problems
-        # A broken file is never silently replaced by the other one's config:
-        # the repo is not reviewed until it is fixed, and its runs say why.
-        if problems:
-            return None, None, "\n".join(problems)
+        if res.config is None:
+            return None, None, "\n".join(problems), ""
+        notice = "\n".join(problems)
         cfg = res.config
         if cfg.trigger != "auto":
             return None, None, ("trigger: requested arrives in phase 2b; this deployment "
-                                "reviews in auto mode only")
+                                "reviews in auto mode only"), notice
         check = against_deploy(cfg, deploy, full_name)
         if check.problems:
-            return None, None, "\n".join(problems + check.problems)
-        return cfg, check.model, ""
+            return None, None, "\n".join(check.problems), notice
+        return cfg, check.model, "", notice
 
     # -- the poll --------------------------------------------------------------------
     def poll(self, installation_id: int) -> int:
@@ -980,20 +1045,26 @@ class Scheduler:
         self.listings[installation_id] = {r["full_name"] for r in repos
                                           if r.get("name") != ORG_REPO and not is_public(r)}
         with self.lock:
-            for repo in [r for r, i in self.installation_of.items()
-                         if i == installation_id and r not in seen]:
-                self.lose_repo(repo, "it was removed from the installation")
+            removed = [r for r, i in self.installation_of.items()
+                       if i == installation_id and r not in seen]
+        for repo in removed:   # outside the lock: lose_repo ends jobs (decision 3)
+            self.lose_repo(repo, "it was removed from the installation")
         dispatched = 0
         self._full = False
-        for info in repos:
-            if info.get("name") == ORG_REPO:
-                continue
-            try:
-                dispatched += self.poll_repo(inst, installation_id, info, deploy)
-            except GitHubError as exc:
-                self.log(f"WARN: {info.get('full_name')}: {exc}; trying again next poll")
-            if self._full:
-                break
+        # The walk holds `walk`, so a drain that sets `halted` can wait for the
+        # walk in progress to stop before it counts what is left to end.
+        with self.walk:
+            for info in repos:
+                if self.halted.is_set():
+                    break
+                if info.get("name") == ORG_REPO:
+                    continue
+                try:
+                    dispatched += self.poll_repo(inst, installation_id, info, deploy)
+                except GitHubError as exc:
+                    self.log(f"WARN: {info.get('full_name')}: {exc}; trying again next poll")
+                if self._full:
+                    break
         return dispatched
 
     def poll_repo(self, inst, installation_id: int, info: Dict[str, Any], deploy) -> int:
@@ -1006,9 +1077,8 @@ class Scheduler:
             return 0
         with self.lock:
             self.installation_of[full] = installation_id
-        cfg, model, problem = self.load_config(inst, full, deploy)
+        cfg, model, problem, notice = self.load_config(inst, full, deploy)
         with self.lock:
-            changed = self.config_problems.get(full, "") != problem
             self.config_problems[full] = problem
         label = cfg.plan_label if cfg is not None else repo_config.RepoConfig().plan_label
         dispatched = 0
@@ -1019,13 +1089,16 @@ class Scheduler:
             n, head = int(pr["number"]), pr["head"]["sha"]
             labels = {l.get("name") for l in pr.get("labels") or []}
             mode = "plan" if label in labels else "code"
+            if self.halted.is_set():
+                break
             self.check_runs.ensure(full, head)
-            # Every poll writes its answer, so a problem fixed since (a config
-            # apply, an edit on the default branch) stops showing on this head.
-            # It is published when it changes as well as while it holds, so a
-            # cleared problem reaches a head that nothing else would publish.
-            self.check_runs.set_config_problem(full, head, problem)
-            if problem or changed:
+            # Published when this head's answer differs from the one last set on
+            # it, including a head with none: a new head shows a held problem, a
+            # fixed one clears without a push, and an unchanged answer costs no
+            # GitHub call.
+            answer = (problem, notice)
+            if self.check_runs.config_answer(full, head) != answer:
+                self.check_runs.set_config_problem(full, head, problem, notice)
                 self._publish(full, head)
             if problem:
                 continue
@@ -1036,6 +1109,16 @@ class Scheduler:
             decider = self._runtime(full, cfg, deploy)
             signal = self._signal(inst, full, n, head, mode, pr.get("updated_at") or "")
             group = decider.build_groups([(n, mode)])[0]
+            # A pair at its round cap will not run at this head or any later
+            # one, so nothing else would ever set its view: it is painted here,
+            # once, or a capped plan PR's new head would read "Queued" for good.
+            capped = [p for p in group.pairs if decider.capped(p)
+                      and self.check_runs.view(full, head, p.persona) is None]
+            for p in capped:
+                self.check_runs.set_pair(full, head, p.persona,
+                                         checkruns.PairView(checkruns.ROUND_CAP))
+            if capped:
+                self._publish(full, head)
             pairs = [p for p in decider.pairs_to_run(group, signal)
                      if self.committer.parked(full, p, head) is None]
             if not pairs:
@@ -1194,8 +1277,6 @@ class Scheduler:
         except RunnerError as exc:
             self.log(f"WARN: could not stop job {job.job_id}'s worker: {exc}")
         self.outbox.forget_job(job.job_id)
-        for cid in job.started.values():
-            self.committer.settled.pop(cid, None)
         with self.records.tx() as c:
             c.execute("UPDATE jobs SET ended_at = ?, end_reason = ? WHERE id = ?",
                       (int(self.clock()), reason[:200], job.job_id))
@@ -1214,10 +1295,7 @@ class Scheduler:
             self.check_runs.forget_repo(repo)
             state = self.states.get(repo)
             if state is not None:
-                state.sessions.clear()
-                state.reviewed.clear()
-                state.passes_done.clear()
-                state.owed = set()
+                state.forget()
             self.runtimes.pop(repo, None)
             self.installation_of.pop(repo, None)
             self.trackers.pop(repo, None)
@@ -1263,7 +1341,7 @@ class _Snapshot:
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_scheduler.py'`, then `./test-python.sh`
-Expected: PASS, 43 tests. The whole suite passes.
+Expected: PASS, 47 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
@@ -1284,7 +1362,7 @@ git commit -m "hosted: the scheduler, from a poll to a dispatched job and back"
   - `WAITING`, `NOT_CONFIGURED`, `SERVING`, `DRAINING`; `DRAIN_SECONDS = 600`; `GATEWAY_TIMEOUT = 60.0`; `SCAN_PREFIX = "CLAUDEBOX_SCAN_"`.
   - `GatewayLink(path, secret, tokens, timeout=60.0)`, callable as `gateway_call(op, **fields)`, with `hello()`.
   - `ControlPlane(records, lock, creds, blobs, app, runner, gateway_call, env, persona_dir, channel_url, gateway_url, clock=time.time, log=print)` with `take_lock() -> bool`, `startup()`, `deploy()`, `backoff_for(profile) -> int`, `hello_tokens() -> list`, `handle_report(msg) -> dict`, `poll_once() -> int`, `start_loops()`, `healthy() -> bool`, `drain(deadline_seconds) -> int`, and the attributes `state`, `jobs`, `scheduler`, `committer`, `channel`, `outbox`, `check_runs`.
-  - `health_server(control, host, port)`; `pem_from_env(value) -> bytes`; `main(env)`, which reads `CLAUDEBOX_DATA`, `CLAUDEBOX_DEPLOYMENT_KEY`, `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GATEWAY_SECRET`, `GATEWAY_SOCKET`, `CONTROL_SOCKET`, `RUNNER_SECRET`, `RUNNER_SOCKET`, `CLAUDEBOX_CHANNEL_URL`, `CLAUDEBOX_GATEWAY_URL`, `CLAUDEBOX_DRAIN_SECONDS`, `CHANNEL_LISTEN` and `HEALTH_LISTEN`.
+  - `NO_DEPLOY`, `NO_KEYS`, `LOCK_FILE = "control.lock"`; `health_server(control, host, port)`; `keys_from_env(env, crypto_mod, app_cls, log=print) -> (sealer, app)`; `pem_from_env(value) -> bytes`; `main(env)`, which reads `CLAUDEBOX_DATA`, `CLAUDEBOX_DEPLOYMENT_KEY`, `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GATEWAY_SECRET`, `GATEWAY_SOCKET`, `CONTROL_SOCKET`, `RUNNER_SECRET`, `RUNNER_SOCKET`, `CLAUDEBOX_CHANNEL_URL`, `CLAUDEBOX_GATEWAY_URL`, `CLAUDEBOX_DRAIN_SECONDS`, `CHANNEL_LISTEN` and `HEALTH_LISTEN`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1381,7 +1459,8 @@ class Base(unittest.TestCase):
         self.control = ControlPlane(
             self.records, self.lock, self.creds, self.blobs, self.app, self.runner,
             lambda op, **f: self.gw.append((op, f)) or {"ok": True},
-            {"CLAUDEBOX_SCAN_OLLAMA_API_KEY": "olk-a-long-secret", "CLAUDEBOX_SCAN_SHORT": "abc",
+            {"CLAUDEBOX_SCAN_OLLAMA_API_KEY": "olk-a-long-secret",
+             "CLAUDEBOX_SCAN_FLY_APP_NAME": "claudebox-control", "CLAUDEBOX_SCAN_FLY_REGION": "iad",
              "UNRELATED": "x"},
             PERSONAS, "http://control:8080", "http://gateway:8090", clock=lambda: T,
             log=self.logs.append)
@@ -1437,9 +1516,29 @@ class StartupTest(Base):
         self.control.poll_once()
         self.assertEqual(self.control.state, SERVING)
 
-    def test_short_scan_literals_are_named_in_a_warning(self):
-        self.assertTrue(any("SHORT" in l for l in self.logs))
-        self.assertFalse(any("UNRELATED" in l for l in self.logs))
+    def test_the_scanner_uses_only_the_credentials_the_deployment_names(self):
+        # A platform's own variables are not secrets (PR #22 review).
+        self.apply()
+        self.control.deploy()
+        scanner = self.control.outbox.scanner
+        self.assertEqual(scanner.first("leaked olk-a-long-secret"), "literal:OLLAMA_API_KEY")
+        self.assertIsNone(scanner.first("deployed as claudebox-control"))
+        self.assertFalse(any("FLY_" in l for l in self.logs))
+
+    def test_a_credential_the_deployment_names_but_the_platform_lacks_is_warned(self):
+        doc = json.loads(json.dumps(DEPLOY))
+        doc["profiles"]["ollama"]["credential"] = "MISSING_KEY"
+        self.apply(doc)
+        self.control.deploy()
+        self.assertTrue(any("MISSING_KEY" in l and "does not hold" in l for l in self.logs))
+
+    def test_not_configured_names_its_cause_once(self):
+        self.control.take_lock()
+        self.control.poll_once()
+        self.control.poll_once()
+        hits = [l for l in self.logs if "hosted config apply" in l]
+        self.assertEqual(len(hits), 1)
+        self.assertIn("no deployment config", self.control.reason)
 
 
 class ReportTest(Base):
@@ -1509,6 +1608,33 @@ class PollTest(Base):
         self.control.state = DRAINING
         self.assertEqual(self.control.poll_once(), 0)
         self.assertEqual(self.app.made, [])
+
+
+class DrainWalkTest(Base):
+    def test_the_drain_halts_the_walk_and_waits_for_one_in_progress(self):
+        # PR #22 review: a walk past poll_once's check would otherwise keep dispatching.
+        import time as time_mod
+        self.apply()
+        self.control.take_lock()
+        entered, walked, results = threading.Event(), threading.Event(), []
+        real = self.control.scheduler.poll_repo
+
+        def slow(*a, **k):
+            entered.set()
+            time_mod.sleep(0.2)
+            try:
+                return real(*a, **k)
+            finally:
+                walked.set()
+        self.control.scheduler.poll_repo = slow
+        t = threading.Thread(target=lambda: results.append(self.control.poll_once()))
+        t.start()
+        self.assertTrue(entered.wait(5))
+        self.control.drain(5)
+        self.assertTrue(walked.is_set())   # the drain waited for the walk before counting
+        t.join(5)
+        self.assertTrue(self.control.scheduler.halted.is_set())
+        self.assertEqual(self.control.poll_once(), 0)
 
 
 class HelloTest(Base):
@@ -1714,6 +1840,10 @@ LOCK_FILE = "control.lock"    # overview decision 13's name, and 2a.1's test's
 DRAIN_SECONDS = 600            # the spec's local and Fly grace period
 GATEWAY_TIMEOUT = 60.0         # the gateway may hold a flush for 50 seconds
 SCAN_PREFIX = "CLAUDEBOX_SCAN_"
+NO_DEPLOY = ("no deployment config in the records store yet; apply one with "
+             "`claudebox.sh hosted config apply FILE`")
+NO_KEYS = ("the App credentials or the deployment key are missing or malformed; "
+           "run `claudebox.sh hosted deploy`, then `claudebox.sh app create`")
 
 
 class GatewayLink:
@@ -1758,11 +1888,14 @@ class ControlPlane:
         self._deploy, self._deploy_stamp = None, None
         self._installations: Dict[int, Any] = {}
         self._drainers: Dict[int, Drainer] = {}
-        literals = {k[len(SCAN_PREFIX):]: v for k, v in env.items() if k.startswith(SCAN_PREFIX)}
-        scanner = Scanner(literals)
-        for name in scanner.skipped:
-            log(f"WARN: secret {name} is shorter than the scan's minimum; findings are not "
-                f"checked for it")
+        # Every candidate literal the supervisor handed over. The scanner uses
+        # only those the applied deployment names (its profiles' credentials and
+        # the Voyage key), so a platform's own variables (FLY_REGION, K_SERVICE)
+        # are never treated as secrets. Rebuilt whenever the deployment changes.
+        self._candidates = {k[len(SCAN_PREFIX):]: v for k, v in env.items()
+                            if k.startswith(SCAN_PREFIX)}
+        scanner = Scanner({})
+        self.reason = ""   # why the state is what it is, for /healthz and the log
         self.jobs = Jobs()
         self.check_runs = CheckRuns(records, self.installation_for_repo, clock=clock)
         self.outbox = Outbox(records, scanner, self.check_runs, 60000, 25, clock=clock)
@@ -1811,9 +1944,26 @@ class ControlPlane:
                 self.log(f"WARN: the stored deployment config does not load: {exc}")
                 return self._deploy
             self._deploy_stamp = row[1]
+            self._rescan(self._deploy)
             self.outbox.comment_bytes = self._deploy.comment_bytes
             self.outbox.comments_per_pass = self._deploy.comments_per_pass
         return self._deploy
+
+    def _rescan(self, deploy) -> None:
+        names = {p.credential for p in deploy.profiles.values()} | {"VOYAGE_API_KEY"}
+        scanner = Scanner({n: v for n, v in self._candidates.items() if n in names})
+        for name in scanner.skipped:
+            self.log(f"WARN: secret {name} is shorter than the scan's minimum; findings are not "
+                     f"checked for it")
+        for name in sorted(n for n in names - set(self._candidates) if n != "VOYAGE_API_KEY"):
+            self.log(f"WARN: the deployment names credential {name}, which the platform "
+                     f"environment does not hold; its profile's tokens will be refused")
+        self.outbox.scanner = scanner
+
+    def _not_configured(self, reason: str) -> None:
+        if self.state != NOT_CONFIGURED or self.reason != reason:
+            self.log(f"not configured: {reason}")
+        self.state, self.reason = NOT_CONFIGURED, reason
 
     def backoff_for(self, profile: str) -> int:
         deploy = self._deploy
@@ -1858,7 +2008,10 @@ class ControlPlane:
                      f"its first reply")
         self.log(f"holding the lock: revoked {revoked} credential(s), stopped {stopped} "
                  f"orphaned worker(s), deleted {deleted} transcript(s)")
-        self.state = SERVING if self.deploy() is not None else NOT_CONFIGURED
+        if self.deploy() is not None:
+            self.state, self.reason = SERVING, ""
+        else:
+            self._not_configured(NO_DEPLOY)
 
     # -- the gateway's reports -------------------------------------------------------
     def handle_report(self, msg: Dict[str, Any]) -> Dict[str, Any]:
@@ -1873,10 +2026,11 @@ class ControlPlane:
         """One poll of every installation. Returns how many jobs it dispatched."""
         deploy = self.deploy()
         if deploy is None:
-            self.state = NOT_CONFIGURED if self.state != DRAINING else DRAINING
+            if self.state != DRAINING:
+                self._not_configured(NO_DEPLOY)
             return 0
         if self.state == NOT_CONFIGURED:
-            self.state = SERVING
+            self.state, self.reason = SERVING, ""
         self.scheduler.reap()
         if self.state != SERVING:
             return 0
@@ -1933,6 +2087,11 @@ class ControlPlane:
         """Stop dispatching, let running jobs finish, end the rest. Returns how many were ended."""
         self.state = DRAINING
         until = self.clock() + deadline_seconds
+        # Halt the walk, then wait for one already past its checks to finish,
+        # so every job it dispatched is in `jobs` before they are counted.
+        self.scheduler.halted.set()
+        if self.scheduler.walk.acquire(timeout=max(deadline_seconds, 0)):
+            self.scheduler.walk.release()
         while self.jobs.all() and self.clock() < until:
             self.scheduler.reap()
             time.sleep(1)
@@ -1950,6 +2109,11 @@ class _Status:
     def __init__(self):
         self.current: Optional[ControlPlane] = None
         self._state = WAITING
+        self._reason = ""
+
+    @property
+    def reason(self) -> str:
+        return self.current.reason if self.current is not None else self._reason
 
     @property
     def state(self) -> str:
@@ -1974,7 +2138,9 @@ def health_server(control, host: str, port: int) -> http.server.ThreadingHTTPSer
                 self.end_headers()
                 return
             ok = control.state == WAITING or control.healthy()
-            body = (control.state if ok else "a loop has died").encode()
+            reason = getattr(control, "reason", "")
+            body = ((control.state + (f": {reason}" if reason else "")) if ok
+                    else "a loop has died").encode()
             self.send_response(200 if ok else 503)
             self.send_header("Content-Type", "text/plain")
             self.send_header("Content-Length", str(len(body)))
@@ -2047,10 +2213,8 @@ def main(env: Mapping[str, str] = os.environ) -> None:
     sealer, app = (keys_from_env(env, crypto, App) if app_id and key and deployment_key
                    else (None, None))
     if app is None:
-        status.state = NOT_CONFIGURED
-        print("not configured: the App credentials or the deployment key are missing or "
-              "malformed (run `claudebox.sh hosted deploy`, then `claudebox.sh app create`)",
-              flush=True)
+        status.state, status._reason = NOT_CONFIGURED, NO_KEYS
+        print(f"not configured: {NO_KEYS}", flush=True)
         signal.sigwait({signal.SIGTERM, signal.SIGINT})
         return
     # Overview decision 13: the lock is taken before the records store is opened.
@@ -2090,7 +2254,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_control.py'`, then `./test-python.sh`
-Expected: PASS, 23 tests. The whole suite passes.
+Expected: PASS, 26 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
@@ -2110,7 +2274,7 @@ git commit -m "hosted: the control-plane process, its lock, its loops and /healt
 - Produces:
   - `CONTROL_SECRETS`, `SETTINGS`, `PROCESS_VARS`, `RUN_DIR = "/run/claudebox"`, `DATA_DIR = "/data"`, `GRACE_SECONDS = 15`.
   - `provider_secrets(env) -> dict`, `split_env(env, gateway_secret, runner_secret) -> {"control", "gateway", "runnerd": env}`, `Spec(name, argv, user, extra_groups=())`, `specs(docker_gid) -> List[Spec]`, `docker_gid(path) -> Optional[int]`.
-  - `Supervisor(specs, envs, drain_seconds, spawn=..., clock=time.monotonic, sleep=time.sleep, log=print)` with `start()`, `exited() -> Optional[str]`, `stop()`, `run() -> int` and the attribute `stop_requested`; `main(env) -> int`.
+  - `SUPERVISOR_UID = SUPERVISOR_GID = 9004`, `CAP_KILL = 5`, `RESERVED`, `CONTROL_SETTINGS`; `drop_privileges(uid=9004, gid=9004, osmod=os, caps=None)`; `Supervisor(specs, envs, drain_seconds, spawn=..., clock=time.monotonic, sleep=time.sleep, log=print, after_start=lambda: None)` with `start()`, `exited() -> Optional[str]`, `stop()`, `run() -> int` and the attribute `stop_requested`; `main(env) -> int`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2124,7 +2288,8 @@ import signal
 import tempfile
 import unittest
 
-from supervisor import Spec, Supervisor, docker_gid, provider_secrets, specs, split_env
+from supervisor import (CAP_KILL, Spec, Supervisor, docker_gid, drop_privileges,
+                        provider_secrets, specs, split_env)
 
 PLATFORM = {
     "GITHUB_APP_ID": "123", "GITHUB_APP_PRIVATE_KEY": "-----BEGIN KEY-----",
@@ -2215,6 +2380,41 @@ class SpecTest(unittest.TestCase):
         with tempfile.NamedTemporaryFile() as f:
             self.assertEqual(docker_gid(f.name), os.stat(f.name).st_gid)
         self.assertIsNone(docker_gid("/nonexistent/docker.sock"))
+
+
+class DropTest(unittest.TestCase):
+    def test_the_supervisor_leaves_root_keeping_only_kill(self):
+        # PR #22 review: root in the container that mounts the Docker socket.
+        calls = []
+
+        class Os:
+            def setgroups(self, g):
+                calls.append(("setgroups", g))
+
+            def setgid(self, g):
+                calls.append(("setgid", g))
+
+            def setuid(self, u):
+                calls.append(("setuid", u))
+
+        class Caps:
+            def keepcaps(self, on):
+                calls.append(("keepcaps", on))
+
+            def set_only(self, cap):
+                calls.append(("caps", cap))
+        drop_privileges(9004, 9004, Os(), Caps())
+        self.assertEqual(calls, [("setgroups", []), ("keepcaps", True), ("setgid", 9004),
+                                 ("setuid", 9004), ("caps", CAP_KILL), ("keepcaps", False)])
+
+    def test_the_drop_runs_after_the_children_start(self):
+        order = []
+        sup = Supervisor([Spec("control", ("c",), "control")], {"control": {}}, 0,
+                         spawn=lambda spec, env: order.append("spawn") or FakeProc("c", []),
+                         log=lambda line: None, after_start=lambda: order.append("drop"))
+        sup.stop_requested = True
+        sup.run()
+        self.assertEqual(order[:2], ["spawn", "drop"])
 
 
 class FakeProc:
@@ -2342,6 +2542,59 @@ RESERVED = frozenset({"GATEWAY_SECRET", "RUNNER_SECRET", "GATEWAY_SOCKET", "CONT
 DATA_DIR = "/data"
 HOSTED = "/opt/claudebox/hosted"
 GRACE_SECONDS = 15
+# The supervisor's own identity once its children run: its own uid and group,
+# in no other group, so it can open neither the sockets nor the Docker socket.
+SUPERVISOR_UID = SUPERVISOR_GID = 9004
+CAP_KILL = 5
+_PR_SET_KEEPCAPS = 8
+_CAP_V3 = 0x20080522
+
+
+class _LinuxCaps:
+    """prctl and capset, the two calls the drop needs that `os` does not have."""
+
+    def __init__(self):
+        import ctypes
+        self.ctypes = ctypes
+        self.libc = ctypes.CDLL(None, use_errno=True)
+
+    def keepcaps(self, on: bool) -> None:
+        if self.libc.prctl(_PR_SET_KEEPCAPS, 1 if on else 0, 0, 0, 0) != 0:
+            raise OSError(self.ctypes.get_errno(), "prctl(PR_SET_KEEPCAPS) failed")
+
+    def set_only(self, cap: int) -> None:
+        ct = self.ctypes
+
+        class Header(ct.Structure):
+            _fields_ = [("version", ct.c_uint32), ("pid", ct.c_int)]
+
+        class Data(ct.Structure):
+            _fields_ = [("effective", ct.c_uint32), ("permitted", ct.c_uint32),
+                        ("inheritable", ct.c_uint32)]
+        data = (Data * 2)()
+        data[0].effective = data[0].permitted = 1 << cap
+        if self.libc.capset(ct.byref(Header(_CAP_V3, 0)), data) != 0:
+            raise OSError(ct.get_errno(), "capset failed")
+
+
+def drop_privileges(uid: int = SUPERVISOR_UID, gid: int = SUPERVISOR_GID, osmod=os,
+                    caps=None) -> None:
+    """Leave root, keeping only CAP_KILL, which signals the children under their uids.
+
+    The spec's "The supervisor then drops to an unprivileged uid itself". Run
+    after the children start, since starting them needs SETUID and SETGID. With
+    KEEPCAPS the permitted set survives setuid; capset then narrows it to KILL,
+    so the supervisor can never become root again, and as uid 9004 in no group
+    it can open neither the process sockets nor the Docker socket that shares
+    its container.
+    """
+    caps = caps if caps is not None else _LinuxCaps()
+    osmod.setgroups([])
+    caps.keepcaps(True)
+    osmod.setgid(gid)
+    osmod.setuid(uid)
+    caps.set_only(CAP_KILL)
+    caps.keepcaps(False)
 
 
 def provider_secrets(env: Mapping[str, str]) -> Dict[str, str]:
@@ -2417,7 +2670,9 @@ class Supervisor:
                  drain_seconds: int, spawn: Callable[[Spec, Dict[str, str]], object] = _spawn,
                  clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep,
-                 log: Callable[[str], None] = lambda line: print(line, flush=True)):
+                 log: Callable[[str], None] = lambda line: print(line, flush=True),
+                 after_start: Callable[[], None] = lambda: None):
+        self.after_start = after_start
         self.specs, self.envs, self.drain_seconds = list(specs), envs, drain_seconds
         self.spawn, self.clock, self.sleep, self.log = spawn, clock, sleep, log
         self.procs: Dict[str, object] = {}
@@ -2453,6 +2708,7 @@ class Supervisor:
 
     def run(self) -> int:
         self.start()
+        self.after_start()
         while True:
             if self.stop_requested:
                 self.stop()
@@ -2469,7 +2725,7 @@ class Supervisor:
 def main(env: Mapping[str, str] = os.environ) -> int:
     envs = split_env(env, os.urandom(32).hex(), os.urandom(32).hex())
     sup = Supervisor(specs(docker_gid(env.get("DOCKER_SOCKET", "/var/run/docker.sock"))), envs,
-                     int(env.get("CLAUDEBOX_DRAIN_SECONDS", "600")))
+                     int(env.get("CLAUDEBOX_DRAIN_SECONDS", "600")), after_start=drop_privileges)
 
     def request_stop(*_):
         sup.stop_requested = True
@@ -2485,7 +2741,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_supervisor.py'`, then `./test-python.sh`
-Expected: PASS, 14 tests. The whole suite passes.
+Expected: PASS, 16 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
@@ -2604,6 +2860,11 @@ class DockerfileTest(unittest.TestCase):
     def test_the_crypto_tests_run_and_a_skip_fails_the_build(self):
         self.assertIn("test_hosted_crypto.py", self.text)
         self.assertIn("! grep -q 'skipped'", self.text)
+        # A failing test must fail the build: no pipe may stand between the test
+        # run and the layer's status (PR #22 review).
+        run = self.text[self.text.index("python3 -m unittest"):self.text.index("! grep")]
+        self.assertNotIn("|", run.replace("||", ""))
+        self.assertIn("|| { cat /tmp/crypto.out; exit 1; }", run)
 
     def test_the_build_context_keeps_the_files_the_build_runs(self):
         ignore = read(".dockerignore")
@@ -2648,7 +2909,9 @@ COPY --from=docker:27.3.1-cli /usr/local/bin/docker /usr/local/bin/docker
 # rebuilds: an id picked by useradd would move with the base image.
 # Each socket gets its own directory, owned by the process that binds it and
 # setgid to the shared group, so a peer can connect and cannot unlink it.
-RUN groupadd --gid 9000 claudebox \
+RUN groupadd --gid 9004 supervisor \
+ && useradd --uid 9004 --gid 9004 --no-create-home --shell /usr/sbin/nologin supervisor \
+ && groupadd --gid 9000 claudebox \
  && for pair in control:9001 gateway:9002 runner:9003; do \
       u=${pair%%:*}; id=${pair##*:}; \
       groupadd --gid $id $u; \
@@ -2665,10 +2928,13 @@ COPY personas/ /opt/claudebox/personas/
 
 # crypto.py's tests skip on a host without cryptography; here they run, so a
 # build against a cryptography that changed under it fails rather than ships.
+# No pipe: a pipeline's status is its last command's, which would hide a
+# failing test. A failure prints the output, and a skip fails the build too.
 COPY tests/_path.py tests/test_hosted_crypto.py /tmp/build-tests/tests/
 RUN ln -s /opt/claudebox/reviewer /opt/claudebox/hosted /tmp/build-tests/ \
- && cd /tmp/build-tests && python3 -m unittest discover -s tests -p 'test_hosted_crypto.py' 2>&1 \
-      | tee /tmp/crypto.out \
+ && cd /tmp/build-tests \
+ && { python3 -m unittest discover -s tests -p 'test_hosted_crypto.py' > /tmp/crypto.out 2>&1 \
+      || { cat /tmp/crypto.out; exit 1; }; } \
  && ! grep -q 'skipped' /tmp/crypto.out \
  && rm -rf /tmp/build-tests /tmp/crypto.out
 
@@ -2677,7 +2943,7 @@ EXPOSE 8080 8081 8090
 HEALTHCHECK --interval=30s --timeout=5s \
   CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/healthz', timeout=4)"
 # The supervisor starts as root, with only SETUID, SETGID and KILL (compose.json),
-# to start each process under its own uid and to signal them.
+# starts each process under its own uid, then drops to uid 9004 keeping KILL alone.
 ENTRYPOINT ["python3", "/opt/claudebox/hosted/supervisor.py"]
 ```
 
@@ -2782,7 +3048,7 @@ docker exec cbx-smoke sh -c 'for p in /proc/[0-9]*; do printf "%s uid=%s caps=%s
   "$(awk "/^CapEff/{print \$2}" $p/status)" "$(awk "/^NoNewPrivs/{print \$2}" $p/status)"; done'
 ```
 
-The supervisor runs as uid 0 with `caps=00000000000000e0` (`KILL`, `SETGID` and `SETUID`). `runnerd.py`, `gateway.py` and `control.py` each run under a different non-zero uid with `caps=0000000000000000`. Every process shows `nnp=1`.
+The supervisor runs as uid 9004, in no group, with `caps=0000000000000020` (`KILL` alone). `runnerd.py`, `gateway.py` and `control.py` each run under a different non-zero uid with `caps=0000000000000000`. Every process shows `nnp=1`.
 
 ```bash
 docker stop -t 30 cbx-smoke; docker inspect cbx-smoke --format '{{.State.ExitCode}}'; docker rm cbx-smoke
