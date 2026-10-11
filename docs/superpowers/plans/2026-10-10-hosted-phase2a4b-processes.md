@@ -36,12 +36,12 @@ The spec and the overview leave these open, and each one changes code. They are 
 3. **A poll per installation lists its repos.** A repo that is public is passed over, and one that turned public since the last poll is lost. A repo gone from the list is lost. An installation gone from `App.installations()`, or one carrying `suspended_at`, loses all its repos. Losing a repo ends its jobs (their started pairs `revoked`), calls 2a.4a's three deleters (`Outbox.drop_repo`, `Committer.forget_repo`, `CheckRuns.forget_repo`), and forgets its fingerprint cache. The jobs end with no scheduler lock held, since ending one calls into the committer, which calls `decider_for`, which takes that lock. After each poll, a sweep drops the outbox and withheld rows of any repo that no live installation's listing returned as private (one lost or made public while the control plane was down, which nothing in memory names). It keys on the listings, never on how far the poll's walk got before `max_concurrent_jobs` stopped it, and runs only when every live installation's listing succeeded. A loss forgets the repo's last published config answer too, so a repo that comes back publishes its problem again. A completion in flight when its job ends commits nothing (2a.4a's `job_live`, wired to the job registry). Its rounds survive, as the spec's "Visibility" says ("Rounds and asks survive a public flip, since they hold no content"). A returning pair starts a fresh session at its next round, as one does after `MAX_PASSES_PER_SESSION` rotation. Its earlier rounds' findings are still on the PR, signed, and with no committed fingerprint its round line reads the local wording, which works from those comments.
 4. **Every non-fork candidate head gets a check run**, created once, whether or not anything is dispatched for it. The config follows the spec's fallback, which `repo_config.resolve` implements: an invalid repo file falls back to the org defaults, an invalid org file under a valid repo file is dropped, and only both invalid stops the review. The dropped file's problems show on each head's run as a notice beside a review that runs. A problem (both files invalid, `trigger: requested`, or a setting the deployment cannot serve) shows on every head's run and dispatches nothing. A read of either file that fails is not a statement about the file: the repo is skipped for that poll and nothing is published. A head is published when its (problem, notice) differs from the one last set on it, a head with none included, so a new head shows a held problem, a fixed one clears without a push, and an unchanged answer costs no GitHub call. A pair at its round cap is painted `round-cap-unread` once on a head no job will run at, or a capped plan PR's new head would read "Queued" for good. It is never painted `round-cap`, which counts as clean: a green check on a commit no persona read would claim a review that did not happen.
 5. **The change gate is local mode's**, `signals.Tracker`, one per repo since a Tracker keys by PR number. A PR's fingerprint is its head, its mode and the newest unsigned comment, and comments, reviews and the 30 newest inline comments are read only when the PR's `updated_at` has moved. A failed lookup is cached against that `updated_at` too, so an outage costs one lookup per change, and the PR gates on `updated_at` through `signals.degraded`. A PR younger than the deployment's `settle_seconds` waits.
-6. **Dispatch bounds.** A PR with a live job is not dispatched again. A pair parked by the commit point waits while its siblings run, and a parked profile dispatches nothing. `max_concurrent_jobs` counts jobs, and a profile's `concurrency` counts pairs in flight (dispatched and not completed) across its jobs. A poll stops dispatching at the first refusal by `max_concurrent_jobs` and keeps walking: every later head and repo still gets its check run and its config answer (decision 4), and only the dispatch stages, which cost lookups, are skipped. The poll logs when the cap starts binding for an installation and when it stops, not on every poll.
+6. **Dispatch bounds.** A PR with a live job is not dispatched again. A pair parked by the commit point waits while its siblings run, and a parked profile dispatches nothing. `max_concurrent_jobs` counts jobs, and a profile's `concurrency` counts pairs in flight (dispatched and not completed) across its jobs. A group larger than the room left dispatches in parts, phase order first: the pairs left out hold no session, so the gate runs them on a later poll once the job has ended, and a 7-persona plan group under a bound of 4 is never starved. A poll stops dispatching at the first refusal by `max_concurrent_jobs` and keeps walking: every later head and repo still gets its check run and its config answer (decision 4), and only the dispatch stages, which cost lookups, are skipped. The poll logs when the cap starts binding for an installation and when it stops, not on every poll.
 7. **Visibility is checked again at dispatch**, uncached, and a check that errors dispatches nothing.
 8. **A job's material is built once, at dispatch.** The prompts are `build_hosted`'s, with `WORKTREE_STANZA` exactly when `shared_worktree` is true, and `shared_worktree` is true when any phase of this job's pairs runs two at once (`min(cap, n) > 1`, a cap of 0 meaning `n`). A pair with a session gets the followup prompt. A pair's round line names the head of its committed fingerprint (`Committer.last_reviewed_head`). When that head is no longer an ancestor of the new one, the round line is round 1's and the check run says the branch was rewritten. An ancestry check that errors counts as a rewrite, since a whole review beats a guess.
 9. **The reap ends a job** when runnerd lists its worker as gone or exited, when its 55-minute deadline has passed, or when its bootstrap token expired unused. Ending a job revokes its credentials, tells the gateway to revoke its unfinished pairs' tokens, marks each started pair `revoked` (`Committer.revoke`, and `checkruns.REVOKED` on the run), owes each unstarted pair, stops its worker, forgets its outbox keys and `settled` entries, and writes `ended_at` and `end_reason` on its row.
 10. **The deployment config is the records store's `deploy_config` row**, re-read on each poll when its `applied_at` moves. A stored config that does not load (one written by another version) keeps the last good one and warns. The outbox's two caps follow it.
-11. **The control plane's startup.** A not-configured instance touches nothing on the volume. Otherwise it takes the lock on `<data>/control.lock` (overview decision 13) before it opens the records store, answering `/healthz` "waiting for lock" meanwhile. On taking it: `Creds.revoke_all`, every `jobs` row with no `ended_at` closed as "the control plane restarted" (this instance's registry never holds those jobs, so nothing else would end them), runnerd's `stop_all` (a failure warns, since every credential is already revoked), every transcript blob deleted, and an empty `hello` (a gateway not yet answering gets its hello on its first reply). The gateway's reports are refused until the lock is held, and its Reporter retries them.
+11. **The control plane's startup.** A not-configured instance touches nothing on the volume. Otherwise it takes the lock on `<data>/control.lock` (overview decision 13) before it opens the records store, answering `/healthz` "waiting for lock" meanwhile. On taking it: `Creds.revoke_all`, every `jobs` row with no `ended_at` closed as "the control plane restarted" (this instance's registry never holds those jobs, so nothing else would end them), runnerd's `stop_all` (a failure warns, since every credential is already revoked, and that includes a runnerd not yet listening, which raises `OSError` rather than `RunnerError`), every transcript blob deleted, and an empty `hello` (a gateway not yet answering gets its hello on its first reply). The gateway's reports are refused until the lock is held, and its Reporter retries them.
 12. **The gateway link opens one connection per call** and waits up to 60 seconds, since a flush may be held for 50. A reply of "hello first" is answered with a `hello` and the call is sent again once. A `hello` carries every live provider token whose job is in memory, with that job's model and route and the token's committed counts. A live token with no job is revoked as the `hello` is built.
 13. **`SIGTERM` drains.** The control plane halts the scheduler's walk and waits for one already in progress to finish, so every job it dispatched is counted, then reaps until no job is left or `CLAUDEBOX_DRAIN_SECONDS` (default 600) has passed, and ends what is left as "the control plane is stopping". The supervisor gives it the deadline plus 15 seconds, then stops the gateway and runnerd and kills whatever is left. Reports a gateway sends after the control plane has gone concern revoked tokens only, and 2a has no budgets, so none of them is needed.
 14. **`/healthz` is its own server on port 8081.** It answers 200 with the state (`waiting for lock`, `not configured`, `serving` or `draining`) and, for `not configured`, its cause and the command that clears it (no App credentials, or no deployment config in the records store yet), and 503 when the poll or drain loop has died. The log names the cause once, on the poll it changes.
@@ -471,6 +471,24 @@ class GateTest(Base):
             job.completed[p.persona] = "ok"
         self.sched.end_job(job, "test")
 
+    def test_a_group_larger_than_the_profiles_concurrency_runs_in_parts(self):
+        # PR #22 review: the whole group was compared with the bound, so a
+        # group larger than it never dispatched at all.
+        d = json.loads(json.dumps({"profiles": {"ollama": {
+            "provider": "ollama", "models": ["glm-5.2:cloud"], "default_model": "glm-5.2:cloud",
+            "credential": "OLLAMA_API_KEY", "concurrency": 1,
+            "budget": {"unit": "tokens", "daily": 1}}}}))
+        self.deploy = deploy_config.load_deploy(json.dumps(d).encode())
+        self.assertEqual(self.poll(), 1)
+        job = self.jobs.all()[0]
+        self.assertEqual([p.persona for p in job.pairs], ["red_team"])   # Sage is phase 2
+        self.finish(job)
+        self.assertEqual(self.poll(), 1)
+        job = self.jobs.all()[0]
+        self.assertEqual([p.persona for p in job.pairs], ["sage"])
+        self.finish(job)
+        self.assertEqual(self.poll(), 0)
+
     def test_an_unchanged_pr_is_not_reviewed_again(self):
         self.poll()
         self.finish(self.jobs.all()[0])
@@ -601,7 +619,8 @@ class BoundsTest(Base):
             "budget": {"unit": "tokens", "daily": 1}}}}))
         self.deploy = deploy_config.load_deploy(json.dumps(d).encode())
         self.inst.prs = [pr(1), pr(2)]
-        self.assertEqual(self.poll(), 1)    # 2 pairs in flight; a second PR would make 4 > 3
+        self.assertEqual(self.poll(), 2)    # 2 pairs in flight leave room for 1 of PR 2's
+        self.assertEqual([len(j.pairs) for j in self.jobs.all()], [2, 1])
 
     def test_shared_worktree_rule(self):
         self.assertFalse(shared_worktree({1: 1, 2: 1}, 0))
@@ -1177,8 +1196,14 @@ class Scheduler:
             profile = deploy.profiles[cfg.profile]
             in_flight = sum(len(j.pairs) - len(j.completed) for j in self.jobs.all()
                             if j.profile == cfg.profile)
-            if in_flight + len(pairs) > profile.concurrency:
+            room = profile.concurrency - in_flight
+            if room <= 0:
                 continue
+            # A group larger than the room left runs in parts, phase order
+            # first, so a 7-persona plan group under a bound of 4 is not
+            # starved: the pairs left out hold no session, so the gate runs
+            # them on a later poll, once this job has ended (PR #22 review).
+            pairs = sorted(pairs, key=decider.phase_of)[:room]
             if self.dispatch(inst, installation_id, info, cfg, model, decider, n, head, mode,
                              pairs, signal):
                 dispatched += 1
@@ -1386,7 +1411,7 @@ class _Snapshot:
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_scheduler.py'`, then `./test-python.sh`
-Expected: PASS, 49 tests. The whole suite passes.
+Expected: PASS, 50 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
@@ -1556,16 +1581,23 @@ class StartupTest(Base):
         self.assertTrue(any("closed 2 job(s)" in l for l in self.logs))
 
     def test_a_runner_that_cannot_stop_orphans_does_not_stop_startup(self):
+        # PR #22 review: a runnerd not yet listening raises what the socket
+        # raises, never RunnerError, and startup must survive both.
         from runner import RunnerError
+        for exc in (RunnerError("docker ps failed"), FileNotFoundError(2, "no socket"),
+                    ConnectionRefusedError(111, "refused"), gwproto.ProtocolError("short read")):
+            with self.subTest(exc=type(exc).__name__):
+                self.setUp()
 
-        def refuse():
-            raise RunnerError("docker ps failed: no socket")
-        self.runner.stop_all = refuse
-        self.creds.mint("capability", "old-job", 3600)
-        self.assertTrue(self.control.take_lock())
-        self.assertEqual(self.records.conn().execute(
-            "SELECT COUNT(*) FROM credentials WHERE revoked_at IS NULL").fetchone()[0], 0)
-        self.assertTrue(any("could not stop orphaned workers" in l for l in self.logs))
+                def refuse(exc=exc):
+                    raise exc
+                self.runner.stop_all = refuse
+                self.creds.mint("capability", "old-job", 3600)
+                self.assertTrue(self.control.take_lock())
+                self.assertEqual(self.records.conn().execute(
+                    "SELECT COUNT(*) FROM credentials WHERE revoked_at IS NULL").fetchone()[0], 0)
+                self.assertTrue(any("could not stop orphaned workers" in l for l in self.logs))
+                self.assertEqual(self.gw[0], ("hello", {"tokens": []}))
 
     def test_no_deployment_config_is_not_configured_and_dispatches_nothing(self):
         self.control.take_lock()
@@ -2062,9 +2094,10 @@ class ControlPlane:
                                (int(self.clock()), "the control plane restarted")).rowcount
         try:
             stopped = self.runner.stop_all()
-        except RunnerError as exc:
+        except (RunnerError, OSError, gwproto.ProtocolError) as exc:
             # Every credential is already revoked, so an orphan that keeps
             # running can neither reach the channel nor spend at the gateway.
+            # A runnerd not yet listening raises OSError, not RunnerError.
             stopped = 0
             self.log(f"WARN: could not stop orphaned workers: {exc}")
         deleted = self.blobs.delete_prefix(blobs_mod.transcripts_prefix())
