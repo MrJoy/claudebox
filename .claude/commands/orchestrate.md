@@ -199,8 +199,9 @@ every lane's transcript sits in the main checkout under `.orchestrator-runs/`, a
 lane's kindex tools reach one graph. A lane that goes looking can `capture-pane` another
 lane's window, `send-keys` into it, `cat` its log, or `search` the graph for what the other
 lane captured, and nothing prevents it. The graph is the one of these a lane is *told* to
-use, so the lane shims narrow it for the run: the Coder searches but does not add, and the
-Tester neither searches the area under test nor adds. The axis that is
+use, so the lane shims narrow it for the run: the Coder searches but does not add, the
+Tester neither searches the area under test nor adds, and the Validator adds nothing
+while the lanes are live. The axis that is
 NOT a leak, named so the prohibition does not swallow the mechanism: you and the
 Validator both address lanes and both read their windows and logs — that is how relaying
 and Phase 4 work. What is forbidden is the Coder obtaining the tests, or anything
