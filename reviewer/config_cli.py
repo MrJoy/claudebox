@@ -15,6 +15,7 @@ from dataclasses import fields
 from typing import Optional, Sequence
 
 import deploy_config
+from config_load import printable
 import repo_config
 from common import ConfigError
 
@@ -24,8 +25,14 @@ def _read(path: str, role: str, stderr) -> Optional[bytes]:
         with open(path, "rb") as fh:
             return fh.read()
     except OSError as exc:
-        stderr.write(f"ERROR: cannot read {role} {path}: {exc.strerror}\n")
+        say(stderr, f"ERROR: cannot read {role} {path}: {exc.strerror}")
         return None
+
+
+def say(stream, text: str) -> None:
+    """Write one line. Every line can carry text from a file the reviewed
+    repo wrote, so nothing unprintable reaches the terminal (PR #17 review)."""
+    stream.write(printable(text) + "\n")
 
 
 def main(argv: Sequence[str], stdout=sys.stdout, stderr=sys.stderr,
@@ -48,15 +55,15 @@ def main(argv: Sequence[str], stdout=sys.stdout, stderr=sys.stderr,
     res = repo_config.resolve(org_data, repo_data, persona_dir)
     failed = False
     for line in res.repo_problems + res.org_problems:
-        stderr.write(f"ERROR: {line}\n")
+        say(stderr, f"ERROR: {line}")
         failed = True
     if res.repo_problems:
         if res.config is None:
-            stderr.write("ERROR: a hosted repo with this file and this org file is not reviewed\n")
+            say(stderr, "ERROR: a hosted repo with this file and this org file is not reviewed")
         elif res.source == "org":
-            stderr.write("ERROR: a hosted repo with this file falls back to the org file\n")
+            say(stderr, "ERROR: a hosted repo with this file falls back to the org file")
         else:
-            stderr.write("ERROR: a hosted repo with this file falls back to the built-in defaults\n")
+            say(stderr, "ERROR: a hosted repo with this file falls back to the built-in defaults")
 
     check = None
     if args.deploy:
@@ -67,29 +74,29 @@ def main(argv: Sequence[str], stdout=sys.stdout, stderr=sys.stderr,
             deploy = deploy_config.load_deploy(deploy_data)
         except deploy_config.DeployError as exc:
             for line in exc.lines:
-                stderr.write(f"ERROR: {line}\n")
+                say(stderr, f"ERROR: {line}")
             return 1
         except ConfigError as exc:
-            stderr.write(f"ERROR: {exc}\n")
+            say(stderr, f"ERROR: {exc}")
             return 1
         if res.config is not None and not failed:
             check = deploy_config.against_deploy(res.config, deploy, args.repo_name)
             for line in check.problems:
-                stderr.write(f"ERROR: against deploy file: {line}\n")
+                say(stderr, f"ERROR: against deploy file: {line}")
                 failed = True
 
     if failed:
         return 1
 
     scope = "" if check is not None else "; deployment not checked"
-    stdout.write(f"OK: config is valid (source: {res.source}{scope})\n")
+    say(stdout, f"OK: config is valid (source: {res.source}{scope})")
     for f in fields(repo_config.RepoConfig):
         value = getattr(res.config, f.name)
-        stdout.write(f"  {f.name}: {'-' if value is None else value}\n")
+        say(stdout, f"  {f.name}: {'-' if value is None else value}")
     if check is not None:
-        stdout.write(f"  effective model: {check.model}\n")
+        say(stdout, f"  effective model: {check.model}")
         for item in check.unchecked:
-            stdout.write(f"NOT CHECKED HERE: {item}\n")
+            say(stdout, f"NOT CHECKED HERE: {item}")
     else:
         stdout.write("NOT CHECKED HERE: profile, model, team and kindex.store are checked "
                      "only against a deployment (pass --deploy)\n")

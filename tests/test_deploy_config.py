@@ -198,6 +198,18 @@ class LoadTest(unittest.TestCase):
         self.assertIn("max_concurrent_jobs",
                       problems({"profiles": {"o": profile()}, "max_concurrent_jobs": True}))
 
+    def test_zero_is_refused_where_the_floor_is_one(self):
+        # PR #17 review: dropping minimum=1 left every one of these loading.
+        for doc, line in (
+                ({"profiles": {"o": profile()}, "max_concurrent_jobs": 0},
+                 "max_concurrent_jobs: must be a positive integer"),
+                ({"profiles": {"o": profile(concurrency=0)}},
+                 "profiles.o.concurrency: must be a positive integer"),
+                ({"profiles": {"o": profile(budget={"unit": "passes", "daily": 0})}},
+                 "profiles.o.budget.daily: must be a positive integer")):
+            with self.subTest(line=line):
+                self.assertIn(line, problems(doc))
+
     def test_share_with_all_private_is_accepted(self):
         # Oracle: tester-brief.md, Task 4, Interfaces and signed starting oracle line 676.
         # Mutation: Reject all-private sharing.

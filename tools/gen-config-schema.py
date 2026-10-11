@@ -47,10 +47,11 @@ def build(persona_dir: str) -> dict:
                     "description": "auto reviews every PR; requested only PRs that ask."},
         "team": dict(NAME, description="Team slug whose review request counts as an ask."),
         "profile": dict(NAME, description="A provider profile the deployment defines."),
-        "model": {"type": "string", "pattern": "^\\S+$",
+        "model": {"type": "string", "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$",
                   "description": "A model the profile allows; omit for its default."},
         "plan": _obj({
-            "label": {"type": "string", "pattern": "^\\S(?:.*\\S)?$",
+            "label": {"type": "string",
+                      "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f](?:[^\\x00-\\x1f\\x7f-\\x9f]*[^\\s\\x00-\\x1f\\x7f-\\x9f])?$",
                       "description": "The label that makes a PR a plan review."},
             "personas": _personas("plan", plan),
         }),

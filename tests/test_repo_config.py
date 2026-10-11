@@ -121,6 +121,20 @@ class CheckTest(unittest.TestCase):
         _, problems = check({"plan": {"label": " "}})
         self.assertTrue(problems)
 
+    def test_control_characters_are_refused_in_free_text_values(self):
+        # PR #17 review: a model or label carrying ESC, BEL, CR or a C1 or
+        # format control validated, then reached the operator's terminal.
+        for doc in ({"model": "glm\x1b]0;x\x07"}, {"model": "glm\x08"},
+                    {"model": "glm\u202e"}, {"plan": {"label": "plan\rOK: config is valid"}},
+                    {"plan": {"label": "plan\x9b2J"}}, {"plan": {"personas": "sage\nred_team"}},
+                    {"code": {"personas": "sage\x1b"}}):
+            with self.subTest(doc=doc):
+                _, problems = check(doc)
+                self.assertTrue(problems)
+                self.assertNotIn("\x1b", "\n".join(problems.lines()))
+        _, problems = check({"model": "glm-5.2:cloud", "plan": {"label": "needs plan review"}})
+        self.assertFalse(problems)
+
     def test_a_section_that_is_not_an_object_is_an_error(self):
         # Oracle: tester-brief.md, Task 2, Interfaces and signed starting oracle line 323.
         # Mutation: Ignore a non-object plan section.

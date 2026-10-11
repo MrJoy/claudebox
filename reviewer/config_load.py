@@ -32,6 +32,18 @@ def is_obj(value) -> bool:
     return isinstance(value, dict)
 
 
+def printable(text: str) -> str:
+    """`text` with every character str.isprintable() refuses written as an escape.
+
+    For anything a config file supplies that is then printed: a control
+    sequence in a key or a value could otherwise move the cursor, conceal
+    lines or forge a verdict on the operator's terminal.
+    """
+    return "".join(c if c.isprintable() else
+                   (f"\\x{ord(c):02x}" if ord(c) < 0x100 else f"\\u{ord(c):04x}")
+                   for c in text)
+
+
 class Problems:
     """Every problem in a file, so one run reports all of them at once."""
 
@@ -50,7 +62,10 @@ class Problems:
         self.add(join(path, key), f"unknown key{hint}")
 
     def lines(self) -> List[str]:
-        return [f"{p}: {m}" if p else m for p, m in self._items]
+        # A key name or a value from the file can reach these lines, and the
+        # file is the reviewed repo's, so nothing unprintable may reach a
+        # terminal through them (PR #17 review).
+        return [printable(f"{p}: {m}" if p else m) for p, m in self._items]
 
     def __bool__(self) -> bool:
         return bool(self._items)

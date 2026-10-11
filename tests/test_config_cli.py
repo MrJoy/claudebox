@@ -74,6 +74,26 @@ class CliTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("is not reviewed", err)
 
+    def test_both_invalid_with_a_deploy_file_says_not_reviewed_and_checks_nothing(self):
+        # PR #17 review: the guard that keeps against_deploy away from a None
+        # config had no test, and without it this command raised.
+        rc, out, err = self.run_cli("validate", self.write("r.json", {"trigger": "x"}),
+                                    "--org", self.write("o.json", {"trigger": "y"}),
+                                    "--deploy", self.write("d.json", DEPLOY))
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("is not reviewed", err)
+        self.assertNotIn("Traceback", err)
+        self.assertNotIn("against deploy file", err)
+
+    def test_a_hostile_key_cannot_put_a_control_sequence_on_the_terminal(self):
+        # PR #17 review: unknown-key names were echoed raw, and SGR 8 hid the
+        # real verdict behind a forged one.
+        rc, out, err = self.run_cli("validate", self.write("r.json", {
+            "\x1b[2K\x1b[8m": 1, "\x1b[28mOK: config is valid (source: repo+org)": 1}))
+        self.assertEqual(rc, 1)
+        self.assertNotIn("\x1b", out + err)
+        self.assertIn("\\x1b[8m: unknown key", err)
+
     def test_an_invalid_org_under_a_valid_repo_is_still_exit_one(self):
         # Oracle: tester-brief.md, Task 6, Interfaces and signed starting oracle line 893.
         # Mutation: Ignore errors in an org file underneath a valid repo.

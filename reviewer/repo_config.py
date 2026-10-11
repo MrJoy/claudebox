@@ -68,7 +68,7 @@ def _count(problems, path, value):
 
 
 def _personas(problems, path, value, mode, persona_dir):
-    if not is_str(value):
+    if not is_str(value) or not value.isprintable():
         problems.add(path, "must be a persona selector string, e.g. \"red_team,sage\" or \"all\"")
         return False
     try:
@@ -87,14 +87,15 @@ def _leaf(problems, path, value, persona_dir) -> bool:
     if path == "profile":
         return _name(problems, path, value, "profile name")
     if path == "model":
-        if is_str(value) and value.strip() and not any(c.isspace() for c in value):
+        if is_str(value) and value and value.isprintable() and not any(c.isspace() for c in value):
             return True
-        problems.add(path, "must be a model name with no spaces")
+        problems.add(path, "must be a model name with no spaces or control characters")
         return False
     if path == "plan.label":
-        if is_str(value) and value.strip() and value == value.strip():
+        if is_str(value) and value.strip() and value == value.strip() and value.isprintable():
             return True
-        problems.add(path, "must be a non-empty label with no surrounding spaces")
+        problems.add(path, "must be a non-empty label with no surrounding spaces or control "
+                     "characters")
         return False
     if path == "plan.personas":
         return _personas(problems, path, value, "plan", persona_dir)

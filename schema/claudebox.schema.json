@@ -31,7 +31,7 @@
     },
     "model": {
       "type": "string",
-      "pattern": "^\\S+$",
+      "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$",
       "description": "A model the profile allows; omit for its default."
     },
     "plan": {
@@ -40,7 +40,7 @@
       "properties": {
         "label": {
           "type": "string",
-          "pattern": "^\\S(?:.*\\S)?$",
+          "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f](?:[^\\x00-\\x1f\\x7f-\\x9f]*[^\\s\\x00-\\x1f\\x7f-\\x9f])?$",
           "description": "The label that makes a PR a plan review."
         },
         "personas": {

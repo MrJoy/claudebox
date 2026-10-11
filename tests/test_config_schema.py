@@ -74,10 +74,12 @@ class SchemaTest(unittest.TestCase):
         props = self.schema["properties"]
         cases = [
             (("plan", "label"), props["plan"]["properties"]["label"]["pattern"],
-             ("plan", "needs plan", " plan", "plan ", " ", "", "plan\n")),
+             ("plan", "needs plan", " plan", "plan ", " ", "", "plan\n", "plan\rOK", "pl\x1bn",
+              "plan\x9b")),
             (("team",), props["team"]["pattern"], ("rev", "a/b", "", "rev\n", "r v")),
             (("profile",), props["profile"]["pattern"], ("ollama", "", "ollama\n")),
-            (("model",), props["model"]["pattern"], ("glm-5.2:cloud", "a b", "", "glm\n")),
+            (("model",), props["model"]["pattern"], ("glm-5.2:cloud", "a b", "", "glm\n",
+                                                      "glm\x07", "glm\x1b]0;x", "glm\x85")),
         ]
         for path, pattern, values in cases:
             for value in values:
