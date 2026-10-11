@@ -47,7 +47,7 @@ The spec and the overview leave these open, and each one changes code. They are 
 10. **A pass that cannot start is an ordinary failed pass**, as in local mode's `_run_one`: any exception from spawning `claude` (`EAGAIN` at the PID limit, `ENOMEM`, no `claude` on `PATH`) becomes a failed `PassResult`, and the pair still sends `complete-pair`. Letting it out would abort the pool, and the started pair, its siblings and the next phase would never complete.
 11. **A refused `start-pair` runs nothing and completes nothing**: the pair stays owed, and the log names the refusal's reason. A usage limit in phase 1 withholds phase 2, as `run_group` does, and those pairs are never started, so the control plane still owes them.
 12. **`complete-pair` notes are `{rc, limited, transcript}`**, where `transcript` is `ok`, `missing` or `over-cap`. They are evidence for the control plane, never an outcome. `complete-pair` is retried up to `COMPLETE_ATTEMPTS` (4) times, with a growing pause, when the channel answers `503` or cannot be reached: the channel bounds the large bodies it holds at once (2a.4a), and a burst of one job's own completions can meet that bound. Any other answer is final.
-13. **The shim allows a fixed set of reads** (`pr view|diff|list`, `issue view|list`, `repo view`, `search`, and `api`) and refuses everything else with one message that names `gh pr comment` as the only way to post. `gh api` is checked by allowlist, because `gh` parses flags with pflag, which accepts attached short values (`-XPOST`, `-fbody=x`) and combined flags, so no list of write spellings is complete. It takes exactly one REST path, and only `--paginate`, `--slurp`, `-i`/`--include`, `--silent`, `--verbose`, `-q`/`--jq`, `-t`/`--template` and `--cache`. Every other flag is refused, `--hostname`, `-H` and `--method` included, and so are `graphql` (always a `POST`) and a full URL. Reads the worker's token can never answer are refused with their own message, which tells the persona to carry on with the review: `pr checks` and `pr status` (check status, which `GH_STANZA` already says the token cannot read, and which `pr status` fetches with no flag to leave it out), `run view|list` (the App asks for no Actions permission), and `auth status` (it needs a user). GitHub's 403 for them would read as a refused read, which the hosted prompt tells a persona to stop the review over.
+13. **The shim allows a fixed set of reads** (`pr view|diff|list`, `issue view|list`, `repo view`, `search`, and `api`) and refuses everything else with one message that names `gh pr comment` as the only way to post. `gh api` is checked by allowlist, because `gh` parses flags with pflag, which accepts attached short values (`-XPOST`, `-fbody=x`) and combined flags, so no list of write spellings is complete. It takes exactly one REST path, and only `--paginate`, `--slurp`, `-i`/`--include`, `--silent`, `--verbose`, `-q`/`--jq`, `-t`/`--template` and `--cache`. Every other flag is refused, `--hostname`, `-H` and `--method` included, and so are `graphql` (always a `POST`) and a full URL. Reads the worker's token can never answer are refused with their own message, which tells the persona to carry on with the review: `pr checks` and `pr status` (check status, which `GH_STANZA` already says the token cannot read, and which `pr status` fetches with no flag to leave it out), `run view|list` (the App asks for no Actions permission), and `auth status` (it needs a user). GitHub's 403 for them would read as a refused read, which the hosted prompt tells a persona to stop the review over. That list is the readable message for the common cases, not the boundary: `gh api` takes any path, so the shim runs the real `gh` as a child, passes its output through, and adds the same "carry on" message whenever GitHub answers that the token has no permission (`HTTP 403`, or GraphQL's "Resource not accessible by integration"). GitHub's answer is the one owner of which reads this token can make.
 14. **`gh pr comment` takes `--body`, `-b`, `--body=`, and `--body-file`/`-F` (with `-` for stdin)**, and one PR number, which must be the job's. Any other flag is refused with a message naming the two that work. The finding number `seq` is counted per persona in a mode-600 file under the reviewer's home, under `flock`, so a pair's concurrent shells never reuse one.
 15. **A refused finding exits 1 and prints the control plane's `message`** on stderr. An unreachable channel exits 1 and says the finding was not posted.
 16. **The channel capability is authority over the whole job, and a pass can name any persona of it.** `start-pair`, `post-finding` and `complete-pair` take the pair from the body, so a prompt-injected pass can start a sibling before it does, complete a started one with its own transcript, or spend a sibling's finding quota. A per-pair channel token would not change that: the worker is one uid, so a pass can read a sibling's token from `/proc/<pid>/environ`, and it can already kill a sibling's `claude` outright. Every pair of a job reviews the same PR, so what this reaches is how that one PR is reviewed, and the person who can inject is that PR's author. It reaches nothing outside the job: no other PR's state, no other repo's, and no outcome the gateway did not see. This is the spec's "What a prompt-injected reviewer holds" ("Everything in the worker: the capability, …"), stated at the precision the channel needs. Its "cannot misreport how its pairs ended" holds for the outcome the gateway records, and not for which transcript a sibling's session keeps. Closing it takes a uid per pair, which is not in 2a.
@@ -729,6 +729,7 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -772,7 +773,7 @@ class ShimParseTest(unittest.TestCase):
                 self.gh.parse_comment(args)
 
     def test_writes_are_refused_before_the_real_gh(self):
-        with mock.patch.object(self.gh.os, "execv") as execv, \
+        with mock.patch.object(self.gh.subprocess, "run") as execv, \
                 mock.patch.object(sys, "stderr", io.StringIO()):
             for argv in (["pr", "review", "7", "--approve"], ["pr", "merge", "7"],
                          ["issue", "comment", "7", "-b", "x"],
@@ -806,14 +807,29 @@ class ShimParseTest(unittest.TestCase):
                 self.assertIn("carry on with the review", err.getvalue())
 
     def test_reads_go_to_the_real_gh(self):
-        with mock.patch.object(self.gh.os, "execv") as execv:
+        ok = subprocess.CompletedProcess([], 0, stderr=b"")
+        with mock.patch.object(self.gh.subprocess, "run", return_value=ok) as execv:
             for argv in (["pr", "diff", "7"], ["pr", "view", "7", "--json", "title"],
                          ["api", "repos/a/b/pulls/7/comments"], ["search", "prs", "x"],
                          ["api", "--paginate", "-q", ".[].body", "repos/a/b/pulls/7/comments"],
                          ["api", "--jq=.title", "repos/a/b/pulls/7"], ["api", "-q.title", "x"]):
                 with self.subTest(argv=argv):
                     self.gh.main(argv)
-                    self.assertEqual(execv.call_args.args[1][1:], argv)
+                    self.assertEqual(execv.call_args.args[0][1:], argv)
+
+    def test_a_403_from_github_says_carry_on(self):
+        # PR #20 review: `gh api` takes any path, so GitHub's 403 is what says
+        # the token cannot read it, not a list of commands.
+        for err, told in ((b"HTTP 403: Resource not accessible by integration\n", True),
+                          (b"GraphQL: Resource not accessible by integration (x)\n", True),
+                          (b"HTTP 404: Not Found\n", False)):
+            done = subprocess.CompletedProcess([], 1, stderr=err)
+            with self.subTest(err=err), mock.patch.object(self.gh.subprocess, "run",
+                                                          return_value=done), \
+                    mock.patch.object(sys, "stderr", io.StringIO()) as out:
+                self.assertEqual(self.gh.main(["api", "repos/a/b/commits/x/check-runs"]), 1)
+                self.assertIn(err.decode(), out.getvalue())
+                self.assertEqual("carry on with the review" in out.getvalue(), told)
 
 
 class Channel(http.server.BaseHTTPRequestHandler):
@@ -907,6 +923,8 @@ Persona text keeps saying `gh pr comment`, so nothing in the prompts changes.
 import fcntl
 import json
 import os
+import re
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -1072,8 +1090,31 @@ def main(argv) -> int:
                     f"...` and `gh pr diff <number>`.")
     if not allowed:
         return fail(f"gh {' '.join(argv[:2])}: not available. {REFUSED}")
-    os.execv(REAL_GH, [REAL_GH] + argv)
-    return 1
+    return run_real(argv)
+
+
+# GitHub's answer when the token lacks a permission, REST and GraphQL spellings.
+_NO_SCOPE = re.compile(r"HTTP 403|Resource not accessible by integration")
+CANNOT_READ = ("claudebox: GitHub refused that read because this deployment's token has no "
+               "permission for it. That is expected and not a refused read: carry on with the "
+               "review, from `gh pr view <number> --json ...` and `gh pr diff <number>`.")
+
+
+def run_real(argv, run=None) -> int:
+    """Run the real gh, passing its output through, and say what a 403 means.
+
+    `gh api` takes any path, so no list of commands covers every read the
+    token cannot answer. GitHub's 403 is the one owner of that fact, so the
+    shim reads it there, and the persona is told to carry on rather than
+    treating it as the deployment refusing a read (PR #20 review).
+    """
+    result = (run or subprocess.run)([REAL_GH] + argv, stderr=subprocess.PIPE)
+    err = result.stderr.decode("utf-8", "replace") if result.stderr else ""
+    sys.stderr.write(err)
+    if result.returncode != 0 and _NO_SCOPE.search(err):
+        sys.stderr.write(CANNOT_READ + "\n")
+    sys.stderr.flush()
+    return result.returncode
 
 
 if __name__ == "__main__":
@@ -1083,7 +1124,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `chmod 755 worker/bin/gh`, then `./test-python.sh -p 'test_worker_gh.py'`, then `./test-python.sh`
-Expected: PASS, 9 tests. The whole suite passes, and no `__pycache__` appears under `worker/bin/`.
+Expected: PASS, 10 tests. The whole suite passes, and no `__pycache__` appears under `worker/bin/`.
 
 - [ ] **Step 5: Commit**
 
