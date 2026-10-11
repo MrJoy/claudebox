@@ -41,16 +41,20 @@ The spec and the overview leave these open, and each one changes code. They are 
 5. **A head's conclusion is `success` only when every pair is reviewed (or at its round cap) and nothing was found**, counting findings queued, posted, dropped, withheld and turned away. Everything else that is complete is `neutral`.
 6. **Acceptance runs scan, then size, then the per-pass count.** A credential is withheld whatever else is wrong with the finding. Size is measured in UTF-8 bytes against `caps.comment_bytes`. A too-long finding is not counted against the pass, since the model is told to shorten it and post again. A finding past `caps.comments_per_pass` is counted on the check run as not posted. A retried `post-finding` with the same key answers what the first one did, and queues once. The key's result is kept in memory for the job's life.
 7. **A withheld record stores a fresh 16-byte salt followed by `sha256(salt || body)`**, and the body with every match replaced by `[withheld:<detector>]`. The day's count per detector is a `withheld_counts` row.
-8. **The drain is one `Drainer` per installation, and `step()` posts at most one item** and returns how long to wait. Pacing is a sliding window: one second between posts and 400 in any hour. A retryable failure with no `Retry-After` waits 30 seconds, doubling per attempt up to 30 minutes. Every drop is an `audit` row (`outbox.drop`, the key and the reason) and a check-run count. A repo that `Installation.repo` reports as not `private` is public. An internal repo reports `private: true`, so it counts as private, as the spec's "Visibility" requires.
-9. **`Installation.pull(full_name, pr)` joins 2a.1's client**, returning None on a 404, because the drain must see whether a PR is open before it posts.
-10. **A pass with no transcript and an empty record is `deferred`**, ahead of the spec's transcript check. Nothing parsed badly: the pass never started `claude`. A missing transcript with real traffic is `failing`. A transcript parses when every non-empty line is a JSON object and its first `sessionId` is a plausible id. A dead capability turns what would be `ok` into `revoked`.
+8. **The drain is one `Drainer` per installation, and `step()` posts at most one item** and returns how long to wait. Pacing is a sliding window: one second between posts and 400 in any hour. A retryable failure with no `Retry-After` waits 30 seconds, doubling per attempt up to 30 minutes. Every drop is an `audit` row (`outbox.drop`, the key and the reason) and a check-run count. Whether a repo is public is `github_app.is_public`, which reads GitHub's three-valued `visibility` field, so an internal repo counts as private (the spec's "Visibility") whatever `private` says for one. `private` is read only when `visibility` is absent, and a repo that says neither counts as public.
+9. **`Installation.pull(full_name, pr)` and `is_public(repo)` join 2a.1's client**, returning None on a 404, because the drain must see whether a PR is open before it posts.
+10. **A pass with no transcript and an empty record is `deferred`**, ahead of the spec's transcript check. Nothing parsed badly: the pass never started `claude`. A missing transcript with real traffic is `failing`. A transcript parses when every non-empty line is a JSON object and its first `sessionId` is a plausible id. `decide` never returns `revoked`: the spec decides it "elsewhere, without a `complete pair`", and that is decision 18. A dead capability never reaches `decide`, because the channel answers it `401`.
 11. **Reports commit only in order.** A report whose seq is not the committed one plus one changes nothing, and the ack names the committed seq, so a resend is harmless and a gap is visible. A `first_*` marker is never overwritten, and its text is cut at 500 characters. A report for a token the control plane never minted is refused.
-12. **The commit point is in memory, under one lock.** The transcript blob is written first and the pair pointed at it second, so a crash between them leaves an unreferenced blob for 2b's sweep, and 2a.4b's startup deletes every transcript blob anyway (overview decision 1). A newer transcript deletes the blob it replaces.
-13. **Parks live beside the pair state.** A head park lifts when the PR's head differs. A timed park lifts at its time. A profile park stops `start-pair`, and its scheduling consequence is 2a.4b's. A page is one `PAGE:` line (overview decision 14).
+12. **The commit point is in memory, under one lock.** The transcript blob is written first and the pair pointed at it second, so a crash between them leaves an unreferenced blob for 2b's sweep, and 2a.4b's startup deletes every transcript blob anyway (overview decision 1). A job does not outlive the control plane that started it because 2a.4b's startup makes it so: 2a.1's rule, "the successor revokes every outstanding row before it serves anything", revokes every capability and provider token (`Creds.revoke_all`), the restarted `hello` carries no live token so the gateway drops them all, and the runner's orphans are stopped. An in-flight pass is lost on a restart, and its pair stays owed. A newer transcript deletes the blob it replaces.
+13. **Parks live beside the pair state, keyed by repo.** The profile's two-PR limit rule counts `(repo, pr)`, since a profile spans repos and every repo has a #1. A head park lifts when the PR's head differs. A timed park lifts at its time. A profile park stops `start-pair`, and its scheduling consequence is 2a.4b's. A page is one `PAGE:` line (overview decision 14).
 14. **`fetch-job` mints the read token and starts the 55-minute deadline in the same call**, so the token outlives the job, and a read token GitHub refuses revokes the new capability at once. A pair's committed transcript travels in the job spec with its session id, and a pair without one gets neither.
-15. **`start-pair` fails closed.** A visibility check that errors, a repo that is public or out of reach, a parked profile, a pair already started, and a gateway that refuses the token all answer `409` and leave the pair unstarted. The provider token lives until the job's deadline, and its `token_records` row exists before the gateway hears of it.
-16. **`complete-pair` turns a bad transcript into one that will not parse.** That covers bad base64, a transcript over 64 MiB, and the worker's own `over-cap` note, so all three are `failing`. A flush the gateway cannot answer is no flush, so the pair is `deferred`. The pair's token is revoked in the records store and then at the gateway, and a gateway that misses the revoke drops the token at its next `hello`.
+15. **`start-pair` fails closed, and reserves the pair before any network call.** A visibility check that errors, a repo that is public or out of reach, a parked profile, a pair already started or starting, and a gateway that refuses the token all answer `409`. The check and the reservation happen under the job's lock, so two concurrent starts for one persona mint one token, and a refusal clears the reservation so the pair stays startable. The provider token lives until the job's deadline, and its `token_records` row exists before the gateway hears of it.
+16. **`complete-pair` records the pair completed only once the commit point has returned**, with its outcome, and answers a resend `200 {}`, the way `post-finding` answers one. A fault before then leaves the pair started, which a retry re-enters and the job's end revokes. A concurrent duplicate is `409`. It turns a bad transcript into one that will not parse. That covers bad base64, a transcript over 64 MiB, and the worker's own `over-cap` note, so all three are `failing`. A flush the gateway cannot answer is no flush, so the pair is `deferred`. The pair's token is revoked in the records store and then at the gateway, and a gateway that misses the revoke drops the token at its next `hello`.
 17. **Body caps are checked on the declared `Content-Length`, before reading.** A missing length is `411`, and a body over the cap is `413`. An oversized `complete-pair` is refused unread, so its pair is revoked when the job ends (the overview, as revised).
+18. **`revoked` is `Committer.revoke`.** A started pair whose job ended without `complete-pair` (the deadline, an access change, a restart) has its transcript discarded and its failure recorded, and stays owed. `revoke` returns `REVOKED` for the job-end handler, which knows the head, to show as `checkruns.REVOKED`. 2a.4b's job end is that handler.
+19. **Loss of access has two deleters, both here.** `Committer.forget_repo` deletes the repo's transcripts and parks and clears its `Decider` state: sessions, fingerprints, pass counts and owed pairs. Rounds hold no content and survive, as the spec says of a public flip. `Outbox.drop_repo` deletes the repo's queued items and its `withheld` rows in one transaction, and keeps the per-detector day counts. 2a.4b's loss-of-access path calls both, plus `CheckRuns.forget_repo`, and revokes the repo's jobs.
+20. **The head a round line names is the committed fingerprint's**, read by `Committer.last_reviewed_head` from `state.reviewed`. There is no second record of it to drift.
+21. **A count moves in the transaction that settles its item**, so a crash cannot lose one. The drain decides an item's fate inside its `try` and settles it after, so a check-run failure is never read as the comment's, and a failed publish waits for the next one. A head this process holds no pair state for is not repainted: after a restart the outbox still posts its findings, and an empty map would turn a finished run back to queued. Pair states sit under a lock, since a group's personas finish together.
 
 ## Review Focus
 
@@ -60,6 +64,8 @@ The spec and the overview leave these open, and each one changes code. They are 
 - **A credential in a finding, at acceptance or slipped in before posting.** Expected: withheld, recorded redacted, counted, never posted. Pinned in Task 3.
 - **One PR's backlog starving another.** Expected: round-robin. Pinned in Task 3.
 - **A repo that goes public or out of reach mid-job.** Expected: `start-pair` refuses, and the outbox drops its items before posting. Pinned in Tasks 3 and 5.
+- **A worker racing two `start-pair`s for one persona.** Expected: one provider token. Pinned in Task 5.
+- **A repo lost while it held withheld findings.** Expected: they are deleted with its queued items. Pinned in Task 3.
 - **A gateway that loses reports, or never answers the flush.** Expected: `deferred`, never `ok`. Pinned in Tasks 4 and 5.
 
 ## Not run here
@@ -350,7 +356,7 @@ git commit -m "prompts: a hosted round line names the head last reviewed"
   - The state names `QUEUED`, `RUNNING`, `REVIEWED`, `DEFERRED`, `USAGE_LIMITED`, `FAILED`, `FAILING`, `CAPPED`, `ROUND_CAP`, `REVOKED`, `CONFIG_INVALID`, and `STATES`.
   - `PairView(state, until=None)` (frozen) and `Counts(queued, posted, dropped, withheld, not_posted)` with `found() -> int`.
   - `render(pairs: Dict[str, PairView], counts, rewritten=False, config_problem="") -> (status, conclusion, title, summary)`.
-  - `CheckRuns(records, installation_for, clock=time.time)` with `run_id`, `counts(repo, head, queued=0)`, `ensure(repo, head) -> int`, `set_pair(repo, head, persona, view, rewritten=None)`, `set_config_problem`, `add(repo, head, **deltas)`, `publish(repo, head, queued=0)` and `forget_repo(repo)`.
+  - `CheckRuns(records, installation_for, clock=time.time)` with `run_id`, `counts(repo, head, queued=0)`, `ensure(repo, head) -> int`, `set_pair(repo, head, persona, view, rewritten=None)`, `set_config_problem`, `add(repo, head, conn=None, **deltas)` (with `conn`, inside the caller's transaction), `publish(repo, head, queued=0)` (a no-op for a head with no pair state) and `forget_repo(repo)`; `lock` guards the pair states.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -491,8 +497,50 @@ class CheckRunsTest(unittest.TestCase):
     def test_forget_repo_drops_its_pair_states(self):
         self.runs.set_pair("acme/web", HEAD, "sage", PairView(checkruns.CAPPED))
         self.runs.forget_repo("acme/web")
+        self.runs.set_pair("acme/web", HEAD, "red_team", PairView(checkruns.QUEUED))
         self.runs.publish("acme/web", HEAD)
-        self.assertEqual(self.inst.updated[-1][1], "queued")
+        self.assertNotIn("sage", self.inst.updated[-1][3])
+
+    def test_a_head_with_no_pair_state_is_left_as_it_last_rendered(self):
+        # After a restart the drain still posts a head's findings; an empty map
+        # would repaint a finished run as queued (PR #21 review).
+        self.runs.ensure("acme/web", HEAD)
+        self.runs.add("acme/web", HEAD, posted=1)
+        before = list(self.inst.updated)
+        self.runs.publish("acme/web", HEAD)
+        self.assertEqual(self.inst.updated, before)
+
+    def test_add_inside_a_callers_transaction_commits_with_it(self):
+        self.runs.ensure("acme/web", HEAD)
+        try:
+            with self.records.tx() as c:
+                self.runs.add("acme/web", HEAD, conn=c, posted=1)
+                raise RuntimeError("crash before commit")
+        except RuntimeError:
+            pass
+        self.assertEqual(self.runs.counts("acme/web", HEAD).posted, 0)
+
+    def test_concurrent_set_and_publish_do_not_race(self):
+        import threading
+        self.runs.ensure("acme/web", HEAD)
+        errors = []
+
+        def setter():
+            for i in range(300):
+                self.runs.set_pair("acme/web", HEAD, f"p{i}", PairView(checkruns.RUNNING))
+
+        def publisher():
+            try:
+                for _ in range(100):
+                    self.runs.publish("acme/web", HEAD)
+            except RuntimeError as exc:
+                errors.append(exc)
+        threads = [threading.Thread(target=setter), threading.Thread(target=publisher)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
 
 
 if __name__ == "__main__":
@@ -522,6 +570,7 @@ The conclusion is never `failure`, and `success` means only "reviewed, and
 found nothing": claudebox does not assert a PR is acceptable.
 """
 
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional, Tuple
@@ -668,6 +717,9 @@ class CheckRuns:
         self.records = records
         self.installation_for = installation_for
         self.clock = clock
+        # Written by request threads (a group's personas finish together) and
+        # read by the drain; one lock covers every change and every render.
+        self.lock = threading.Lock()
         self._heads: Dict[Tuple[str, str], _Head] = {}
 
     def run_id(self, repo: str, head: str) -> Optional[int]:
@@ -698,42 +750,65 @@ class CheckRuns:
 
     def set_pair(self, repo: str, head: str, persona: str, view: PairView,
                  rewritten: Optional[bool] = None) -> None:
-        h = self._heads.setdefault((repo, head), _Head())
-        h.pairs[persona] = view
-        if rewritten is not None:
-            h.rewritten = rewritten
+        with self.lock:
+            h = self._heads.setdefault((repo, head), _Head())
+            h.pairs[persona] = view
+            if rewritten is not None:
+                h.rewritten = rewritten
 
     def set_config_problem(self, repo: str, head: str, problem: str) -> None:
-        self._heads.setdefault((repo, head), _Head()).config_problem = problem
+        with self.lock:
+            self._heads.setdefault((repo, head), _Head()).config_problem = problem
 
-    def add(self, repo: str, head: str, **deltas: int) -> None:
-        """Move the head's counts: posted, dropped, withheld or not_posted."""
+    def add(self, repo: str, head: str, conn=None, **deltas: int) -> None:
+        """Move the head's counts: posted, dropped, withheld or not_posted.
+
+        Pass `conn` to move them inside the caller's transaction, which is how
+        the drain deletes an item and counts it in one commit.
+        """
         for name in deltas:
             if name not in ("posted", "dropped", "withheld", "not_posted"):
                 raise ValueError(f"not a count: {name}")
         sets = ", ".join(f"{n} = {n} + ?" for n in deltas)
+        sql = f"UPDATE check_runs SET {sets} WHERE repo = ? AND head = ?"
+        args = tuple(deltas.values()) + (repo, head)
+        if conn is not None:
+            conn.execute(sql, args)
+            return
         with self.records.tx() as c:
-            c.execute(f"UPDATE check_runs SET {sets} WHERE repo = ? AND head = ?",
-                      tuple(deltas.values()) + (repo, head))
+            c.execute(sql, args)
 
     def publish(self, repo: str, head: str, queued: int = 0) -> None:
-        """Render the head's current state onto its run."""
+        """Render the head's current state onto its run.
+
+        A head this process holds no pair state for (the control plane
+        restarted since its pass, and the outbox is still posting its findings)
+        is left as it last rendered: an empty map would repaint a finished run
+        as queued. Its counts are rows, and the next publish with pair state
+        shows them.
+        """
+        with self.lock:
+            h = self._heads.get((repo, head))
+            if h is None:
+                return
+            pairs = dict(h.pairs)
+            rewritten, problem = h.rewritten, h.config_problem
         run_id = self.ensure(repo, head)
-        h = self._heads.get((repo, head), _Head())
-        status, conclusion, title, summary = render(h.pairs, self.counts(repo, head, queued),
-                                                    h.rewritten, h.config_problem)
+        status, conclusion, title, summary = render(pairs, self.counts(repo, head, queued),
+                                                    rewritten, problem)
         self.installation_for(repo).update_check_run(repo, run_id, status, title, summary,
                                                      conclusion)
 
     def forget_repo(self, repo: str) -> None:
-        for key in [k for k in self._heads if k[0] == repo]:
-            del self._heads[key]
+        with self.lock:
+            for key in [k for k in self._heads if k[0] == repo]:
+                del self._heads[key]
 ```
 
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_checkruns.py'`, then `./test-python.sh`
-Expected: PASS, 16 tests. The whole suite passes.
+Expected: PASS, 19 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
@@ -746,17 +821,17 @@ git commit -m "hosted: the per-PR check run and its wording"
 
 **Files:**
 - Create: `hosted/outbox.py`
-- Modify: `hosted/github_app.py` (`Installation.pull`)
+- Modify: `hosted/github_app.py` (`Installation.pull`, `is_public`)
 - Test: `tests/test_hosted_outbox.py`
 - Modify: `tests/test_hosted_github_app.py`
 
 **Interfaces:**
 - Consumes: `records.Records`, `scan.Scanner`, `scan.sign`, `github_app.GitHubError` (2a.1); Task 2's `CheckRuns.add` and `publish`.
 - Produces:
-  - `Installation.pull(full_name, pr) -> Optional[dict]`.
+  - `Installation.pull(full_name, pr) -> Optional[dict]`, and `is_public(repo) -> bool`, which reads `visibility` before `private` and fails closed.
   - `QUEUED`, `WITHHELD`, `TOO_LONG`, `ENOUGH`, `MESSAGES`, `MIN_INTERVAL = 1.0`, `PER_HOUR = 400`, `BACKOFF_BASE = 30`, `BACKOFF_MAX = 1800`.
   - `JobContext(job_id, installation_id, repo, pr, head)` (frozen).
-  - `Outbox(records, scanner, check_runs, comment_bytes, comments_per_pass, clock=time.time)` with `accept(job, persona, seq, body) -> (result, message)`, `queued(repo, head) -> int`, `forget_job(job_id)` and `drop_repo(repo, reason) -> int`.
+  - `Outbox(records, scanner, check_runs, comment_bytes, comments_per_pass, clock=time.time)` with `accept(job, persona, seq, body) -> (result, message)`, `queued(repo, head) -> int`, `forget_job(job_id)` and `drop_repo(repo, reason) -> int`, which also deletes the repo's `withheld` rows.
   - `Drainer(outbox, installation, installation_id, clock=time.time, min_interval=MIN_INTERVAL, per_hour=PER_HOUR)` with `step() -> float`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -786,12 +861,18 @@ class FakeRuns:
     def __init__(self):
         self.counts = {}
         self.published = []
+        self.outside_tx = []     # count moves made outside a caller's transaction
+        self.publish_error = None
 
-    def add(self, repo, head, **deltas):
+    def add(self, repo, head, conn=None, **deltas):
+        if conn is None:
+            self.outside_tx.append(deltas)
         for k, v in deltas.items():
             self.counts[(repo, head, k)] = self.counts.get((repo, head, k), 0) + v
 
     def publish(self, repo, head, queued=0):
+        if self.publish_error is not None:
+            raise self.publish_error
         self.published.append((repo, head, queued))
 
 
@@ -894,6 +975,15 @@ class AcceptTest(Base):
         self.assertEqual(self.rows("outbox"), [])
         self.assertEqual(self.runs.counts[("acme/web", HEAD, "dropped")], 2)
         self.assertEqual(len(self.rows("audit")), 2)
+        self.assertEqual(self.runs.outside_tx, [])
+
+    def test_drop_repo_deletes_its_withheld_records_and_keeps_the_day_counts(self):
+        # The spec's Visibility list names withheld-finding records (PR #21 review).
+        self.box.accept(JOB, "sage", 1, "token olk-secret-value here")
+        self.box.accept(JobContext("j2", 7, "acme/api", 3, HEAD), "sage", 1, "olk-secret-value")
+        self.box.drop_repo("acme/web", "the repository went public")
+        self.assertEqual(self.rows("withheld", "repo"), [("acme/api",)])
+        self.assertNotEqual(self.rows("withheld_counts"), [])
 
 
 class DrainTest(Base):
@@ -985,6 +1075,29 @@ class DrainTest(Base):
                 self.assertIn(why, self.rows("audit", "detail")[-1][0])
         self.assertEqual(self.inst.posted, [])
 
+    def test_every_settle_moves_its_count_inside_the_deleting_transaction(self):
+        self.box.accept(JOB, "sage", 1, "a")
+        self.box.accept(JOB, "sme", 1, "b")
+        self.drain.step()
+        self.now[0] += 1
+        self.inst.pull_info = {"state": "closed", "head": {"sha": HEAD}}
+        self.drain.step()
+        self.assertEqual(self.runs.outside_tx, [])
+
+    def test_a_check_run_failure_after_a_post_is_not_read_as_the_comments(self):
+        self.box.accept(JOB, "sage", 1, "x")
+        self.runs.publish_error = GitHubError(404, "gone")
+        self.drain.step()
+        self.assertEqual(len(self.inst.posted), 1)
+        self.assertEqual(self.runs.counts, {("acme/web", HEAD, "posted"): 1})
+        self.assertEqual(self.rows("audit"), [])
+
+    def test_an_internal_repo_is_posted_to(self):
+        self.box.accept(JOB, "sage", 1, "x")
+        self.inst.repo_info = {"private": False, "visibility": "internal"}
+        self.drain.step()
+        self.assertEqual(len(self.inst.posted), 1)
+
     def test_a_closed_or_missing_pr_drops(self):
         self.box.accept(JOB, "sage", 1, "x")
         self.inst.pull_info = {"state": "closed", "head": {"sha": HEAD}}
@@ -1020,9 +1133,18 @@ And apply this change to `tests/test_hosted_github_app.py`:
 
 ```diff
 diff --git a/tests/test_hosted_github_app.py b/tests/test_hosted_github_app.py
-index 5d64031..90be73d 100644
+index 5d64031..d7ea215 100644
 --- a/tests/test_hosted_github_app.py
 +++ b/tests/test_hosted_github_app.py
+@@ -5,7 +5,7 @@ import json
+ import unittest
+ 
+ from github_app import (API, CHECK_RUN_NAME, READ_PERMISSIONS, SUMMARY_MAX, App, GitHubError,
+-                        Response, app_jwt, is_fork_pr, parse_time, public_user, user_for_token)
++                        Response, app_jwt, is_fork_pr, is_public, parse_time, public_user, user_for_token)
+ 
+ 
+ class FakeSigner:
 @@ -126,6 +126,12 @@ class InstallationTest(unittest.TestCase):
          self.routes[("GET", "/repos/acme/gone")] = Response(404, {}, b'{"message":"Not Found"}')
          self.assertIsNone(self.inst.repo("acme/gone"))
@@ -1036,12 +1158,38 @@ index 5d64031..90be73d 100644
      def test_repos_come_from_the_repositories_key(self):
          self.routes[("GET", "/installation/repositories?per_page=100")] = {
              "total_count": 1, "repositories": [{"full_name": "acme/web"}]}
+@@ -281,6 +287,25 @@ class RedirectTest(unittest.TestCase):
+         self.assertEqual(seen, [])
+ 
+ 
++class VisibilityTest(unittest.TestCase):
++    def test_an_internal_repo_counts_as_private_whatever_private_says(self):
++        # The spec's Visibility; PR #21 review: judge on `visibility`, the field
++        # that names internal, not on what `private` reports for one.
++        cases = [
++            ({"visibility": "internal", "private": False}, False),
++            ({"visibility": "internal", "private": True}, False),
++            ({"visibility": "private"}, False),
++            ({"visibility": "public", "private": True}, True),
++            ({"private": True}, False),
++            ({"private": False}, True),
++            ({}, True),
++            ({"private": "true"}, True),
++        ]
++        for repo, public in cases:
++            with self.subTest(repo=repo):
++                self.assertEqual(is_public(repo), public)
++
++
+ class ForkTest(unittest.TestCase):
+     def pr(self, head, base="acme/web"):
+         return {"head": {"repo": None if head is None else {"full_name": head}},
 ```
 
 - [ ] **Step 2: Run them to see them fail**
 
 Run: `./test-python.sh -p 'test_hosted_outbox.py'` and `./test-python.sh -p 'test_hosted_github_app.py'`
-Expected: FAIL: `No module named 'outbox'`, and `'Installation' object has no attribute 'pull'`.
+Expected: FAIL: `No module named 'outbox'`, and `cannot import name 'is_public'`.
 
 - [ ] **Step 3: Implement**
 
@@ -1049,7 +1197,7 @@ Apply this change to `hosted/github_app.py`:
 
 ```diff
 diff --git a/hosted/github_app.py b/hosted/github_app.py
-index 73f58ad..37ad25e 100644
+index 73f58ad..d8bdb86 100644
 --- a/hosted/github_app.py
 +++ b/hosted/github_app.py
 @@ -248,6 +248,15 @@ class Installation(_Client):
@@ -1067,6 +1215,27 @@ index 73f58ad..37ad25e 100644
 +
      def open_prs(self, full_name: str) -> List[dict]:
          return self._pages(f"/repos/{check_repo(full_name)}/pulls?state=open&per_page=100")
+ 
+@@ -324,6 +333,20 @@ class Installation(_Client):
+         self._call("PATCH", f"/repos/{check_repo(full_name)}/check-runs/{int(run_id)}", payload)
+ 
+ 
++def is_public(repo: Mapping[str, Any]) -> bool:
++    """Whether a repository GitHub described is public, for the spec's "Visibility".
++
++    `visibility` is the three-valued field (public, private, internal), and an
++    internal repo counts as private. `private` is read only when `visibility`
++    is absent, and a repo that says neither counts as public: the rule fails
++    closed.
++    """
++    visibility = repo.get("visibility")
++    if isinstance(visibility, str):
++        return visibility != "private" and visibility != "internal"
++    return repo.get("private") is not True
++
++
+ def is_fork_pr(pr: Mapping[str, Any]) -> bool:
+     """The spec's fork rule: the head repository alone decides.
  
 ```
 
@@ -1098,7 +1267,7 @@ from dataclasses import dataclass
 from typing import Callable, Deque, Dict, Optional, Set, Tuple
 
 import scan
-from github_app import GitHubError
+from github_app import GitHubError, is_public
 
 QUEUED = "queued"
 WITHHELD = "withheld"
@@ -1214,17 +1383,22 @@ class Outbox:
                 del self._results[key]
 
     def drop_repo(self, repo: str, reason: str) -> int:
-        """Drop every queued item for a repo (lost access, gone public). Returns how many."""
+        """Loss of access: drop the repo's queued items and delete its withheld records.
+
+        Both are content-bearing rows keyed to the repo, which the spec's
+        "Visibility" deletes "before any further pass". The per-detector day
+        counts are not content and survive. Returns how many items dropped.
+        """
         with self.records.tx() as c:
             rows = c.execute("SELECT key, head FROM outbox WHERE repo = ?", (repo,)).fetchall()
             c.execute("DELETE FROM outbox WHERE repo = ?", (repo,))
+            c.execute("DELETE FROM withheld WHERE repo = ?", (repo,))
+            heads: Dict[str, int] = {}
             for key, head in rows:
                 self._audit_drop(c, repo, key, reason)
-        heads: Dict[str, int] = {}
-        for _, head in rows:
-            heads[head] = heads.get(head, 0) + 1
-        for head, n in heads.items():
-            self.check_runs.add(repo, head, dropped=n)
+                heads[head] = heads.get(head, 0) + 1
+            for head, n in heads.items():
+                self.check_runs.add(repo, head, conn=c, dropped=n)
         return len(rows)
 
     def _audit_drop(self, c, repo: str, key: str, reason: str) -> None:
@@ -1286,27 +1460,33 @@ class Drainer:
             return 5.0
         key, repo, pr, head, body, attempts = item
         self._last_pr = (repo, pr)
+        # Decide the item's fate inside the try, and settle it after: a check-run
+        # failure is never read as a failure of the comment.
         try:
             reason = self._undeliverable(repo, pr)
-            if reason is not None:
-                return self._drop(key, repo, head, reason)
-            detector = self.outbox.scanner.first(body)
-            if detector is not None:
-                return self._withhold(key, repo, pr, head, body, detector)
-            current = (self._pull or {}).get("head", {}).get("sha")
-            text = body
-            if current and current != head:
-                text = (f"Written against commit {head[:12]}; this PR has moved on since.\n\n"
-                        + body)
-            self.inst.comment(repo, pr, scan.sign(text))
+            if reason is None:
+                detector = self.outbox.scanner.first(body)
+                if detector is None:
+                    current = (self._pull or {}).get("head", {}).get("sha")
+                    text = body
+                    if current and current != head:
+                        text = (f"Written against commit {head[:12]}; this PR has moved on "
+                                f"since.\n\n" + body)
+                    self.inst.comment(repo, pr, scan.sign(text))
         except GitHubError as exc:
             if exc.retryable:
                 return self._retry(key, attempts, exc.retry_after)
-            return self._drop(key, repo, head, f"GitHub {exc.status}: {exc.message}"[:200])
-        self._posted_at.append(self.clock())
-        with self.outbox.records.tx() as c:
-            c.execute("DELETE FROM outbox WHERE key = ?", (key,))
-        self._settled(repo, head, posted=1)
+            reason, detector = f"GitHub {exc.status}: {exc.message}"[:200], None
+        if reason is not None:
+            self._drop(key, repo, head, reason)
+        elif detector is not None:
+            self._withhold(key, repo, pr, head, body, detector)
+        else:
+            self._posted_at.append(self.clock())
+            with self.outbox.records.tx() as c:
+                c.execute("DELETE FROM outbox WHERE key = ?", (key,))
+                self.outbox.check_runs.add(repo, head, conn=c, posted=1)
+        self._publish(repo, head)
         return 0.0
 
     def _undeliverable(self, repo: str, pr: int) -> Optional[str]:
@@ -1314,7 +1494,7 @@ class Drainer:
         info = self.inst.repo(repo)
         if info is None:
             return "the App can no longer see the repository"
-        if not info.get("private", False):
+        if is_public(info):
             return "the repository is public"
         pull = self.inst.pull(repo, pr)
         if pull is None:
@@ -1324,24 +1504,24 @@ class Drainer:
         self._pull = pull
         return None
 
-    def _settled(self, repo: str, head: str, **counts: int) -> None:
-        self.outbox.check_runs.add(repo, head, **counts)
-        self.outbox.check_runs.publish(repo, head, queued=self.outbox.queued(repo, head))
+    def _publish(self, repo: str, head: str) -> None:
+        try:
+            self.outbox.check_runs.publish(repo, head, queued=self.outbox.queued(repo, head))
+        except GitHubError:
+            pass   # the item is settled; the run catches up at its next publish
 
-    def _drop(self, key: str, repo: str, head: str, reason: str) -> float:
+    def _drop(self, key: str, repo: str, head: str, reason: str) -> None:
         with self.outbox.records.tx() as c:
             c.execute("DELETE FROM outbox WHERE key = ?", (key,))
             self.outbox._audit_drop(c, repo, key, reason)
-        self._settled(repo, head, dropped=1)
-        return 0.0
+            self.outbox.check_runs.add(repo, head, conn=c, dropped=1)
 
-    def _withhold(self, key, repo, pr, head, body, detector) -> float:
+    def _withhold(self, key, repo, pr, head, body, detector) -> None:
         job_id, persona, _ = key.split("/", 2)
         with self.outbox.records.tx() as c:
             c.execute("DELETE FROM outbox WHERE key = ?", (key,))
             self.outbox._withhold(repo, pr, job_id, persona, detector, body, int(self.clock()), c)
-        self._settled(repo, head, withheld=1)
-        return 0.0
+            self.outbox.check_runs.add(repo, head, conn=c, withheld=1)
 
     def _retry(self, key: str, attempts: int, retry_after: Optional[int]) -> float:
         delay = retry_after if retry_after is not None else min(BACKOFF_MAX,
@@ -1355,7 +1535,7 @@ class Drainer:
 - [ ] **Step 4: Run them to see them pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_outbox.py'`, `./test-python.sh -p 'test_hosted_github_app.py'`, then `./test-python.sh`
-Expected: PASS, 22 and 32 tests. The whole suite passes.
+Expected: PASS, 26 and 33 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
@@ -1376,9 +1556,9 @@ git commit -m "hosted: the outbox, its acceptance caps and its paced drain"
   - The outcome names `OK`, `CAPPED`, `USAGE_LIMITED`, `DEFERRED`, `FAILING`, `FAILED`, `REVOKED`, and `OUTCOMES`; `PROFILE_FAILURES_TO_PARK = 3`; `REPO_DEFERS_TO_PAGE = 3`.
   - `Record` (frozen) with `from_row(row)` and `counts() -> dict` (the `counts` a gateway `hello` carries).
   - `ensure_record(conn, credential_id)`, `record_for(records, credential_id) -> Optional[Record]`, `apply_report(records, msg) -> {ack} | {error}`, `flush_complete(flush, record) -> bool`, `transcript_session(data: bytes) -> Optional[str]`.
-  - `decide(record, flush_ok, transcript, reported_session, expected_session, capability_live) -> str`.
-  - `Park(reason, until=None, head=None)`; `Completion(repo, pair, head, profile, credential_id, transcript, session_id, expected_session, flush, capability_live, signal=None)` (frozen).
-  - `Committer(records, blob_store, decider_for, backoff_for, clock=time.time, log=print)` with `commit(completion) -> str`, `apply(completion, outcome, record)`, `revoke(repo, pair)`, `parked(repo, pair, head) -> Optional[Park]`, `profile_parked_until(profile) -> int`, `transcript_for(repo, pair) -> Optional[bytes]`, `forget_repo(repo)`, and the attributes `parks`, `transcripts`, `last_head`, `profiles`.
+  - `decide(record, flush_ok, transcript, reported_session, expected_session) -> str`, which never returns `REVOKED`.
+  - `Park(reason, until=None, head=None)`; `Completion(repo, pair, head, profile, credential_id, transcript, session_id, expected_session, flush, signal=None)` (frozen).
+  - `Committer(records, blob_store, decider_for, backoff_for, clock=time.time, log=print)` with `commit(completion) -> str`, `apply(completion, outcome, record)`, `revoke(repo, pair) -> str` (returns `REVOKED`; the caller publishes it), `parked(repo, pair, head) -> Optional[Park]`, `profile_parked_until(profile) -> int`, `transcript_for(repo, pair) -> Optional[bytes]`, `last_reviewed_head(repo, pair) -> Optional[str]` (the committed fingerprint's head), `forget_repo(repo)`, and the attributes `parks`, `transcripts`, `profiles`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1391,6 +1571,7 @@ import json
 import os
 import shutil
 import tempfile
+from signals import Signal
 import unittest
 
 import commit
@@ -1418,9 +1599,9 @@ def rec(**over):
 
 
 class DecideTest(unittest.TestCase):
-    def d(self, record=None, flush_ok=True, data=None, reported=SID, expected=None, live=True):
+    def d(self, record=None, flush_ok=True, data=None, reported=SID, expected=None):
         return decide(record, flush_ok, transcript() if data is None else data, reported,
-                      expected, live)
+                      expected)
 
     def test_the_spec_order(self):
         cases = [
@@ -1440,7 +1621,6 @@ class DecideTest(unittest.TestCase):
             ("limit", dict(record=rec(first_limit="upstream 429")), "usage-limited"),
             ("rejected only", dict(record=rec(successes=0, first_rejected="upstream 400")), "failing"),
             ("rejected with a success", dict(record=rec(first_rejected="upstream 400")), "ok"),
-            ("dead capability", dict(record=rec(), live=False), "revoked"),
             ("abandoned replaces ok", dict(record=rec(first_abandoned="hung up")), "deferred"),
             ("abandoned never beats a cap", dict(record=rec(first_abandoned="x", cap_hit="requests")),
              "capped"),
@@ -1454,11 +1634,11 @@ class DecideTest(unittest.TestCase):
                 self.assertEqual(self.d(**kw), expected)
 
     def test_a_pass_that_never_started_is_a_claudebox_fault(self):
-        self.assertEqual(decide(None, True, None, None, None, True), "deferred")
-        self.assertEqual(decide(rec(requests=0, successes=0), True, None, None, None, True), "deferred")
+        self.assertEqual(decide(None, True, None, None, None), "deferred")
+        self.assertEqual(decide(rec(requests=0, successes=0), True, None, None, None), "deferred")
 
     def test_a_missing_transcript_after_real_traffic_is_failing(self):
-        self.assertEqual(decide(rec(), True, None, SID, None, True), "failing")
+        self.assertEqual(decide(rec(), True, None, SID, None), "failing")
 
 
 class TranscriptTest(unittest.TestCase):
@@ -1566,7 +1746,7 @@ class CommitterTest(unittest.TestCase):
                            clock=lambda: self.now[0], log=self.logs.append)
         self.pair = Pair(7, "code", "sage")
 
-    def complete(self, report=None, data=None, session=SID, expected=None, live=True, pr=7,
+    def complete(self, report=None, data=None, session=SID, expected=None, pr=7, repo="acme/web",
                  flush=None, signal="fp1", head=HEAD):
         token = self.creds.mint("provider", "job1", 600, persona="sage")
         cid = creds.credential_id_of(token)
@@ -1578,8 +1758,8 @@ class CommitterTest(unittest.TestCase):
             seq = 1
         pair = Pair(pr, "code", "sage")
         return self.c.commit(Completion(
-            "acme/web", pair, head, "ollama", cid, transcript() if data is None else data, session,
-            expected, flush or {"last_seq": seq, "drained": True}, live, signal))
+            repo, pair, head, "ollama", cid, transcript() if data is None else data, session,
+            expected, flush or {"last_seq": seq, "drained": True}, signal))
 
     def test_ok_commits_everything_together(self):
         self.assertEqual(self.complete({}), "ok")
@@ -1588,7 +1768,14 @@ class CommitterTest(unittest.TestCase):
         self.assertEqual(self.state.reviewed[self.pair], "fp1")
         self.assertNotIn(self.pair, self.state.owed)
         self.assertEqual(self.c.transcript_for("acme/web", self.pair), transcript())
-        self.assertEqual(self.c.last_head[("acme/web", self.pair)], HEAD)
+
+    def test_the_last_reviewed_head_is_the_committed_fingerprints(self):
+        # One source for the round line's head: state.reviewed (PR #21 review).
+        self.assertIsNone(self.c.last_reviewed_head("acme/web", self.pair))
+        self.complete({}, signal=Signal(HEAD, "code", ""))
+        self.assertEqual(self.c.last_reviewed_head("acme/web", self.pair), HEAD)
+        self.complete({}, signal=None)    # an ok with no fingerprint moves nothing
+        self.assertEqual(self.c.last_reviewed_head("acme/web", self.pair), HEAD)
 
     def test_a_newer_transcript_replaces_the_older_blob(self):
         self.complete({})
@@ -1628,6 +1815,12 @@ class CommitterTest(unittest.TestCase):
         self.complete({"first_limit": "x"}, pr=8)
         self.assertEqual(self.c.profile_parked_until("ollama"), 1100 + 1800)
 
+    def test_limits_on_same_numbered_prs_in_two_repos_park_the_profile(self):
+        # A profile spans repos, and every repo has a #7 (PR #21 review).
+        self.complete({"first_limit": "x"}, pr=7)
+        self.complete({"first_limit": "x"}, pr=7, repo="acme/api")
+        self.assertGreater(self.c.profile_parked_until("ollama"), 0)
+
     def test_limits_outside_the_window_do_not(self):
         self.complete({"first_limit": "x"}, pr=7)
         self.now[0] += 1800
@@ -1652,7 +1845,7 @@ class CommitterTest(unittest.TestCase):
 
     def test_revoke_discards_and_owes(self):
         self.complete({})
-        self.c.revoke("acme/web", self.pair)
+        self.assertEqual(self.c.revoke("acme/web", self.pair), "revoked")
         self.assertIn(self.pair, self.state.owed)
         self.assertNotIn(self.pair, self.state.sessions)
         self.assertEqual(self.blobs.data, {})
@@ -1660,9 +1853,15 @@ class CommitterTest(unittest.TestCase):
     def test_forget_repo_deletes_its_transcripts(self):
         self.complete({})
         self.complete({"first_limit": "x"}, pr=8)
+        self.state.rounds[self.pair] = 3
         self.c.forget_repo("acme/web")
         self.assertEqual(self.blobs.data, {})
         self.assertEqual(self.c.parks, {})
+        # The spec's Visibility list names sessions, and owed pairs go "since
+        # nothing can serve them"; rounds hold no content and survive.
+        self.assertEqual((self.state.sessions, self.state.reviewed, self.state.owed),
+                         ({}, {}, set()))
+        self.assertEqual(self.state.rounds[self.pair], 3)
 
 
 if __name__ == "__main__":
@@ -1841,14 +2040,15 @@ def transcript_session(data: bytes) -> Optional[str]:
 
 
 def decide(record: Optional[Record], flush_ok: bool, transcript: Optional[bytes],
-           reported_session: Optional[str], expected_session: Optional[str],
-           capability_live: bool) -> str:
+           reported_session: Optional[str], expected_session: Optional[str]) -> str:
     """The outcome of a pair that reached complete-pair, in the spec's order.
 
     `expected_session` is the session the pair was dispatched to resume, or
     None for a fresh one. A transcript that is absent altogether (the pass
     never started claude) with an empty record is a claudebox fault, not a
-    pair failure: nothing parsed badly, nothing happened at all.
+    pair failure: nothing parsed badly, nothing happened at all. `revoked` is
+    never decided here: the spec decides it "elsewhere, without a complete
+    pair", which is Committer.revoke.
     """
     empty = record is None or record.requests == 0
     if transcript is None and empty:
@@ -1866,8 +2066,6 @@ def decide(record: Optional[Record], flush_ok: bool, transcript: Optional[bytes]
         return USAGE_LIMITED
     if record.first_rejected and record.successes == 0:
         return FAILING
-    if not capability_live:
-        return REVOKED
     if record.first_abandoned:
         return DEFERRED
     return OK
@@ -1884,7 +2082,8 @@ class Park:
 class _Profile:
     failed_in_a_row: int = 0
     parked_until: int = 0
-    recent_limits: Dict[int, int] = field(default_factory=dict)   # pr -> when
+    # (repo, pr) -> when: a profile spans every repo, and every repo has a #1.
+    recent_limits: Dict[Tuple[str, int], int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1899,8 +2098,7 @@ class Completion:
     session_id: Optional[str]
     expected_session: Optional[str]
     flush: Optional[Dict[str, Any]]
-    capability_live: bool
-    signal: Any = None              # the fingerprint an ok commits
+    signal: Any = None              # the fingerprint an ok commits, its head included
 
 
 class Committer:
@@ -1916,24 +2114,29 @@ class Committer:
         self.lock = threading.Lock()
         self.parks: Dict[Tuple[str, Pair], Park] = {}
         self.transcripts: Dict[Tuple[str, Pair], str] = {}
-        self.last_head: Dict[Tuple[str, Pair], str] = {}
         self.profiles: Dict[str, _Profile] = {}
         self.defers_in_a_row: Dict[str, int] = {}
 
     def commit(self, c: Completion) -> str:
         record = record_for(self.records, c.credential_id)
         outcome = decide(record, flush_complete(c.flush, record), c.transcript, c.session_id,
-                         c.expected_session, c.capability_live)
+                         c.expected_session)
         self.apply(c, outcome, record)
         return outcome
 
-    def revoke(self, repo: str, pair: Pair) -> None:
-        """A pair whose job ended without complete-pair: timeout, access change, restart."""
+    def revoke(self, repo: str, pair: Pair) -> str:
+        """`revoked`: a started pair whose job ended without complete-pair.
+
+        A timeout, an access change or a restart. Its transcript is discarded and
+        it stays owed. The caller, which knows the head, shows it on the check
+        run (checkruns.REVOKED).
+        """
         with self.lock:
             decider = self.decider_for(repo)
             self._drop_transcript(repo, pair)
             decider.record_failure(pair)
             decider.state.owed.add(pair)
+        return REVOKED
 
     def apply(self, c: Completion, outcome: str, record: Optional[Record]) -> None:
         key = (c.repo, c.pair)
@@ -1957,7 +2160,6 @@ class Committer:
                 decider.record_success(c.pair, _Result(c.session_id), c.signal)
                 decider.state.owed.discard(c.pair)
                 self.parks.pop(key, None)
-                self.last_head[key] = c.head
             else:
                 decider.state.owed.add(c.pair)
             if record is not None and record.successes > 0:
@@ -1977,7 +2179,7 @@ class Committer:
                 window = self.backoff_for(c.profile)
                 profile.recent_limits = {pr: t for pr, t in profile.recent_limits.items()
                                          if now - t < window}
-                profile.recent_limits[c.pair.pr] = now
+                profile.recent_limits[(c.repo, c.pair.pr)] = now
                 if len(profile.recent_limits) >= 2:
                     profile.parked_until = now + window
                     self.log(f"profile {c.profile}: usage limits on two PRs; parked until "
@@ -2022,15 +2224,34 @@ class Committer:
         name = self.transcripts.get((repo, pair))
         return self.blobs.get(name) if name else None
 
+    def last_reviewed_head(self, repo: str, pair: Pair) -> Optional[str]:
+        """The head of the pair's committed fingerprint: the spec's one source for it."""
+        signal = self.decider_for(repo).state.reviewed.get(pair)
+        return getattr(signal, "head_oid", None) or None
+
     def forget_repo(self, repo: str) -> None:
-        """Loss of access: every content-bearing record for the repo goes."""
+        """Loss of access: the repo's transcripts, sessions and pair state go; its rounds stay.
+
+        The spec's "Visibility": every content-bearing record keyed to the repo,
+        and its owed pairs, "since nothing can serve them". Rounds hold no
+        content and "survive a public flip". Outbox items and withheld records
+        are rows, and Outbox.drop_repo deletes them.
+        """
         with self.lock:
             for key in [k for k in self.transcripts if k[0] == repo]:
                 self.blobs.delete(self.transcripts.pop(key))
-            for d in (self.parks, self.last_head):
-                for key in [k for k in d if k[0] == repo]:
-                    del d[key]
+            for key in [k for k in self.parks if k[0] == repo]:
+                del self.parks[key]
             self.defers_in_a_row.pop(repo, None)
+            for profile in self.profiles.values():
+                for key in [k for k in profile.recent_limits if k[0] == repo]:
+                    del profile.recent_limits[key]
+            state = self.decider_for(repo).state
+            state.sessions.clear()
+            state.reviewed.clear()
+            state.passes_done.clear()
+            state.owed = set()
+            state.cut_group = None
 
 
 @dataclass(frozen=True)
@@ -2042,7 +2263,7 @@ class _Result:
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_commit.py'`, then `./test-python.sh`
-Expected: PASS, 24 tests. The whole suite passes.
+Expected: PASS, 26 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
@@ -2061,7 +2282,7 @@ git commit -m "hosted: the commit point, from the gateway's record to the pair's
 - Consumes: `creds.Creds` and `github_app.GitHubError` (2a.1); 2a.2's gateway ops (`add_token`, `flush`, `revoke`) through an injected `gateway_call(op, **fields)`; Tasks 2–4.
 - Produces:
   - `JOB_DEADLINE = 3300`, `BODY_MAX = 1048576`, `COMPLETE_BODY_MAX = 100663296`, `TRANSCRIPT_MAX = 67108864`.
-  - `PairMaterial(persona, phase, system_prompt, prompt, session_id=None, signal=None)` and `JobMaterial(...)` with `pair_for(persona)`, the in-memory record of a dispatch, which 2a.4b's scheduler builds.
+  - `PairMaterial(persona, phase, system_prompt, prompt, session_id=None, signal=None)` and `JobMaterial(...)` with `pair_for(persona)`, the in-memory record of a dispatch, which 2a.4b's scheduler builds. Its `started` maps persona to credential id, `completed` maps persona to outcome, and `busy` with `lock` reserves a pair between its check and its record.
   - `Jobs` with `add`, `get`, `remove` and `all`.
   - `Channel(records, creds, jobs, outbox, committer, gateway_call, app, installation_for, check_runs, transcript_for, clock=time.time, log=print)` with `handle(path, token, body) -> (status, dict)`.
   - `make_server(channel, host, port) -> ThreadingHTTPServer`.
@@ -2264,6 +2485,11 @@ class StartPairTest(Base):
         self.assertNotIn(reply["provider_token"], json.dumps(fields))
         self.assertEqual(self.runs.views["sme"].state, checkruns.RUNNING)
 
+    def test_an_internal_repo_starts(self):
+        cap, _ = self.fetch()
+        self.inst.info = {"private": False, "visibility": "internal"}
+        self.assertEqual(self.start(cap)[0], 200)
+
     def test_each_refusal_leaves_the_pair_unstarted(self):
         cap, _ = self.fetch()
         cases = [
@@ -2295,6 +2521,37 @@ class StartPairTest(Base):
         cap, _ = self.fetch()
         self.start(cap)
         self.assertEqual(self.start(cap)[0], 409)
+
+    def test_two_concurrent_starts_for_one_pair_mint_one_token(self):
+        # A prompt-injected worker can fire both at once (PR #21 review): the
+        # second must be refused before the first has reached the gateway.
+        import threading
+        cap, _ = self.fetch()
+        entered, release = threading.Event(), threading.Event()
+        real = self.gw.__call__
+
+        def slow(op, **fields):
+            if op == "add_token":
+                entered.set()
+                release.wait(5)
+            return real(op, **fields)
+        self.ch.gateway_call = slow
+        results = []
+        first = threading.Thread(target=lambda: results.append(self.start(cap)[0]))
+        first.start()
+        self.assertTrue(entered.wait(5))
+        results.append(self.start(cap)[0])
+        release.set()
+        first.join()
+        self.assertEqual(sorted(results), [200, 409])
+        self.assertEqual(sum(1 for op, _ in self.gw.calls if op == "add_token"), 1)
+
+    def test_a_refused_start_leaves_the_pair_startable(self):
+        cap, _ = self.fetch()
+        self.gw.refuse_add = True
+        self.assertEqual(self.start(cap)[0], 409)
+        self.gw.refuse_add = False
+        self.assertEqual(self.start(cap)[0], 200)
 
     def test_a_persona_outside_the_job_or_a_dead_capability_is_refused(self):
         cap, _ = self.fetch()
@@ -2365,7 +2622,27 @@ class FindingAndCompleteTest(Base):
         self.assertEqual(self.complete(cap, data=transcript())[0], 409)
         self.start(cap)
         self.complete(cap, data=transcript())
-        self.assertEqual(self.complete(cap, data=transcript())[0], 409)
+        rounds = dict(self.state.rounds)
+        # A resend is answered as committed, and commits nothing again.
+        self.assertEqual(self.complete(cap, data=transcript()), (200, {}))
+        self.assertEqual(self.state.rounds, rounds)
+
+    def test_a_commit_that_faults_leaves_the_pair_completable(self):
+        # The pair is recorded completed only after the commit point returns
+        # (PR #21 review); a fault before then is re-entered by a retry.
+        cap, _ = self.fetch()
+        self.start(cap)
+        real = self.committer.commit
+
+        def broken(c):
+            raise OSError("disk full")
+        self.committer.commit = broken
+        with self.assertRaises(OSError):
+            self.complete(cap, data=transcript())
+        self.assertNotIn("sme", self.job.completed)
+        self.committer.commit = real
+        self.assertEqual(self.complete(cap, data=transcript())[0], 200)
+        self.assertIn("sme", self.job.completed)
 
     def test_a_flush_the_gateway_cannot_answer_is_deferred(self):
         cap, _ = self.fetch()
@@ -2455,7 +2732,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import checkruns
 import commit as commit_mod
 from common import Pair
-from github_app import GitHubError
+from github_app import GitHubError, is_public
 from outbox import JobContext
 
 JOB_DEADLINE = 55 * 60          # the spec's job deadline, under the read token's hour
@@ -2470,7 +2747,6 @@ _VIEW = {
     commit_mod.DEFERRED: checkruns.DEFERRED,
     commit_mod.FAILING: checkruns.FAILING,
     commit_mod.FAILED: checkruns.FAILED,
-    commit_mod.REVOKED: checkruns.REVOKED,
 }
 
 
@@ -2504,8 +2780,13 @@ class JobMaterial:
     gateway_url: str
     channel_url: str
     started: Dict[str, str] = field(default_factory=dict)   # persona -> provider credential id
-    completed: Set[str] = field(default_factory=set)
+    completed: Dict[str, str] = field(default_factory=dict)  # persona -> its outcome
     fetched: bool = False
+    # Pairs between their check and their record. A request thread reserves a
+    # pair under `lock` before any network call, so two start-pairs (or two
+    # complete-pairs) for one persona cannot both get past the check.
+    busy: Set[str] = field(default_factory=set)
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def pair_for(self, persona: str) -> Optional[PairMaterial]:
         return next((p for p in self.pairs if p.persona == persona), None)
@@ -2612,15 +2893,24 @@ class Channel:
         return 409, {"reason": reason}
 
     def start_pair(self, job: JobMaterial, pair: PairMaterial) -> Tuple[int, Dict[str, Any]]:
-        if pair.persona in job.started:
-            return self._refuse_start(job, pair.persona, "this pair has already started")
+        with job.lock:
+            if pair.persona in job.started or pair.persona in job.busy:
+                return self._refuse_start(job, pair.persona, "this pair has already started")
+            job.busy.add(pair.persona)
+        try:
+            return self._start(job, pair)
+        finally:
+            with job.lock:
+                job.busy.discard(pair.persona)
+
+    def _start(self, job: JobMaterial, pair: PairMaterial) -> Tuple[int, Dict[str, Any]]:
         try:
             info = self.installation_for(job.repo).repo(job.repo)
         except GitHubError as exc:
             return self._refuse_start(job, pair.persona, f"the visibility check failed: {exc}")
         if info is None:
             return self._refuse_start(job, pair.persona, "the App can no longer see the repository")
-        if not info.get("private", False):
+        if is_public(info):
             return self._refuse_start(job, pair.persona, "the repository is public")
         if self.committer.profile_parked_until(job.profile):
             return self._refuse_start(job, pair.persona, f"profile {job.profile} is parked")
@@ -2642,7 +2932,8 @@ class Channel:
             self.creds.revoke(cid)
             return self._refuse_start(job, pair.persona, f"the gateway refused the token: "
                                                          f"{reply['error']}")
-        job.started[pair.persona] = cid
+        with job.lock:
+            job.started[pair.persona] = cid
         self._publish(job, pair.persona, checkruns.PairView(checkruns.RUNNING))
         return 200, {"provider_token": token}
 
@@ -2661,12 +2952,29 @@ class Channel:
     # -- complete-pair -------------------------------------------------------------
     def complete_pair(self, job: JobMaterial, pair: PairMaterial,
                       body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
-        cid = job.started.get(pair.persona)
-        if cid is None:
-            return 409, {"reason": "this pair never started"}
-        if pair.persona in job.completed:
-            return 409, {"reason": "this pair has already completed"}
-        job.completed.add(pair.persona)
+        with job.lock:
+            cid = job.started.get(pair.persona)
+            if cid is None:
+                return 409, {"reason": "this pair never started"}
+            if pair.persona in job.completed:
+                return 200, {}   # a resend: the outcome is committed, as post-finding answers one
+            if pair.persona in job.busy:
+                return 409, {"reason": "this pair is completing"}
+            job.busy.add(pair.persona)
+        try:
+            outcome = self._complete(job, pair, cid, body)
+        finally:
+            with job.lock:
+                job.busy.discard(pair.persona)
+        # Recorded once the commit point has returned: a fault before it leaves
+        # the pair started and not completed, which a retry re-enters and the
+        # job's end revokes.
+        with job.lock:
+            job.completed[pair.persona] = outcome
+        return 200, {}
+
+    def _complete(self, job: JobMaterial, pair: PairMaterial, cid: str,
+                  body: Dict[str, Any]) -> str:
         transcript = self._transcript(body.get("transcript_b64"))
         notes = body.get("notes") if isinstance(body.get("notes"), dict) else {}
         if transcript is None and notes.get("transcript") == "over-cap":
@@ -2679,7 +2987,7 @@ class Channel:
         p = Pair(job.pr, job.mode, pair.persona)
         outcome = self.committer.commit(commit_mod.Completion(
             job.repo, p, job.head, job.profile, cid, transcript, session, pair.session_id,
-            flush, True, pair.signal))
+            flush, pair.signal))
         self.creds.revoke(cid)
         try:
             self.gateway_call("revoke", credential_ids=[cid])
@@ -2691,7 +2999,7 @@ class Channel:
             state = checkruns.ROUND_CAP
         self._publish(job, pair.persona, checkruns.PairView(state, park.until if park else None))
         self.log(f"{job.repo}#{job.pr} {job.mode}/{pair.persona}: {outcome}")
-        return 200, {}
+        return outcome
 
     def _transcript(self, value: Any) -> Optional[bytes]:
         """The decoded transcript; b"" (which will not parse) when it is bad or over the cap."""
@@ -2762,7 +3070,7 @@ def make_server(channel: Channel, host: str, port: int) -> http.server.Threading
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_channel.py'`, then `./test-python.sh`
-Expected: PASS, 20 tests. The whole suite passes.
+Expected: PASS, 24 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
