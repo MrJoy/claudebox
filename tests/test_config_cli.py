@@ -94,6 +94,20 @@ class CliTest(unittest.TestCase):
         self.assertNotIn("\x1b", out + err)
         self.assertIn("\\x1b[8m: unknown key", err)
 
+    def test_a_bidi_key_is_escaped_through_both_layers(self):
+        # PR #17 review: the \u arm of printable had no input reaching it, and
+        # say()'s own escaping could be deleted with nothing failing. An
+        # unknown key goes through Problems.lines(); a duplicate key's message
+        # comes from read_json and reaches the terminal through say() alone.
+        rc, out, err = self.run_cli("validate", self.write("r.json", {"\u202e": 1}))
+        self.assertEqual(rc, 1)
+        self.assertNotIn("\u202e", out + err)
+        self.assertIn("\\u202e: unknown key", err)
+        rc, out, err = self.run_cli("validate", self.write("d.json", '{"\u202e": 1, "\u202e": 2}'))
+        self.assertEqual(rc, 1)
+        self.assertNotIn("\u202e", out + err)
+        self.assertIn("duplicate key '\\u202e'", err)
+
     def test_an_invalid_org_under_a_valid_repo_is_still_exit_one(self):
         # Oracle: tester-brief.md, Task 6, Interfaces and signed starting oracle line 893.
         # Mutation: Ignore errors in an org file underneath a valid repo.
