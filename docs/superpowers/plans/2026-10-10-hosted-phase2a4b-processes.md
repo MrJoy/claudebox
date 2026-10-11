@@ -644,6 +644,23 @@ class ConfigTest(Base):
         self.assertEqual((self.inst.created, self.inst.updated), ([], []))
         self.assertTrue(any("trying again next poll" in l for l in self.logs))
 
+    def test_a_failed_paint_is_retried_on_the_next_poll(self):
+        # PR #21 review: the gate compares against what the run shows.
+        self.inst.files[("acme/web", ".github/claudebox.json")] = b'{"profile": "nope"}'
+        real = self.inst.update_check_run
+
+        def broken(*a, **k):
+            raise GitHubError(502, "x")
+        self.inst.update_check_run = broken
+        self.poll()
+        self.inst.update_check_run = real
+        before = len(self.inst.updated)
+        self.poll()
+        self.assertEqual(len(self.inst.updated), before + 1)
+        self.assertEqual(self.inst.updated[-1][2], "Not reviewed: configuration")
+        self.poll()
+        self.assertEqual(len(self.inst.updated), before + 1)   # then quiet again
+
     def test_a_held_problem_writes_to_github_once_per_head(self):
         # PR #22 review: not once per head per poll.
         self.inst.files[("acme/web", ".github/claudebox.json")] = b'{"profile": "nope"}'
@@ -1344,7 +1361,7 @@ class _Snapshot:
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_scheduler.py'`, then `./test-python.sh`
-Expected: PASS, 47 tests. The whole suite passes.
+Expected: PASS, 48 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
