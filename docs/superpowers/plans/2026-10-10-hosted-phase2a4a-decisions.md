@@ -37,7 +37,7 @@ The spec and the overview leave these open, and each one changes code. They are 
 1. **2a.4 is two plans.** 2a.4a is the decision libraries, testable with fakes. 2a.4b is the processes: the scheduler, the control-plane main, the supervisor, `hosted/Dockerfile` and `hosted/compose.json`. Each is one factory run. The overview's split table says so.
 2. **A hosted round line from round 2 on reads "Read closely only the commits after `<head>`: the ones `git log --oneline <head>..HEAD` lists."** (plan mode: "the revisions after commit `<head>`", keeping its last sentence). `since_head` must be a full commit id. A rewritten branch gets round 1's line whatever the round, and the summary of the check run says the branch was rewritten.
 3. **`build_hosted` is `build({})` with `HOSTED_GH_SENTENCE` after every copy of `GH_STANZA`.** It raises if a default ever loses `GH_STANZA`, so the sentence can never silently go missing.
-4. **The check-run states in 2a** are queued, running, reviewed, deferred, usage-limited, failed, failing, capped, round-cap, revoked and config-invalid. Budget, too-large and refused-read arrive with 2b. When a head's pairs differ, the title names the state that waits on a person before one that clears itself, before one that is done. The wording is the table in `checkruns._WORDS`, with a retry time in UTC where one exists. The summary has one line per persona and the counts: posted, waiting to post, dropped, withheld, and turned away by the per-pass limit. A config problem stops the review and is titled "Not reviewed: configuration", with one sentence true of every cause (an invalid file, a setting the deployment cannot serve) and the problem text below it. A config notice (one file broken and the other applied, the spec's fallback) shows below a review that runs and makes its conclusion `neutral`. `CheckRuns.config_answer` and `CheckRuns.view` let 2a.4b publish a head only when its answer changes, and paint a pair no job will ever set.
+4. **The check-run states in 2a** are queued, running, reviewed, deferred, usage-limited, failed, failing, capped, round-cap, round-cap-unread, revoked and config-invalid. `round-cap-unread` is a pair at its round cap on a head no pass ran at: it is titled "Not reviewed: round cap reached" and never concludes `success`, since `success` means a pass read this commit and found nothing. Budget, too-large and refused-read arrive with 2b. When a head's pairs differ, the title names the state that waits on a person before one that clears itself, before one that is done. The wording is the table in `checkruns._WORDS`, with a retry time in UTC where one exists. The summary has one line per persona and the counts: posted, waiting to post, dropped, withheld, and turned away by the per-pass limit. A config problem stops the review and is titled "Not reviewed: configuration", with one sentence true of every cause (an invalid file, a setting the deployment cannot serve) and the problem text below it. A config notice (one file broken and the other applied, the spec's fallback) shows below a review that runs and makes its conclusion `neutral`. `CheckRuns.config_answer` and `CheckRuns.view` let 2a.4b publish a head only when its answer changes, and paint a pair no job will ever set.
 5. **A head's conclusion is `success` only when every pair is reviewed (or at its round cap) and nothing was found**, counting findings queued, posted, dropped, withheld and turned away. Everything else that is complete is `neutral`.
 6. **Acceptance runs scan, then size, then the per-pass count.** A credential is withheld whatever else is wrong with the finding. Size is measured in UTF-8 bytes against `caps.comment_bytes`. A too-long finding is not counted against the pass, since the model is told to shorten it and post again. A finding past `caps.comments_per_pass` is counted on the check run as not posted. A retried `post-finding` with the same key answers what the first one did, and queues once. The key's result is kept in memory for the job's life.
 7. **A withheld record stores a fresh 16-byte salt followed by `sha256(salt || body)`**, and the body with every match replaced by `[withheld:<detector>]`. The day's count per detector is a `withheld_counts` row.
@@ -622,14 +622,16 @@ FAILED = "failed"
 FAILING = "failing"
 CAPPED = "capped"
 ROUND_CAP = "round-cap"
+# A pair at its round cap on a head no pass ran at: nobody read this commit.
+CAP_UNREAD = "round-cap-unread"
 REVOKED = "revoked"
 CONFIG_INVALID = "config-invalid"
 STATES = (QUEUED, RUNNING, REVIEWED, DEFERRED, USAGE_LIMITED, FAILED, FAILING, CAPPED,
-          ROUND_CAP, REVOKED, CONFIG_INVALID)
+          ROUND_CAP, CAP_UNREAD, REVOKED, CONFIG_INVALID)
 
 # Which state names the run when its pairs differ. A state that waits on a
 # person outranks one that clears itself, which outranks one that is done.
-_RANK = (CONFIG_INVALID, FAILING, CAPPED, FAILED, USAGE_LIMITED, DEFERRED, REVOKED, ROUND_CAP,
+_RANK = (CONFIG_INVALID, FAILING, CAPPED, CAP_UNREAD, FAILED, USAGE_LIMITED, DEFERRED, REVOKED, ROUND_CAP,
          REVIEWED)
 
 # Per state: the title, and the one sentence a person reads in the summary
@@ -651,6 +653,11 @@ _WORDS = {
     ROUND_CAP: ("Reviewed; round cap reached",
                 "has reviewed this plan as many rounds as `rounds.cap` allows, and will not review "
                 "it again."),
+    # Never a green check: `success` means a pass read this commit and found
+    # nothing, and no pass read this one (PR #22 review).
+    CAP_UNREAD: ("Not reviewed: round cap reached",
+                 "has reviewed this plan as many rounds as `rounds.cap` allows, so it did not "
+                 "read this revision and will not review it again on its own."),
     REVOKED: ("Interrupted",
               "was interrupted (a timeout, an access change, or a restart). It runs again on its "
               "own."),
