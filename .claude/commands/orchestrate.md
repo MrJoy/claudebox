@@ -109,10 +109,16 @@ neither lane's uncommitted files ever appear in the other's tree. Neither lane c
 Integration is the Validator's: it copies each lane's changed and new files into its own
 checkout, runs the judging suites there, and on the human's signature commits exactly
 those files, so the committed tree is the judged tree by construction. Before a later
-slice is dispatched, both lane worktrees move to the feature branch's new head
-(`git -C <worktree> checkout --detach <head>`), so no lane builds on a stale base. You
-remove the two worktrees when the run closes, after checking that the committed files
-match them.
+slice is dispatched, both lane worktrees move to the feature branch's new head so no lane
+builds on a stale base. A lane hands over uncommitted files, so its tree is dirty in
+exactly the paths the commit changed, and a plain checkout refuses. So, per lane: check
+that every file the lane handed over matches the commit (`git -C <worktree> diff --quiet
+<head> -- <paths>`), then discard the now-redundant copy and move it
+(`git -C <worktree> checkout --force --detach <head>` and `git -C <worktree> clean -fd`),
+then tell the lane it was re-pointed, so its next hand-over lists only the new slice's
+paths. A lane whose files do not match the commit is not moved: that is an anomaly for
+the Validator. You remove the two worktrees when the run closes, after the same check
+against the last slice's commit.
 
     # Substitute the run id, the lane brief, and one launcher per lane before running
     # this. It is written to fail loudly rather than create a session literally named
