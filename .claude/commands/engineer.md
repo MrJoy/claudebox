@@ -22,7 +22,10 @@ judging suite is the five suites `./test-python.sh` (unittest, under `tests/`),
 `./test-providers.sh`, `./test-personas.sh`, `./test-shim.sh` and `./test-launcher.sh`.
 **The Validator runs those and judges; you do not.** `python3 -m py_compile` and
 `bash -n` on the files you touched, and scratch scripts in your own scratch directory,
-are your tools; run them freely. Running any of the five suites, or opening any file
+are your tools; run them freely. Make that directory with `mktemp -d`, outside your
+worktree: the Validator stages your whole tree (`git add -A`) and holds a lane back when
+anything in it is outside your change set, so a scratch file left in the worktree either
+stalls the slice or, listed in the change set, lands on the branch. Running any of the five suites, or opening any file
 under `tests/` or any `test-*.sh`, is not. The judging run, and the word "done", belong
 to the Validator.
 
