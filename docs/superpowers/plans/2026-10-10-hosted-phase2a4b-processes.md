@@ -611,6 +611,24 @@ class GateTest(Base):
         self.assertTrue(self.sched._full)
         self.assertEqual(self.runs.view("acme/web", NEW, "sage").state, checkruns.CAP_UNREAD)
 
+    def test_a_held_publish_never_repaints_a_pair_that_reviewed_the_head(self):
+        # PR #21 review: view answered None while a publish was owed, and the
+        # round-cap paint read that as "never set".
+        self.inst.prs = [pr(labels=("plan",))]
+        self.inst.files[("acme/web", ".github/claudebox.json")] = json.dumps(
+            {"profile": "ollama", "plan": {"personas": "sage"}, "rounds": {"cap": 1}}).encode()
+        self.poll()
+        self.finish(self.jobs.all()[0])
+        self.runs.set_pair("acme/web", HEAD, "sage", checkruns.PairView(checkruns.ROUND_CAP))
+        real = self.inst.update_check_run
+
+        def held(*a, **k):
+            raise GitHubError(403, "secondary rate limit", retry_after=600)
+        self.inst.update_check_run = held
+        self.poll()
+        self.inst.update_check_run = real
+        self.assertEqual(self.runs.view("acme/web", HEAD, "sage").state, checkruns.ROUND_CAP)
+
     def test_a_parked_profile_dispatches_nothing(self):
         from commit import _Profile
         self.committer.profiles["ollama"] = _Profile(parked_until=int(T) + 100)
@@ -1514,7 +1532,7 @@ class _Snapshot:
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_scheduler.py'`, then `./test-python.sh`
-Expected: PASS, 54 tests. The whole suite passes.
+Expected: PASS, 55 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
