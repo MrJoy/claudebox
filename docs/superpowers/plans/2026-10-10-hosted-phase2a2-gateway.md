@@ -4,7 +4,7 @@
 
 **Goal:** The gateway process: a worker-facing HTTP route to the model provider that checks a per-pair token, overwrites the model, enforces per-pair caps, injects the profile's real credential, streams the response unbuffered, and reports every pair's provider outcome to the control plane over a unix socket.
 
-**Architecture:** `hosted/gwproto.py` is line-delimited JSON over unix sockets, with the per-deployment secret on every message in both directions. `hosted/gateway.py` is the process. The control plane connects to the gateway's socket to send `hello`, `add_token`, `revoke` and `flush`. The gateway connects to the control plane's socket to send `report`s, in order per token, buffered while the control plane is away. Workers reach the gateway over HTTP and present a provider token minted by `creds.py` (2a.1). The gateway checks it against rows the control plane handed it, so it holds no records store. Each token row carries the profile it was dispatched under, so a deployment change reaches new jobs without touching running ones. Admission reserves a request and its `max_tokens` under a lock before forwarding, so the caps hold against any client, not only against Claude Code. `deploy_config` gains the two profile keys a hosted `custom` or `anthropic` profile needs, `base_url` and `auth`.
+**Architecture:** `hosted/gwproto.py` is line-delimited JSON over unix sockets, with the per-deployment secret on every message in both directions. `hosted/gateway.py` is the process. The control plane connects to the gateway's socket to send `hello`, `add_token`, `revoke` and `flush`. The gateway connects to the control plane's socket to send `report`s, in order per token, buffered while the control plane is away. Workers reach the gateway over HTTP and present a provider token minted by `creds.py` (2a.1). The gateway checks it against rows the control plane handed it, so it holds no records store. Each token row carries the profile it was dispatched under, so a deployment change reaches new jobs without touching running ones. Admission counts a request and reserves its `max_tokens` under a lock before forwarding, so the request cap holds against any client, and output never outruns the token cap. Input tokens are counted when the provider reports them, so a parallel client can pass the token cap by at most `IN_FLIGHT_MAX` requests' worth of input. `deploy_config` gains the two profile keys a hosted `custom` or `anthropic` profile needs, `base_url` and `auth`.
 
 **Tech Stack:** Python 3.9+ standard library (`http.server`, `http.client`, `ssl`, `socket`, `threading`, `json`, `unittest`).
 
@@ -39,26 +39,27 @@ The spec and the overview leave these open, and each one changes code. They are 
 1. **Two sockets, each with one direction of request and reply.** The gateway listens on `GATEWAY_SOCKET` for the control plane's `hello`, `add_token`, `revoke` and `flush`. The control plane listens on `CONTROL_SOCKET` for the gateway's `report`. Each side is a plain client of the other's server, so no connection ever carries requests both ways. Both socket files are mode 0660.
 2. **A token carries its profile.** A token row is `{credential_id, hash_hex, salt_hex, job_id, persona, model, expires_at, route: {name, provider, base_url, auth, credential, per_pair_requests, per_pair_tokens, budget_unit}, counts}`. `credential` is the secret's name, and the gateway reads its value from its own environment at request time. A token whose route cannot be served (an unserved provider, or a credential the gateway's environment lacks) is refused on its own, with a `WARN` line and an entry in the `hello` reply's `refused` list, using `served_problems`'s wording. Every other token is still served.
 3. **`hello` is a full, non-regressing snapshot.** A token the gateway already holds keeps whichever copy has the higher `seq`, and a token the snapshot leaves out is dropped (the control plane revoked it). Before its first `hello` the gateway answers every other op with `{error: "hello first", ready: false}`, and the control plane (2a.4) answers that with a `hello`. That is how a gateway that restarted alone gets its tokens back. `add_token` for a token already held changes nothing.
-4. **Admission is atomic per token, and bounded.** Under the lock, a request is refused if the token has `IN_FLIGHT_MAX` (8) requests in flight, or has used its request cap, or has no tokens left once in-flight reservations are subtracted. Otherwise one request is counted and `max_tokens` is reserved, both before the forward. Concurrent requests serialize on the check, so a client that is not Claude Code cannot pass a cap by sending many at once. The in-flight refusal is a 429 that records nothing, because nothing reached upstream.
-5. **A cap refusal is HTTP 400 with an `invalid_request_error` body** naming the cap. Claude Code retries a 429 or a 5xx, and a 429 would also read as a usage limit. A cap hit is reported once, and later refusals on the same token report nothing, so a capped pair stays inert apart from its 400s.
+4. **Admission is atomic per token, and bounded.** Under the lock, a request is refused if a cap was already hit, if the token has used its request cap, or if its counted tokens have reached the token cap. Those three are cap refusals. It is paced instead (HTTP 429, nothing recorded, nothing concluded) if the token has `IN_FLIGHT_MAX` (8) requests in flight, or if what is left of the token cap is all reserved by requests still running. Otherwise one request is counted and `max_tokens` is reserved, both before the forward. Concurrent requests serialize on the check, so the request cap holds against a client that is not Claude Code. Input is counted when the provider reports it, so the token cap can be passed by at most `IN_FLIGHT_MAX` requests' worth of input. The reservation is released on every path from admission to the reply, an unlisted exception included: `do_POST` wraps the forward in a `finally` that completes the request as `abandoned` with `gateway fault: <type>` and logs a `WARN` when nothing else did.
+5. **A cap refusal is HTTP 400 with an `invalid_request_error` body** naming the cap. Claude Code retries a 429 or a 5xx, and a 429 would also read as a usage limit. A cap hit is terminal: every later request on that token is refused with a 400 that says the pair is done, and reports nothing. A cap hit therefore means counted use reached a cap, never a shortfall caused by reservations, which is pacing.
 6. **The body cap refuses the request, and is not a pair outcome**, as the spec's cap table has it: "provider request body | 4 MB | fixed | request refused". The 413 is sent on the declared `Content-Length`, before the body is read.
 7. **A starting gateway answers 503**, and that refusal is in no record: the spec's "a request ... a starting gateway turned away" is a claudebox fault.
 8. **Tokens are counted as every kind of input the provider reports** (`input_tokens`, `cache_creation_input_tokens` and `cache_read_input_tokens`) plus the largest `output_tokens` seen. Output is cumulative across `message_delta`s, and summing it would double-count.
 9. **Classification.** HTTP 429 or 529, or an error event of type `rate_limit_error` or `overloaded_error`, is a usage limit. A 401 or 403 is a failure: the provider refused the deployment's credential, which the operator must hear about. A 5xx is a failure. Any other 4xx is `rejected`. The request body is the worker's, so a rejected request is reported as `first_rejected` and never moves the profile's failure counter, which a worker could otherwise drive to park the profile for every repo on it. A transport error reaching upstream, or a read that breaks mid-response, is a failure named `upstream transport: <exception type>`. A 2xx stream that ends without `message_stop` is a failure (`the stream ended before message_stop`). A 2xx on `/v1/messages` is a success. A 2xx on `count_tokens` is neutral: it counts as a request, never as a pass.
-10. **A worker that hangs up mid-response** stops the relay. The request and the tokens seen so far are counted, and nothing else is concluded.
+10. **A worker that hangs up mid-response** stops the relay. The request and the tokens seen so far are counted, and the report carries `first_abandoned`, which the control plane commits as `deferred` (overview decision 2), so a cut-off pass never commits as `ok`. On a tokens profile, an abandoned request whose usage was never seen is also `usage_missing` (decision 12): a non-streamed response is generated whole before it is sent, so hanging up cannot un-spend it, and the pair is failed closed and paged rather than left to spend unmeasured.
 11. **A passes profile clamps `max_tokens` to 64,000** (`MAX_TOKENS_CEILING`), the spec's "caps ... `max_tokens`" for a provider that cannot report usage. A tokens profile clamps to whatever its pair has left after in-flight reservations.
 12. **A response without usage on a tokens profile** is passed through to the worker. The pair is marked `usage_missing`, reported, and paged (`PAGE:` on stdout, overview decision 14), and every later request on that token is refused. The control plane commits that record as `capped` (overview decision 2).
 13. **The token travels as `Authorization: Bearer`**, which is how Claude Code sends both `ANTHROPIC_AUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN`. `x-api-key` is accepted too. Neither is ever forwarded upstream.
 14. **A flush waits at most 50 seconds and answers `{last_seq, drained}`.** `last_seq` is the last sequence number the gateway emitted for the token, not the last one acknowledged, since the acknowledged one is the control plane's own commit and could never reveal a gap. The control plane's gateway client must therefore time out after more than 50 seconds.
-15. **The listener is bounded.** A connection idle for 60 seconds (`IDLE_SECONDS`) is closed, and past 256 open connections (`MAX_CONNECTIONS`) a new one is closed at once. Its client is a worker, which may be prompt-injected.
+15. **The listener is bounded, overall and per peer.** A connection idle for 60 seconds (`IDLE_SECONDS`) is closed. Past 256 open connections (`MAX_CONNECTIONS`), or past 16 from one peer address (`MAX_CONNECTIONS_PER_PEER`, twice `IN_FLIGHT_MAX`), a new one is closed at once. Both are charged at accept, before a byte is read, so a client that never sends a token is bounded too. Each worker is its own container with its own address, so one prompt-injected worker cannot take the listener from every other job.
 16. **A clean stop drains.** On `SIGTERM` the gateway stops accepting requests and gives queued reports up to 10 seconds to reach the control plane, then logs whether they drained. A crash loses what was queued, within the spec's stated bound.
 17. **`TOKEN_REPORTING` stays provisional** (Phase 1 decision 6). Narrowing it needs a live response from each provider type, which is a check the human runs by hand (below).
-18. **A cleartext `base_url` is refused unless its host is loopback.** The gateway sends the profile's credential there, and `workersai-shim.py` applies the same rule to its upstream.
+18. **A cleartext `base_url` is refused unless its host is loopback, and a `base_url` whose port is not a number is refused at load.** The gateway sends the profile's credential there, and `workersai-shim.py` applies the same rule to its upstream.
 
 ## Review Focus
 
 - **A usage field or a CRLF frame terminator split across two reads of the stream.** Expected: counted. Pinned in Task 3, at every split point of an LF and a CRLF sample.
-- **A prompt-injected worker firing many requests at once with its token.** Expected: no more than the request cap reaches upstream, the granted `max_tokens` stays within the token cap, and no more than `IN_FLIGHT_MAX` are in flight. Pinned in Task 4.
+- **A prompt-injected worker firing many requests at once with its token.** Expected: no more than the request cap reaches upstream, the granted `max_tokens` stays within the token cap, no more than `IN_FLIGHT_MAX` are in flight, and a reservation shortfall is paced, never reported as a cap hit. Pinned in Task 4.
+- **A worker that hangs up, or a forward that raises.** Expected: the reservation is released, the pass is never `ok`, and unmeasured spend on a tokens profile fails the pair closed. Pinned in Task 4.
 - **The provider cuts a response off mid-stream.** Expected: a failure, never a success. Pinned in Task 4.
 - **A deployment change while jobs run.** Expected: a running token keeps its dispatch-time profile. Pinned in Task 4.
 - **The gateway restarts mid-job, or gets a stale `hello`.** Expected: nothing is served until the `hello`, the caps resume from the committed counts, and a stale `hello` never moves a count back. Pinned in Task 4.
@@ -91,7 +92,7 @@ Apply this change to `tests/test_deploy_config.py`. The existing custom-profile 
 
 ```diff
 diff --git a/tests/test_deploy_config.py b/tests/test_deploy_config.py
-index 8283e41..3fd9d06 100644
+index 8283e41..0bf2763 100644
 --- a/tests/test_deploy_config.py
 +++ b/tests/test_deploy_config.py
 @@ -24,6 +24,13 @@ def profile(**over):
@@ -144,7 +145,7 @@ index 8283e41..3fd9d06 100644
                      concrete = path.replace("profiles.*.", "profiles.o.")
                      concrete = concrete.replace("overrides.*", "overrides.api")
                      keys = concrete.split(".")
-@@ -421,3 +435,61 @@ class DeployLeafCoverageTest(unittest.TestCase):
+@@ -421,3 +435,67 @@ class DeployLeafCoverageTest(unittest.TestCase):
                      observed.append(getattr(target, field))
                  self.assertEqual(observed, [expected_before, expected_after])
                  self.assertNotEqual(observed[0], observed[1], "declared leaf has no observable effect")
@@ -173,6 +174,12 @@ index 8283e41..3fd9d06 100644
 +        self.assertIn("ends with an endpoint path",
 +                      problems({"profiles": {"c": custom(base_url="https://llm.example/v1/messages",
 +                                                         usage="reported")}}))
++
++    def test_a_port_that_is_not_a_number_is_refused(self):
++        for url in ("http://127.0.0.1:notaport", "https://llm.example:99999"):
++            with self.subTest(url=url):
++                self.assertIn("has a port that is not a number",
++                              problems({"profiles": {"c": custom(base_url=url, usage="reported")}}))
 +
 +    def test_cleartext_is_refused_except_to_loopback(self):
 +        self.assertIn("must be https unless its host is loopback",
@@ -219,7 +226,7 @@ Apply this change to `reviewer/deploy_config.py`:
 
 ```diff
 diff --git a/reviewer/deploy_config.py b/reviewer/deploy_config.py
-index 14c5193..989ae27 100644
+index 14c5193..eb0b482 100644
 --- a/reviewer/deploy_config.py
 +++ b/reviewer/deploy_config.py
 @@ -9,12 +9,13 @@ YAML, by founder ruling (2026-10-09).
@@ -271,7 +278,7 @@ index 14c5193..989ae27 100644
  
  
  @dataclass(frozen=True)
-@@ -116,6 +130,27 @@ def _int(problems, raw, key, path, default, minimum=0) -> int:
+@@ -116,6 +130,31 @@ def _int(problems, raw, key, path, default, minimum=0) -> int:
      return default
  
  
@@ -289,6 +296,10 @@ index 14c5193..989ae27 100644
 +        check_url("base_url", value)
 +    except ConfigError as exc:
 +        return str(exc)[len("base_url "):]
++    try:
++        urllib.parse.urlsplit(value).port
++    except ValueError:
++        return "has a port that is not a number from 0 to 65535"
 +    if value.startswith("http://"):
 +        host = urllib.parse.urlsplit(value).hostname or ""
 +        if host not in ("127.0.0.1", "localhost", "::1"):
@@ -299,7 +310,7 @@ index 14c5193..989ae27 100644
  def _profile(problems: Problems, name: str, raw) -> Optional[Profile]:
      path = join("profiles", name)
      before = len(problems.lines())
-@@ -149,6 +184,30 @@ def _profile(problems: Problems, name: str, raw) -> Optional[Profile]:
+@@ -149,6 +188,30 @@ def _profile(problems: Problems, name: str, raw) -> Optional[Profile]:
          problems.add(join(path, "usage"), "only 'reported', and only on a custom profile")
      usage_reported = usage == "reported" and provider == "custom"
  
@@ -330,7 +341,7 @@ index 14c5193..989ae27 100644
      budget = _section(problems, raw, "budget", path)
      bpath = join(path, "budget")
      unit = budget.get("unit")
-@@ -187,7 +246,8 @@ def _profile(problems: Problems, name: str, raw) -> Optional[Profile]:
+@@ -187,7 +250,8 @@ def _profile(problems: Problems, name: str, raw) -> Optional[Profile]:
      if len(problems.lines()) > before:
          return None
      return Profile(name, provider, tuple(models), default_model, credential, concurrency,
@@ -345,7 +356,7 @@ index 14c5193..989ae27 100644
 - [ ] **Step 4: Run them to see them pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_deploy_config.py'`, then `./test-python.sh`
-Expected: PASS, 49 tests. The whole suite passes.
+Expected: PASS, 50 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
@@ -678,7 +689,7 @@ git commit -m "hosted: the socket protocol between the control plane and the gat
   - `upstream_headers(route, value, incoming, length) -> Dict[str, str]`: the pass-through set plus the injected credential `value` and `content-length`, with names lowercased.
   - `UsageMeter(streaming)` with `feed(chunk)`, `finish()`, and the attributes `input_tokens`, `output_tokens`, `saw_usage`, `saw_stop` and `error_type`.
   - `classify(path, status, meter) -> str`, one of `success`, `limit`, `failure`, `rejected` and `neutral`.
-  - Constants also include `CREDENTIAL_STATUSES = (401, 403)`, `IN_FLIGHT_MAX = 8`, `DRAIN_SECONDS = 10.0`, `IDLE_SECONDS = 60` and `MAX_CONNECTIONS = 256`.
+  - Constants also include `CREDENTIAL_STATUSES = (401, 403)`, `IN_FLIGHT_MAX = 8`, `DRAIN_SECONDS = 10.0`, `IDLE_SECONDS = 60`, `MAX_CONNECTIONS = 256` and `MAX_CONNECTIONS_PER_PEER = 16`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -903,6 +914,7 @@ import json
 import os
 import signal
 import ssl
+import sys
 import threading
 import time
 import urllib.parse
@@ -943,6 +955,10 @@ DRAIN_SECONDS = 10.0
 # closed at once. Streaming is unaffected: a live stream is never idle.
 IDLE_SECONDS = 60
 MAX_CONNECTIONS = 256
+# One peer's share of those. Each worker is its own container with its own
+# address, so this holds one worker, with or without a token, to its own
+# budget instead of letting it take every slot from every other job.
+MAX_CONNECTIONS_PER_PEER = 2 * IN_FLIGHT_MAX
 # Headers passed upstream from the worker's request, lowercased. Everything
 # else, Authorization and x-api-key above all, is dropped.
 _PASS_UP = ("content-type", "accept", "anthropic-version", "anthropic-beta", "user-agent",
@@ -1130,9 +1146,9 @@ git commit -m "hosted: the gateway route's profiles, headers and usage meter"
 - Produces:
   - `TokenState` (a mutable dataclass) with `TokenState.from_row(row, env, upstreams)`. The row is a token row, which carries its own `route`, and its `counts` are the committed record. It raises `ValueError` when the route cannot be served.
   - `Reporter(call, retry_seconds=1.0)` with `start()`, `stop()`, `enqueue(report)`, `pending(credential_id=None) -> int`, `acked(credential_id) -> int` and `flush(credential_id_or_None, timeout=FLUSH_SECONDS) -> bool` (True when drained). `call` is a `gwproto.Client.call`.
-  - `Gateway(env, reporter, upstreams=UPSTREAMS, clock=time.time, log=print, flush_seconds=FLUSH_SECONDS)` with `handle_control(msg) -> dict` (ops `hello` → `{ok, tokens, refused}`; `add_token`; `revoke`; `flush` → `{last_seq, drained}`; anything but `hello` before the first `hello` → `{error: "hello first", ready: false}`), `find(token) -> Optional[TokenState]`, `admit(state, path, requested_max) -> (refusal, max_tokens)`, `refuse_cap(state, cap)` and `complete(state, kind, granted, meter=None, detail="")`.
-  - A report is `{credential_id, seq, delta: {requests, successes, input_tokens, output_tokens}}`, plus whichever of `first_limit`, `first_failure`, `first_rejected`, `cap_hit` and `usage_missing` this response set for the first time.
-  - `BoundedServer` (a `ThreadingHTTPServer` with `max_connections`), `make_server(gateway, host, port) -> BoundedServer` and `main(env=os.environ)`. `main` reads `GATEWAY_SECRET`, `GATEWAY_SOCKET`, `CONTROL_SOCKET` and `GATEWAY_LISTEN` (default `0.0.0.0:8090`). Its first stdout line is `gateway listening on <host>:<port>; waiting for the control plane's hello`, and on `SIGTERM` it drains reports and prints `gateway stopping; reports drained` (or `NOT drained`).
+  - `Gateway(env, reporter, upstreams=UPSTREAMS, clock=time.time, log=print, flush_seconds=FLUSH_SECONDS)` with `handle_control(msg) -> dict` (ops `hello` → `{ok, tokens, refused}`; `add_token`; `revoke`; `flush` → `{last_seq, drained}`; anything but `hello` before the first `hello` → `{error: "hello first", ready: false}`), `find(token) -> Optional[TokenState]`, `admit(state, path, requested_max) -> (refusal, max_tokens)`, where a refusal is `capped`, `requests`, `tokens` or `pacing`, `refuse_cap(state, cap)` and `complete(state, kind, granted, meter=None, detail="")`.
+  - A report is `{credential_id, seq, delta: {requests, successes, input_tokens, output_tokens}}`, plus whichever of `first_limit`, `first_failure`, `first_rejected`, `first_abandoned`, `cap_hit` and `usage_missing` this response set for the first time.
+  - `BoundedServer` (a `ThreadingHTTPServer` with `max_connections` and `max_per_peer`, both charged at accept), `make_server(gateway, host, port) -> BoundedServer` and `main(env=os.environ)`. `main` reads `GATEWAY_SECRET`, `GATEWAY_SOCKET`, `CONTROL_SOCKET` and `GATEWAY_LISTEN` (default `0.0.0.0:8090`). Its first stdout line is `gateway listening on <host>:<port>; waiting for the control plane's hello`, and on `SIGTERM` it drains reports and prints `gateway stopping; reports drained` (or `NOT drained`).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1378,10 +1394,13 @@ class GatewayTest(unittest.TestCase):
 
     def test_a_spent_token_cap_ends_the_pair_as_capped_and_reports_it_once(self):
         token, cid = self.hello(counts={"input_tokens": 600, "output_tokens": 400})
+        bodies = []
         for _ in range(3):
             status, body = self.post(token)
             self.assertEqual(status, 400)
-            self.assertIn(b"tokens cap", body)
+            bodies.append(body)
+        self.assertIn(b"tokens cap", bodies[0])
+        self.assertTrue(all(b"reached a cap" in b for b in bodies[1:]))
         self.assertEqual(self.up.seen, [])
         self.assertEqual(self.flush(cid), {"last_seq": 1, "drained": True})
         self.assertEqual([r.get("cap_hit") for r in self.reports], ["tokens"])
@@ -1419,6 +1438,21 @@ class GatewayTest(unittest.TestCase):
             t.join()
         granted = sum(s["body"]["max_tokens"] for s in self.up.seen)
         self.assertLessEqual(granted, 1000)
+        # A shortfall decided by reservations is pacing, not a cap hit.
+        self.flush(cid)
+        self.assertFalse(any(r.get("cap_hit") for r in self.reports))
+        self.up.delay = 0
+        self.assertEqual(self.post(token)[0], 200)
+
+    def test_a_cap_hit_is_terminal_even_after_usage_would_allow_more(self):
+        token, cid = self.hello(self.profile(per_pair_requests=1))
+        self.assertEqual(self.post(token)[0], 200)
+        self.assertEqual(self.post(token)[0], 400)   # requests cap, reported
+        self.gw.tokens[cid].requests = 0             # anything that would reopen it
+        status, body = self.post(token)
+        self.assertEqual(status, 400)
+        self.assertIn(b"reached a cap", body)
+        self.assertEqual(len(self.up.seen), 1)
 
     def test_a_token_past_its_in_flight_bound_is_paced_and_nothing_is_recorded(self):
         token, cid = self.hello(self.profile(per_pair_requests=100, per_pair_tokens=None,
@@ -1516,9 +1550,43 @@ class GatewayTest(unittest.TestCase):
         time.sleep(0.5)
         self.flush(cid)
         report = self.reports[-1]
-        self.assertEqual(report["delta"]["requests"], 1)
+        self.assertEqual(report["delta"], {"requests": 1, "successes": 0,
+                                           "input_tokens": 0, "output_tokens": 0})
+        self.assertEqual(report["first_abandoned"], "the worker hung up mid-response")
         for key in ("first_failure", "first_limit", "first_rejected"):
             self.assertNotIn(key, report)
+        # Its spend was never seen, so a tokens profile fails closed and pages.
+        self.assertTrue(report["usage_missing"])
+        self.assertTrue(any(line.startswith("PAGE: ") for line in self.logs))
+
+    def test_a_hangup_on_a_passes_profile_is_abandoned_and_not_failed_closed(self):
+        token, cid = self.hello(self.profile(budget_unit="passes", per_pair_tokens=None))
+        self.up.delay = 0.2
+        conn = socket.create_connection(("127.0.0.1", self.server.server_port))
+        body = b'{"messages": []}'
+        conn.sendall(b"POST /v1/messages HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer "
+                     + token.encode() + b"\r\nContent-Length: " + str(len(body)).encode()
+                     + b"\r\n\r\n" + body)
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, b"\x01\x00\x00\x00\x00\x00\x00\x00")
+        conn.close()
+        time.sleep(0.5)
+        self.flush(cid)
+        self.assertIn("first_abandoned", self.reports[-1])
+        self.assertNotIn("usage_missing", self.reports[-1])
+        self.up.delay = 0
+        self.assertEqual(self.post(token)[0], 200)
+
+    def test_an_unexpected_fault_in_the_forward_releases_the_reservation(self):
+        token, cid = self.hello(self.profile(base_url="http://127.0.0.1:notaport"))
+        for _ in range(3):
+            self.post_tolerant(token)
+        state = self.gw.tokens[cid]
+        self.assertEqual((state.in_flight, state.reserved_tokens), (0, 0))
+        self.flush(cid)
+        self.assertEqual([r.get("first_abandoned") for r in self.reports][:1],
+                         ["gateway fault: ValueError"])
+        self.assertNotIn("first_failure", self.reports[0])
+        self.assertTrue(any(l.startswith("WARN: gateway fault") for l in self.logs))
 
     def test_a_tokens_profile_without_usage_fails_the_pair_closed_and_pages(self):
         token, cid = self.hello()
@@ -1569,8 +1637,8 @@ class ListenerTest(unittest.TestCase):
     def setUp(self):
         reporter = gateway.Reporter(lambda *a, **k: {"ack": 0})
         self.server = gateway.make_server(gateway.Gateway({}, reporter), "127.0.0.1", 0)
-        self.server.max_connections = 2
-        self.server._slots = threading.BoundedSemaphore(2)
+        self.server.max_connections = 3
+        self.server.max_per_peer = 2
         threading.Thread(target=self.server.serve_forever, args=(0.01,), daemon=True).start()
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
@@ -1583,6 +1651,19 @@ class ListenerTest(unittest.TestCase):
         extra.settimeout(2)
         self.assertEqual(extra.recv(1), b"")
         extra.close()
+
+    def test_a_slot_is_given_back_when_its_connection_closes(self):
+        for _ in range(5):
+            s = socket.create_connection(("127.0.0.1", self.server.server_port))
+            s.close()
+        time.sleep(0.1)
+        self.assertEqual(self.server._open, 0)
+        self.assertEqual(self.server._per_peer, {})
+
+    def test_the_overall_bound_holds_across_peers(self):
+        self.server._open = 3
+        self.assertFalse(self.server._take("10.0.0.9"))
+        self.server._open = 0
 
     def test_an_idle_connection_has_a_timeout(self):
         self.assertEqual(gateway.Handler.timeout, gateway.IDLE_SECONDS)
@@ -1658,6 +1739,7 @@ class TokenState:
     first_limit: Optional[str] = None
     first_failure: Optional[str] = None
     first_rejected: Optional[str] = None
+    first_abandoned: Optional[str] = None
     cap_hit: Optional[str] = None
     usage_missing: bool = False
     revoked: bool = False
@@ -1680,6 +1762,7 @@ class TokenState:
                    first_limit=counts.get("first_limit"),
                    first_failure=counts.get("first_failure"),
                    first_rejected=counts.get("first_rejected"),
+                   first_abandoned=counts.get("first_abandoned"),
                    cap_hit=counts.get("cap_hit"),
                    usage_missing=bool(counts.get("usage_missing", False)))
 
@@ -1850,24 +1933,33 @@ class Gateway:
     def admit(self, state: TokenState, path: str, requested_max: Any) -> Tuple[Optional[str], int]:
         """Reserve one request, and its max_tokens, before forwarding.
 
-        Returns (refusal, max_tokens). A refusal is "in_flight", "requests" or
-        "tokens", and nothing is reserved. Under the lock, so concurrent
-        requests on one token serialize on the check instead of all passing it.
+        Returns (refusal, max_tokens), and reserves nothing on a refusal. A
+        refusal is "capped" (a cap was already hit: the pair is done), a cap
+        name ("requests" or "tokens", hit now, by counted use), or "pacing"
+        (too many in flight, or what is left is all reserved by requests
+        still running: wait, nothing is concluded). Under the lock, so
+        concurrent requests on one token serialize on the check instead of
+        all passing it.
         """
         route = state.route
         with self.lock:
-            if state.in_flight >= IN_FLIGHT_MAX:
-                return "in_flight", 0
+            if state.cap_hit is not None:
+                return "capped", 0
             if state.requests >= route.per_pair_requests:
                 return "requests", 0
+            used = state.input_tokens + state.output_tokens
+            if path == "/v1/messages" and route.per_pair_tokens is not None \
+                    and used >= route.per_pair_tokens:
+                return "tokens", 0
+            if state.in_flight >= IN_FLIGHT_MAX:
+                return "pacing", 0
             granted = 0
             if path == "/v1/messages":
                 ceiling = MAX_TOKENS_CEILING
                 if route.per_pair_tokens is not None:
-                    ceiling = (route.per_pair_tokens - state.input_tokens - state.output_tokens
-                               - state.reserved_tokens)
+                    ceiling = route.per_pair_tokens - used - state.reserved_tokens
                     if ceiling <= 0:
-                        return "tokens", 0
+                        return "pacing", 0
                 granted = requested_max if isinstance(requested_max, int) and \
                     not isinstance(requested_max, bool) and 0 < requested_max <= ceiling else ceiling
                 if route.per_pair_tokens is not None:
@@ -1892,8 +1984,12 @@ class Gateway:
                  meter: Optional[UsageMeter] = None, detail: str = "") -> None:
         """Release an admitted request's reservation and report what it did.
 
-        `kind` is classify()'s, or "abandoned" when the worker hung up first:
-        the tokens it saw are counted and nothing else is concluded.
+        `kind` is classify()'s, or "abandoned" when the worker hung up before
+        the response was relayed in full. An abandoned request is reported as
+        `first_abandoned`, which the control plane commits as `deferred`, never
+        `ok`. On a tokens profile, an abandoned request whose usage was never
+        seen is also `usage_missing`: its spend cannot be counted, so the pair
+        is failed closed and paged, the same as a success without usage.
         """
         route = state.route
         report: Dict[str, Any] = {}
@@ -1906,13 +2002,15 @@ class Gateway:
                 state.input_tokens += meter.input_tokens
                 state.output_tokens += meter.output_tokens
                 delta["input_tokens"], delta["output_tokens"] = meter.input_tokens, meter.output_tokens
+            if kind in ("success", "abandoned") and route.tokens_unit and meter is not None \
+                    and not meter.saw_usage and not state.usage_missing:
+                state.usage_missing = True
+                report["usage_missing"] = True
             if kind == "success":
                 state.successes += 1
                 delta["successes"] = 1
-                if route.tokens_unit and meter is not None and not meter.saw_usage \
-                        and not state.usage_missing:
-                    state.usage_missing = True
-                    report["usage_missing"] = True
+            elif kind == "abandoned" and state.first_abandoned is None:
+                state.first_abandoned = report["first_abandoned"] = detail or "the worker hung up"
             elif kind == "limit" and state.first_limit is None:
                 state.first_limit = report["first_limit"] = detail
             elif kind == "failure" and state.first_failure is None:
@@ -1997,10 +2095,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._refuse(400, "invalid_request_error",
                                 "this pair was failed closed: a response carried no usage")
         refusal, granted = gw.admit(state, path, body.get("max_tokens"))
-        if refusal == "in_flight":
-            # Pacing, not an outcome: nothing reached upstream, so nothing is recorded.
+        if refusal == "pacing":
+            # Not an outcome: nothing reached upstream, so nothing is recorded.
             return self._refuse(429, "rate_limit_error",
-                                f"more than {IN_FLIGHT_MAX} requests in flight for this pair")
+                                "this pair's requests in flight hold its whole allowance; retry")
+        if refusal == "capped":
+            return self._refuse(400, "invalid_request_error", "this pair reached a cap; it is done")
         if refusal is not None:
             gw.refuse_cap(state, refusal)
             return self._refuse(400, "invalid_request_error",
@@ -2008,7 +2108,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
         body["model"] = state.model
         if path == "/v1/messages":
             body["max_tokens"] = granted
-        self._forward(state, path, json.dumps(body).encode("utf-8"), granted)
+        # The reservation admit() took is released on every path, including an
+        # exception nobody listed: without that, a request that died here would
+        # hold its pair's in-flight slot and reserved tokens for the life of the
+        # process, and the record would never hear of it.
+        self._completed = False
+        try:
+            self._forward(state, path, json.dumps(body).encode("utf-8"), granted)
+        finally:
+            if not self._completed:
+                exc = sys.exc_info()[1]
+                fault = type(exc).__name__ if exc is not None else "no outcome"
+                gw.log(f"WARN: gateway fault forwarding for job {state.job_id}: {fault}")
+                gw.complete(state, "abandoned", granted, detail=f"gateway fault: {fault}")
+
+    def _complete(self, state: TokenState, kind: str, granted: int,
+                  meter: Optional[UsageMeter] = None, detail: str = "") -> None:
+        self._completed = True
+        self.gateway.complete(state, kind, granted, meter, detail=detail)
 
     def _forward(self, state: TokenState, path: str, payload: bytes, granted: int) -> None:
         gw = self.gateway
@@ -2028,7 +2145,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             resp = conn.getresponse()
         except (OSError, http.client.HTTPException, ssl.SSLError) as exc:
             conn.close()
-            gw.complete(state, "failure", granted, detail=f"upstream transport: {type(exc).__name__}")
+            self._complete(state, "failure", granted, detail=f"upstream transport: {type(exc).__name__}")
             return self._refuse(502, "api_error", "the provider could not be reached")
 
         meter = UsageMeter("text/event-stream" in (resp.getheader("Content-Type") or ""))
@@ -2048,19 +2165,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except _WorkerGone:
             conn.close()
             meter.finish()
-            gw.complete(state, "abandoned", granted, meter)
+            self._complete(state, "abandoned", granted, meter, detail="the worker hung up mid-response")
             return
         conn.close()
         meter.finish()
         if broke is not None:
             kind = "limit" if meter.error_type in LIMIT_TYPES else "failure"
-            gw.complete(state, kind, granted, meter, detail=f"upstream transport: {broke}")
+            self._complete(state, kind, granted, meter, detail=f"upstream transport: {broke}")
             return
         kind = classify(path, resp.status, meter)
         detail = f"upstream {resp.status}" + (f" {meter.error_type}" if meter.error_type else "")
         if kind == "failure" and resp.status < 300 and meter.error_type is None:
             detail = f"upstream {resp.status}: the stream ended before message_stop"
-        gw.complete(state, kind, granted, meter, detail=detail)
+        self._complete(state, kind, granted, meter, detail=detail)
 
     def _relay_head(self, resp) -> None:
         try:
@@ -2083,30 +2200,56 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 class BoundedServer(http.server.ThreadingHTTPServer):
-    """A ThreadingHTTPServer that refuses connections past MAX_CONNECTIONS."""
+    """A ThreadingHTTPServer with a connection bound overall and per peer.
+
+    Both are charged at accept, before a byte of the request is read, so a
+    client that never sends a token is bounded as tightly as one that does.
+    """
 
     daemon_threads = True
     max_connections = MAX_CONNECTIONS
+    max_per_peer = MAX_CONNECTIONS_PER_PEER
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._slots = threading.BoundedSemaphore(self.max_connections)
+        self._count_lock = threading.Lock()
+        self._open = 0
+        self._per_peer: Dict[str, int] = {}
+
+    def _take(self, peer: str) -> bool:
+        with self._count_lock:
+            if self._open >= self.max_connections or \
+                    self._per_peer.get(peer, 0) >= self.max_per_peer:
+                return False
+            self._open += 1
+            self._per_peer[peer] = self._per_peer.get(peer, 0) + 1
+            return True
+
+    def _give(self, peer: str) -> None:
+        with self._count_lock:
+            self._open -= 1
+            left = self._per_peer.get(peer, 1) - 1
+            if left:
+                self._per_peer[peer] = left
+            else:
+                self._per_peer.pop(peer, None)
 
     def process_request(self, request, client_address):
-        if not self._slots.acquire(blocking=False):
+        peer = client_address[0]
+        if not self._take(peer):
             self.shutdown_request(request)
             return
         try:
             super().process_request(request, client_address)
         except BaseException:
-            self._slots.release()
+            self._give(peer)
             raise
 
     def process_request_thread(self, request, client_address):
         try:
             super().process_request_thread(request, client_address)
         finally:
-            self._slots.release()
+            self._give(client_address[0])
 
 
 def make_server(gateway: Gateway, host: str, port: int) -> BoundedServer:
@@ -2150,7 +2293,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run them to see them pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_gateway.py'`, then `./test-python.sh`
-Expected: PASS, 51 tests. The whole suite passes.
+Expected: PASS, 56 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
