@@ -49,7 +49,7 @@ The spec and the overview leave these open, and each one changes code. They are 
 11. **A passes profile clamps `max_tokens` to 64,000** (`MAX_TOKENS_CEILING`), the spec's "caps ... `max_tokens`" for a provider that cannot report usage. A tokens profile clamps to whatever its pair has left after in-flight reservations.
 12. **A response without usage on a tokens profile** is passed through to the worker. The pair is marked `usage_missing`, reported, and paged (`PAGE:` on stdout, overview decision 14), and every later request on that token is refused. The control plane commits that record as `capped` (overview decision 2).
 13. **The token travels as `Authorization: Bearer`**, which is how Claude Code sends both `ANTHROPIC_AUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN`. `x-api-key` is accepted too. Neither is ever forwarded upstream.
-14. **A flush waits at most 50 seconds and answers `{last_seq, drained}`.** It is drained only when the token has no request in flight as well as nothing queued: a request still streaming has no sequence number yet, and its report can be the one that decides the pair (a hang-up the gateway has not yet seen, on its next write). A pair's worker sends nothing more once its pass is over, so the wait covers requests already admitted, and one that outlasts the budget is the incomplete flush the spec answers with `deferred`. `last_seq` is the last sequence number the gateway emitted for the token, not the last one acknowledged, since the acknowledged one is the control plane's own commit and could never reveal a gap. The control plane's gateway client must therefore time out after more than 50 seconds.
+14. **A flush waits at most 50 seconds and answers `{last_seq, drained}`.** It is drained only when the token has no request in flight as well as nothing queued: a request still streaming has no sequence number yet, and its report can be the one that decides the pair (a hang-up the gateway has not yet seen, on its next write). A pair's worker sends nothing more once its pass is over, so the wait covers requests already admitted, and one that outlasts the budget is the incomplete flush the spec answers with `deferred`. `last_seq` is the last sequence number the gateway emitted for the token, not the last one acknowledged, since the acknowledged one is the control plane's own commit and could never reveal a gap. That holds only within one gateway process: a gateway that restarts loses the reports it had not delivered, and a token it gets back from the control plane's `hello` restarts its seq from the committed one, so a lost report leaves no gap. A token a `hello` restores, rather than one the gateway already held, is therefore marked rebuilt, and its flush always answers `drained: false`, which the control plane answers with `deferred`. In production only a restarted gateway is sent a `hello` carrying live tokens: the control plane's own startup revokes them all first, and every other token arrives by `add_token`. The control plane's gateway client must therefore time out after more than 50 seconds.
 15. **The listener is bounded, overall and per peer.** A connection idle for 60 seconds (`IDLE_SECONDS`) is closed. Past 256 open connections (`MAX_CONNECTIONS`), or past 16 from one peer address (`MAX_CONNECTIONS_PER_PEER`, twice `IN_FLIGHT_MAX`), a new one is closed at once. Both are charged at accept, before a byte is read, so a client that never sends a token is bounded too. Each worker is its own container with its own address, so one prompt-injected worker cannot take the listener from every other job.
 16. **A clean stop drains.** On `SIGTERM` the gateway stops accepting requests and gives queued reports up to 10 seconds to reach the control plane, then logs whether they drained. A crash loses what was queued, within the spec's stated bound.
 17. **`TOKEN_REPORTING` stays provisional** (Phase 1 decision 6). Narrowing it needs a live response from each provider type, which is a check the human runs by hand (below).
@@ -1242,9 +1242,13 @@ class GatewayTest(unittest.TestCase):
                            counts=counts or {})
 
     def hello(self, profile=None, counts=None):
+        # As in production: the control plane's hello is empty after its
+        # startup revocation, and each token arrives by add_token at start-pair.
         token, row = self.row(profile, counts)
-        reply = self.gw.handle_control({"op": "hello", "tokens": [row]})
-        self.assertEqual(reply, {"ok": True, "tokens": 1, "refused": []})
+        if not self.gw.ready:
+            self.assertEqual(self.gw.handle_control({"op": "hello", "tokens": []}),
+                             {"ok": True, "tokens": 0, "refused": []})
+        self.assertEqual(self.gw.handle_control({"op": "add_token", "token": row}), {"ok": True})
         return token, row["credential_id"]
 
     def post(self, token, path="/v1/messages?beta=true", body=None, raw=None, length=None):
@@ -1600,6 +1604,23 @@ class GatewayTest(unittest.TestCase):
             self.assertNotIn(key, report)
         self.assertFalse(any(line.startswith("PAGE: ") for line in self.logs))
 
+    def test_a_token_a_hello_restores_never_flushes_drained(self):
+        # PR #19 review: a gateway that restarted lost whatever it had not
+        # delivered, and its seq restarts from the committed one, so no gap shows.
+        token, row = self.row()
+        restarted = self.gw.handle_control({"op": "hello", "tokens": [row]})
+        self.assertEqual(restarted["tokens"], 1)
+        cid = row["credential_id"]
+        self.assertEqual(self.post(token)[0], 200)
+        self.assertFalse(self.flush(cid)["drained"])
+
+    def test_a_second_hello_keeps_a_held_token_drainable(self):
+        token, cid = self.hello()
+        self.post(token)
+        row = [r for r in self.creds.live_provider_rows() if r["credential_id"] == cid][0]
+        self.gw.handle_control({"op": "hello", "tokens": [row]})
+        self.assertTrue(self.flush(cid)["drained"])
+
     def test_a_flush_never_reads_a_seq_whose_report_is_not_queued(self):
         # PR #19 review: seq and enqueue are one step under the gateway's lock.
         token, cid = self.hello()
@@ -1838,6 +1859,10 @@ class TokenState:
     cap_hit: Optional[str] = None
     usage_missing: bool = False
     revoked: bool = False
+    # Restored from a hello's committed counts rather than held since it was
+    # added: this gateway restarted while the token was live, and reports it
+    # had not delivered died with the old process, so its flush is never drained.
+    rebuilt: bool = False
     # Not reported: what admission has reserved for requests still in flight.
     in_flight: int = 0
     reserved_tokens: int = 0
@@ -2002,7 +2027,9 @@ class Gateway:
             with self.lock:
                 for cid, fresh in built.items():
                     held = self.tokens.get(cid)
-                    if held is not None and held.seq >= fresh.seq:
+                    if held is None:
+                        fresh.rebuilt = True
+                    elif held.seq >= fresh.seq:
                         built[cid] = held
                 self.tokens, self.ready = built, True
             return {"ok": True, "tokens": len(built), "refused": refused}
@@ -2046,6 +2073,12 @@ class Gateway:
                 if not busy or time.monotonic() >= deadline:
                     break
                 time.sleep(0.02)
+            # A rebuilt token may have lost a report with the old process, and
+            # nothing here can say which: its seq restarts from the committed
+            # one, so a gap would never show. Not drained is the spec's
+            # incomplete flush, which the control plane answers with deferred.
+            if state is not None and state.rebuilt:
+                return {"last_seq": state.seq, "drained": False}
             drained = not busy and self.reporter.flush(
                 cid, timeout=max(0.0, deadline - time.monotonic()))
             with self.lock:
@@ -2440,7 +2473,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run them to see them pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_gateway.py'`, then `./test-python.sh`
-Expected: PASS, 62 tests. The whole suite passes.
+Expected: PASS, 64 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
