@@ -33,7 +33,7 @@ The spec and the overview leave these open, and each one changes code. They are 
 
 1. **2a reviews in `auto` mode only.** A repo whose config asks for `trigger: requested` is shown as a config problem on its check runs ("arrives in phase 2b") rather than reviewed against its wishes.
 2. **The org file is `.github/claudebox.json` in `<owner>/.github`**, read at the default branch. A read that fails is "no org defaults". The org `.github` repo is never itself reviewed.
-3. **A poll per installation lists its repos.** A repo that is public is passed over, and one that turned public since the last poll is lost. A repo gone from the list is lost. An installation gone from `App.installations()`, or one carrying `suspended_at`, loses all its repos. Losing a repo ends its jobs (their started pairs `revoked`), calls 2a.4a's three deleters (`Outbox.drop_repo`, `Committer.forget_repo`, `CheckRuns.forget_repo`), and forgets its fingerprint cache. The jobs end with no scheduler lock held, since ending one calls into the committer, which calls `decider_for`, which takes that lock. After each poll, a sweep drops the outbox and withheld rows of any repo no live installation lists (one lost while the control plane was down, which nothing in memory names), and runs only when every live installation's listing succeeded. Its rounds survive, as the spec's "Visibility" says ("Rounds and asks survive a public flip, since they hold no content"). A returning pair starts a fresh session at its next round, as one does after `MAX_PASSES_PER_SESSION` rotation. Its earlier rounds' findings are still on the PR, signed, and with no committed fingerprint its round line reads the local wording, which works from those comments.
+3. **A poll per installation lists its repos.** A repo that is public is passed over, and one that turned public since the last poll is lost. A repo gone from the list is lost. An installation gone from `App.installations()`, or one carrying `suspended_at`, loses all its repos. Losing a repo ends its jobs (their started pairs `revoked`), calls 2a.4a's three deleters (`Outbox.drop_repo`, `Committer.forget_repo`, `CheckRuns.forget_repo`), and forgets its fingerprint cache. The jobs end with no scheduler lock held, since ending one calls into the committer, which calls `decider_for`, which takes that lock. After each poll, a sweep drops the outbox and withheld rows of any repo that no live installation's listing returned as private (one lost or made public while the control plane was down, which nothing in memory names). It keys on the listings, never on how far the poll's walk got before `max_concurrent_jobs` stopped it, and runs only when every live installation's listing succeeded. A loss forgets the repo's last published config answer too, so a repo that comes back publishes its problem again. A completion in flight when its job ends commits nothing (2a.4a's `job_live`, wired to the job registry). Its rounds survive, as the spec's "Visibility" says ("Rounds and asks survive a public flip, since they hold no content"). A returning pair starts a fresh session at its next round, as one does after `MAX_PASSES_PER_SESSION` rotation. Its earlier rounds' findings are still on the PR, signed, and with no committed fingerprint its round line reads the local wording, which works from those comments.
 4. **Every non-fork candidate head gets a check run**, created once, whether or not anything is dispatched for it. A repo with a config problem shows it on every head's run and dispatches nothing. A problem in either file is a config problem, even when the other file is valid: `repo_config.resolve` would fall back to the other's config, and a broken file must never be replaced in silence. Each poll writes its answer onto the head and publishes it while the problem holds and on the poll it changes, so a problem fixed since (a `config apply`, an edit on the default branch) stops showing without a push, and an unchanged answer costs no GitHub call.
 5. **The change gate is local mode's**, `signals.Tracker`, one per repo since a Tracker keys by PR number. A PR's fingerprint is its head, its mode and the newest unsigned comment, and comments, reviews and the 30 newest inline comments are read only when the PR's `updated_at` has moved. A failed lookup is cached against that `updated_at` too, so an outage costs one lookup per change, and the PR gates on `updated_at` through `signals.degraded`. A PR younger than the deployment's `settle_seconds` waits.
 6. **Dispatch bounds.** A PR with a live job is not dispatched again. A pair parked by the commit point waits while its siblings run, and a parked profile dispatches nothing. `max_concurrent_jobs` counts jobs, and a profile's `concurrency` counts pairs in flight (dispatched and not completed) across its jobs. A poll stops dispatching at the first refusal by `max_concurrent_jobs`.
@@ -618,6 +618,16 @@ class ConfigTest(Base):
         self.poll()
         self.assertEqual(len(self.inst.updated), before)   # unchanged: no extra GitHub call
 
+    def test_a_lost_repo_that_returns_publishes_its_unchanged_problem(self):
+        # PR #22 review: the last answer must not outlive the run it was on.
+        self.inst.files[("acme/web", ".github/claudebox.json")] = b'{"profile": "nope"}'
+        self.poll()
+        self.sched.lose_repo("acme/web", "test")
+        before = len(self.inst.updated)
+        self.poll()
+        self.assertGreater(len(self.inst.updated), before)
+        self.assertEqual(self.inst.updated[-1][2], "Configuration invalid")
+
     def test_requested_mode_is_shown_as_not_yet_supported(self):
         self.inst.files[("acme/web", ".github/claudebox.json")] = json.dumps(
             {"profile": "ollama", "trigger": "requested"}).encode()
@@ -708,6 +718,30 @@ class AccessTest(Base):
         self.assertEqual(self.box.queued("gone/repo", HEAD), 0)
         self.assertEqual(self.records.conn().execute(
             "SELECT COUNT(*) FROM withheld WHERE repo = 'gone/repo'").fetchone()[0], 0)
+
+    def test_a_listed_repo_the_walk_did_not_reach_keeps_its_rows(self):
+        # PR #22 review: max_concurrent_jobs breaks the walk, and the sweep must
+        # key on the listing, not on how far the walk got.
+        from outbox import JobContext
+        for name, rid in (("api", 43), ("docs", 44)):
+            self.inst.repo_list.append({"full_name": f"acme/{name}", "name": name, "id": rid,
+                                        "private": True})
+            self.inst.files[(f"acme/{name}", ".github/claudebox.json")] = \
+                self.inst.files[("acme/web", ".github/claudebox.json")]
+        self.box.accept(JobContext("old", 7, "acme/docs", 1, HEAD), "sage", 1, "x")
+        self.deploy = deploy(max_concurrent_jobs=1)
+        self.poll()
+        self.assertNotIn("acme/docs", self.sched.installation_of)   # the walk broke in acme/api
+        self.assertEqual(self.sched.sweep_orphans({7}), 0)
+        self.assertEqual(self.box.queued("acme/docs", HEAD), 1)
+
+    def test_a_listed_repo_that_turned_public_while_down_is_swept(self):
+        from outbox import JobContext
+        self.inst.repo_list.append({"full_name": "acme/pub", "name": "pub", "id": 44,
+                                    "private": False})
+        self.box.accept(JobContext("old", 7, "acme/pub", 1, HEAD), "sage", 1, "x")
+        self.poll()
+        self.assertEqual(self.sched.sweep_orphans({7}), 1)
 
     def test_a_failed_listing_blocks_the_sweep(self):
         from outbox import JobContext
@@ -869,6 +903,9 @@ class Scheduler:
         # runs only when every live one did, or it would drop a repo whose
         # listing merely failed.
         self.listed: Set[int] = set()
+        # installation id -> the private repos its last successful listing
+        # returned. The sweep keys on these, never on how far a poll's walk got.
+        self.listings: Dict[int, Set[str]] = {}
 
     # -- the decision core per repo ----------------------------------------------
     def decider_for(self, repo: str) -> Decider:
@@ -940,9 +977,12 @@ class Scheduler:
         except GitHubError as exc:
             self.log(f"WARN: installation {installation_id}: could not list repositories: {exc}")
             self.listed.discard(installation_id)
+            self.listings.pop(installation_id, None)
             return 0
         self.listed.add(installation_id)
         seen = {r["full_name"] for r in repos}
+        self.listings[installation_id] = {r["full_name"] for r in repos
+                                          if r.get("name") != ORG_REPO and not is_public(r)}
         with self.lock:
             for repo in [r for r, i in self.installation_of.items()
                          if i == installation_id and r not in seen]:
@@ -1185,6 +1225,9 @@ class Scheduler:
             self.runtimes.pop(repo, None)
             self.installation_of.pop(repo, None)
             self.trackers.pop(repo, None)
+            # The last config answer published goes too, so a repo that comes
+            # back publishes its problem again on its first poll.
+            self.config_problems.pop(repo, None)
         self.log(f"{repo}: not reviewed, because {reason}; dropped {dropped} queued finding(s)")
 
     def sweep_orphans(self, live: Set[int]) -> int:
@@ -1196,7 +1239,7 @@ class Scheduler:
         """
         if not live <= self.listed:
             return 0
-        known = set(self.installation_of)
+        known = set().union(*(self.listings.get(i, set()) for i in live))
         conn = self.records.conn()
         rows = {r[0] for r in conn.execute("SELECT DISTINCT repo FROM outbox")}
         rows |= {r[0] for r in conn.execute("SELECT DISTINCT repo FROM withheld")}
@@ -1224,7 +1267,7 @@ class _Snapshot:
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_scheduler.py'`, then `./test-python.sh`
-Expected: PASS, 40 tests. The whole suite passes.
+Expected: PASS, 43 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
@@ -1733,7 +1776,8 @@ class ControlPlane:
             self.installation, self.deploy, gateway_call, persona_dir, gateway_url, channel_url,
             clock=clock, log=log)
         self.committer = Committer(records, blobs, self.scheduler.decider_for, self.backoff_for,
-                                   clock=clock, log=log)
+                                   clock=clock, log=log,
+                                   job_live=lambda job_id: self.jobs.get(job_id) is not None)
         self.scheduler.committer = self.committer
         self.channel = Channel(records, creds, self.jobs, self.outbox, self.committer,
                                gateway_call, app, self.installation_for_repo, self.check_runs,
