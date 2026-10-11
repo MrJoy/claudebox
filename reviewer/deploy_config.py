@@ -130,9 +130,13 @@ def _profile(problems: Problems, name: str, raw) -> Optional[Profile]:
         problems.add(join(path, "provider"), f"must be one of {', '.join(PROVIDERS)}; got {provider!r}")
 
     models = raw.get("models")
-    if not (isinstance(models, list) and models and all(is_str(m) and m for m in models)
+    # The same rule as the repo file's `model`: no whitespace, since a model
+    # name with a space fails only at request time, for every repo on the profile.
+    if not (isinstance(models, list) and models
+            and all(is_str(m) and m and not any(c.isspace() for c in m) for m in models)
             and len(set(models)) == len(models)):
-        problems.add(join(path, "models"), "must be a non-empty list of distinct model names")
+        problems.add(join(path, "models"),
+                     "must be a non-empty list of distinct model names with no spaces")
         models = []
     default_model = raw.get("default_model")
     if default_model not in models:

@@ -188,6 +188,26 @@ class LoadTest(unittest.TestCase):
                   "kindex": {"org_store": {"share_with": "all-private"}}})
         self.assertEqual(d.org_store_share_with, "all-private")
 
+    def test_a_share_with_entry_that_is_not_a_repo_name_is_an_error(self):
+        # PR #17 review: only the per-entry check stands between a full name
+        # (or a trailing newline) and a store that can never match.
+        # Mutation: Accept any string entry in a share_with list.
+        for entry in ("myorg/web", "api\n"):
+            with self.subTest(entry=entry):
+                self.assertIn("kindex.org_store.share_with",
+                              problems({"profiles": {"o": profile()},
+                                        "kindex": {"org_store": {"share_with": [entry]}}}))
+
+    def test_a_profile_model_with_whitespace_is_an_error(self):
+        # PR #17 review: the repo file's `model` rule, on the deployment's side.
+        # Mutation: Accept any non-empty model string in a profile.
+        for models in (["bad model"], ["glm-5.2:cloud", "kimi\n"]):
+            with self.subTest(models=models):
+                self.assertIn("profiles.o.models: must be a non-empty list of distinct model "
+                              "names with no spaces",
+                              problems({"profiles": {"o": profile(models=models,
+                                                                  default_model=models[0])}}))
+
     def test_share_with_any_other_string_is_an_error(self):
         # Oracle: tester-brief.md, Task 4, Interfaces and signed starting oracle line 681.
         # Mutation: Accept arbitrary share_with strings.

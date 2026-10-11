@@ -94,4 +94,11 @@ def read_json(data: bytes, cap: int, label: str) -> dict:
         raise ConfigError(f"{label}: is nested too deeply to read.")
     if not is_obj(value):
         raise ConfigError(f"{label}: must hold a JSON object at the top level.")
+    try:
+        # A `\ud800` escape is valid JSON and decodes to a lone surrogate, which
+        # no UTF-8 output can carry: refused here, so nothing downstream meets it.
+        json.dumps(value, ensure_ascii=False).encode("utf-8")
+    except UnicodeEncodeError:
+        raise ConfigError(f"{label}: holds a lone surrogate escape (\\ud800 to \\udfff), "
+                          "which is not a character.")
     return value

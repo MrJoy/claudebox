@@ -68,6 +68,15 @@ class ReadJsonTest(unittest.TestCase):
         raw = b'{"a": "' + b"x" * 10 + b'"}'
         self.assertEqual(read_json(raw, len(raw), "repo file"), {"a": "x" * 10})
 
+    def test_a_lone_surrogate_escape_is_an_error_not_a_traceback(self):
+        # PR #17 review: valid JSON, and no UTF-8 output can carry it.
+        # Mutation: Return the decoded value without checking it encodes.
+        for raw in (b'{"plan": {"label": "\\ud800"}}', b'{"\\udfff": 1}'):
+            with self.subTest(raw=raw), self.assertRaises(ConfigError) as ctx:
+                read_json(raw, 65536, "repo file")
+            self.assertIn("repo file: holds a lone surrogate", str(ctx.exception))
+        self.assertEqual(read_json(b'{"a": "\\ud83d\\ude00"}', 65536, "f"), {"a": "\U0001f600"})
+
     def test_deep_nesting_is_an_error_not_a_traceback(self):
         # Oracle: tester-brief.md, Task 1, Interfaces and signed starting oracle line 173.
         # Mutation: Let RecursionError escape instead of ConfigError.
