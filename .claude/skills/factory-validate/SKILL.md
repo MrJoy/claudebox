@@ -169,8 +169,9 @@ for this boundary: a probe that cannot pass is worse than an absent one.
 ## Phase 4 — Dispatch
 
 Dispatch **factory-engineer** (Coder) and **factory-test** (Tester) in parallel, in separate
-invocations with separate contexts and separate tool grants. **Neither receives the other's
-output. Neither can reach the other.**
+invocations with separate contexts and separate tool grants. **Neither is given the other's
+output, and neither is told about or addressed by the other;** the limit of that is the
+*Isolation* section above.
 
 **Both receive the same spec** — the agreed artifacts, the repo rules excerpts, the interface
 and schema, the criticality class of each disturbed surface. Telling two parties to build
