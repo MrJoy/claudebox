@@ -106,11 +106,13 @@ One tmux session per run. You live in window 0 (`ctl`); each lane gets its own w
 The Validator runs in the main checkout, on the run's feature branch. **The Coder and the
 Tester each get a detached worktree at the run's base commit**, beside the checkout, so
 neither lane's uncommitted files ever appear in the other's tree. Neither lane commits.
-Integration is the Validator's: it creates an assembly worktree at the same base, copies
-each lane's changed files into it, runs the judging suites there, and on the human's
-signature commits the assembled files on the feature branch, recording a digest of each
-so the commit is provably what was judged. You remove the three worktrees when the run
-closes, after checking that the committed files match them.
+Integration is the Validator's: it copies each lane's changed and new files into its own
+checkout, runs the judging suites there, and on the human's signature commits exactly
+those files, so the committed tree is the judged tree by construction. Before a later
+slice is dispatched, both lane worktrees move to the feature branch's new head
+(`git -C <worktree> checkout --detach <head>`), so no lane builds on a stale base. You
+remove the two worktrees when the run closes, after checking that the committed files
+match them.
 
     # Substitute the run id, the lane brief, and one launcher per lane before running
     # this. It is written to fail loudly rather than create a session literally named

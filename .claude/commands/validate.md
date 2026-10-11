@@ -80,11 +80,12 @@ session gives you.
   to hand the Coder, by a route that outlives the run. Hold your captures in the verdict
   package and add them after the signature.
 - **Phase 4's assembly.** The Coder and the Tester work in their own detached worktrees,
-  which `/orchestrate` created. Before you run the gates, create an assembly worktree at
-  the run's base commit (`.orchestrator-runs/<run>/base-sha.txt`), copy each lane's changed
-  and new files into it, and run every gate there. Record a digest of every assembled file.
-  On the human's signature, commit exactly those files on the feature branch, and check
-  their digests match before you do. Leave the worktrees for `/orchestrate` to remove.
+  which `/orchestrate` created. Before you run the gates, copy each lane's changed and new
+  files into your own checkout, on the feature branch, and run every gate there. On the
+  human's signature, commit exactly those files, so the commit is the tree you judged. A
+  slice the human rejects is reverted with `git restore`. Leave the lane worktrees for
+  `/orchestrate` to remove, and before dispatching a later slice ask it to move them to
+  the branch's new head.
 
 ## Who may send, and how a lane answers
 
