@@ -899,12 +899,10 @@ class Scheduler:
         self.config_problems: Dict[str, str] = {}
         self.trackers: Dict[str, signals_mod.Tracker] = {}   # one per repo: a Tracker keys by PR number
         self._full = False
-        # Installations whose last poll listed their repos. The orphan sweep
-        # runs only when every live one did, or it would drop a repo whose
-        # listing merely failed.
-        self.listed: Set[int] = set()
         # installation id -> the private repos its last successful listing
-        # returned. The sweep keys on these, never on how far a poll's walk got.
+        # returned; an installation whose last listing failed has no entry. The
+        # sweep keys on these, never on how far a poll's walk got, and runs only
+        # when every live installation has one.
         self.listings: Dict[int, Set[str]] = {}
 
     # -- the decision core per repo ----------------------------------------------
@@ -976,10 +974,8 @@ class Scheduler:
             repos = inst.repos()
         except GitHubError as exc:
             self.log(f"WARN: installation {installation_id}: could not list repositories: {exc}")
-            self.listed.discard(installation_id)
             self.listings.pop(installation_id, None)
             return 0
-        self.listed.add(installation_id)
         seen = {r["full_name"] for r in repos}
         self.listings[installation_id] = {r["full_name"] for r in repos
                                           if r.get("name") != ORG_REPO and not is_public(r)}
@@ -1237,7 +1233,7 @@ class Scheduler:
         outbox and withheld rows nothing else would ever drop. Runs only after
         every live installation's listing succeeded. Returns how many repos.
         """
-        if not live <= self.listed:
+        if not live <= set(self.listings):
             return 0
         known = set().union(*(self.listings.get(i, set()) for i in live))
         conn = self.records.conn()
