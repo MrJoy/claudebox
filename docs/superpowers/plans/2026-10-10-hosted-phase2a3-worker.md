@@ -46,7 +46,7 @@ The spec and the overview leave these open, and each one changes code. They are 
 9. **The session id is read from the transcript.** The first line whose `sessionId` is a plausible id wins, and a session id that could escape the projects directory is refused. A transcript with no id starts a fresh session with a `WARN`. When the job's `session_id` disagrees with the transcript's, the transcript's resumes, with a `WARN`. A `session_id` with no transcript starts fresh.
 10. **A pass that cannot start is an ordinary failed pass**, as in local mode's `_run_one`: any exception from spawning `claude` (`EAGAIN` at the PID limit, `ENOMEM`, no `claude` on `PATH`) becomes a failed `PassResult`, and the pair still sends `complete-pair`. Letting it out would abort the pool, and the started pair, its siblings and the next phase would never complete.
 11. **A refused `start-pair` runs nothing and completes nothing**: the pair stays owed, and the log names the refusal's reason. A usage limit in phase 1 withholds phase 2, as `run_group` does, and those pairs are never started, so the control plane still owes them.
-12. **`complete-pair` notes are `{rc, limited, transcript}`**, where `transcript` is `ok`, `missing` or `over-cap`. They are evidence for the control plane, never an outcome.
+12. **`complete-pair` notes are `{rc, limited, transcript}`**, where `transcript` is `ok`, `missing` or `over-cap`. They are evidence for the control plane, never an outcome. `complete-pair` is retried up to `COMPLETE_ATTEMPTS` (4) times, with a growing pause, when the channel answers `503` or cannot be reached: the channel bounds the large bodies it holds at once (2a.4a), and a burst of one job's own completions can meet that bound. Any other answer is final.
 13. **The shim allows a fixed set of reads** (`pr view|diff|list`, `issue view|list`, `repo view`, `search`, and `api`) and refuses everything else with one message that names `gh pr comment` as the only way to post. `gh api` is checked by allowlist, because `gh` parses flags with pflag, which accepts attached short values (`-XPOST`, `-fbody=x`) and combined flags, so no list of write spellings is complete. It takes exactly one REST path, and only `--paginate`, `--slurp`, `-i`/`--include`, `--silent`, `--verbose`, `-q`/`--jq`, `-t`/`--template` and `--cache`. Every other flag is refused, `--hostname`, `-H` and `--method` included, and so are `graphql` (always a `POST`) and a full URL. Reads the worker's token can never answer are refused with their own message, which tells the persona to carry on with the review: `pr checks` and `pr status` (check status, which `GH_STANZA` already says the token cannot read, and which `pr status` fetches with no flag to leave it out), `run view|list` (the App asks for no Actions permission), and `auth status` (it needs a user). GitHub's 403 for them would read as a refused read, which the hosted prompt tells a persona to stop the review over.
 14. **`gh pr comment` takes `--body`, `-b`, `--body=`, and `--body-file`/`-F` (with `-` for stdin)**, and one PR number, which must be the job's. Any other flag is refused with a message naming the two that work. The finding number `seq` is counted per persona in a mode-600 file under the reviewer's home, under `flock`, so a pair's concurrent shells never reuse one.
 15. **A refused finding exits 1 and prints the control plane's `message`** on stderr. An unreachable channel exits 1 and says the finding was not posted.
@@ -1459,6 +1459,31 @@ class RunGroupTest(unittest.TestCase):
         w.run_group(job(pairs=[self.pair("sage", session_id="sess-7")]), "cap")
         self.assertNotIn("--resume", claude.calls[0]["argv"])
 
+    def completes(self, answers):
+        """How many complete-pair calls a pass makes against these answers."""
+        class Busy(FakeChannel):
+            def post(inner, path, token, payload):
+                if path == "/channel/complete-pair":
+                    inner.calls.append((path, token, payload))
+                    return answers.pop(0), {}
+                return FakeChannel.post(inner, path, token, payload)
+        channel, claude = Busy(), FakeClaude(self.home)
+        w = self.make(channel, claude)
+        w.sleep = lambda s: None
+        w.run_group(job(pairs=[self.pair("sage")]), "cap")
+        return len([c for c in channel.calls if c[0] == "/channel/complete-pair"])
+
+    def test_a_busy_channel_is_retried(self):
+        # PR #21 review: the channel answers 503 when it holds its bound of large bodies.
+        self.assertEqual(self.completes([503, 503, 200]), 3)
+
+    def test_a_refusal_is_not_retried(self):
+        self.assertEqual(self.completes([401]), 1)
+
+    def test_retries_are_bounded(self):
+        self.assertEqual(self.completes([503] * worker.COMPLETE_ATTEMPTS),
+                         worker.COMPLETE_ATTEMPTS)
+
     def test_an_over_cap_transcript_is_reported_and_not_sent(self):
         channel, claude = FakeChannel(), FakeClaude(self.home)
         w = self.make(channel, claude)
@@ -1512,6 +1537,7 @@ import json
 import os
 import re
 import subprocess
+import time
 import sys
 import threading
 import urllib.error
@@ -1530,6 +1556,8 @@ from review_loop import lock_git_dir  # noqa: E402
 # test-worker.sh rewrites this line to a fixture.
 PROC_STATUS = "/proc/self/status"
 JOB_SPEC_MAX = 65536
+COMPLETE_ATTEMPTS = 4
+COMPLETE_RETRY_SECONDS = 5
 # The overview's channel cap: a decoded transcript of at most 64 MiB.
 TRANSCRIPT_MAX = 64 * 1024 * 1024
 REQUEST_TIMEOUT = 120
@@ -1706,7 +1734,9 @@ def claude_env(job: Dict[str, Any], home: str, path: str, provider_token: str,
 class Worker:
     def __init__(self, home: str, path: str, channel: Channel,
                  run: Callable[..., Any] = subprocess.run,
-                 popen: Callable[..., Any] = subprocess.Popen):
+                 popen: Callable[..., Any] = subprocess.Popen,
+                 sleep: Callable[[float], None] = time.sleep):
+        self.sleep = sleep
         self.home = home
         self.path = path
         self.channel = channel
@@ -1797,7 +1827,19 @@ class Worker:
                 with open(path, "rb") as f:
                     payload["transcript_b64"] = base64.b64encode(f.read()).decode("ascii")
                 notes["transcript"] = "ok"
-        status, _ = self.channel.post("/channel/complete-pair", capability, payload)
+        # The channel bounds what it holds at once: a 503, or a connection it
+        # closed past its cap, means try again, and a few tries cover any burst
+        # one job's own pairs can make. Anything else is the answer.
+        for attempt in range(COMPLETE_ATTEMPTS):
+            try:
+                status, _ = self.channel.post("/channel/complete-pair", capability, payload)
+            except WorkerError as exc:
+                status = None
+                log(f"WARN: complete-pair: {exc}", pair=tag)
+            if status not in (None, 503):
+                break
+            if attempt + 1 < COMPLETE_ATTEMPTS:
+                self.sleep(COMPLETE_RETRY_SECONDS * (attempt + 1))
         if status != 200:
             log(f"WARN: complete-pair answered {status}", pair=tag)
 
@@ -1860,7 +1902,7 @@ if __name__ == "__main__":
 - [ ] **Step 5: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_worker.py'`, then `./test-python.sh`
-Expected: PASS, 30 tests. The whole suite passes.
+Expected: PASS, 33 tests. The whole suite passes.
 
 - [ ] **Step 6: Commit**
 
