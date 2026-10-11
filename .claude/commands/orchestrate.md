@@ -131,7 +131,10 @@ nothing outside `<paths>`. Only then discard the now-redundant copy and move it
 and tell the lane it was re-pointed, so its next hand-over lists only the new slice's
 paths. A lane that fails either check is not moved: that is an anomaly for the
 Validator, and nothing in its tree is discarded. You remove the two worktrees when the run closes, after the same check
-against the last slice's commit.
+against the last slice's commit, with `git worktree remove --force <worktree>`: the check
+leaves the tree staged, and a plain `remove` refuses a tree with changes. `--force` is safe
+here only because the check just proved the tree holds the committed slice and nothing else.
+A lane that fails the check keeps its worktree, for the Validator.
 
     # Substitute the run id, the lane brief, and one launcher per lane before running
     # this. It is written to fail loudly rather than create a session literally named
