@@ -134,7 +134,8 @@ it.
 ## Hand over
 
 1. **The test files, uncommitted**, each assertion citing its authorizing item. Hand
-   over the exact list of paths; the Validator commits each accepted slice on the run's feature branch.
+   over the exact change set: every path you created, modified, deleted or renamed, marked
+   as `git status --porcelain` would mark it (`A`, `M`, `D`, `R old -> new`); the Validator commits each accepted slice on the run's feature branch.
    Never run `git add .`, `git add -A`, `git commit`, or `git push`.
 2. **A falsifiability ledger** — per test: what it claims to prove, and the named mutation that
    turns it red.

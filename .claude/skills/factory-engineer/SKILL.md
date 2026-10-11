@@ -150,7 +150,8 @@ An artifact set, not a narration:
 1. **The changed files, uncommitted.** This repo works on the run's feature branch
    (named in your dispatch), and the Validator commits each accepted slice there after
    the human signs the verdict; the pull request is opened afterwards, on the human's word. So you leave your changes in the working tree and hand over
-   the exact list of paths you created or modified. Never run `git add .`, `git add -A`,
+   the exact change set: every path you created, modified, deleted or renamed, marked as
+   `git status --porcelain` would mark it (`A`, `M`, `D`, `R old -> new`). Never run `git add .`, `git add -A`,
    `git commit`, or `git push`. Supply the text for the slice's commit message in the
    repo's style, for the Validator to use:
 

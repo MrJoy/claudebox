@@ -80,9 +80,14 @@ session gives you.
   to hand the Coder, by a route that outlives the run. Hold your captures in the verdict
   package and add them after the signature.
 - **Phase 4's assembly.** The Coder and the Tester work in their own detached worktrees,
-  which `/orchestrate` created. Before you run the gates, copy each lane's changed and new
-  files into your own checkout, on the feature branch, and run every gate there. On the
-  human's signature, commit exactly those files, so the commit is the tree you judged. A
+  which `/orchestrate` created. Before you run the gates, apply each lane's change set to
+  your own checkout, on the feature branch: copy the added and modified paths, and
+  `git rm` the deleted ones (a rename is both), and stage them. The lane and your checkout
+  sit at the same head, so the application is checked by comparing their staged diffs:
+  after `git -C <lane> add -A`, the output of `git -C <lane> diff --cached --binary` must
+  equal your `git diff --cached --binary` (with two lanes, the lanes' union). A mismatch is
+  an anomaly, and nothing is judged until it is resolved. Run every gate there. On the
+  human's signature, commit exactly that change set, so the commit is the tree you judged. A
   slice the human rejects is reverted with `git restore`. Leave the lane worktrees for
   `/orchestrate` to remove, and before dispatching a later slice ask it to move them to
   the branch's new head.
