@@ -25,7 +25,7 @@
 - The spec's clone: "blobless (`--filter=blob:none`) with a full checkout of the PR head". The spec's group: "phase 1 together and then phase 2", and "the shared-clone defenses in `review_loop.py` (`WORKTREE_STANZA`, `lock_git_dir`) carry over".
 - The spec's shim: "`gh pr comment` becomes `post finding`. Other `gh` calls use the read token in 2a". `post finding` answers **queued** ("exit 0, print 'queued'") or a refusal the model is told about (exit non-zero).
 - The spec's worker "reports each pair's outcome" only as evidence: "The worker contributes the transcript, the session id and its own notes, never the outcome."
-- The overview's worker channel: `POST /channel/fetch-job` (bootstrap token, `200 {capability, job}`), `POST /channel/start-pair` (`{persona}`, `200 {provider_token}` or `409 {reason}`, which leaves the pair owed), `POST /channel/post-finding` (`{persona, seq, body}`, `200 {result: "queued"}` or `422 {result, message}`), and `POST /channel/complete-pair` (`{persona, session_id, transcript_b64, notes}`). The job spec is `{job_id, repo, pr, head, mode, clone_url, read_token, model, auth_env, gateway_url, max_concurrent_personas, pairs: [{persona, phase, system_prompt, prompt, session_id, transcript_b64}]}`.
+- The overview's worker channel: `POST /channel/fetch-job` (bootstrap token, `200 {capability, job}`), `POST /channel/start-pair` (`{persona}`, `200 {provider_token}` or `409 {reason}`, which leaves the pair owed), `POST /channel/post-finding` (`{persona, seq, body}`, `200 {result: "queued"}` or `422 {result, message}`), and `POST /channel/complete-pair` (`{persona, session_id, transcript_b64, notes}`). The job spec is `{job_id, repo, pr, head, mode, clone_url, read_token, model, auth_env, gateway_url, max_concurrent_personas, shared_worktree, pairs: [{persona, phase, system_prompt, prompt, session_id, transcript_b64}]}`.
 - The overview's transcript cap: `TRANSCRIPT_MAX = 64 * 1024 * 1024` decoded. "The worker checks the same 64 MiB cap before sending, and reports an over-cap transcript as `failing` in its notes rather than sending it."
 - The overview's runner socket: `start {job_id, bootstrap_token, channel_url, gateway_url}`, `list` (answered by `{jobs: [{job_id, state}]}`), `stop {job_id}` and `stop_all`, in `gwproto`'s framing.
 - **Spike S3** (overview decision 9): an `oauth_token` profile hands the worker its pair token as `CLAUDE_CODE_OAUTH_TOKEN`; every other profile as `ANTHROPIC_AUTH_TOKEN`. The job spec's `auth_env` names which.
@@ -42,7 +42,7 @@ The spec and the overview leave these open, and each one changes code. They are 
 5. **`stop` is `docker rm -f`**, and a container that is already gone is a success, so `stop_all` after a crash is idempotent.
 6. **The clone authenticates with an `http.extraheader` scoped to `https://github.com/`** and kept in the clone's config, because a blobless clone fetches history lazily whenever a persona asks for it. The read token sits in the reviewer's reach anyway in 2a (the spec's "in 2a only, the worker holds a GitHub read token"). A clone URL off `https://github.com/` and a head that is not a full commit id are refused before `git` runs, and a checkout that lands anywhere but the job's head is an error.
 7. **`claude` gets a built environment, never an inherited one**: `HOME`, `PATH`, `DISABLE_AUTOUPDATER=1`, `ANTHROPIC_BASE_URL` (the gateway), the pair's provider token under `auth_env`, `GH_TOKEN` (the read token), the channel URL, the capability, the persona and the PR number for the shim, and the job's model in every model-tier variable the local entrypoint pins. `ANTHROPIC_API_KEY` is never set. Every pass carries `--strict-mcp-config` and no other MCP flag, since hosted Linear is deferred and kindex is 3a.
-8. **The `.git` lock applies when any phase runs two personas at once**, by local mode's rule (`min(cap, size) > 1`, with an unset or zero cap meaning the phase's size), using `review_loop.lock_git_dir` unchanged. Assembling `WORKTREE_STANZA` into the prompts is the control plane's (2a.4), by the same rule.
+8. **Whether the personas share the worktree is decided once, by the control plane, and carried in the job spec as `shared_worktree`.** The control plane puts `WORKTREE_STANZA` in the prompts by that answer (2a.4), and the worker locks `.git` with `review_loop.lock_git_dir`, unchanged, exactly when it is true. The worker never recomputes it, so the stanza and the lock cannot disagree. A job spec without a boolean `shared_worktree` is refused at `fetch-job`.
 9. **The session id is read from the transcript.** The first line whose `sessionId` is a plausible id wins, and a session id that could escape the projects directory is refused. A transcript with no id starts a fresh session with a `WARN`. When the job's `session_id` disagrees with the transcript's, the transcript's resumes, with a `WARN`. A `session_id` with no transcript starts fresh.
 10. **A pass that cannot start is an ordinary failed pass**, as in local mode's `_run_one`: any exception from spawning `claude` (`EAGAIN` at the PID limit, `ENOMEM`, no `claude` on `PATH`) becomes a failed `PassResult`, and the pair still sends `complete-pair`. Letting it out would abort the pool, and the started pair, its siblings and the next phase would never complete.
 11. **A refused `start-pair` runs nothing and completes nothing**: the pair stays owed, and the log names the refusal's reason. A usage limit in phase 1 withholds phase 2, as `run_group` does, and those pairs are never started, so the control plane still owes them.
@@ -58,7 +58,7 @@ The spec and the overview leave these open, and each one changes code. They are 
 - **A field crafted to smuggle a `docker` flag or path through `start` or `stop`.** Expected: refused before `docker` runs. Pinned in Task 1.
 - **A prompt-injected reviewer writing to GitHub through `gh`.** Expected: every write verb, `gh api` with a method, field, header or host in any spelling (`-XPOST`, `-fbody=x`, `-iXPOST`), and a comment on another PR are refused without reaching the real `gh` or the channel. Pinned in Task 3.
 - **A resume that silently starts fresh.** Expected: a pair run twice in two fresh homes resumes the first run's session, and the second transcript holds both runs' turns. Pinned in Task 4.
-- **Personas racing on one clone.** Expected: the clone's `.git` is locked whenever a phase runs two at once. Pinned in Task 4.
+- **Personas racing on one clone.** Expected: the clone's `.git` is locked exactly when the job spec's `shared_worktree` says so, and a spec that does not say is refused. Pinned in Task 4.
 
 ## Not run here
 
@@ -1099,7 +1099,7 @@ git commit -m "worker: the gh shim, which turns gh pr comment into post-finding"
 - Consumes: `passes.run_pass` and `passes.PassResult`, `common.Pair`, `common.log`, `common.ConfigError`, and `review_loop.lock_git_dir`, all from `reviewer/` unchanged. Task 3's environment variables.
 - Produces:
   - `WorkerError(Exception)`; `TRANSCRIPT_MAX = 64 * 1024 * 1024`; `MODEL_VARS`; `AUTH_ENVS = ("ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")`.
-  - `posture_problems(status_text, uid) -> List[str]`; `encode_cwd(path) -> str`; `transcript_path(home, cwd, session_id) -> str`; `session_id_of(transcript: bytes) -> Optional[str]`; `shared_worktree(job) -> bool`; `read_job_file(path) -> dict`.
+  - `posture_problems(status_text, uid) -> List[str]`; `encode_cwd(path) -> str`; `transcript_path(home, cwd, session_id) -> str`; `session_id_of(transcript: bytes) -> Optional[str]`; `read_job_file(path) -> dict`.
   - `Channel(base_url, opener=None)` with `post(path, token, payload) -> (status, dict)`, following no redirect.
   - `git(args, cwd=None, run=subprocess.run) -> str`, `clone(job, repo_dir, run=subprocess.run)`, and `claude_env(job, home, path, provider_token, capability, persona) -> Dict[str, str]`.
   - `Worker(home, path, channel, run=subprocess.run, popen=subprocess.Popen)` with `repo_dir` (`<home>/work/repo`), `fetch_job(bootstrap_token) -> (capability, job)`, `prepare(job)`, `run_pair(job, capability, pair) -> Optional[PassResult]`, `complete(capability, tag, result)` and `run_group(job, capability)`.
@@ -1152,7 +1152,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import worker
-from worker import (Worker, session_id_of, shared_worktree, WorkerError, claude_env, clone, encode_cwd,
+from worker import (Worker, session_id_of, WorkerError, claude_env, clone, encode_cwd,
                     posture_problems, read_job_file, transcript_path)
 
 GOOD_STATUS = "Name:\tpython3\nNoNewPrivs:\t1\nCapBnd:\t0000000000000000\n"
@@ -1248,7 +1248,7 @@ def job(**over):
          "clone_url": "https://github.com/acme/web.git", "read_token": "ghs_read",
          "model": "glm-5.2:cloud", "auth_env": "ANTHROPIC_AUTH_TOKEN",
          "gateway_url": "http://gateway:8090", "channel_url": "http://control:8080",
-         "max_concurrent_personas": 0, "pairs": []}
+         "max_concurrent_personas": 0, "shared_worktree": False, "pairs": []}
     j.update(over)
     return j
 
@@ -1306,34 +1306,28 @@ class HelpersTest(unittest.TestCase):
         self.assertEqual(session_id_of(data), "abc-1")
         self.assertIsNone(session_id_of(b'{"x": 1}\n'))
 
-    def test_shared_worktree_follows_the_per_phase_concurrency(self):
-        one = {"persona": "a", "phase": 1}
-        cases = [
-            ([one], 0, False),
-            ([one, dict(one, persona="b")], 0, True),
-            ([one, dict(one, persona="b")], 1, False),
-            ([one, {"persona": "sage", "phase": 2}], 0, False),
-        ]
-        for pairs, cap, expected in cases:
-            with self.subTest(pairs=pairs, cap=cap):
-                self.assertEqual(shared_worktree({"pairs": pairs, "max_concurrent_personas": cap}),
-                                 expected)
-
 
 class PrepareTest(unittest.TestCase):
-    def test_a_concurrent_group_gets_its_git_dir_locked_and_a_lone_persona_does_not(self):
-        for pairs, locked in (([{"persona": "a"}, {"persona": "b"}], True), ([{"persona": "a"}], False)):
+    def test_the_git_dir_is_locked_exactly_when_the_job_says_the_worktree_is_shared(self):
+        for shared in (True, False):
             home = tempfile.mkdtemp()
             self.addCleanup(shutil.rmtree, home)
             w = Worker(home, "/p", None, run=FakeRun())
             os.makedirs(os.path.join(w.repo_dir, ".git", "refs", "heads"))
-            with self.subTest(locked=locked), mock.patch.object(worker, "clone"):
-                w.prepare(job(pairs=pairs))
+            with self.subTest(shared=shared), mock.patch.object(worker, "clone"):
+                w.prepare(job(shared_worktree=shared, pairs=[{"persona": "a"}]))
                 writable = os.access(os.path.join(w.repo_dir, ".git"), os.W_OK)
-                self.assertEqual(writable, not locked)
-            os.chmod(os.path.join(w.repo_dir, ".git"), 0o700)
-            os.chmod(os.path.join(w.repo_dir, ".git", "refs"), 0o700)
-            os.chmod(os.path.join(w.repo_dir, ".git", "refs", "heads"), 0o700)
+                self.assertEqual(writable, not shared)
+            for d in (".git", ".git/refs", ".git/refs/heads"):
+                os.chmod(os.path.join(w.repo_dir, d), 0o700)
+
+    def test_a_job_that_does_not_say_is_refused(self):
+        class C:
+            def post(self, path, token, payload):
+                return 200, {"capability": "c", "job": dict(job(), shared_worktree=None)}
+        with self.assertRaises(WorkerError) as ctx:
+            Worker("/h", "/p", C()).fetch_job("b")
+        self.assertIn("share the worktree", str(ctx.exception))
 
 
 class FakeChannel:
@@ -1615,20 +1609,6 @@ def session_id_of(transcript: bytes) -> Optional[str]:
     return None
 
 
-def shared_worktree(job: Dict[str, Any]) -> bool:
-    """Whether any phase runs more than one persona at once.
-
-    The same rule as review_loop.shared_worktree_modes, per phase: when it
-    holds, the prompts carry WORKTREE_STANZA and the clone's .git is locked.
-    """
-    cap = int(job.get("max_concurrent_personas") or 0)
-    for phase in {int(p.get("phase", 1)) for p in job["pairs"]}:
-        size = sum(1 for p in job["pairs"] if int(p.get("phase", 1)) == phase)
-        if (min(cap, size) if cap > 0 else size) > 1:
-            return True
-    return False
-
-
 def read_job_file(path: str) -> Dict[str, Any]:
     """The job spec root wrote: ours, mode 600, not a link. Unlinked once read."""
     try:
@@ -1759,6 +1739,8 @@ class Worker:
         job = data["job"]
         if job.get("auth_env") not in AUTH_ENVS:
             raise WorkerError(f"the job names an unknown auth_env {job.get('auth_env')!r}")
+        if not isinstance(job.get("shared_worktree"), bool):
+            raise WorkerError("the job does not say whether its personas share the worktree")
         return data["capability"], job
 
     def prepare(self, job: Dict[str, Any]) -> None:
@@ -1767,7 +1749,10 @@ class Worker:
         if not os.access(work, os.W_OK):
             raise WorkerError(f"{work} is not writable by the reviewer")
         clone(job, self.repo_dir, run=self.run)
-        if shared_worktree(job):
+        # The control plane decided this once, and put WORKTREE_STANZA in the
+        # prompts by the same answer; the worker honours it rather than
+        # recomputing, so the stanza and the lock cannot disagree.
+        if job["shared_worktree"]:
             try:
                 lock_git_dir(self.repo_dir)
             except ConfigError as exc:
