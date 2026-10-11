@@ -16,7 +16,7 @@
 
 - **Standard library only**, and **Python 3.9 syntax** (overview decision 15). Flat modules, imported by plain name (overview decision 19). Nothing here runs a process: 2a.4b does.
 - **Overview decision 1:** pair state stays in memory in 2a. The control plane holds one `MemoryStateStore` and one `Decider` per repo, and this plan's parks and check-run pair states live in memory beside them. Token rows, check-run counts, outbox items and withheld records are the records store's.
-- **Overview decision 2:** 2a's outcomes are `ok`, `capped`, `usage-limited`, `deferred`, `failing`, `failed` and `revoked`. `usage_missing` is `capped`. A rejected-only record (`first_rejected`, no success, no failure) is `failing`. `first_abandoned` takes the place of `ok` and nothing else.
+- **Overview decision 2:** 2a's outcomes are `ok`, `capped`, `usage-limited`, `deferred`, `failing`, `failed` and `revoked`. `usage_missing` is `capped`. A rejected-only record (`first_rejected`, no success, no failure) is `deferred`, with the transcript discarded and the session dropped (`commit.rejected_only`): a 4xx cannot say whether claudebox's request or an overgrown session was refused, so it is a claudebox fault, and resuming a refused session would be refused again. `first_abandoned` takes the place of `ok` and nothing else.
 - **Overview decision 16:** `prompts.round_stanza(mode, round, since_head=None)` names the commits after `since_head` when it is given, and keeps today's wording otherwise. `Decider.system_prompt_for(pair, since_head=None, rewritten=False)` passes it through, so local mode's prompts stay byte-identical, which `tests/fixtures/` pins. A rewritten branch runs as round 1 at the `should-fix` floor, and the round count still advances.
 - **Overview decision 17:** hosted prompts are today's defaults with no Linear and no kindex stanza, plus one sentence in `GH_STANZA`: "If the deployment refuses a read, stop the review and say so; do not guess at the diff."
 - **Overview decision 18:** the check-run wording is decided here.
@@ -1627,7 +1627,7 @@ git commit -m "hosted: the outbox, its acceptance caps and its paced drain"
   - The outcome names `OK`, `CAPPED`, `USAGE_LIMITED`, `DEFERRED`, `FAILING`, `FAILED`, `REVOKED`, and `OUTCOMES`; `PROFILE_FAILURES_TO_PARK = 3`; `REPO_DEFERS_TO_PAGE = 3`.
   - `Record` (frozen) with `from_row(row)` and `counts() -> dict` (the `counts` a gateway `hello` carries).
   - `ensure_record(conn, credential_id)`, `record_for(records, credential_id) -> Optional[Record]`, `apply_report(records, msg) -> {ack} | {error}`, `flush_complete(flush, record) -> bool`, `transcript_session(data: bytes) -> Optional[str]`.
-  - `decide(record, flush_ok, transcript, reported_session, expected_session) -> str`, which never returns `REVOKED`.
+  - `rejected_only(record) -> bool`; `decide(record, flush_ok, transcript, reported_session, expected_session) -> str`, which never returns `REVOKED`.
   - `Park(reason, until=None, head=None)`; `Completion(repo, pair, head, profile, credential_id, transcript, session_id, expected_session, flush, signal=None, job_id=None)` (frozen).
   - `Committer(records, blob_store, decider_for, backoff_for, clock=time.time, log=print, job_live=lambda job_id: True)` with `commit(completion) -> str`, `apply(completion, outcome, record)`, `revoke(repo, pair) -> str` (returns `REVOKED`; the caller publishes it), `parked(repo, pair, head) -> Optional[Park]`, `profile_parked_until(profile) -> int`, `transcript_for(repo, pair) -> Optional[bytes]`, `last_reviewed_head(repo, pair) -> Optional[str]` (the committed fingerprint's head), `forget_repo(repo)`, and the attributes `parks`, `transcripts` and `profiles`. `commit` answers `REVOKED` for a completion whose `job_id` is not `job_live`, and applies nothing.
 
@@ -1690,7 +1690,7 @@ class DecideTest(unittest.TestCase):
             ("cap hit", dict(record=rec(cap_hit="requests")), "capped"),
             ("usage missing", dict(record=rec(usage_missing=True)), "capped"),
             ("limit", dict(record=rec(first_limit="upstream 429")), "usage-limited"),
-            ("rejected only", dict(record=rec(successes=0, first_rejected="upstream 400")), "failing"),
+            ("rejected only", dict(record=rec(successes=0, first_rejected="upstream 400")), "deferred"),
             ("rejected with a success", dict(record=rec(first_rejected="upstream 400")), "ok"),
             ("abandoned replaces ok", dict(record=rec(first_abandoned="hung up")), "deferred"),
             ("abandoned never beats a cap", dict(record=rec(first_abandoned="x", cap_hit="requests")),
@@ -1863,6 +1863,20 @@ class CommitterTest(unittest.TestCase):
                        {"last_seq": 0, "drained": True}, "fp1", "job1")
         self.assertEqual(self.c.commit(c), "revoked")
         self.assertEqual((self.blobs.data, self.state.sessions, self.state.rounds), ({}, {}, {}))
+
+    def test_a_rejected_only_pass_is_deferred_with_a_fresh_session(self):
+        # PR #18 review: a 4xx can be claudebox's request or an overgrown
+        # session, so it never parks the pair, and the session is not resumed.
+        self.state.sessions[self.pair] = "old"
+        out = self.complete({"first_rejected": "upstream 400 invalid_request_error",
+                             "delta": {"requests": 1, "successes": 0}})
+        self.assertEqual(out, "deferred")
+        self.assertNotIn(self.pair, self.state.sessions)
+        self.assertEqual(self.blobs.data, {})
+        self.assertIn(self.pair, self.state.owed)
+        self.assertNotIn(("acme/web", self.pair), {k: v for k, v in self.c.parks.items()
+                                                  if v.head is not None})
+        self.assertFalse(any(l.startswith("PAGE:") for l in self.logs))
 
     def test_the_store_forgets_everything_but_rounds_and_clears_in_place(self):
         from state import MemoryStateStore
@@ -2220,11 +2234,20 @@ def decide(record: Optional[Record], flush_ok: bool, transcript: Optional[bytes]
         return CAPPED
     if record.first_limit:
         return USAGE_LIMITED
-    if record.first_rejected and record.successes == 0:
-        return FAILING
+    if rejected_only(record):
+        # A 4xx does not say who built the part the provider refused: the
+        # gateway's request shape and an overgrown session both look like
+        # this. So it is a claudebox fault, never the pair's (PR #18 review).
+        return DEFERRED
     if record.first_abandoned:
         return DEFERRED
     return OK
+
+
+def rejected_only(record: Optional[Record]) -> bool:
+    """Every upstream answer was a rejected request: no success and no failure."""
+    return (record is not None and bool(record.first_rejected) and record.successes == 0
+            and not record.first_failure)
 
 
 @dataclass
@@ -2320,8 +2343,12 @@ class Committer:
         key = (c.repo, c.pair)
         now = int(self.clock())
         decider = decider if decider is not None else self.decider_for(c.repo)
+        # A rejected-only pass is deferred with a fresh session: if the session
+        # is what the provider refused (past its context window), resuming it
+        # would be refused the same way.
+        keeps = outcome in _KEEPS_TRANSCRIPT and not (outcome == DEFERRED and rejected_only(record))
         with self.lock:
-            if outcome in _KEEPS_TRANSCRIPT and c.transcript is not None:
+            if keeps and c.transcript is not None:
                 name = blobs_mod.transcript_name(c.repo, c.pair.pr, c.pair.mode, c.pair.persona, now)
                 self.blobs.put(name, c.transcript)
                 old = self.transcripts.get(key)
@@ -2330,7 +2357,7 @@ class Committer:
                     decider.state.sessions[c.pair] = c.session_id
                 if old:
                     self.blobs.delete(old)
-            elif outcome not in _KEEPS_TRANSCRIPT:
+            elif not keeps:
                 self._drop_transcript(c.repo, c.pair)
                 decider.record_failure(c.pair)
             profile = self.profiles.setdefault(c.profile, _Profile())
@@ -2437,7 +2464,7 @@ class _Result:
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_commit.py'`, then `./test-python.sh`
-Expected: PASS, 29 tests. The whole suite passes.
+Expected: PASS, 30 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
