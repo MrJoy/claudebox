@@ -46,7 +46,7 @@ The spec and the overview leave these open, and each one changes code. They are 
 10. **A pass with no transcript and an empty record is `deferred`**, ahead of the spec's transcript check. Nothing parsed badly: the pass never started `claude`. A missing transcript with real traffic is `failing`. A transcript parses when every non-empty line is a JSON object and its first `sessionId` is a plausible id. `decide` never returns `revoked`: the spec decides it "elsewhere, without a `complete pair`", and that is decision 18. A dead capability never reaches `decide`, because the channel answers it `401`.
 11. **Reports commit only in order.** A report whose seq is not the committed one plus one changes nothing, and the ack names the committed seq, so a resend is harmless and a gap is visible. A `first_*` marker is never overwritten, and its text is cut at 500 characters. A report for a token the control plane never minted is refused.
 12. **The commit point is in memory, under one lock, and never calls `decider_for` while holding it.** The decider is resolved first, because 2a.4b's `decider_for` takes the scheduler's lock and the scheduler calls into the committer; a call under the lock would deadlock the two (2a.4b's review). The transcript blob is written first and the pair pointed at it second, so a crash between them leaves an unreferenced blob for 2b's sweep, and 2a.4b's startup deletes every transcript blob anyway (overview decision 1). A job does not outlive the control plane that started it because 2a.4b's startup makes it so: 2a.1's rule, "the successor revokes every outstanding row before it serves anything", revokes every capability and provider token (`Creds.revoke_all`), the restarted `hello` carries no live token so the gateway drops them all, and the runner's orphans are stopped. An in-flight pass is lost on a restart, and its pair stays owed. A newer transcript deletes the blob it replaces.
-13. **Parks live beside the pair state, keyed by repo.** The profile's two-PR limit rule counts `(repo, pr)`, since a profile spans repos and every repo has a #1. A head park lifts when the PR's head differs. A timed park lifts at its time. A profile park stops `start-pair`, and its scheduling consequence is 2a.4b's. A page is one `PAGE:` line (overview decision 14).
+13. **Parks live beside the pair state, keyed by repo.** The profile's two-PR limit rule counts `(repo, pr)`, since a profile spans repos and every repo has a #1. A head park lifts when the PR's head differs. A timed park lifts at its time. A profile park stops `start-pair`, and its scheduling consequence is 2a.4b's. A page is one `PAGE:` line (overview decision 14). The commit point emits the pair outcomes that page (`capped`, `failing`), a repo deferred three times in a row, and both profile parks (three failed pairs, limits on two PRs), since "a profile parked for failures" is on the spec's paging list and a profile park stops every repo on it.
 14. **`fetch-job` mints the read token and starts the 55-minute deadline in the same call**, so the token outlives the job, and a read token GitHub refuses revokes the new capability at once. A pair's committed transcript travels in the job spec with its session id, and a pair without one gets neither.
 15. **`start-pair` fails closed, and reserves the pair before any network call.** A visibility check that errors, a repo that is public or out of reach, a parked profile, a pair already started or starting, and a gateway that refuses the token all answer `409`. The check and the reservation happen under the job's lock, so two concurrent starts for one persona mint one token, and a refusal clears the reservation so the pair stays startable. The provider token lives until the job's deadline, and its `token_records` row exists before the gateway hears of it.
 16. **`complete-pair` records the pair completed as soon as the commit point returns**, with its outcome, in the same critical section that ends its reservation, and answers a resend `200 {}`, the way `post-finding` answers one. After the record, the pair's check-run view is set (in memory, and published), and only then is the token revoked, so a fault in the revocation leaves the run showing the true outcome and the token for the job's end to revoke. A fault before the commit point leaves the pair started, which a retry re-enters. A concurrent duplicate is `409`. The resend's sender is 2a.3's worker, which retries `complete-pair` on a `503` or a connection that dropped, and a fault on this side reaches it as a dropped connection. A resend runs the settle step again from the recorded outcome, since every part of it is idempotent. The view is set in memory before anything in that step can fail, so the run shows the true outcome at its next publish either way, and the resend is what gives a lost publish a next time without waiting for the job's end. `job.completed` is the one record that a pair is done. A fault inside `apply` itself, before the record, is re-entered and may spend its round twice: the window is accepted, and closing it needs a durable commit, which 2b's SQL state brings. A completion whose job is no longer registered (`job_live`, checked under the commit point's lock) commits nothing and answers `revoked`: the job's end already revoked and showed the pair, and a loss of access may already have deleted what it would write back (2a.4b's review). It turns a bad transcript into one that will not parse. That covers bad base64, a transcript over 64 MiB, and the worker's own `over-cap` note, so all three are `failing`. A flush the gateway cannot answer is no flush, so the pair is `deferred`. The pair's token is revoked in the records store and then at the gateway, and a gateway that misses the revoke drops the token at its next `hello`.
@@ -1999,6 +1999,8 @@ class CommitterTest(unittest.TestCase):
         self.now[0] += 100
         self.complete({"first_limit": "x"}, pr=8)
         self.assertEqual(self.c.profile_parked_until("ollama"), 1100 + 1800)
+        # A parked profile is on the spec's paging list (PR #18 review).
+        self.assertTrue(any(l.startswith("PAGE: profile ollama") for l in self.logs))
 
     def test_limits_on_same_numbered_prs_in_two_repos_park_the_profile(self):
         # A profile spans repos, and every repo has a #7 (PR #21 review).
@@ -2020,8 +2022,10 @@ class CommitterTest(unittest.TestCase):
         self.complete(fail)
         self.complete(fail)
         self.assertEqual(self.c.profile_parked_until("ollama"), 0)
+        self.assertFalse(any(l.startswith("PAGE: profile") for l in self.logs))
         self.complete(fail)
         self.assertGreater(self.c.profile_parked_until("ollama"), 0)
+        self.assertTrue(any(l.startswith("PAGE: profile ollama") for l in self.logs))
 
     def test_a_repo_deferred_three_times_in_a_row_pages(self):
         for _ in range(3):
@@ -2142,7 +2146,8 @@ _KEEPS_TRANSCRIPT = (OK, CAPPED, USAGE_LIMITED, DEFERRED)
 _PARK_ON_HEAD = (CAPPED, FAILING)
 # Parked for the profile's limit backoff.
 _PARK_TIMED = (USAGE_LIMITED, DEFERRED, FAILED)
-# Pages, by the spec's paging list.
+# Pair outcomes that page. The spec's other pages are emitted where their
+# condition is decided: a repo deferred three times and a parked profile, in apply.
 _PAGES = (CAPPED, FAILING)
 
 # The profile-level rules (spec, "The gateway").
@@ -2431,7 +2436,7 @@ class Committer:
                 profile.failed_in_a_row += 1
                 if profile.failed_in_a_row >= PROFILE_FAILURES_TO_PARK:
                     profile.parked_until = now + self.backoff_for(c.profile)
-                    self.log(f"profile {c.profile}: {profile.failed_in_a_row} failed pairs in a "
+                    self.log(f"PAGE: profile {c.profile}: {profile.failed_in_a_row} failed pairs in a "
                              f"row; parked until {profile.parked_until}")
             if outcome == USAGE_LIMITED:
                 window = self.backoff_for(c.profile)
@@ -2440,7 +2445,7 @@ class Committer:
                 profile.recent_limits[(c.repo, c.pair.pr)] = now
                 if len(profile.recent_limits) >= 2:
                     profile.parked_until = now + window
-                    self.log(f"profile {c.profile}: usage limits on two PRs; parked until "
+                    self.log(f"PAGE: profile {c.profile}: usage limits on two PRs; parked until "
                              f"{profile.parked_until}")
             if outcome == DEFERRED:
                 n = self.defers_in_a_row[c.repo] = self.defers_in_a_row.get(c.repo, 0) + 1
