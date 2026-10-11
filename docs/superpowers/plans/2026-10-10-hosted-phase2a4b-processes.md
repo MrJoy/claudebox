@@ -38,7 +38,7 @@ The spec and the overview leave these open, and each one changes code. They are 
 5. **The change gate is local mode's**, `signals.Tracker`, one per repo since a Tracker keys by PR number. A PR's fingerprint is its head, its mode and the newest unsigned comment, and comments, reviews and the 30 newest inline comments are read only when the PR's `updated_at` has moved. A failed lookup is cached against that `updated_at` too, so an outage costs one lookup per change, and the PR gates on `updated_at` through `signals.degraded`. A PR younger than the deployment's `settle_seconds` waits.
 6. **Dispatch bounds.** A PR with a live job is not dispatched again. A pair parked by the commit point waits while its siblings run, and a parked profile dispatches nothing. `max_concurrent_jobs` counts jobs, and a profile's `concurrency` counts pairs in flight (dispatched and not completed) across its jobs. A group larger than the room left dispatches in parts, phase order first: the pairs left out hold no session, so the gate runs them on a later poll once the job has ended, and a 7-persona plan group under a bound of 4 is never starved. A poll stops dispatching at the first refusal by `max_concurrent_jobs` and keeps walking: every later head and repo still gets its check run and its config answer (decision 4), and only the dispatch stages, which cost lookups, are skipped. The poll logs when the cap starts binding for an installation and when it stops, not on every poll.
 7. **Visibility is checked again at dispatch**, uncached, and a check that errors dispatches nothing.
-8. **A job's material is built once, at dispatch.** The prompts are `build_hosted`'s, with `WORKTREE_STANZA` exactly when `shared_worktree` is true, and `shared_worktree` is true when any phase of this job's pairs runs two at once (`min(cap, n) > 1`, a cap of 0 meaning `n`). A pair with a session gets the followup prompt. A pair's round line names the head of its committed fingerprint (`Committer.last_reviewed_head`). When that head is no longer an ancestor of the new one, the round line is round 1's and the check run says the branch was rewritten. An ancestry check that errors counts as a rewrite, since a whole review beats a guess.
+8. **A job's material is built once, at dispatch.** The prompts are `build_hosted`'s, with `WORKTREE_STANZA` exactly when `shared_worktree` is true, and `shared_worktree` is true when the job has more than one pair, whatever their phases or the cap: a phase-1 pass that writes to the clone is read by phase 2, and one-at-a-time passes read each other's writes the same way (PR #20 review). A pair with a session gets the followup prompt. A pair's round line names the head of its committed fingerprint (`Committer.last_reviewed_head`). When that head is no longer an ancestor of the new one, the round line is round 1's and the check run says the branch was rewritten. An ancestry check that errors counts as a rewrite, since a whole review beats a guess.
 9. **The reap ends a job** when runnerd lists its worker as gone or exited, when its 55-minute deadline has passed, or when its bootstrap token expired unused. Ending a job revokes its credentials, tells the gateway to revoke its unfinished pairs' tokens, marks each started pair `revoked` (`Committer.revoke`, and `checkruns.REVOKED` on the run), owes each unstarted pair, stops its worker, forgets its outbox keys and `settled` entries, and writes `ended_at` and `end_reason` on its row.
 10. **The deployment config is the records store's `deploy_config` row**, re-read on each poll when its `applied_at` moves. A stored config that does not load (one written by another version) keeps the last good one and warns. The outbox's two caps follow it.
 11. **The control plane's startup.** A not-configured instance touches nothing on the volume. Otherwise it takes the lock on `<data>/control.lock` (overview decision 13) before it opens the records store, answering `/healthz` "waiting for lock" meanwhile. On taking it: `Creds.revoke_all`, every `jobs` row with no `ended_at` closed as "the control plane restarted" (this instance's registry never holds those jobs, so nothing else would end them), runnerd's `stop_all` (a failure warns, since every credential is already revoked, and that includes a runnerd not yet listening, which raises `OSError` rather than `RunnerError`), every transcript blob deleted, and an empty `hello` (a gateway not yet answering gets its hello on its first reply). The gateway's reports are refused until the lock is held, and its Reporter retries them.
@@ -239,7 +239,7 @@ git commit -m "repo config: plan.label whitespace and the empty selector's wordi
 **Interfaces:**
 - Consumes: `repo_config.resolve`, `deploy_config.against_deploy`, `personas.resolve`, `signals`, `prompts.build_hosted`, `decisions.Decider`, `state.MemoryStateStore` (`reviewer/`); `creds.Creds` and `BOOTSTRAP_TTL`, `github_app.GitHubError`, `is_fork_pr` and `is_public` (2a.1); `runner.RunnerError` (2a.3); `channel.Jobs`, `JobMaterial` and `PairMaterial`, `checkruns`, `outbox.Outbox`, `commit.Committer` (2a.4a).
 - Produces:
-  - `ORG_REPO = ".github"`; `shared_worktree(pairs_by_phase: Dict[int, int], cap: int) -> bool`.
+  - `ORG_REPO = ".github"`; `shared_worktree(n_pairs: int) -> bool`.
   - `Scheduler(records, creds, jobs, committer, check_runs, outbox, runner, installation_for, deploy_for, gateway_call, persona_dir, gateway_url, channel_url, clock=time.time, log=print, new_job_id=...)` with `poll(installation_id) -> int`, `poll_repo(inst, installation_id, info, deploy) -> int`, `load_config(inst, full_name, deploy) -> (config, model, problem, notice)` (a failed read raises `GitHubError`), `dispatch(...) -> bool`, `reap() -> int`, `end_job(job, reason)`, `lose_repo(repo, reason)`, `sweep_orphans(live) -> int` and `decider_for(repo) -> Decider`, and the attributes `installation_of` (repo to installation id), `listings` (installation id to the private repos its last successful listing returned), `states`, `runtimes`, `trackers`, `full_installations` (the installations whose last poll met `max_concurrent_jobs`), `halted` (an event the drain sets) and `walk` (a lock the poll's walk holds). `committer` may be set after construction, since the `Committer` takes `decider_for`.
 
 - [ ] **Step 1: Write the failing test**
@@ -417,11 +417,23 @@ class DispatchTest(Base):
         self.assertIn("round 1 of your review", sage.system_prompt)
         self.assertEqual(sage.phase, 2)
 
-    def test_red_team_and_sage_run_in_different_phases_so_the_worktree_is_not_shared(self):
+    def test_red_team_then_sage_share_the_worktree_though_their_phases_differ(self):
+        # PR #20 review: Sage's phase-2 pass reads whatever red_team left in
+        # the clone, so one persona per phase is still a shared clone.
+        self.poll()
+        job = self.jobs.all()[0]
+        self.assertTrue(job.shared_worktree)
+        import prompts
+        self.assertTrue(all(p.prompt.endswith(prompts.WORKTREE_STANZA) for p in job.pairs))
+
+    def test_a_lone_persona_has_the_worktree_to_itself(self):
+        self.inst.files[("acme/web", ".github/claudebox.json")] = json.dumps(
+            {"profile": "ollama", "code": {"personas": "sage"}}).encode()
         self.poll()
         job = self.jobs.all()[0]
         self.assertFalse(job.shared_worktree)
-        self.assertNotIn("working copy is shared", job.pairs[0].prompt)
+        import prompts
+        self.assertNotIn(prompts.WORKTREE_STANZA, job.pairs[0].prompt)
 
     def test_two_phase_one_personas_share_the_worktree_and_say_so(self):
         self.inst.files[("acme/web", ".github/claudebox.json")] = json.dumps(
@@ -623,10 +635,9 @@ class BoundsTest(Base):
         self.assertEqual([len(j.pairs) for j in self.jobs.all()], [2, 1])
 
     def test_shared_worktree_rule(self):
-        self.assertFalse(shared_worktree({1: 1, 2: 1}, 0))
-        self.assertTrue(shared_worktree({1: 2}, 0))
-        self.assertFalse(shared_worktree({1: 3}, 1))
-        self.assertTrue(shared_worktree({1: 3}, 2))
+        # PR #20 review: red_team then Sage, one phase each, share the clone.
+        self.assertTrue(shared_worktree(2))
+        self.assertFalse(shared_worktree(1))
 
 
 class ConfigTest(Base):
@@ -974,13 +985,16 @@ from state import MemoryStateStore
 ORG_REPO = ".github"
 
 
-def shared_worktree(pairs_by_phase: Dict[int, int], cap: int) -> bool:
-    """Whether any phase runs two personas at once: `min(cap, size) > 1`, 0 meaning size.
+def shared_worktree(n_pairs: int) -> bool:
+    """Whether more than one persona reads the job's clone.
 
-    Computed here, once, and sent to the worker in the job spec, which locks
-    `.git` by it; the prompts carry WORKTREE_STANZA by the same answer.
+    Not whether two run at once: a phase-1 pass that mutates the clone is read
+    by phase 2, and one-at-a-time passes read each other's changes the same
+    way, so the cap does not enter into it (PR #20 review). Computed here,
+    once, and sent to the worker in the job spec, which locks `.git` by it;
+    the prompts carry WORKTREE_STANZA by the same answer.
     """
-    return any((min(cap, n) if cap > 0 else n) > 1 for n in pairs_by_phase.values())
+    return n_pairs > 1
 
 
 @dataclass
@@ -1250,10 +1264,7 @@ class Scheduler:
             return False
         deploy = self.deploy_for()
         profile = deploy.profiles[cfg.profile]
-        by_phase: Dict[int, int] = {}
-        for p in pairs:
-            by_phase[decider.phase_of(p)] = by_phase.get(decider.phase_of(p), 0) + 1
-        shared = shared_worktree(by_phase, cfg.max_concurrent_personas)
+        shared = shared_worktree(len(pairs))
         prompts = prompts_mod.build_hosted(frozenset({mode}) if shared else frozenset())
         materials, rewritten_any = [], False
         for p in pairs:
@@ -1416,7 +1427,7 @@ class _Snapshot:
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_scheduler.py'`, then `./test-python.sh`
-Expected: PASS, 50 tests. The whole suite passes.
+Expected: PASS, 51 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
