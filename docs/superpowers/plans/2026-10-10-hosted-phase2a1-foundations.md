@@ -363,6 +363,7 @@ git commit -m "hosted: the deployment's cryptography, behind one module"
   - `records.Records(path: str)`: opens or creates the store. A store at a newer version raises `RecordsError` naming "newer than" and "deploy the newer image". An older one raises naming "no migration".
   - `Records.conn() -> sqlite3.Connection`: this thread's connection (`row_factory = sqlite3.Row`, WAL, `secure_delete=ON`, `foreign_keys=ON`, `busy_timeout=5000`, autocommit).
   - `Records.tx()`: a context manager yielding the connection inside `BEGIN IMMEDIATE`. It commits on exit and rolls back and re-raises on any exception.
+  - `Records.erase_wal()`: `PRAGMA wal_checkpoint(TRUNCATE)`, raising `RecordsError` if a reader kept the WAL from truncating. Erasure (2b) calls it after its deletes commit, since `secure_delete` does not reach the `-wal` file.
   - `Records.close()` closes this thread's connection.
   - `records.InstanceLock(path: str)` with `try_acquire() -> bool`, `release()` and the `held` property. The lock file is created mode 600.
 
@@ -416,6 +417,20 @@ class RecordsTest(unittest.TestCase):
         self.assertEqual(c.execute("PRAGMA secure_delete").fetchone()[0], 1)
         self.assertEqual(c.execute("PRAGMA journal_mode").fetchone()[0], "wal")
         self.assertEqual(c.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+
+    def test_erase_wal_leaves_no_deleted_bytes_on_disk(self):
+        # PR #18 review: secure_delete does not reach the -wal file.
+        r = Records(self.path)
+        with r.tx() as c:
+            c.execute("INSERT INTO audit (at, action, scope, detail) VALUES (1, 'a', 's', ?)",
+                      ("zq-erase-me-zq",))
+        with r.tx() as c:
+            c.execute("DELETE FROM audit")
+        r.erase_wal()
+        for name in (self.path, self.path + "-wal"):
+            if os.path.exists(name):
+                with open(name, "rb") as f:
+                    self.assertFalse(b"zq-erase-me-zq" in f.read(), name)
 
     def test_an_exception_in_a_transaction_rolls_it_back(self):
         r = Records(self.path)
@@ -522,8 +537,9 @@ integer Unix seconds, UTC.
 One connection per thread, because sqlite3 connections must not cross threads.
 Writes go through tx(), which takes SQLite's write lock up front (BEGIN
 IMMEDIATE) so two writers queue instead of one failing halfway through.
-`secure_delete` is on so a deleted row's bytes are overwritten, which is part
-of what makes erasure erase.
+`secure_delete` is on so a deleted row's bytes are overwritten in the
+database file. Under WAL a deleted row's page also sits in the `-wal` file,
+which `secure_delete` does not touch, so erasure ends with `erase_wal()`.
 """
 
 import fcntl
@@ -622,6 +638,16 @@ class Records:
             raise
         c.execute("COMMIT")
 
+    def erase_wal(self) -> None:
+        """Checkpoint the WAL into the database file and truncate it to nothing.
+
+        Erasure calls this after its deletes commit: until then a deleted row's
+        bytes are still in the `-wal` file. It waits for readers to finish.
+        """
+        busy = self.conn().execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+        if busy:
+            raise RecordsError("the WAL could not be truncated: a reader held it")
+
     def close(self) -> None:
         c = getattr(self._local, "conn", None)
         if c is not None:
@@ -691,7 +717,7 @@ class InstanceLock:
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_records.py'`, then `./test-python.sh`
-Expected: PASS, 12 tests. The whole suite passes.
+Expected: PASS, 13 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
