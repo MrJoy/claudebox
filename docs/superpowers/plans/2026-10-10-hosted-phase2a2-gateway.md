@@ -92,7 +92,7 @@ Apply this change to `tests/test_deploy_config.py`. The existing custom-profile 
 
 ```diff
 diff --git a/tests/test_deploy_config.py b/tests/test_deploy_config.py
-index 2d10aff..554db1f 100644
+index 657ed43..a69d0f2 100644
 --- a/tests/test_deploy_config.py
 +++ b/tests/test_deploy_config.py
 @@ -24,6 +24,13 @@ def profile(**over):
@@ -109,7 +109,7 @@ index 2d10aff..554db1f 100644
  def load(doc):
      return deploy_config.load_deploy(json.dumps(doc).encode("utf-8"))
  
-@@ -172,8 +179,8 @@ class LoadTest(unittest.TestCase):
+@@ -174,8 +181,8 @@ class LoadTest(unittest.TestCase):
          # Oracle: tester-brief.md, Task 4, Interfaces and signed starting oracle line 656.
          # Mutation: Permit custom token budgets without usage reported.
          self.assertIn("profiles.c.budget.unit",
@@ -120,7 +120,7 @@ index 2d10aff..554db1f 100644
          self.assertTrue(d.profiles["c"].usage_reported)
  
      def test_usage_is_only_for_custom(self):
-@@ -417,6 +424,10 @@ class DeployLeafCoverageTest(unittest.TestCase):
+@@ -419,6 +426,10 @@ class DeployLeafCoverageTest(unittest.TestCase):
              ("profiles.*.concurrency", "concurrency", 2, 3, 2, 3),
              # None here means omitted: usage has only one accepted explicit value.
              ("profiles.*.usage", "usage_reported", None, "reported", False, True),
@@ -131,7 +131,7 @@ index 2d10aff..554db1f 100644
              ("profiles.*.limit_backoff_seconds", "limit_backoff_seconds", 17, 19, 17, 19),
              ("profiles.*.budget.unit", "budget_unit", "tokens", "passes", "tokens", "passes"),
              ("profiles.*.budget.daily", "budget_daily", 101, 103, 101, 103),
-@@ -447,8 +458,11 @@ class DeployLeafCoverageTest(unittest.TestCase):
+@@ -449,8 +460,11 @@ class DeployLeafCoverageTest(unittest.TestCase):
                  for value in (before, after):
                      doc = {"profiles": {"o": profile()}}
                      if path == "profiles.*.usage":
@@ -145,7 +145,7 @@ index 2d10aff..554db1f 100644
                      concrete = path.replace("profiles.*.", "profiles.o.")
                      concrete = concrete.replace("overrides.*", "overrides.api")
                      keys = concrete.split(".")
-@@ -462,3 +476,67 @@ class DeployLeafCoverageTest(unittest.TestCase):
+@@ -464,3 +478,67 @@ class DeployLeafCoverageTest(unittest.TestCase):
                      observed.append(getattr(target, field))
                  self.assertEqual(observed, [expected_before, expected_after])
                  self.assertNotEqual(observed[0], observed[1], "declared leaf has no observable effect")
