@@ -33,22 +33,22 @@ The spec and the overview leave these open, and each one changes code. They are 
 
 1. **2a reviews in `auto` mode only.** A repo whose config asks for `trigger: requested` is shown as a config problem on its check runs ("arrives in phase 2b") rather than reviewed against its wishes.
 2. **The org file is `.github/claudebox.json` in `<owner>/.github`**, read at the default branch. A read that fails is "no org defaults". The org `.github` repo is never itself reviewed.
-3. **A poll per installation lists its repos.** A repo that is public is passed over, and one that turned public since the last poll is lost. A repo gone from the list is lost. An installation gone from `App.installations()`, or one carrying `suspended_at`, loses all its repos. Losing a repo ends its jobs (their started pairs `revoked`), calls 2a.4a's three deleters (`Outbox.drop_repo`, `Committer.forget_repo`, `CheckRuns.forget_repo`), and forgets its fingerprint cache. Its rounds survive.
-4. **Every non-fork candidate head gets a check run**, created once, whether or not anything is dispatched for it. A repo with a config problem shows it on every head's run and dispatches nothing.
-5. **The change gate is local mode's.** A PR's fingerprint is its head, its mode and the newest unsigned comment, and comments, reviews and the 30 newest inline comments are read only when the PR's `updated_at` has moved. A comment lookup that fails gates on `updated_at` through `signals.degraded`. A PR younger than the deployment's `settle_seconds` waits.
+3. **A poll per installation lists its repos.** A repo that is public is passed over, and one that turned public since the last poll is lost. A repo gone from the list is lost. An installation gone from `App.installations()`, or one carrying `suspended_at`, loses all its repos. Losing a repo ends its jobs (their started pairs `revoked`), calls 2a.4a's three deleters (`Outbox.drop_repo`, `Committer.forget_repo`, `CheckRuns.forget_repo`), and forgets its fingerprint cache. Its rounds survive, as the spec's "Visibility" says ("Rounds and asks survive a public flip, since they hold no content"). A returning pair starts a fresh session at its next round, as one does after `MAX_PASSES_PER_SESSION` rotation. Its earlier rounds' findings are still on the PR, signed, and with no committed fingerprint its round line reads the local wording, which works from those comments.
+4. **Every non-fork candidate head gets a check run**, created once, whether or not anything is dispatched for it. A repo with a config problem shows it on every head's run and dispatches nothing. A problem in either file is a config problem, even when the other file is valid: `repo_config.resolve` would fall back to the other's config, and a broken file must never be replaced in silence. Each poll writes its answer onto the head, so a problem fixed since (a `config apply`, an edit on the default branch) stops showing without a push.
+5. **The change gate is local mode's**, `signals.Tracker`, one per repo since a Tracker keys by PR number. A PR's fingerprint is its head, its mode and the newest unsigned comment, and comments, reviews and the 30 newest inline comments are read only when the PR's `updated_at` has moved. A failed lookup is cached against that `updated_at` too, so an outage costs one lookup per change, and the PR gates on `updated_at` through `signals.degraded`. A PR younger than the deployment's `settle_seconds` waits.
 6. **Dispatch bounds.** A PR with a live job is not dispatched again. A pair parked by the commit point waits while its siblings run, and a parked profile dispatches nothing. `max_concurrent_jobs` counts jobs, and a profile's `concurrency` counts pairs in flight (dispatched and not completed) across its jobs. A poll stops dispatching at the first refusal by `max_concurrent_jobs`.
 7. **Visibility is checked again at dispatch**, uncached, and a check that errors dispatches nothing.
 8. **A job's material is built once, at dispatch.** The prompts are `build_hosted`'s, with `WORKTREE_STANZA` exactly when `shared_worktree` is true, and `shared_worktree` is true when any phase of this job's pairs runs two at once (`min(cap, n) > 1`, a cap of 0 meaning `n`). A pair with a session gets the followup prompt. A pair's round line names the head of its committed fingerprint (`Committer.last_reviewed_head`). When that head is no longer an ancestor of the new one, the round line is round 1's and the check run says the branch was rewritten. An ancestry check that errors counts as a rewrite, since a whole review beats a guess.
 9. **The reap ends a job** when runnerd lists its worker as gone or exited, when its 55-minute deadline has passed, or when its bootstrap token expired unused. Ending a job revokes its credentials, tells the gateway to revoke its unfinished pairs' tokens, marks each started pair `revoked` (`Committer.revoke`, and `checkruns.REVOKED` on the run), owes each unstarted pair, stops its worker, forgets its outbox keys and `settled` entries, and writes `ended_at` and `end_reason` on its row.
 10. **The deployment config is the records store's `deploy_config` row**, re-read on each poll when its `applied_at` moves. A stored config that does not load (one written by another version) keeps the last good one and warns. The outbox's two caps follow it.
-11. **The control plane's startup**, on taking the lock: `Creds.revoke_all`, runnerd's `stop_all` (a failure warns, since every credential is already revoked), every transcript blob deleted, and an empty `hello` (a gateway not yet answering gets its hello on its first reply). The gateway's reports are refused until the lock is held, and its Reporter retries them.
+11. **The control plane's startup.** A not-configured instance touches nothing on the volume. Otherwise it takes the lock on `<data>/control.lock` (overview decision 13) before it opens the records store, answering `/healthz` "waiting for lock" meanwhile. On taking it: `Creds.revoke_all`, runnerd's `stop_all` (a failure warns, since every credential is already revoked), every transcript blob deleted, and an empty `hello` (a gateway not yet answering gets its hello on its first reply). The gateway's reports are refused until the lock is held, and its Reporter retries them.
 12. **The gateway link opens one connection per call** and waits up to 60 seconds, since a flush may be held for 50. A reply of "hello first" is answered with a `hello` and the call is sent again once. A `hello` carries every live provider token whose job is in memory, with that job's model and route and the token's committed counts. A live token with no job is revoked as the `hello` is built.
 13. **`SIGTERM` drains.** The control plane stops dispatching, reaps until no job is left or `CLAUDEBOX_DRAIN_SECONDS` (default 600) has passed, and ends what is left as "the control plane is stopping". The supervisor gives it the deadline plus 15 seconds, then stops the gateway and runnerd and kills whatever is left. Reports a gateway sends after the control plane has gone concern revoked tokens only, and 2a has no budgets, so none of them is needed.
 14. **`/healthz` is its own server on port 8081.** It answers 200 with the state (`waiting for lock`, `not configured`, `serving` or `draining`), and 503 when the poll or drain loop has died.
-15. **The supervisor's secrets split.** The control plane's are a closed list (`GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET`, `CLAUDEBOX_DEPLOYMENT_KEY`). A provider credential is anything else in the platform environment that is not a supervisor setting or an ordinary process variable, because the deployment file that names them lives in the records store, which only the control plane can read. The gateway gets the provider credentials, the control plane gets each as `CLAUDEBOX_SCAN_<NAME>` for the scanner, and runnerd gets none. The secrets between processes (`GATEWAY_SECRET`, `RUNNER_SECRET`) are random per container start. Nothing else from the platform environment crosses.
+15. **The supervisor's secrets split.** The control plane's are a closed list (`GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET`, `CLAUDEBOX_DEPLOYMENT_KEY`). A provider credential is anything else in the platform environment that is not a supervisor setting or an ordinary process variable, because the deployment file that names them lives in the records store, which only the control plane can read. The gateway gets the provider credentials, the control plane gets each as `CLAUDEBOX_SCAN_<NAME>` for the scanner, and runnerd gets none. The secrets between processes (`GATEWAY_SECRET`, `RUNNER_SECRET`) are random per container start. They, the socket paths, the gateway's listener and `CLAUDEBOX_DATA` are reserved: never a credential, and never taken from the platform. The control plane's own settings (`PERSONA_DIR`, `CHANNEL_LISTEN`, `HEALTH_LISTEN`) are forwarded to it alone. Nothing else from the platform environment crosses. A malformed App key or deployment key is named in the log, and the instance is not configured.
 16. **The supervisor stays root, with only `SETUID`, `SETGID` and `KILL`.** The spec says it "then drops to an unprivileged uid itself". A process that changes uid can no longer signal processes under other uids, and the drain depends on signalling the control plane, so it does not drop. It parses no input, opens no socket, and runs nothing after its three children start.
 17. **One process exiting stops the container, and the restarts are bounded.** The supervisor logs a `PAGE:` line naming the process, stops the other two in the drain's order and exits 1. Every restart re-reviews every open PR (overview decision 1), so a child that dies on every start would re-review the whole installation each time Docker brought it back. `compose.json` therefore restarts on failure at most three times, and then the container stays down for a person. The cost is that a host reboot does not bring the control plane back by itself: `hosted deploy` (2a.5) starts it.
-18. **The image is `debian:bookworm-slim`** with `python3` and `python3-cryptography`, and the Docker CLI copied from `docker:27.3.1-cli`. Its code is root-owned. `/data` is `control`'s, mode 0700. The sockets live in `/run/claudebox`, owned by `root:claudebox` with mode 2770, so each socket takes the shared group. The build runs `test_hosted_crypto.py` and fails if any test skips.
+18. **The image is `debian:bookworm-slim`** with `python3` and `python3-cryptography`, and the Docker CLI copied from `docker:27.3.1-cli`. Its code is root-owned. The three users and the shared group have pinned ids (9001 to 9003, and 9000), because `/data` is a volume that keeps its owner across rebuilds. `/data` is `control`'s, mode 0700. Each socket has its own directory, `/run/claudebox/<user>`, owned by the process that binds it, in the shared group, mode 2750: a peer can connect, and can neither unlink the socket nor bind its own in its place. The build runs `test_hosted_crypto.py` and fails if any test skips.
 19. **`hosted/compose.json`** runs the container with `cap_drop: ALL` and the supervisor's three capabilities, `no-new-privileges`, a named volume at `/data`, the Docker socket for runnerd, `restart: on-failure:3` (decision 17), a `claudebox` network the workers join, an 11-minute stop grace period (the drain's 600 seconds plus both 15-second graces fit inside it), and only `/healthz` published, on loopback. The worker image is built by `docker compose --profile build build`.
 20. **The App key may arrive on one line**, with its newlines written as the two characters `\n`, because `docker run --env-file` holds one line per variable. Only that pair is translated, and only in a value with no real newline.
 21. **Phase 1 finding F5:** `plan.label` refuses any whitespace inside the label other than a plain space, in the loader and in the schema's pattern. **F6:** an empty persona selector in a repo file is reported against its key (`code.personas` or `plan.personas`), never as an environment variable to unset.
@@ -507,6 +507,23 @@ class GateTest(Base):
         self.inst.prs = [pr(updated="2025-10-09T08:20:00Z")]
         self.assertEqual(self.poll(), 1)
 
+    def test_a_failed_comment_lookup_is_not_repeated_until_updated_at_moves(self):
+        # PR #22 review: local mode's Tracker caches the failure too.
+        calls = []
+
+        def failing(repo, n):
+            calls.append(n)
+            raise GitHubError(502, "x")
+        self.inst.issue_comments = failing
+        self.poll()
+        self.sched.end_job(self.jobs.all()[0], "test")
+        self.poll()
+        self.assertEqual(len(calls), 1)
+        self.inst.prs = [pr(updated="2025-10-09T08:30:00Z")]
+        self.sched.end_job(self.jobs.all()[0], "test") if self.jobs.all() else None
+        self.poll()
+        self.assertEqual(len(calls), 2)
+
     def test_claudebox_own_comment_does_not(self):
         self.poll()
         self.finish(self.jobs.all()[0])
@@ -565,6 +582,26 @@ class ConfigTest(Base):
             {"profile": "ollama", "code": {"personas": "sme"}}).encode()
         self.poll()
         self.assertEqual([p.persona for p in self.jobs.all()[0].pairs], ["sme"])
+
+    def test_a_config_problem_fixed_since_stops_showing_on_the_same_head(self):
+        # PR #22 review: a deployment-side fix moves no PR's head.
+        self.inst.files[("acme/web", ".github/claudebox.json")] = b'{"profile": "nope"}'
+        self.poll()
+        self.inst.files[("acme/web", ".github/claudebox.json")] = json.dumps(
+            {"profile": "ollama"}).encode()
+        self.assertEqual(self.poll(), 1)
+        self.assertNotEqual(self.inst.updated[-1][2], "Configuration invalid")
+
+    def test_a_broken_file_is_never_replaced_by_the_others_config_in_silence(self):
+        # PR #22 review: either file invalid means not reviewed, and the run says why.
+        for repo_file, org_file, words in (
+                (b'{"plan": {"label": ""}}', b'{"profile": "ollama"}', "repo file"),
+                (b'{"profile": "ollama"}', b'{"plan": {"label": ""}}', "org file")):
+            with self.subTest(words=words):
+                self.inst.files[("acme/web", ".github/claudebox.json")] = repo_file
+                self.inst.files[("acme/.github", ".github/claudebox.json")] = org_file
+                self.assertEqual(self.poll(), 0)
+                self.assertIn(words, self.inst.updated[-1][3])
 
     def test_requested_mode_is_shown_as_not_yet_supported(self):
         self.inst.files[("acme/web", ".github/claudebox.json")] = json.dumps(
@@ -770,7 +807,7 @@ class Scheduler:
         self.runtimes: Dict[str, _Runtime] = {}
         self.installation_of: Dict[str, int] = {}
         self.config_problems: Dict[str, str] = {}
-        self._signals: Dict[Tuple[str, int], Tuple[str, str]] = {}
+        self.trackers: Dict[str, signals_mod.Tracker] = {}   # one per repo: a Tracker keys by PR number
         self._full = False
 
     # -- the decision core per repo ----------------------------------------------
@@ -818,7 +855,9 @@ class Scheduler:
             org_data = None   # an unreadable org .github repo is "no org defaults"
         res = repo_config.resolve(org_data, repo_data, self.persona_dir)
         problems = res.repo_problems + res.org_problems
-        if res.config is None:
+        # A broken file is never silently replaced by the other one's config:
+        # the repo is not reviewed until it is fixed, and its runs say why.
+        if problems:
             return None, None, "\n".join(problems)
         cfg = res.config
         if cfg.trigger != "auto":
@@ -882,8 +921,10 @@ class Scheduler:
             labels = {l.get("name") for l in pr.get("labels") or []}
             mode = "plan" if label in labels else "code"
             self.check_runs.ensure(full, head)
+            # Every poll writes its answer, so a problem fixed since (a config
+            # apply, an edit on the default branch) stops showing on this head.
+            self.check_runs.set_config_problem(full, head, problem)
             if problem:
-                self.check_runs.set_config_problem(full, head, problem)
                 self.check_runs.publish(full, head)
                 continue
             if any(j.repo == full and j.pr == n for j in self.jobs.all()):
@@ -913,21 +954,26 @@ class Scheduler:
         return dispatched
 
     def _signal(self, inst, full: str, n: int, head: str, mode: str, updated_at: str):
-        """The PR's fingerprint, fetching comments only when updatedAt moved."""
-        cached = self._signals.get((full, n))
-        if cached is not None and cached[0] == updated_at and updated_at:
-            return signals_mod.Signal(head, mode, cached[1])
-        try:
-            entries = [(c.get("created_at"), c.get("body")) for c in inst.issue_comments(full, n)]
-            entries += [(r.get("submitted_at"), r.get("body")) for r in inst.reviews(full, n)]
-            entries += [(c.get("created_at"), c.get("body"))
-                        for c in inst.newest_review_comments(full, n)]
-        except GitHubError as exc:
-            self.log(f"WARN: {full}#{n}: comment lookup failed ({exc}); gating on updatedAt")
-            return signals_mod.degraded(_Snapshot(head, mode, updated_at))
-        newest = signals_mod.newest_unsigned(entries)
-        self._signals[(full, n)] = (updated_at, newest)
-        return signals_mod.Signal(head, mode, newest)
+        """The PR's fingerprint, through the repo's signals.Tracker, as local mode reads it.
+
+        The Tracker caches a failed lookup against updatedAt too, so a GitHub
+        outage costs one lookup per updatedAt change rather than one per poll.
+        """
+        snapshot = _Snapshot(n, head, mode, updated_at)
+
+        def fetch(snap):
+            try:
+                entries = [(c.get("created_at"), c.get("body")) for c in inst.issue_comments(full, n)]
+                entries += [(r.get("submitted_at"), r.get("body")) for r in inst.reviews(full, n)]
+                entries += [(c.get("created_at"), c.get("body"))
+                            for c in inst.newest_review_comments(full, n)]
+            except GitHubError as exc:
+                self.log(f"WARN: {full}#{n}: comment lookup failed ({exc}); gating on updatedAt")
+                return None
+            return signals_mod.Signal(head, mode, signals_mod.newest_unsigned(entries))
+        tracker = self.trackers.setdefault(full, signals_mod.Tracker())
+        signal = tracker.signal_for(snapshot, fetch)
+        return signal if signal is not None else signals_mod.degraded(snapshot)
 
     # -- dispatch ----------------------------------------------------------------
     def dispatch(self, inst, installation_id, info, cfg, model, decider, n, head, mode,
@@ -1070,8 +1116,7 @@ class Scheduler:
                 state.owed = set()
             self.runtimes.pop(repo, None)
             self.installation_of.pop(repo, None)
-            for key in [k for k in self._signals if k[0] == repo]:
-                del self._signals[key]
+            self.trackers.pop(repo, None)
         self.log(f"{repo}: not reviewed, because {reason}; dropped {dropped} queued finding(s)")
 
     def _publish(self, repo: str, head: str) -> None:
@@ -1083,7 +1128,8 @@ class Scheduler:
 
 @dataclass(frozen=True)
 class _Snapshot:
-    """The fields signals.degraded reads, from a PR the REST API listed."""
+    """The fields signals.Tracker and signals.degraded read, from a PR the REST API listed."""
+    number: int
     head_oid: str
     mode: str
     updated_at: str
@@ -1092,7 +1138,7 @@ class _Snapshot:
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_scheduler.py'`, then `./test-python.sh`
-Expected: PASS, 33 tests. The whole suite passes.
+Expected: PASS, 36 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
@@ -1135,7 +1181,7 @@ import creds
 import gwproto
 from blobs import Blobs
 from control import (DRAINING, NOT_CONFIGURED, SERVING, WAITING, ControlPlane, GatewayLink,
-                     health_server, pem_from_env)
+                     health_server, keys_from_env, pem_from_env, _Status, LOCK_FILE)
 from records import InstanceLock, Records
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
@@ -1389,6 +1435,18 @@ class HealthTest(Base):
     def test_waiting_for_the_lock_answers_200_so_the_old_instance_is_told_to_stop(self):
         self.assertEqual(self.get(), (200, "waiting for lock"))
 
+    def test_before_a_control_plane_exists_it_reports_its_own_state(self):
+        status = _Status()
+        self.assertEqual((status.state, status.healthy()), (WAITING, True))
+        status.state = NOT_CONFIGURED
+        self.assertEqual(status.state, NOT_CONFIGURED)
+        status.current = self.control
+        self.control.state = SERVING
+        self.assertEqual(status.state, SERVING)
+
+    def test_the_lock_file_has_decision_13s_name(self):
+        self.assertEqual(LOCK_FILE, "control.lock")
+
     def test_a_dead_loop_answers_503(self):
         self.control.state = SERVING
         dead = threading.Thread(target=lambda: None)
@@ -1404,6 +1462,49 @@ class PemTest(unittest.TestCase):
         self.assertEqual(pem_from_env(real), real.encode())
         self.assertEqual(pem_from_env("-----BEGIN KEY-----\\nAAA\\n-----END KEY-----"),
                          b"-----BEGIN KEY-----\nAAA\n-----END KEY-----")
+
+
+class KeysTest(unittest.TestCase):
+    """A malformed key is named and leaves the deployment not configured (PR #22 review)."""
+
+    class Crypto:
+        class CryptoError(Exception):
+            pass
+
+        def __init__(self, bad=()):
+            self.bad = bad
+
+        def decode_key(self, text):
+            if "deploy" in self.bad:
+                raise self.CryptoError("the deployment key must be 32 bytes; got 3")
+            return text
+
+        def AesGcmSealer(self, key):
+            return ("sealer", key)
+
+        def Rs256Signer(self, pem):
+            if "app" in self.bad:
+                raise self.CryptoError("the App private key is not an unencrypted PEM key")
+            return ("signer", pem)
+
+    ENV = {"CLAUDEBOX_DEPLOYMENT_KEY": "dk", "GITHUB_APP_PRIVATE_KEY": "pem", "GITHUB_APP_ID": "1"}
+
+    def keys(self, bad=()):
+        logs = []
+        sealer, app = keys_from_env(self.ENV, self.Crypto(bad), lambda i, s: ("app", i, s),
+                                    log=logs.append)
+        return sealer, app, logs
+
+    def test_good_keys_build_both(self):
+        sealer, app, logs = self.keys()
+        self.assertEqual((sealer, app[1], logs), (("sealer", "dk"), "1", []))
+
+    def test_each_malformed_key_is_named_and_there_is_no_app(self):
+        for bad, name in (("deploy", "CLAUDEBOX_DEPLOYMENT_KEY"), ("app", "GITHUB_APP_PRIVATE_KEY")):
+            with self.subTest(bad=bad):
+                _, app, logs = self.keys((bad,))
+                self.assertIsNone(app)
+                self.assertTrue(logs[0].startswith(name + ": "), logs)
 
 
 class GatewayLinkTest(unittest.TestCase):
@@ -1484,6 +1585,7 @@ from scheduler import Scheduler
 WAITING, NOT_CONFIGURED, SERVING, DRAINING = ("waiting for lock", "not configured", "serving",
                                               "draining")
 LOCK_RETRY_SECONDS = 5
+LOCK_FILE = "control.lock"    # overview decision 13's name, and 2a.1's test's
 DRAIN_SECONDS = 600            # the spec's local and Fly grace period
 GATEWAY_TIMEOUT = 60.0         # the gateway may hold a flush for 50 seconds
 SCAN_PREFIX = "CLAUDEBOX_SCAN_"
@@ -1714,7 +1816,27 @@ class ControlPlane:
         return len(left)
 
 
-def health_server(control: ControlPlane, host: str, port: int) -> http.server.ThreadingHTTPServer:
+class _Status:
+    """What /healthz reports: "waiting for lock" or "not configured" before a
+    ControlPlane exists, and the ControlPlane's own state once it does."""
+
+    def __init__(self):
+        self.current: Optional[ControlPlane] = None
+        self._state = WAITING
+
+    @property
+    def state(self) -> str:
+        return self.current.state if self.current is not None else self._state
+
+    @state.setter
+    def state(self, value: str) -> None:
+        self._state = value
+
+    def healthy(self) -> bool:
+        return self.current.healthy() if self.current is not None else True
+
+
+def health_server(control, host: str, port: int) -> http.server.ThreadingHTTPServer:
     class Health(http.server.BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             pass
@@ -1749,6 +1871,27 @@ def pem_from_env(value: str) -> bytes:
     return value.encode()
 
 
+def keys_from_env(env: Mapping[str, str], crypto_mod, app_cls,
+                  log: Callable[[str], None] = lambda line: print(line, flush=True)):
+    """(sealer, app) from the deployment key and the App key, or None for each one malformed.
+
+    A key that is present but malformed is the same unfinished deployment as
+    a missing one: named, and not configured, never a crash loop. The App is
+    built only when both keys are good, since blobs need the sealer.
+    """
+    sealer = signer = None
+    try:
+        sealer = crypto_mod.AesGcmSealer(crypto_mod.decode_key(env["CLAUDEBOX_DEPLOYMENT_KEY"]))
+    except crypto_mod.CryptoError as exc:
+        log(f"CLAUDEBOX_DEPLOYMENT_KEY: {exc}")
+    try:
+        signer = crypto_mod.Rs256Signer(pem_from_env(env["GITHUB_APP_PRIVATE_KEY"]))
+    except crypto_mod.CryptoError as exc:
+        log(f"GITHUB_APP_PRIVATE_KEY: {exc}")
+    app = app_cls(env["GITHUB_APP_ID"], signer) if sealer is not None and signer is not None else None
+    return sealer, app
+
+
 def _listen(value: str, default_port: int):
     host, _, port = value.rpartition(":")
     return host or "0.0.0.0", int(port or default_port)
@@ -1766,17 +1909,30 @@ def main(env: Mapping[str, str] = os.environ) -> None:
     # the main thread's sigwait is the one place a stop is handled.
     signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
     data = env.get("CLAUDEBOX_DATA", "/data")
-    records = Records(os.path.join(data, "records.db"))
-    lock = InstanceLock(os.path.join(data, "records.lock"))
+    status = _Status()
+    health = health_server(status, *_listen(env.get("HEALTH_LISTEN", "0.0.0.0:8081"), 8081))
+    threading.Thread(target=health.serve_forever, daemon=True).start()
     app_id, key = env.get("GITHUB_APP_ID"), env.get("GITHUB_APP_PRIVATE_KEY")
     deployment_key = env.get("CLAUDEBOX_DEPLOYMENT_KEY")
-    configured = bool(app_id and key and deployment_key)
     # Not configured: /healthz answers and nothing else happens (the spec's
-    # "Bringing a deployment up"). Nothing is decoded until all three exist.
-    sealer = crypto.AesGcmSealer(crypto.decode_key(deployment_key)) if configured else None
+    # "Bringing a deployment up"). Nothing is decoded until all three exist,
+    # and the records store is not touched.
+    sealer, app = (keys_from_env(env, crypto, App) if app_id and key and deployment_key
+                   else (None, None))
+    if app is None:
+        status.state = NOT_CONFIGURED
+        print("not configured: the App credentials or the deployment key are missing or "
+              "malformed (run `claudebox.sh hosted deploy`, then `claudebox.sh app create`)",
+              flush=True)
+        signal.sigwait({signal.SIGTERM, signal.SIGINT})
+        return
+    # Overview decision 13: the lock is taken before the records store is opened.
+    lock = InstanceLock(os.path.join(data, LOCK_FILE))
+    while not lock.try_acquire():
+        time.sleep(LOCK_RETRY_SECONDS)
+    records = Records(os.path.join(data, "records.db"))
     blob_store = blobs_mod.Blobs(os.path.join(data, "blobs"), sealer)
     creds = creds_mod.Creds(records)
-    app = App(app_id, crypto.Rs256Signer(pem_from_env(key))) if configured else None
     runner = RunnerClient(gwproto.Client(env["RUNNER_SOCKET"], env["RUNNER_SECRET"]))
     control: Optional[ControlPlane] = None
     link = GatewayLink(env["GATEWAY_SOCKET"], env["GATEWAY_SECRET"],
@@ -1784,16 +1940,8 @@ def main(env: Mapping[str, str] = os.environ) -> None:
     control = ControlPlane(records, lock, creds, blob_store, app, runner, link, env,
                            env.get("PERSONA_DIR", "/opt/claudebox/personas"),
                            env["CLAUDEBOX_CHANNEL_URL"], env["CLAUDEBOX_GATEWAY_URL"])
-    health = health_server(control, *_listen(env.get("HEALTH_LISTEN", "0.0.0.0:8081"), 8081))
-    threading.Thread(target=health.serve_forever, daemon=True).start()
-    if app is None:
-        control.state = NOT_CONFIGURED
-        control.log("not configured: no App credentials or deployment key yet "
-                    "(run `claudebox.sh hosted deploy`, then `claudebox.sh app create`)")
-        signal.sigwait({signal.SIGTERM, signal.SIGINT})
-        return
-    while not control.take_lock():
-        time.sleep(LOCK_RETRY_SECONDS)
+    control.take_lock()   # held already: this runs the startup
+    status.current = control
     reports = gwproto.Server(env["CONTROL_SOCKET"], env["GATEWAY_SECRET"],
                              control.handle_report).start()
     channel = make_channel_server(control.channel, *_listen(env.get("CHANNEL_LISTEN",
@@ -1815,7 +1963,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_control.py'`, then `./test-python.sh`
-Expected: PASS, 19 tests. The whole suite passes.
+Expected: PASS, 23 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
@@ -1893,6 +2041,30 @@ class EnvSplitTest(unittest.TestCase):
             self.assertNotIn("LC_ALL", env)
             self.assertNotIn("lowercase", env)
             self.assertEqual(env["PATH"], "/usr/local/bin:/usr/bin:/bin")
+
+    def test_the_control_planes_settings_reach_it_and_are_never_filed_as_credentials(self):
+        # PR #22 review: these were read by control.main and never forwarded.
+        env = dict(PLATFORM, PERSONA_DIR="/personas", HEALTH_LISTEN="0.0.0.0:9090",
+                   CHANNEL_LISTEN="0.0.0.0:9080", CLAUDEBOX_DATA="/elsewhere")
+        envs = split_env(env, "g", "r")
+        self.assertEqual((envs["control"]["PERSONA_DIR"], envs["control"]["HEALTH_LISTEN"],
+                          envs["control"]["CHANNEL_LISTEN"]), ("/personas", "0.0.0.0:9090",
+                                                               "0.0.0.0:9080"))
+        self.assertEqual(envs["control"]["CLAUDEBOX_DATA"], "/data")
+        for name in ("PERSONA_DIR", "HEALTH_LISTEN", "CHANNEL_LISTEN", "CLAUDEBOX_DATA"):
+            self.assertNotIn(name, envs["gateway"])
+            self.assertNotIn("CLAUDEBOX_SCAN_" + name, envs["control"])
+
+    def test_the_platform_cannot_set_what_the_supervisor_generates(self):
+        # PR #22 review: these crossed as "credentials" and overrode the gateway's.
+        env = dict(PLATFORM, GATEWAY_SECRET="pinned", CONTROL_SOCKET="/elsewhere",
+                   GATEWAY_LISTEN="0.0.0.0:1", RUNNER_SECRET="x")
+        envs = split_env(env, "gws", "rns")
+        self.assertEqual(envs["gateway"]["GATEWAY_SECRET"], "gws")
+        self.assertEqual(envs["gateway"]["CONTROL_SOCKET"], envs["control"]["CONTROL_SOCKET"])
+        self.assertEqual(envs["gateway"]["GATEWAY_LISTEN"], "0.0.0.0:8090")
+        self.assertNotIn("RUNNER_SECRET", envs["gateway"])
+        self.assertNotIn("CLAUDEBOX_SCAN_GATEWAY_SECRET", envs["control"])
 
     def test_provider_secrets_are_what_is_left(self):
         self.assertEqual(set(provider_secrets(PLATFORM)),
@@ -2027,18 +2199,26 @@ from typing import Callable, Dict, List, Mapping, Optional, Sequence
 
 CONTROL_SECRETS = ("GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY", "GITHUB_WEBHOOK_SECRET",
                    "CLAUDEBOX_DEPLOYMENT_KEY")
+# The supervisor's own settings, and the control plane's that it forwards.
+# CLAUDEBOX_DATA is listed so it is never filed as a credential; the volume's
+# path is fixed by the image, so its value is not forwarded.
+CONTROL_SETTINGS = ("PERSONA_DIR", "CHANNEL_LISTEN", "HEALTH_LISTEN")
 SETTINGS = ("CLAUDEBOX_CHANNEL_URL", "CLAUDEBOX_GATEWAY_URL", "CLAUDEBOX_DRAIN_SECONDS",
-            "WORKER_IMAGE", "WORKER_NETWORK", "DOCKER_SOCKET")
+            "WORKER_IMAGE", "WORKER_NETWORK", "DOCKER_SOCKET", "CLAUDEBOX_DATA") + CONTROL_SETTINGS
 PROCESS_VARS = frozenset({"PATH", "HOME", "HOSTNAME", "TERM", "LANG", "PWD", "SHLVL", "_",
                           "PYTHONUNBUFFERED", "PYTHONDONTWRITEBYTECODE", "TZ"})
 RUN_DIR = "/run/claudebox"
+# Generated or fixed by the supervisor for its children; never a credential,
+# and never taken from the platform environment.
+RESERVED = frozenset({"GATEWAY_SECRET", "RUNNER_SECRET", "GATEWAY_SOCKET", "CONTROL_SOCKET",
+                      "RUNNER_SOCKET", "GATEWAY_LISTEN", "PYTHONPATH", "CLAUDEBOX_DATA"})
 DATA_DIR = "/data"
 HOSTED = "/opt/claudebox/hosted"
 GRACE_SECONDS = 15
 
 
 def provider_secrets(env: Mapping[str, str]) -> Dict[str, str]:
-    skip = set(CONTROL_SECRETS) | set(SETTINGS) | PROCESS_VARS
+    skip = set(CONTROL_SECRETS) | set(SETTINGS) | PROCESS_VARS | RESERVED
     return {k: v for k, v in env.items()
             if k not in skip and not k.startswith("LC_") and k.replace("_", "").isalnum()
             and k[:1].isalpha() and k.upper() == k}
@@ -2048,9 +2228,11 @@ def split_env(env: Mapping[str, str], gateway_secret: str, runner_secret: str) -
     """Each process's whole environment. Nothing else crosses."""
     base = {"PATH": "/usr/local/bin:/usr/bin:/bin", "PYTHONUNBUFFERED": "1",
             "PYTHONPATH": f"/opt/claudebox/reviewer:{HOSTED}"}
-    sockets = {"GATEWAY_SOCKET": f"{RUN_DIR}/gateway.sock",
-               "CONTROL_SOCKET": f"{RUN_DIR}/control.sock",
-               "RUNNER_SOCKET": f"{RUN_DIR}/runner.sock"}
+    # One directory per socket, owned by the process that binds it: a peer in
+    # the shared group can connect but can neither unlink nor replace it.
+    sockets = {"GATEWAY_SOCKET": f"{RUN_DIR}/gateway/gateway.sock",
+               "CONTROL_SOCKET": f"{RUN_DIR}/control/control.sock",
+               "RUNNER_SOCKET": f"{RUN_DIR}/runner/runner.sock"}
     providers = provider_secrets(env)
     drain = env.get("CLAUDEBOX_DRAIN_SECONDS", "600")
     control = dict(base, HOME="/home/control", CLAUDEBOX_DATA=DATA_DIR,
@@ -2060,11 +2242,12 @@ def split_env(env: Mapping[str, str], gateway_secret: str, runner_secret: str) -
                    CLAUDEBOX_GATEWAY_URL=env.get("CLAUDEBOX_GATEWAY_URL",
                                                  "http://claudebox:8090"),
                    CLAUDEBOX_DRAIN_SECONDS=drain, **sockets)
-    control.update({k: env[k] for k in CONTROL_SECRETS if env.get(k)})
+    control.update({k: env[k] for k in CONTROL_SECRETS + CONTROL_SETTINGS if env.get(k)})
     control.update({f"CLAUDEBOX_SCAN_{k}": v for k, v in providers.items() if v})
-    gateway = dict(base, HOME="/home/gateway", GATEWAY_SECRET=gateway_secret,
+    gateway = dict(providers)
+    gateway.update(base, HOME="/home/gateway", GATEWAY_SECRET=gateway_secret,
                    GATEWAY_SOCKET=sockets["GATEWAY_SOCKET"], CONTROL_SOCKET=sockets["CONTROL_SOCKET"],
-                   GATEWAY_LISTEN="0.0.0.0:8090", **providers)
+                   GATEWAY_LISTEN="0.0.0.0:8090")
     runner = dict(base, HOME="/home/runner", RUNNER_SECRET=runner_secret,
                   RUNNER_SOCKET=sockets["RUNNER_SOCKET"],
                   WORKER_IMAGE=env.get("WORKER_IMAGE", "claudebox-worker"),
@@ -2175,7 +2358,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_supervisor.py'`, then `./test-python.sh`
-Expected: PASS, 12 tests. The whole suite passes.
+Expected: PASS, 14 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
@@ -2263,12 +2446,28 @@ class DockerfileTest(unittest.TestCase):
     def setUp(self):
         self.text = read("hosted/Dockerfile")
 
-    def test_it_creates_every_user_the_supervisor_starts(self):
-        users = re.search(r"for u in ([a-z ]+); do", self.text).group(1).split()
-        self.assertEqual(sorted(users), sorted(s.user for s in supervisor.specs(None)))
+    def pairs(self):
+        return [p.split(":") for p in re.search(r"for pair in ([a-z0-9: ]+); do",
+                                                 self.text).group(1).split()]
 
-    def test_the_socket_directory_is_group_shared_and_setgid(self):
-        self.assertIn(f"install -d -o root -g claudebox -m 2770 {supervisor.RUN_DIR}", self.text)
+    def test_it_creates_every_user_the_supervisor_starts_with_a_pinned_id(self):
+        # /data is a volume that keeps its owner across rebuilds (PR #22 review).
+        self.assertEqual(sorted(u for u, _ in self.pairs()),
+                         sorted(s.user for s in supervisor.specs(None)))
+        self.assertTrue(all(i.isdigit() for _, i in self.pairs()))
+        self.assertIn("groupadd --gid 9000 claudebox", self.text)
+        self.assertIn("useradd --uid $id --gid $id", self.text)
+
+    def test_each_socket_has_a_directory_only_its_binder_can_write(self):
+        # A peer in the shared group could otherwise unlink and replace it (PR #22 review).
+        self.assertIn("install -d -o $u -g claudebox -m 2750 /run/claudebox/$u", self.text)
+        self.assertNotIn("2770", self.text)
+        envs = supervisor.split_env({}, "g", "r")
+        owner = {"GATEWAY_SOCKET": "gateway", "CONTROL_SOCKET": "control", "RUNNER_SOCKET": "runner"}
+        for name, user in owner.items():
+            self.assertEqual(os.path.dirname(envs["control"].get(name) or envs["gateway"].get(name)
+                                             or envs["runnerd"][name]),
+                             f"{supervisor.RUN_DIR}/{user}")
         self.assertIn("install -d -o control -g control -m 0700 /data", self.text)
 
     def test_the_code_is_root_owned(self):
@@ -2318,13 +2517,19 @@ RUN apt-get update \
 COPY --from=docker:27.3.1-cli /usr/local/bin/docker /usr/local/bin/docker
 
 # One uid per process, and a shared group for the sockets between them.
-RUN groupadd --system claudebox \
- && for u in control gateway runner; do \
-      useradd --system --create-home --home-dir /home/$u --shell /usr/sbin/nologin \
-              --user-group --groups claudebox $u; \
+# The ids are pinned, because /data is a volume that keeps its owner across
+# rebuilds: an id picked by useradd would move with the base image.
+# Each socket gets its own directory, owned by the process that binds it and
+# setgid to the shared group, so a peer can connect and cannot unlink it.
+RUN groupadd --gid 9000 claudebox \
+ && for pair in control:9001 gateway:9002 runner:9003; do \
+      u=${pair%%:*}; id=${pair##*:}; \
+      groupadd --gid $id $u; \
+      useradd --uid $id --gid $id --groups claudebox --create-home --home-dir /home/$u \
+              --shell /usr/sbin/nologin $u; \
+      install -d -o $u -g claudebox -m 2750 /run/claudebox/$u; \
     done \
- && install -d -o control -g control -m 0700 /data \
- && install -d -o root -g claudebox -m 2770 /run/claudebox
+ && install -d -o control -g control -m 0700 /data
 
 # Root-owned, like the worker's code: no process here may rewrite it.
 COPY reviewer/ /opt/claudebox/reviewer/
@@ -2458,7 +2663,7 @@ docker stop -t 30 cbx-smoke; docker inspect cbx-smoke --format '{{.State.ExitCod
 
 The stop takes about a second, and the exit code is `0`.
 
-Then the configured path. Make an env file holding a throwaway RSA key in one line, with `GITHUB_APP_ID=1`, `CLAUDEBOX_DEPLOYMENT_KEY` from `crypto.new_key()` and `OLLAMA_API_KEY=olk-smoke-test-value`. Run the container on its own network, with a named volume at `/data` and the Docker socket mounted. The log says `holding the lock: revoked 0 credential(s), stopped 0 orphaned worker(s), deleted 0 transcript(s)`, and `/healthz` says `not configured`. Insert a `deploy_config` row as the `control` user (with `timing.poll_seconds: 10`). Within a poll, `/healthz` says `serving`, and the log shows `WARN: could not list installations: GitHub 404: Integration not found`, which shows a JWT signed by the image's `cryptography` reaching GitHub. Start a second container on the same volume. Its `/healthz` says `waiting for lock`. Stop the first, and the second's log says `holding the lock` and its `/healthz` says `serving`. Remove both containers, the volume, the network and the env file.
+Then the configured path. Make an env file holding a throwaway RSA key in one line, with `GITHUB_APP_ID=1`, `CLAUDEBOX_DEPLOYMENT_KEY` from `crypto.new_key()` and `OLLAMA_API_KEY=olk-smoke-test-value`. Run the container on its own network, with a named volume at `/data` and the Docker socket mounted. The log says `holding the lock: revoked 0 credential(s), stopped 0 orphaned worker(s), deleted 0 transcript(s)`, and `/healthz` says `not configured`. Insert a `deploy_config` row as the `control` user (with `timing.poll_seconds: 10`). Within a poll, `/healthz` says `serving`, and the log shows `WARN: could not list installations: GitHub 404: Integration not found`, which shows a JWT signed by the image's `cryptography` reaching GitHub. Start a second container on the same volume. Its `/healthz` says `waiting for lock`. Stop the first, and the second's log says `holding the lock` and its `/healthz` says `serving`. As the `gateway` user, `rm /run/claudebox/control/control.sock` fails with `Permission denied`. `/data` and `control.lock` are owned by uid 9001. Remove both containers, the volume, the network and the env file.
 
 - [ ] **Step 6: Commit**
 
