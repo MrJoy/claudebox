@@ -4,7 +4,7 @@
 
 **Goal:** The gateway process: a worker-facing HTTP route to the model provider that checks a per-pair token, overwrites the model, enforces per-pair caps, injects the profile's real credential, streams the response unbuffered, and reports every pair's provider outcome to the control plane over a unix socket.
 
-**Architecture:** `hosted/gwproto.py` is line-delimited JSON over unix sockets, with the per-deployment secret on every message in both directions. `hosted/gateway.py` is the process. The control plane connects to the gateway's socket to send `hello`, `add_token`, `revoke` and `flush`. The gateway connects to the control plane's socket to send `report`s, in order per token, buffered while the control plane is away. Workers reach the gateway over HTTP and present a provider token minted by `creds.py` (2a.1). The gateway checks it against rows the control plane handed it, so it holds no records store. Each token row carries the profile it was dispatched under, so a deployment change reaches new jobs without touching running ones. Admission counts a request and reserves its `max_tokens` under a lock before forwarding, so the request cap holds against any client, and output never outruns the token cap. Input tokens are counted when the provider reports them, so a parallel client can pass the token cap by at most `IN_FLIGHT_MAX` requests' worth of input. `deploy_config` gains the two profile keys a hosted `custom` or `anthropic` profile needs, `base_url` and `auth`.
+**Architecture:** `hosted/gwproto.py` is line-delimited JSON over unix sockets, with the per-deployment secret on every message in both directions. `hosted/gateway.py` is the process. The control plane connects to the gateway's socket to send `hello`, `add_token`, `revoke` and `flush`. The gateway connects to the control plane's socket to send `report`s, in order per token, buffered while the control plane is away. A report's sequence number is taken and the report queued in one critical section, so queue order is sequence order. Each token has its own queue, and one thread visits them in turn, so a report the control plane will not acknowledge stalls that token's flush and no other, with one WARN naming it. Workers reach the gateway over HTTP and present a provider token minted by `creds.py` (2a.1). The gateway checks it against rows the control plane handed it, so it holds no records store. Each token row carries the profile it was dispatched under, so a deployment change reaches new jobs without touching running ones. Admission counts a request and reserves its `max_tokens` under a lock before forwarding, so the request cap holds against any client, and output never outruns the token cap. Input tokens are counted when the provider reports them, so a parallel client can pass the token cap by at most `IN_FLIGHT_MAX` requests' worth of input. `deploy_config` gains the two profile keys a hosted `custom` or `anthropic` profile needs, `base_url` and `auth`.
 
 **Tech Stack:** Python 3.9+ standard library (`http.server`, `http.client`, `ssl`, `socket`, `threading`, `json`, `unittest`).
 
@@ -45,11 +45,11 @@ The spec and the overview leave these open, and each one changes code. They are 
 7. **A starting gateway answers 503**, and that refusal is in no record: the spec's "a request ... a starting gateway turned away" is a claudebox fault.
 8. **Tokens are counted as every kind of input the provider reports** (`input_tokens`, `cache_creation_input_tokens` and `cache_read_input_tokens`) plus the largest `output_tokens` seen. Output is cumulative across `message_delta`s, and summing it would double-count.
 9. **Classification.** HTTP 429 or 529, or an error event of type `rate_limit_error` or `overloaded_error`, is a usage limit. A 401 or 403 is a failure: the provider refused the deployment's credential, which the operator must hear about. A 5xx is a failure. Any other 4xx is `rejected`. The request body is the worker's, so a rejected request is reported as `first_rejected` and never moves the profile's failure counter, which a worker could otherwise drive to park the profile for every repo on it. A transport error reaching upstream, or a read that breaks mid-response, is a failure named `upstream transport: <exception type>`. A 2xx stream that ends without `message_stop` is a failure (`the stream ended before message_stop`). A 2xx on `/v1/messages` is a success. A 2xx on `count_tokens` is neutral: it counts as a request, never as a pass.
-10. **A worker that hangs up mid-response** stops the relay. The request and the tokens seen so far are counted, and the report carries `first_abandoned`, which takes the place of `ok` and nothing else (overview decision 2): a record that would otherwise decide `ok` decides `deferred`, and every other outcome, a cap hit's `capped` included, stands over it. The worker chooses when to hang up, so the marker must never turn a cap into a retry. On a tokens profile, an abandoned request whose usage was never seen is also `usage_missing` (decision 12): a non-streamed response is generated whole before it is sent, so hanging up cannot un-spend it, and the record decides `capped`, with the pair parked and paged rather than left to spend unmeasured.
+10. **A worker that hangs up mid-response** stops the relay. The request and the tokens seen so far are counted, and the report carries `first_abandoned`, which takes the place of `ok` and nothing else (overview decision 2): a record that would otherwise decide `ok` decides `deferred`, and every other outcome, a cap hit's `capped` included, stands over it. The worker chooses when to hang up, so the marker must never turn a cap into a retry, nor hide what upstream answered: a hang-up after a non-2xx status line is recorded as that status's outcome (a limit, a failure, a rejection), since the status alone decides it. Only a lost 2xx, whose outcome needs the body, is abandoned. On a tokens profile, an abandoned request whose usage was never seen is also `usage_missing` (decision 12): a non-streamed response is generated whole before it is sent, so hanging up cannot un-spend it, and the record decides `capped`, with the pair parked and paged rather than left to spend unmeasured.
 11. **A passes profile clamps `max_tokens` to 64,000** (`MAX_TOKENS_CEILING`), the spec's "caps ... `max_tokens`" for a provider that cannot report usage. A tokens profile clamps to whatever its pair has left after in-flight reservations.
 12. **A response without usage on a tokens profile** is passed through to the worker. The pair is marked `usage_missing`, reported, and paged (`PAGE:` on stdout, overview decision 14), and every later request on that token is refused. The control plane commits that record as `capped` (overview decision 2).
 13. **The token travels as `Authorization: Bearer`**, which is how Claude Code sends both `ANTHROPIC_AUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN`. `x-api-key` is accepted too. Neither is ever forwarded upstream.
-14. **A flush waits at most 50 seconds and answers `{last_seq, drained}`.** `last_seq` is the last sequence number the gateway emitted for the token, not the last one acknowledged, since the acknowledged one is the control plane's own commit and could never reveal a gap. The control plane's gateway client must therefore time out after more than 50 seconds.
+14. **A flush waits at most 50 seconds and answers `{last_seq, drained}`.** It is drained only when the token has no request in flight as well as nothing queued: a request still streaming has no sequence number yet, and its report can be the one that decides the pair (a hang-up the gateway has not yet seen, on its next write). A pair's worker sends nothing more once its pass is over, so the wait covers requests already admitted, and one that outlasts the budget is the incomplete flush the spec answers with `deferred`. `last_seq` is the last sequence number the gateway emitted for the token, not the last one acknowledged, since the acknowledged one is the control plane's own commit and could never reveal a gap. The control plane's gateway client must therefore time out after more than 50 seconds.
 15. **The listener is bounded, overall and per peer.** A connection idle for 60 seconds (`IDLE_SECONDS`) is closed. Past 256 open connections (`MAX_CONNECTIONS`), or past 16 from one peer address (`MAX_CONNECTIONS_PER_PEER`, twice `IN_FLIGHT_MAX`), a new one is closed at once. Both are charged at accept, before a byte is read, so a client that never sends a token is bounded too. Each worker is its own container with its own address, so one prompt-injected worker cannot take the listener from every other job.
 16. **A clean stop drains.** On `SIGTERM` the gateway stops accepting requests and gives queued reports up to 10 seconds to reach the control plane, then logs whether they drained. A crash loses what was queued, within the spec's stated bound.
 17. **`TOKEN_REPORTING` stays provisional** (Phase 1 decision 6). Narrowing it needs a live response from each provider type, which is a check the human runs by hand (below).
@@ -1317,8 +1317,11 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(self.post(bad)[0], 401)
 
     def test_a_token_keeps_the_route_it_was_dispatched_with(self):
-        old_token, _ = self.hello()
-        _, new_row = self.row(self.profile(per_pair_requests=1), persona="sme")
+        # The same credential, re-sent with a narrower route (PR #19 review):
+        # a second token would leave the first untouched by construction.
+        old_token, cid = self.hello()
+        new_row = dict(self.row(self.profile(per_pair_requests=1), persona="sme")[1],
+                       credential_id=cid)
         self.gw.handle_control({"op": "add_token", "token": new_row})
         for _ in range(3):
             self.assertEqual(self.post(old_token)[0], 200)
@@ -1559,6 +1562,60 @@ class GatewayTest(unittest.TestCase):
         self.assertTrue(report["usage_missing"])
         self.assertTrue(any(line.startswith("PAGE: ") for line in self.logs))
 
+    def test_a_hangup_after_a_429_still_records_the_limit(self):
+        # PR #19 review: the status was read before the worker left.
+        token, cid = self.hello()
+        self.up.reply = (429, "application/json",
+                         b'{"type":"error","error":{"type":"rate_limit_error"}}' + b" " * 300000)
+        conn = socket.create_connection(("127.0.0.1", self.server.server_port))
+        body = b'{"messages": [], "max_tokens": 10}'
+        conn.sendall(b"POST /v1/messages HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer "
+                     + token.encode() + b"\r\nContent-Length: " + str(len(body)).encode()
+                     + b"\r\n\r\n" + body)
+        conn.recv(64)   # the status line has been relayed
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, b"\x01\x00\x00\x00\x00\x00\x00\x00")
+        conn.close()
+        time.sleep(0.5)
+        self.flush(cid)
+        report = self.reports[-1]
+        self.assertIn("first_limit", report)
+        self.assertNotIn("first_abandoned", report)
+
+    def test_a_flush_never_reads_a_seq_whose_report_is_not_queued(self):
+        # PR #19 review: seq and enqueue are one step under the gateway's lock.
+        token, cid = self.hello()
+        state = next(iter(self.gw.tokens.values()))
+        real = self.gw.reporter.enqueue
+        seen = []
+
+        def enqueue(report):
+            seen.append(self.gw.lock.acquire(blocking=False) and (self.gw.lock.release() or True))
+            return real(report)
+        self.gw.reporter.enqueue = enqueue
+        self.assertEqual(self.post(token)[0], 200)   # complete()
+        self.gw.refuse_cap(state, "requests")
+        self.assertEqual(len(seen), 2)
+        self.assertFalse(any(seen))   # every enqueue ran while seq's lock was held
+
+    def test_a_flush_waits_for_a_request_still_in_flight(self):
+        # PR #19 review: an empty queue is not a quiet token.
+        token, cid = self.hello()
+        self.up.delay = 0.15
+        t = threading.Thread(target=self.post, args=(token,))
+        t.start()
+        time.sleep(0.05)
+        self.assertEqual(self.flush(cid), {"last_seq": 1, "drained": True})
+        t.join()
+
+    def test_a_request_that_outlasts_the_flush_is_not_drained(self):
+        token, cid = self.hello()
+        self.up.delay = 0.6
+        t = threading.Thread(target=self.post, args=(token,))
+        t.start()
+        time.sleep(0.05)
+        self.assertFalse(self.flush(cid)["drained"])
+        t.join()
+
     def test_a_hangup_on_a_passes_profile_is_abandoned_and_not_failed_closed(self):
         token, cid = self.hello(self.profile(budget_unit="passes", per_pair_tokens=None))
         self.up.delay = 0.2
@@ -1709,6 +1766,25 @@ class MainTest(unittest.TestCase):
         proc.send_signal(signal.SIGTERM)
         self.assertEqual(proc.wait(timeout=10), 0)
         self.assertIn("reports drained", proc.stdout.read())
+
+
+
+class ReporterIsolationTest(unittest.TestCase):
+    def test_a_report_the_control_plane_refuses_stalls_only_its_own_token(self):
+        # PR #19 review: one global head would stall every token behind it.
+        lines = []
+
+        def call(op, **report):
+            return {"error": "x"} if report["credential_id"] == "a" else {"ack": report["seq"]}
+        reporter = gateway.Reporter(call, retry_seconds=0.05, log=lines.append).start()
+        self.addCleanup(reporter.stop)
+        reporter.enqueue({"credential_id": "a", "seq": 1})
+        reporter.enqueue({"credential_id": "b", "seq": 1})
+        reporter.enqueue({"credential_id": "b", "seq": 2})
+        self.assertTrue(reporter.flush("b", timeout=2))
+        self.assertEqual(reporter.acked("b"), 2)
+        self.assertFalse(reporter.flush("a", timeout=0.2))
+        self.assertEqual(len([l for l in lines if "report 1 for a" in l]), 1)   # logged once
 ```
 
 - [ ] **Step 2: Run them to see them fail**
@@ -1768,18 +1844,24 @@ class TokenState:
 
 
 class Reporter:
-    """Sends reports to the control plane in order, buffering while it is away.
+    """Sends reports to the control plane in order per token, buffering while it is away.
 
-    Reports are deltas, so order matters: one thread, one FIFO. A report stays
-    at the head of the queue until acknowledged. Every report is one admitted
-    request or one cap hit, so a token's share of the queue is bounded by its
-    caps, and what a crash loses is bounded the same way.
+    Reports are deltas, so a token's order matters: each token has its own
+    FIFO, and its head stays there until acknowledged. One thread visits the
+    tokens in turn, so a report the control plane will not acknowledge stalls
+    its own token's flush and no other. Every report is one admitted request or
+    one cap hit, so a token's share is bounded by its caps, and what a crash
+    loses is bounded the same way.
     """
 
-    def __init__(self, call: Callable[..., Dict[str, Any]], retry_seconds: float = 1.0):
+    def __init__(self, call: Callable[..., Dict[str, Any]], retry_seconds: float = 1.0,
+                 log: Callable[[str], None] = lambda line: None):
         self._call = call
         self._retry = retry_seconds
-        self._queue: Deque[Dict[str, Any]] = deque()
+        self._log = log
+        self._queues: Dict[str, Deque[Dict[str, Any]]] = {}
+        self._retry_at: Dict[str, float] = {}
+        self._refused: Dict[str, int] = {}   # token -> the seq last logged as refused
         self._acked: Dict[str, int] = {}
         self._cond = threading.Condition()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -1796,13 +1878,13 @@ class Reporter:
 
     def enqueue(self, report: Dict[str, Any]) -> None:
         with self._cond:
-            self._queue.append(report)
+            self._queues.setdefault(report["credential_id"], deque()).append(report)
             self._cond.notify_all()
 
     def pending(self, credential_id: Optional[str] = None) -> int:
         with self._cond:
-            return sum(1 for r in self._queue
-                       if credential_id is None or r["credential_id"] == credential_id)
+            return sum(len(q) for cid, q in self._queues.items()
+                       if credential_id is None or cid == credential_id)
 
     def acked(self, credential_id: str) -> int:
         with self._cond:
@@ -1812,8 +1894,8 @@ class Reporter:
         """Wait until nothing is queued for this token (or at all, for None). True if drained."""
         deadline = time.monotonic() + timeout
         with self._cond:
-            while any(credential_id is None or r["credential_id"] == credential_id
-                      for r in self._queue):
+            while any(q for cid, q in self._queues.items()
+                      if credential_id is None or cid == credential_id):
                 left = deadline - time.monotonic()
                 if left <= 0:
                     return False
@@ -1823,23 +1905,42 @@ class Reporter:
     def _run(self) -> None:
         while True:
             with self._cond:
-                while not self._queue and not self._stopping:
-                    self._cond.wait()
-                if self._stopping:
-                    return
-                head = self._queue[0]
-            try:
-                reply = self._call("report", **head)
-                ok = reply.get("ack") == head["seq"]
-            except (OSError, gwproto.ProtocolError):
-                ok = False
-            with self._cond:
-                if ok:
-                    self._queue.popleft()
-                    self._acked[head["credential_id"]] = head["seq"]
-                    self._cond.notify_all()
-                    continue
-                self._cond.wait(self._retry)
+                while True:
+                    if self._stopping:
+                        return
+                    now = time.monotonic()
+                    ready = [cid for cid, q in self._queues.items()
+                             if q and self._retry_at.get(cid, 0) <= now]
+                    if ready:
+                        break
+                    waits = [self._retry_at[cid] - now for cid, q in self._queues.items() if q]
+                    self._cond.wait(min(waits) if waits else None)
+                heads = [self._queues[cid][0] for cid in ready]
+            for head in heads:
+                cid = head["credential_id"]
+                try:
+                    reply = self._call("report", **head)
+                    ok = reply.get("ack") == head["seq"]
+                    refused = not ok
+                except (OSError, gwproto.ProtocolError):
+                    ok = refused = False   # the control plane is away: every token waits alike
+                with self._cond:
+                    if ok:
+                        self._queues[cid].popleft()
+                        if not self._queues[cid]:
+                            del self._queues[cid]
+                        self._retry_at.pop(cid, None)
+                        self._acked[cid] = head["seq"]
+                        self._cond.notify_all()
+                        continue
+                    self._retry_at[cid] = time.monotonic() + self._retry
+                    log_it = refused and self._refused.get(cid) != head["seq"]
+                    if log_it:
+                        self._refused[cid] = head["seq"]
+                if log_it:
+                    self._log(f"WARN: the control plane answered report {head['seq']} for "
+                              f"{cid} without acknowledging it ({reply!r:.200}); that token's "
+                              f"reports wait, and no other's")
 
 
 class Gateway:
@@ -1912,8 +2013,22 @@ class Gateway:
             # the queue to drain. The control plane compares it with the last seq
             # it committed: equal means it holds every report; a gap, or
             # drained false, means the flush did not complete.
+            # Drained means quiet as well as sent: a request still in flight
+            # has no seq yet, and its report may be the one that decides the
+            # pair (a hang-up the gateway has not yet seen). A pair's worker
+            # sends nothing more once its pass is over, so this waits out
+            # requests already admitted, within the same budget.
             cid = msg["credential_id"]
-            drained = self.reporter.flush(cid, timeout=self.flush_seconds)
+            deadline = time.monotonic() + self.flush_seconds
+            while True:
+                with self.lock:
+                    state = self.tokens.get(cid)
+                    busy = state is not None and state.in_flight > 0
+                if not busy or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.02)
+            drained = not busy and self.reporter.flush(
+                cid, timeout=max(0.0, deadline - time.monotonic()))
             with self.lock:
                 state = self.tokens.get(cid)
                 return {"last_seq": state.seq if state else 0, "drained": drained}
@@ -1978,7 +2093,9 @@ class Gateway:
             report = {"credential_id": state.credential_id, "seq": state.seq, "cap_hit": cap,
                       "delta": {"requests": 0, "successes": 0, "input_tokens": 0,
                                 "output_tokens": 0}}
-        self.reporter.enqueue(report)
+            # Queued under the lock that bumped seq, so a flush that finds the
+            # queue empty never reads a seq whose report is not yet in it.
+            self.reporter.enqueue(report)
 
     def complete(self, state: TokenState, kind: str, granted: int,
                  meter: Optional[UsageMeter] = None, detail: str = "") -> None:
@@ -2019,10 +2136,10 @@ class Gateway:
                 state.first_rejected = report["first_rejected"] = detail
             state.seq += 1
             report.update(credential_id=state.credential_id, seq=state.seq, delta=delta)
+            self.reporter.enqueue(report)   # under the lock: see refuse_cap
         if report.get("usage_missing"):
             self.log(f"PAGE: profile {route.name} reports tokens but a response for "
                      f"{state.job_id}/{state.persona} carried no usage; that pair is failed closed")
-        self.reporter.enqueue(report)
 
 
 def _error_body(kind: str, message: str) -> bytes:
@@ -2165,7 +2282,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except _WorkerGone:
             conn.close()
             meter.finish()
-            self._complete(state, "abandoned", granted, meter, detail="the worker hung up mid-response")
+            # The status line was read before the worker left. A non-2xx is
+            # decided by its status alone, so it is recorded as what upstream
+            # did; only a lost 2xx, whose outcome needs the body, is abandoned.
+            if resp.status >= 300:
+                kind = classify(path, resp.status, meter)
+                self._complete(state, kind, granted, meter, detail=f"upstream {resp.status}"
+                               + (f" {meter.error_type}" if meter.error_type else ""))
+            else:
+                self._complete(state, "abandoned", granted, meter,
+                               detail="the worker hung up mid-response")
             return
         conn.close()
         meter.finish()
@@ -2266,7 +2392,7 @@ def main(env: Mapping[str, str] = os.environ) -> None:
     """
     secret = env["GATEWAY_SECRET"]
     client = gwproto.Client(env["CONTROL_SOCKET"], secret)
-    reporter = Reporter(client.call).start()
+    reporter = Reporter(client.call, log=lambda line: print(line, flush=True)).start()
     gateway = Gateway(env, reporter)
     control = gwproto.Server(env["GATEWAY_SOCKET"], secret, gateway.handle_control).start()
     host, _, port = env.get("GATEWAY_LISTEN", "0.0.0.0:8090").rpartition(":")
@@ -2293,7 +2419,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run them to see them pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_gateway.py'`, then `./test-python.sh`
-Expected: PASS, 56 tests. The whole suite passes.
+Expected: PASS, 61 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
