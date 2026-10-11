@@ -33,10 +33,10 @@ The spec and the overview leave these open, and each one changes code. They are 
 
 1. **2a reviews in `auto` mode only.** A repo whose config asks for `trigger: requested` is shown as a config problem on its check runs ("arrives in phase 2b") rather than reviewed against its wishes.
 2. **The org file is `.github/claudebox.json` in `<owner>/.github`**, read at the default branch. A read that fails is "no org defaults". The org `.github` repo is never itself reviewed.
-3. **A poll per installation lists its repos.** A repo that is public is passed over, and one that turned public since the last poll is lost. A repo gone from the list is lost. An installation gone from `App.installations()`, or one carrying `suspended_at`, loses all its repos, and the control plane logs one `PAGE: installation N was uninstalled or suspended; M repo(s) stop being reviewed` for it: the spec pages this, and with no webhook receiver in 2a the poll is its only producer. Losing a repo ends its jobs (their started pairs `revoked`), calls 2a.4a's three deleters (`Outbox.drop_repo`, `Committer.forget_repo`, `CheckRuns.forget_repo`), and forgets its fingerprint cache. The jobs end with no scheduler lock held, since ending one calls into the committer, which calls `decider_for`, which takes that lock. After each poll, a sweep drops the outbox and withheld rows of any repo that no live installation's listing returned as private (one lost or made public while the control plane was down, which nothing in memory names). It keys on the listings, never on how far the poll's walk got before a drain stopped it, and runs only when every live installation's listing succeeded. An installation gone while the control plane was down is never in memory, so `poll_once` cannot page it: the sweep finds it as an `installation_id` on outbox rows that is not live, logs the same `PAGE: installation N was uninstalled or suspended while the control plane was down; M repo(s) stop being reviewed`, and, for a repo listed again under a new installation, drops only the old installation's queued items (`Outbox.drop_installation`), which no drainer carries. Withheld rows carry no installation, so they go with the repo or stay with it. A loss forgets the repo's last published config answer too, so a repo that comes back publishes its problem again. A completion in flight when its job ends commits nothing (2a.4a's `job_live`, wired to the job registry). Its rounds survive, as the spec's "Visibility" says ("Rounds and asks survive a public flip, since they hold no content"). A returning pair starts a fresh session at its next round, as one does after `MAX_PASSES_PER_SESSION` rotation. Its earlier rounds' findings are still on the PR, signed, and with no committed fingerprint its round line reads the local wording, which works from those comments.
+3. **A poll per installation lists its repos.** A repo that is public is passed over, and one that turned public since the last poll is lost. A repo gone from the list is lost. An installation gone from `App.installations()`, or one carrying `suspended_at`, loses all its repos, and the control plane logs one `PAGE: installation N was uninstalled or suspended; M repo(s) stop being reviewed` for it: the spec pages this, and with no webhook receiver in 2a the poll is its only producer. Losing a repo ends its jobs (their started pairs `revoked`), calls 2a.4a's three deleters (`Outbox.drop_repo`, `Committer.forget_repo`, `CheckRuns.forget_repo`), and forgets its fingerprint cache. The jobs end with no scheduler lock held, since ending one calls into the committer, which calls `decider_for`, which takes that lock. After each poll, a sweep drops the outbox and withheld rows of any repo that no live installation's listing returned as private (one lost or made public while the control plane was down, which nothing in memory names). It keys on the listings, never on how far the poll's walk got before a drain stopped it, and runs only when every live installation's listing succeeded. An installation gone while the control plane was down is never in memory, so `poll_once` cannot page it: the sweep finds it in `jobs`, the durable record of every installation that ran work here, as an `installation_id` that is not live, and logs the same `PAGE: installation N was uninstalled or suspended while the control plane was down; M repo(s) stop being reviewed`. Outbox rows are a queue, empty in the steady state, so they decide only what to drop: for a repo listed again under a new installation, the old installation's queued items (`Outbox.drop_installation`), which no drainer carries. Either path pages a lost installation once, marked by an `installation_lost` audit row, since `jobs` keeps its rows for the life of the volume and a restart would otherwise page it again; a job dispatched after the mark (an installation unsuspended) lets a later loss page again. Withheld rows carry no installation, so they go with the repo or stay with it. A loss forgets the repo's last published config answer too, so a repo that comes back publishes its problem again. A completion in flight when its job ends commits nothing (2a.4a's `job_live`, wired to the job registry). Its rounds survive, as the spec's "Visibility" says ("Rounds and asks survive a public flip, since they hold no content"). A returning pair starts a fresh session at its next round, as one does after `MAX_PASSES_PER_SESSION` rotation. Its earlier rounds' findings are still on the PR, signed, and with no committed fingerprint its round line reads the local wording, which works from those comments.
 4. **Every non-fork candidate head gets a check run**, created once, whether or not anything is dispatched for it. The config follows the spec's fallback, which `repo_config.resolve` implements: an invalid repo file falls back to the org defaults, an invalid org file under a valid repo file is dropped, and only both invalid stops the review. The dropped file's problems show on each head's run as a notice beside a review that runs. A problem (both files invalid, `trigger: requested`, or a setting the deployment cannot serve) shows on every head's run and dispatches nothing, and the poll logs `PAGE: <repo>: not reviewed, because of a configuration problem` when a repo starts not being reviewed for one, and a plain line when it clears, so a problem held across polls pages once. The problem text is the repo's and stays on the check run, out of the log. A read of either file that fails is not a statement about the file: the repo is skipped for that poll and nothing is published. A head is published when its (problem, notice) differs from the one last set on it, a head with none included, so a new head shows a held problem, a fixed one clears without a push, and an unchanged answer costs no GitHub call. A pair at its round cap is painted `round-cap-unread` once on a head no job will run at, or a capped plan PR's new head would read "Queued" for good. The paint needs no lookup, so it happens above the gate a full deployment closes, along with the check run and the config answer. It is never painted `round-cap`, which counts as clean: a green check on a commit no persona read would claim a review that did not happen.
 5. **The change gate is local mode's**, `signals.Tracker`, one per repo since a Tracker keys by PR number. A PR's fingerprint is its head, its mode and the newest unsigned comment, and comments, reviews and the 30 newest inline comments are read only when the PR's `updated_at` has moved. A failed lookup is cached against that `updated_at` too, so an outage costs one lookup per change, and the PR gates on `updated_at` through `signals.degraded`. A PR younger than the deployment's `settle_seconds` waits.
-6. **Dispatch bounds.** A PR with a live job is not dispatched again. A pair parked by the commit point waits while its siblings run, and a parked profile dispatches nothing. `max_concurrent_jobs` counts jobs, and a profile's `concurrency` counts pairs in flight (dispatched and not completed) across its jobs. A group larger than the room left dispatches in parts, phase order first: the pairs left out hold no session, so the gate runs them on a later poll once the job has ended, and a 7-persona plan group under a bound of 4 is never starved. The pairs left for a later part are painted `queued` at dispatch with the rest, so the head cannot conclude `success` on the first part alone. A poll stops dispatching at the first refusal by `max_concurrent_jobs` and keeps walking: every later head and repo still gets its check run and its config answer (decision 4), and only the dispatch stages, which cost lookups, are skipped. The poll logs when the cap starts binding for an installation and when it stops, not on every poll.
+6. **Dispatch bounds.** A PR with a live job is not dispatched again. A pair parked by the commit point waits while its siblings run, and a parked profile dispatches nothing. `max_concurrent_jobs` counts jobs, and a profile's `concurrency` counts pairs in flight (dispatched and not completed) across its jobs. A group larger than the room left dispatches in parts, phase order first: the pairs left out hold no session, so the gate runs them on a later poll once the job has ended, and a 7-persona plan group under a bound of 4 is never starved. The pairs left for a later part are painted `queued` at dispatch with the rest, so the head cannot conclude `success` on the first part alone. A pair the commit point has parked on a timer holds across a push, while its view was set at the head it ran at, so a parked pair with no view at this head is painted with the park's own state (`deferred`, `usage-limited`, `failed`), which is never clean. A poll stops dispatching at the first refusal by `max_concurrent_jobs` and keeps walking: every later head and repo still gets its check run and its config answer (decision 4), and only the dispatch stages, which cost lookups, are skipped. The poll logs when the cap starts binding for an installation and when it stops, not on every poll.
 7. **Visibility is checked again at dispatch**, uncached, and a check that errors dispatches nothing.
 8. **A job's material is built once, at dispatch.** The prompts are `build_hosted`'s, with `WORKTREE_STANZA` exactly when `shared_worktree` is true, and `shared_worktree` is true when the job has more than one pair, whatever their phases or the cap: a phase-1 pass that writes to the clone is read by phase 2, and one-at-a-time passes read each other's writes the same way (PR #20 review). A pair with a session gets the followup prompt. A pair's round line names the head of its committed fingerprint (`Committer.last_reviewed_head`). When that head is no longer an ancestor of the new one, the round line is round 1's and the check run says the branch was rewritten. An ancestry check that errors counts as a rewrite, since a whole review beats a guess.
 9. **The reap ends a job** when runnerd lists its worker as gone or exited, when its 55-minute deadline has passed, or when its bootstrap token expired unused. Ending a job revokes its credentials, tells the gateway to revoke its unfinished pairs' tokens, marks each started pair `revoked` (`Committer.revoke`, and `checkruns.REVOKED` on the run), owes each unstarted pair, stops its worker, forgets its outbox keys and `settled` entries, and writes `ended_at` and `end_reason` on its row.
@@ -578,6 +578,22 @@ class GateTest(Base):
         self.poll()
         self.assertEqual([p.persona for p in self.jobs.all()[0].pairs], ["red_team"])
 
+    def test_a_timed_park_across_a_push_keeps_the_new_head_from_going_green(self):
+        # PR #22 review: a timed park holds across a push, and a parked pair
+        # painted nothing at the new head, so red_team alone made it green.
+        self.poll()
+        self.finish(self.jobs.all()[0])
+        from commit import Park
+        self.committer.parks[("acme/web", Pair(7, "code", "sage"))] = Park(
+            "deferred", until=int(T) + 600)
+        self.inst.prs = [pr(head=NEW, updated="2025-10-09T08:10:00Z")]
+        self.poll()
+        job = self.jobs.all()[0]
+        self.assertEqual([p.persona for p in job.pairs], ["red_team"])
+        self.assertEqual(self.runs.view("acme/web", NEW, "sage").state, checkruns.DEFERRED)
+        self.finish(job)
+        self.assertNotEqual(self.inst.updated[-1][4], "success")
+
     def test_a_capped_plan_prs_new_head_shows_round_cap_not_queued(self):
         # PR #21 review: nothing dispatches at it, so nothing else would paint it.
         self.inst.prs = [pr(labels=("plan",))]
@@ -895,16 +911,38 @@ class AccessTest(Base):
         self.assertEqual(self.box.queued("gone/repo", HEAD), 0)
         self.assertEqual(self.records.conn().execute(
             "SELECT COUNT(*) FROM withheld WHERE repo = 'gone/repo'").fetchone()[0], 0)
-        # PR #22 review: the installation went while this process was down, so
-        # poll_once never knew it; the sweep pages it from the rows' id.
+
+    def ran_job(self, inst_id, repo, at=0):
+        with self.records.tx() as c:
+            c.execute("INSERT INTO jobs (id, installation_id, repo, pr, head, mode, profile, "
+                      "model, dispatched_at, ended_at) VALUES (?, ?, ?, 1, ?, 'code', 'ollama', "
+                      "'m', ?, ?)", (f"j{inst_id}-{repo}-{at}", inst_id, repo, HEAD, at, at))
+
+    def test_an_installation_lost_while_down_pages_from_its_jobs_once(self):
+        # PR #22 review: outbox rows are a queue, empty in the steady state;
+        # jobs is the durable record of an installation that ran work here.
+        self.ran_job(3, "gone/repo")
+        self.ran_job(3, "gone/other")
+        self.poll()
+        self.sched.sweep_orphans({7})
+        self.sched.sweep_orphans({7})
         self.assertEqual([l for l in self.logs if l.startswith("PAGE:")],
                          ["PAGE: installation 3 was uninstalled or suspended while the control "
-                          "plane was down; 1 repo(s) stop being reviewed"])
+                          "plane was down; 2 repo(s) stop being reviewed"])
+        # The mark is a row, never memory, so a restart on the same records
+        # stays quiet; a job after the mark (an unsuspended installation)
+        # lets a later loss page again.
+        self.assertEqual([r[0] for r in self.records.conn().execute(
+            "SELECT scope FROM audit WHERE action = 'installation_lost'")], ["3"])
+        self.ran_job(3, "gone/repo", at=int(T) + 10)
+        self.sched.sweep_orphans({7})
+        self.assertEqual(len([l for l in self.logs if l.startswith("PAGE:")]), 2)
 
     def test_a_repo_reinstalled_under_a_new_installation_loses_only_the_old_rows(self):
         # PR #22 review: keyed on the repo alone, the old installation's rows
         # were neither drained (no drainer has its id) nor swept.
         from outbox import JobContext
+        self.ran_job(3, "acme/web")
         self.box.accept(JobContext("old", 3, "acme/web", 1, HEAD), "sage", 1, "old finding")
         self.poll()
         self.box.accept(JobContext("new", 7, "acme/web", 1, HEAD), "sme", 1, "new finding")
@@ -1289,8 +1327,23 @@ class Scheduler:
             if signals_mod.is_settling(pr.get("updated_at") or "", deploy.settle_seconds, now):
                 continue
             signal = self._signal(inst, full, n, head, mode, pr.get("updated_at") or "")
-            pairs = [p for p in decider.pairs_to_run(group, signal)
-                     if self.committer.parked(full, p, head) is None]
+            pairs, parked = [], []
+            for p in decider.pairs_to_run(group, signal):
+                park = self.committer.parked(full, p, head)
+                (pairs if park is None else parked).append((p, park))
+            # A timed park carries no head, so it holds across a push while the
+            # pair's view was set at the head it ran at. It is painted here
+            # with its own state, or the head could conclude `success` without
+            # it (PR #22 review). A park's reason is an outcome name, which is
+            # the check-run state of the same name.
+            fresh = [(p, park) for p, park in parked
+                     if self.check_runs.view(full, head, p.persona) is None]
+            for p, park in fresh:
+                self.check_runs.set_pair(full, head, p.persona,
+                                         checkruns.PairView(park.reason, park.until))
+            if fresh:
+                self._publish(full, head)
+            pairs = [p for p, _ in pairs]
             if not pairs:
                 continue
             if self.committer.profile_parked_until(cfg.profile):
@@ -1481,6 +1534,29 @@ class Scheduler:
             self.config_paged.discard(repo)
         self.log(f"{repo}: not reviewed, because {reason}; dropped {dropped} queued finding(s)")
 
+    def page_lost_installation(self, inst_id: int, repos: int, when: str = "") -> None:
+        """Page a lost installation once, for good: an audit row marks it.
+
+        The mark is durable because the sweep reads `jobs`, which keeps an
+        uninstalled installation's rows for the life of the volume, and
+        without it every restart would page the same loss again. An
+        installation that runs a job after its mark (unsuspended) can be
+        paged again.
+        """
+        conn = self.records.conn()
+        marked = conn.execute(
+            "SELECT 1 FROM audit WHERE action = 'installation_lost' AND scope = ? AND at >= "
+            "(SELECT COALESCE(MAX(dispatched_at), 0) FROM jobs WHERE installation_id = ?)",
+            (str(inst_id), inst_id)).fetchone()
+        if marked:
+            return
+        with self.records.tx() as c:
+            c.execute("INSERT INTO audit (at, actor_id, action, scope, detail) "
+                      "VALUES (?, NULL, 'installation_lost', ?, '')",
+                      (int(self.clock()), str(inst_id)))
+        self.log(f"PAGE: installation {inst_id} was uninstalled or suspended{when}; "
+                 f"{repos} repo(s) stop being reviewed")
+
     def sweep_orphans(self, live: Set[int]) -> int:
         """Rows of repos no live installation lists: lost while this process was down.
 
@@ -1492,20 +1568,21 @@ class Scheduler:
             return 0
         known = set().union(*(self.listings.get(i, set()) for i in live))
         conn = self.records.conn()
-        queued = conn.execute("SELECT DISTINCT installation_id, repo FROM outbox").fetchall()
         # An installation gone while this process was down is never in
-        # `installation_of`, so poll_once cannot page it: its outbox rows
-        # carry its id, and this is where it is found (PR #22 review).
-        gone = sorted({i for i, _ in queued if i not in live})
-        for inst_id in gone:
-            repos = sorted({r for i, r in queued if i == inst_id})
-            self.log(f"PAGE: installation {inst_id} was uninstalled or suspended while the "
-                     f"control plane was down; {len(repos)} repo(s) stop being reviewed")
-            for repo in repos:
-                if repo in known:
-                    # Listed again under a new installation: only the old
-                    # installation's rows go, since no drainer carries its id.
-                    self.outbox.drop_installation(inst_id, repo, "its installation is gone")
+        # `installation_of`, so poll_once cannot page it. `jobs` is the
+        # durable record of every installation that ran work here; outbox
+        # rows are a queue that is empty in the steady state (PR #22 review).
+        ran = conn.execute("SELECT installation_id, COUNT(DISTINCT repo) FROM jobs "
+                           "GROUP BY installation_id").fetchall()
+        for inst_id, n in ran:
+            if inst_id not in live:
+                self.page_lost_installation(inst_id, n, " while the control plane was down")
+        queued = conn.execute("SELECT DISTINCT installation_id, repo FROM outbox").fetchall()
+        for inst_id, repo in queued:
+            if inst_id not in live and repo in known:
+                # Listed again under a new installation: only the old
+                # installation's rows go, since no drainer carries its id.
+                self.outbox.drop_installation(inst_id, repo, "its installation is gone")
         rows = {r for _, r in queued}
         rows |= {r[0] for r in conn.execute("SELECT DISTINCT repo FROM withheld")}
         orphans = sorted(rows - known)
@@ -1532,7 +1609,7 @@ class _Snapshot:
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_scheduler.py'`, then `./test-python.sh`
-Expected: PASS, 55 tests. The whole suite passes.
+Expected: PASS, 57 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
@@ -2280,8 +2357,7 @@ class ControlPlane:
         for inst_id, repos in sorted(lost.items()):
             # The spec pages this, and with no webhook receiver in 2a the poll
             # is its only producer (PR #18 review). Once per installation.
-            self.log(f"PAGE: installation {inst_id} was uninstalled or suspended; "
-                     f"{len(repos)} repo(s) stop being reviewed")
+            self.scheduler.page_lost_installation(inst_id, len(repos))
             for repo in repos:
                 self.scheduler.lose_repo(repo, "the App was uninstalled or suspended")
         for inst_id in [i for i in self._drainers if i not in live]:
