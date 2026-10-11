@@ -35,19 +35,22 @@ The spec leaves these open, and each one changes code. They are this plan's answ
 
 1. **Blob seals are AES-256-GCM.** Each one has a random 12-byte nonce and a leading version byte (`0x01`), and the blob's name is the associated data. A sealed file renamed on disk then fails authentication instead of being read as another blob. The deployment key is standard base64 of 32 bytes, and anything else is refused by name.
 2. **Blob names are lowercase segments** matching `[a-z0-9._-]+`, with `.` and `..` refused. A transcript is `transcripts/<owner>/<name>/pr-<n>/<mode>/<persona>/<yyyymmddthhmmssz>-<8 hex>.jsonl`. The random suffix keeps two commits in one second from colliding, which is what keeps names immutable.
-3. **The scan's detectors** are: claudebox's own tokens, GitHub (`gh[pousr]_`, `github_pat_`), Anthropic (`sk-ant-`), OpenAI (`sk-`, `sk-proj-`), AWS access key ids, Slack (`xox?-`), Google API keys, and PEM private-key headers. There is no generic high-entropy rule, because reviewers quote commit SHAs and base64 fixtures all the time. Deployment literals shorter than 8 characters are skipped and named in `Scanner.skipped`, so the caller can warn about them.
+3. **The scan's detectors** are: claudebox's own tokens, GitHub (`gh[pousr]_`, `github_pat_`), Anthropic (`sk-ant-`), OpenAI (`sk-`, `sk-proj-`), AWS access key ids, Slack (`xox` and one letter, so `xoxc-` and `xoxd-` too), Google API keys, and PEM private-key headers. There is no generic high-entropy rule, because reviewers quote commit SHAs and base64 fixtures all the time. Deployment literals shorter than 8 characters are skipped and named in `Scanner.skipped`, so the caller can warn about them.
 4. **A redacted body** replaces every matched span with `[withheld:<detector>]`, and a literal's detector is `literal:<SECRET NAME>`. A value is never echoed.
 5. **The fork rule fails closed.** A head repository GitHub reports as `null`, which is a deleted fork, counts as a fork.
-6. **An installation client refreshes its token five minutes before expiry.** A `Link: rel="next"` page that is off the API host is refused before any request is sent, because the client would otherwise send its token there.
+6. **No credential leaves the API host by any route GitHub's answers control.** An installation client refreshes its token five minutes before expiry. A `Link: rel="next"` page off the API host is refused before any request is sent. The real transport follows no redirect at all: urllib would replay the `Authorization` header to wherever a 30x pointed, so a redirect comes back as the 30x it is and the caller treats it as an error. A repository name with a `.` or `..` segment is refused before it reaches a URL.
 7. **Only `Retry-After`, an exhausted rate limit, a 5xx and an unreachable GitHub count as retryable.** That is the spec's "Only `Retry-After` and 5xx answers are retried". An exhausted primary rate limit (`x-ratelimit-remaining: 0`) is the same wait, timed from `x-ratelimit-reset`.
 8. **Config files are read through the contents API with no `ref`**, which GitHub reads as the default branch. A file the API will not inline (over 1 MB) is an error that names its size. Phase 1's caps (64 KB and 256 KB) refuse it long before that.
-
+9. **Every blob directory is 0700**, intermediate ones included, and a directory that already exists with looser permissions is tightened. `os.makedirs` applies its mode to the leaf alone, and a blob's directories name its repo.
+10. **The rewrite test belongs to the control plane, through `Installation.is_ancestor`** (overview decision 16). It is the compare API's `ahead` or `identical` status, and a 404 counts as not an ancestor, so a rewrite that also dropped the old head still widens the scope.
+11. **The gateway's `verify_against` accepts provider tokens only.** A token whose kind letter is not `p` is refused before its secret is compared.
 ## Review Focus
 
 - **A token whose kind letter was edited** (`cbx_c_…` presented as `cbx_p_…`). Expected: refused, never resolved to the row by id alone. Pinned in Task 3.
 - **Two workers racing one bootstrap token** (the job spec read from platform metadata by someone else). Expected: exactly one exchange succeeds. Pinned in Task 3.
-- **A `Link` header pointing off `api.github.com`.** Expected: refused before the token leaves. Pinned in Task 6.
-- **A repo full name or login carrying path syntax** (`acme/web/../../x`, `octo/../x`). Expected: `ValueError` before any request. Pinned in Task 6.
+- **A `Link` header or a 30x pointing off `api.github.com`.** Expected: refused or not followed, before the token leaves. Pinned in Task 6, the redirect case against real loopback servers.
+- **A repo full name or login carrying path syntax** (`acme/web/../../x`, `../web`, `acme/..`, `octo/../x`). Expected: `ValueError` before any request. Pinned in Task 6.
+- **A provider token presented to the gateway with its kind letter edited.** Expected: refused. Pinned in Task 3.
 - **A blob file moved or renamed on disk.** Expected: it fails to open rather than serving another blob's content. Pinned in Task 4 (with a fake sealer that checks the associated data) and Task 1 (with the real cipher).
 - **A records store written by a newer control plane** (a rollback). Expected: refused, naming the fix. Pinned in Task 2.
 
@@ -714,7 +717,7 @@ git commit -m "hosted: the records store, schema version 1, and the instance loc
     - `exchange_bootstrap(token, capability_ttl) -> Optional[Tuple[str, Credential]]`: marks the bootstrap token used and mints the job's capability in one transaction.
     - `revoke(credential_id)`, `revoke_job(job_id) -> int`, `revoke_all() -> int`.
     - `live_provider_rows() -> List[dict]`: keys `credential_id`, `salt_hex`, `hash_hex`, `job_id`, `persona`, `expires_at`.
-  - `creds.verify_against(token, salt_hex, hash_hex) -> bool` and `creds.credential_id_of(token) -> Optional[str]`, for the gateway (2a.2), which holds rows rather than a records store.
+  - `creds.verify_against(token, salt_hex, hash_hex) -> bool` (provider tokens only: any other kind letter is refused) and `creds.credential_id_of(token) -> Optional[str]`, for the gateway (2a.2), which holds rows rather than a records store.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -873,6 +876,14 @@ class CredsTest(unittest.TestCase):
         self.assertTrue(verify_against(token, row["salt_hex"], row["hash_hex"]))
         self.assertFalse(verify_against(token[:-1] + ("A" if token[-1] != "A" else "B"),
                                         row["salt_hex"], row["hash_hex"]))
+
+    def test_verify_against_refuses_a_provider_token_with_its_kind_letter_edited(self):
+        token = self.creds.mint("provider", "job1", 60, persona="sage")
+        row = self.creds.live_provider_rows()[0]
+        for letter in ("b", "c"):
+            with self.subTest(letter=letter):
+                edited = f"cbx_{letter}_" + token[6:]
+                self.assertFalse(verify_against(edited, row["salt_hex"], row["hash_hex"]))
 
     def test_live_provider_rows_leave_out_revoked_and_expired_tokens(self):
         a = self.creds.mint("provider", "job1", 60, persona="sage")
@@ -1033,12 +1044,15 @@ class Creds:
 
 
 def verify_against(token: str, salt_hex: str, hash_hex: str) -> bool:
-    """Check a presented token against a row the gateway was handed.
+    """Check a presented provider token against a row the gateway was handed.
 
-    The gateway holds no records store; it is given rows by the control plane.
+    The gateway holds no records store; it is given rows by the control plane,
+    and only provider rows. A token whose kind letter is not `p` is refused
+    before its secret is compared, so a capability with its letter edited
+    never passes as a provider token.
     """
     m = TOKEN_RE.fullmatch(token or "")
-    if not m:
+    if not m or m.group(1) != KINDS["provider"]:
         return False
     return hmac.compare_digest(bytes.fromhex(hash_hex), _hash(bytes.fromhex(salt_hex), m.group(3)))
 
@@ -1052,7 +1066,7 @@ def credential_id_of(token: str) -> Optional[str]:
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_creds.py'`, then `./test-python.sh`
-Expected: PASS, 19 tests. The whole suite passes.
+Expected: PASS, 20 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
@@ -1073,7 +1087,7 @@ git commit -m "hosted: credentials as salted-hash rows, single-use bootstrap, re
   - `blobs.BlobNameError(ValueError)` and `blobs.check_name(name) -> str`.
   - `blobs.transcript_name(repo: str, pr: int, mode: str, persona: str, now: float) -> str`.
   - `blobs.transcripts_prefix(repo: Optional[str] = None, pr: Optional[int] = None) -> str`.
-  - `blobs.Blobs(root: str, sealer)` with `put(name, data: bytes)` (atomic, files 600, directories 700), `get(name) -> Optional[bytes]`, `delete(name) -> bool`, `list(prefix) -> List[str]` (sorted, temporary files excluded) and `delete_prefix(prefix) -> int`. The seal's associated data is `name.encode("utf-8")`.
+  - `blobs.Blobs(root: str, sealer)` with `put(name, data: bytes)` (atomic, files 600, every store directory 700 and tightened if it already exists), `get(name) -> Optional[bytes]`, `delete(name) -> bool`, `list(prefix) -> List[str]` (sorted, temporary files excluded) and `delete_prefix(prefix) -> int`. The seal's associated data is `name.encode("utf-8")`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1181,6 +1195,24 @@ class BlobsTest(unittest.TestCase):
         self.assertEqual(
             os.stat(os.path.join(self.root, "jobs", "j1", "material.json")).st_mode & 0o777, 0o600)
 
+    def test_every_intermediate_directory_is_private(self):
+        name = transcript_name("acme/web", 1, "code", "sage", 0)
+        self.blobs.put(name, b"t")
+        directory = self.root
+        for segment in name.split("/")[:-1]:
+            directory = os.path.join(directory, segment)
+            with self.subTest(directory=directory):
+                self.assertEqual(os.stat(directory).st_mode & 0o777, 0o700)
+
+    def test_permissive_existing_directories_are_tightened(self):
+        os.chmod(self.root, 0o755)
+        os.makedirs(os.path.join(self.root, "jobs"), mode=0o755)
+        os.chmod(os.path.join(self.root, "jobs"), 0o755)
+        again = Blobs(self.root, FakeSealer())
+        again.put("jobs/j1/material.json", b"x")
+        self.assertEqual(os.stat(self.root).st_mode & 0o777, 0o700)
+        self.assertEqual(os.stat(os.path.join(self.root, "jobs")).st_mode & 0o777, 0o700)
+
     def test_list_and_delete_by_prefix(self):
         a = transcript_name("acme/web", 1, "code", "sage", 0)
         b = transcript_name("acme/web", 2, "code", "sage", 0)
@@ -1275,19 +1307,36 @@ def transcripts_prefix(repo: Optional[str] = None, pr: Optional[int] = None) -> 
     return check_name(prefix if pr is None else f"{prefix}/pr-{int(pr)}")
 
 
+def _private_dir(path: str) -> None:
+    """Create a directory if absent and make it 0700 either way.
+
+    os.makedirs applies its mode to the leaf alone and never tightens a
+    directory that already exists, and a blob's directories name its repo.
+    """
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    os.chmod(path, 0o700)
+
+
 class Blobs:
     def __init__(self, root: str, sealer):
         self.root = root
         self.sealer = sealer
-        os.makedirs(root, mode=0o700, exist_ok=True)
+        parent = os.path.dirname(os.path.abspath(root))
+        os.makedirs(parent, exist_ok=True)
+        _private_dir(root)
 
     def _path(self, name: str) -> str:
         return os.path.join(self.root, *check_name(name).split("/"))
 
     def put(self, name: str, data: bytes) -> None:
         path = self._path(name)
-        directory = os.path.dirname(path)
-        os.makedirs(directory, mode=0o700, exist_ok=True)
+        directory = self.root
+        for segment in check_name(name).split("/")[:-1]:
+            directory = os.path.join(directory, segment)
+            _private_dir(directory)
         tmp = f"{path}{_TMP_MARK}{os.urandom(4).hex()}"
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
@@ -1348,7 +1397,7 @@ class Blobs:
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_blobs.py'`, then `./test-python.sh`
-Expected: PASS, 16 tests. The whole suite passes.
+Expected: PASS, 18 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
@@ -1404,6 +1453,11 @@ class DetectorTest(unittest.TestCase):
         for name, sample in SAMPLES.items():
             with self.subTest(name=name):
                 self.assertEqual(self.scanner.first(f"see `{sample}` here"), name)
+
+    def test_every_slack_token_family_is_found(self):
+        for prefix in ("xoxa", "xoxb", "xoxc", "xoxd", "xoxe", "xoxp", "xoxr", "xoxs"):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(self.scanner.first(f"{prefix}-1234567890-abc"), "slack")
 
     def test_a_fine_grained_github_pat_is_found(self):
         self.assertEqual(self.scanner.first("github_pat_" + "x" * 30), "github")
@@ -1517,7 +1571,7 @@ DETECTORS: Tuple[Tuple[str, "re.Pattern[str]"], ...] = tuple(
         ("anthropic", r"sk-ant-[A-Za-z0-9_-]{20,}"),
         ("openai", r"sk-(?:proj-)?[A-Za-z0-9_-]{20,}"),
         ("aws", r"(?<![A-Z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Z0-9])"),
-        ("slack", r"xox[abprs]-[A-Za-z0-9-]{10,}"),
+        ("slack", r"xox[a-z]-[A-Za-z0-9-]{10,}"),
         ("google", r"AIza[0-9A-Za-z_-]{35}"),
         ("private_key", r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----"),
     ))
@@ -1596,7 +1650,7 @@ def sign(body: str) -> str:
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_scan.py'`, then `./test-python.sh`
-Expected: PASS, 15 tests. The whole suite passes.
+Expected: PASS, 16 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
@@ -1615,11 +1669,11 @@ git commit -m "hosted: the comment scan and the signature"
 - Consumes: a Signer (Task 1's `Rs256Signer` shape: `sign(message) -> bytes`). The tests pass a fake one.
 - Produces:
   - Constants: `API`, `API_VERSION = "2022-11-28"`, `CHECK_RUN_NAME = "claudebox"`, `READ_PERMISSIONS`, `SUMMARY_MAX = 65535`, `MAX_PAGES = 100`.
-  - `github_app.Response(status: int, headers: Dict[str, str], body: bytes)`, where header names are lowercased; `Transport = Callable[[method, url, headers, body], Response]`; `urllib_transport`.
+  - `github_app.Response(status: int, headers: Dict[str, str], body: bytes)`, where header names are lowercased; `Transport = Callable[[method, url, headers, body], Response]`; `urllib_transport` (follows no redirect).
   - `github_app.GitHubError(status, message, retry_after=None)` with the `retryable` property.
   - `app_jwt(app_id, signer, now) -> str`, `parse_time(stamp) -> int`, `check_repo(full_name) -> str`.
   - `App(app_id, signer, transport=urllib_transport, clock=time.time, api=API)` with `installations()`, `installation_token(installation_id, repository_ids=None, permissions=None) -> (token, expires_at)`, `read_token(installation_id, repo_id) -> (token, expires_at)` and `installation(installation_id) -> Installation`.
-  - `Installation` with `repos()`, `repo(full_name) -> Optional[dict]`, `open_prs(full_name)`, `file_at_default(full_name, path) -> Optional[bytes]`, `issue_comments(full_name, pr)`, `reviews(full_name, pr)`, `newest_review_comments(full_name, pr, n=30)`, `comment(full_name, pr, body) -> int`, `create_check_run(full_name, head_sha, status, title, summary, conclusion=None) -> int` and `update_check_run(full_name, run_id, status, title, summary, conclusion=None)`.
+  - `Installation` with `repos()`, `repo(full_name) -> Optional[dict]`, `open_prs(full_name)`, `file_at_default(full_name, path) -> Optional[bytes]`, `is_ancestor(full_name, ancestor, head) -> bool` (commit ids only; a 404 is `False`), `issue_comments(full_name, pr)`, `reviews(full_name, pr)`, `newest_review_comments(full_name, pr, n=30)`, `comment(full_name, pr, body) -> int`, `create_check_run(full_name, head_sha, status, title, summary, conclusion=None) -> int` and `update_check_run(full_name, run_id, status, title, summary, conclusion=None)`.
   - `is_fork_pr(pr: Mapping) -> bool`, `user_for_token(user_token, transport=..., api=API) -> {id, login}` and `public_user(login, transport=..., api=API) -> {id, login}`.
 
 - [ ] **Step 1: Write the failing test**
@@ -1783,7 +1837,8 @@ class InstallationTest(unittest.TestCase):
         self.assertIn("2000000 bytes", str(ctx.exception))
 
     def test_a_repo_name_that_could_alter_the_path_is_refused(self):
-        for bad in ("acme/web/../../x", "acme", "acme/web?x=1", ""):
+        for bad in ("acme/web/../../x", "acme", "acme/web?x=1", "", "../web", "./web",
+                    "acme/..", "acme/."):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 self.inst.repo(bad)
 
@@ -1807,6 +1862,26 @@ class InstallationTest(unittest.TestCase):
         self.routes[("POST", "/repos/acme/web/issues/3/comments")] = {"id": 9}
         self.assertEqual(self.inst.comment("acme/web", 3, "hi"), 9)
         self.assertEqual(self.t.requests[-1][3], {"body": "hi"})
+
+    def test_is_ancestor_reads_the_compare_status(self):
+        old, new = "a" * 40, "b" * 40
+        path = f"/repos/acme/web/compare/{old}...{new}?per_page=1"
+        for status, expected in (("ahead", True), ("identical", True),
+                                 ("diverged", False), ("behind", False)):
+            with self.subTest(status=status):
+                self.routes[("GET", path)] = {"status": status}
+                self.assertEqual(self.inst.is_ancestor("acme/web", old, new), expected)
+
+    def test_a_commit_github_no_longer_has_is_not_an_ancestor(self):
+        old, new = "a" * 40, "b" * 40
+        self.routes[("GET", f"/repos/acme/web/compare/{old}...{new}?per_page=1")] = Response(
+            404, {}, b'{"message":"Not Found"}')
+        self.assertFalse(self.inst.is_ancestor("acme/web", old, new))
+
+    def test_is_ancestor_refuses_a_value_that_is_not_a_commit_id(self):
+        for bad in ("main", "a" * 39, "../x", "A" * 40):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.inst.is_ancestor("acme/web", bad, "b" * 40)
 
     def test_newest_review_comments_ask_for_thirty_newest(self):
         path = "/repos/acme/web/pulls/3/comments?sort=created&direction=desc&per_page=30"
@@ -1843,6 +1918,50 @@ class ErrorTest(unittest.TestCase):
         e = self.fail(Response(403, {"x-ratelimit-remaining": "10"}, b'{"message":"no"}'))
         self.assertFalse(e.retryable)
         self.assertEqual(e.message, "no")
+
+
+class RedirectTest(unittest.TestCase):
+    """urllib_transport against real loopback servers: a 30x is never followed."""
+
+    def serve(self, handler_cls):
+        import http.server
+        import threading
+        server = http.server.HTTPServer(("127.0.0.1", 0), handler_cls)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server
+
+    def test_an_authenticated_redirect_off_host_is_not_followed(self):
+        import http.server
+        from github_app import urllib_transport
+        seen = []
+
+        class Elsewhere(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append(self.headers.get("Authorization"))
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        other = self.serve(Elsewhere)
+
+        class Redirector(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(302)
+                self.send_header("Location", f"http://127.0.0.1:{other.server_port}/steal")
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        first = self.serve(Redirector)
+        resp = urllib_transport("GET", f"http://127.0.0.1:{first.server_port}/x",
+                                {"Authorization": "token secret"}, None)
+        self.assertEqual(resp.status, 302)
+        self.assertEqual(seen, [])
 
 
 class ForkTest(unittest.TestCase):
@@ -1935,6 +2054,8 @@ MAX_PAGES = 100
 
 _REPO_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
 _LOGIN_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
+# A commit id: SHA-1 (40 hex) or SHA-256 (64 hex).
+_SHA_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 
 
 @dataclass(frozen=True)
@@ -1960,11 +2081,23 @@ class GitHubError(Exception):
         return self.retry_after is not None or self.status >= 500 or self.status == 0
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow no redirect. urllib would replay the Authorization header to
+    wherever a 30x pointed, off the API host included, so a redirect comes
+    back as the 30x it is and the caller treats it as an error."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def urllib_transport(method: str, url: str, headers: Dict[str, str],
                      body: Optional[bytes]) -> Response:
     req = urllib.request.Request(url, data=body, method=method, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with _OPENER.open(req, timeout=30) as r:
             return Response(r.status, {k.lower(): v for k, v in r.headers.items()}, r.read())
     except urllib.error.HTTPError as e:
         return Response(e.code, {k.lower(): v for k, v in e.headers.items()}, e.read())
@@ -2010,7 +2143,9 @@ def _next_link(headers: Mapping[str, str]) -> Optional[str]:
 
 
 def check_repo(full_name: str) -> str:
-    if not _REPO_RE.fullmatch(full_name or ""):
+    """An owner/name safe to put in a URL path: no `.` or `..` segment, nothing else."""
+    if not _REPO_RE.fullmatch(full_name or "") or any(
+            part in (".", "..") for part in full_name.split("/")):
         raise ValueError(f"not a repository name: {full_name!r}")
     return full_name
 
@@ -2151,6 +2286,28 @@ class Installation(_Client):
             raise GitHubError(413, f"{path} is {data.get('size')} bytes, too large to read")
         return base64.b64decode(data.get("content", ""))
 
+    def is_ancestor(self, full_name: str, ancestor: str, head: str) -> bool:
+        """Whether `ancestor` is reachable from `head`.
+
+        The spec's rewrite test: a pair's last reviewed head that is no longer an
+        ancestor of the current head means a rebase or force-push rewrote the
+        branch, and the pass widens to the whole PR. The compare API's status is
+        `ahead` or `identical` exactly when that holds. A 404 (a commit GitHub no
+        longer has) is not an ancestor, so a rewrite that also dropped the old
+        head still widens.
+        """
+        for sha in (ancestor, head):
+            if not _SHA_RE.fullmatch(sha or ""):
+                raise ValueError(f"not a commit id: {sha!r}")
+        url = f"/repos/{check_repo(full_name)}/compare/{ancestor}...{head}?per_page=1"
+        try:
+            data = self._call("GET", url)
+        except GitHubError as e:
+            if e.status == 404:
+                return False
+            raise
+        return data.get("status") in ("ahead", "identical")
+
     def issue_comments(self, full_name: str, pr: int) -> List[dict]:
         return self._pages(f"/repos/{check_repo(full_name)}/issues/{int(pr)}/comments?per_page=100")
 
@@ -2225,7 +2382,7 @@ def public_user(login: str, transport: Transport = urllib_transport, api: str = 
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_github_app.py'`, then `./test-python.sh`
-Expected: PASS, 27 tests. The whole suite passes.
+Expected: PASS, 31 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
@@ -2285,7 +2442,7 @@ At the top of "Unreleased" in `HISTORY.md`, add:
 - [ ] **Step 5: Run every suite**
 
 Run: `./test-python.sh && ./test-providers.sh && ./test-personas.sh && ./test-shim.sh && ./test-launcher.sh`
-Expected: all five pass. The Python suite reports 106 more tests than at the base, 12 of them skipped on a host without `cryptography`.
+Expected: all five pass. The Python suite reports 114 more tests than at the base, 12 of them skipped on a host without `cryptography`.
 
 - [ ] **Step 6: Commit**
 
