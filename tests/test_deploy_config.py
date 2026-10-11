@@ -88,13 +88,15 @@ class LoadTest(unittest.TestCase):
         # Mutation: Drop any one of the section, name, body or override guards.
         for doc, line in (
                 ({"profiles": {"o": profile()}, "timing": 5}, "timing: must be an object"),
+                ({"profiles": {"o": profile()}, "caps": 5}, "caps: must be an object"),
                 ({"profiles": {"o/../x": profile()}},
                  "profiles.o/../x: profile names use letters, digits"),
                 ({"profiles": {"o\n": profile()}}, "profile names use letters, digits"),
                 ({"profiles": {"o": 5}}, "profiles.o: must be an object"),
-                ({"profiles": {"o": profile()},
-                  "caps": {"clone_bytes": {"overrides": {"api": "big"}}}},
-                 "caps.clone_bytes.overrides.api: must be a positive integer")):
+                *(({"profiles": {"o": profile()},
+                    "caps": {"clone_bytes": {"overrides": {"api": bad}}}},
+                   "caps.clone_bytes.overrides.api: must be a positive integer")
+                  for bad in ("big", 0, True, None))):
             with self.subTest(line=line):
                 self.assertIn(line, problems(doc))
 
