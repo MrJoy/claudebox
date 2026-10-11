@@ -37,7 +37,7 @@ The spec and the overview leave these open, and each one changes code. They are 
 1. **2a.4 is two plans.** 2a.4a is the decision libraries, testable with fakes. 2a.4b is the processes: the scheduler, the control-plane main, the supervisor, `hosted/Dockerfile` and `hosted/compose.json`. Each is one factory run. The overview's split table says so.
 2. **A hosted round line from round 2 on reads "Read closely only the commits after `<head>`: the ones `git log --oneline <head>..HEAD` lists."** (plan mode: "the revisions after commit `<head>`", keeping its last sentence). `since_head` must be a full commit id. A rewritten branch gets round 1's line whatever the round, and the summary of the check run says the branch was rewritten.
 3. **`build_hosted` is `build({})` with `HOSTED_GH_SENTENCE` after every copy of `GH_STANZA`.** It raises if a default ever loses `GH_STANZA`, so the sentence can never silently go missing.
-4. **The check-run states in 2a** are queued, running, reviewed, deferred, usage-limited, failed, failing, capped, round-cap, revoked and config-invalid. Budget, too-large and refused-read arrive with 2b. When a head's pairs differ, the title names the state that waits on a person before one that clears itself, before one that is done. The wording is the table in `checkruns._WORDS`, with a retry time in UTC where one exists. The summary has one line per persona and the counts: posted, waiting to post, dropped, withheld, and turned away by the per-pass limit.
+4. **The check-run states in 2a** are queued, running, reviewed, deferred, usage-limited, failed, failing, capped, round-cap, revoked and config-invalid. Budget, too-large and refused-read arrive with 2b. When a head's pairs differ, the title names the state that waits on a person before one that clears itself, before one that is done. The wording is the table in `checkruns._WORDS`, with a retry time in UTC where one exists. The summary has one line per persona and the counts: posted, waiting to post, dropped, withheld, and turned away by the per-pass limit. A config problem stops the review and is titled "Not reviewed: configuration", with one sentence true of every cause (an invalid file, a setting the deployment cannot serve) and the problem text below it. A config notice (one file broken and the other applied, the spec's fallback) shows below a review that runs and makes its conclusion `neutral`. `CheckRuns.config_answer` and `CheckRuns.view` let 2a.4b publish a head only when its answer changes, and paint a pair no job will ever set.
 5. **A head's conclusion is `success` only when every pair is reviewed (or at its round cap) and nothing was found**, counting findings queued, posted, dropped, withheld and turned away. Everything else that is complete is `neutral`.
 6. **Acceptance runs scan, then size, then the per-pass count.** A credential is withheld whatever else is wrong with the finding. Size is measured in UTF-8 bytes against `caps.comment_bytes`. A too-long finding is not counted against the pass, since the model is told to shorten it and post again. A finding past `caps.comments_per_pass` is counted on the check run as not posted. A retried `post-finding` with the same key answers what the first one did, and queues once. The key's result is kept in memory for the job's life.
 7. **A withheld record stores a fresh 16-byte salt followed by `sha256(salt || body)`**, and the body with every match replaced by `[withheld:<detector>]`. The day's count per detector is a `withheld_counts` row.
@@ -49,10 +49,10 @@ The spec and the overview leave these open, and each one changes code. They are 
 13. **Parks live beside the pair state, keyed by repo.** The profile's two-PR limit rule counts `(repo, pr)`, since a profile spans repos and every repo has a #1. A head park lifts when the PR's head differs. A timed park lifts at its time. A profile park stops `start-pair`, and its scheduling consequence is 2a.4b's. A page is one `PAGE:` line (overview decision 14).
 14. **`fetch-job` mints the read token and starts the 55-minute deadline in the same call**, so the token outlives the job, and a read token GitHub refuses revokes the new capability at once. A pair's committed transcript travels in the job spec with its session id, and a pair without one gets neither.
 15. **`start-pair` fails closed, and reserves the pair before any network call.** A visibility check that errors, a repo that is public or out of reach, a parked profile, a pair already started or starting, and a gateway that refuses the token all answer `409`. The check and the reservation happen under the job's lock, so two concurrent starts for one persona mint one token, and a refusal clears the reservation so the pair stays startable. The provider token lives until the job's deadline, and its `token_records` row exists before the gateway hears of it.
-16. **`complete-pair` records the pair completed as soon as the commit point returns**, with its outcome, in the same critical section that ends its reservation, and answers a resend `200 {}`, the way `post-finding` answers one. After the record, the pair's check-run view is set (in memory, and published), and only then is the token revoked, so a fault in the revocation leaves the run showing the true outcome and the token for the job's end to revoke. A fault before the commit point leaves the pair started, which a retry re-enters. A concurrent duplicate is `409`. Behind both, the commit point settles each provider credential once (`Committer.settled`), so any re-entry is a replay of the first outcome and never spends a round twice. A completion whose job is no longer registered (`job_live`, checked under the commit point's lock) commits nothing and answers `revoked`: the job's end already revoked and showed the pair, and a loss of access may already have deleted what it would write back (2a.4b's review). It turns a bad transcript into one that will not parse. That covers bad base64, a transcript over 64 MiB, and the worker's own `over-cap` note, so all three are `failing`. A flush the gateway cannot answer is no flush, so the pair is `deferred`. The pair's token is revoked in the records store and then at the gateway, and a gateway that misses the revoke drops the token at its next `hello`.
-17. **Body caps are checked on the declared `Content-Length`, before reading.** A missing length is `411`, and a body over the cap is `413`. An oversized `complete-pair` is refused unread, so its pair is revoked when the job ends (the overview, as revised).
+16. **`complete-pair` records the pair completed as soon as the commit point returns**, with its outcome, in the same critical section that ends its reservation, and answers a resend `200 {}`, the way `post-finding` answers one. After the record, the pair's check-run view is set (in memory, and published), and only then is the token revoked, so a fault in the revocation leaves the run showing the true outcome and the token for the job's end to revoke. A fault before the commit point leaves the pair started, which a retry re-enters. A concurrent duplicate is `409`. A resend runs the settle step again from the recorded outcome, since every part of it is idempotent, so a fault in that step the first time cannot leave the run showing the pair as running. `job.completed` is the one record that a pair is done. A fault inside `apply` itself, before the record, is re-entered and may spend its round twice: the window is accepted, and closing it needs a durable commit, which 2b's SQL state brings. A completion whose job is no longer registered (`job_live`, checked under the commit point's lock) commits nothing and answers `revoked`: the job's end already revoked and showed the pair, and a loss of access may already have deleted what it would write back (2a.4b's review). It turns a bad transcript into one that will not parse. That covers bad base64, a transcript over 64 MiB, and the worker's own `over-cap` note, so all three are `failing`. A flush the gateway cannot answer is no flush, so the pair is `deferred`. The pair's token is revoked in the records store and then at the gateway, and a gateway that misses the revoke drops the token at its next `hello`.
+17. **Body caps and the credential are checked before reading.** A missing length is `411`, and a body over the cap is `413`. The token is in a header, so a request with no live credential for its call (a bootstrap for `fetch-job`, a capability with a registered job for the rest), or to no known call, is answered `401` or `404` without reading its body: the bodies run to 96 MiB, and the worker network is the untrusted side. A body that does not parse, a deeply nested one included, is `400`. An oversized `complete-pair` is refused unread, so its pair is revoked when the job ends (the overview, as revised).
 18. **`revoked` is `Committer.revoke`.** A started pair whose job ended without `complete-pair` (the deadline, an access change, a restart) has its transcript discarded and its failure recorded, and stays owed. `revoke` returns `REVOKED` for the job-end handler, which knows the head, to show as `checkruns.REVOKED`. 2a.4b's job end is that handler.
-19. **Loss of access has two deleters, both here.** `Committer.forget_repo` deletes the repo's transcripts and parks and clears its `Decider` state: sessions, fingerprints, pass counts and owed pairs. Rounds hold no content and survive, as the spec says of a public flip. `Outbox.drop_repo` deletes the repo's queued items and its `withheld` rows in one transaction, and keeps the per-detector day counts. 2a.4b's loss-of-access path calls both, plus `CheckRuns.forget_repo`, and revokes the repo's jobs.
+19. **Loss of access has two deleters, both here.** `Committer.forget_repo` deletes the repo's transcripts and parks and calls `StateStore.forget`, which drops sessions, fingerprints, pass counts, owed pairs and the cut, and keeps rounds, since they hold no content and survive a public flip, as the spec says. The policy lives in the store, beside the fields it names, so a field added later is forgotten or kept on purpose. `Outbox.drop_repo` deletes the repo's queued items and its `withheld` rows in one transaction, and keeps the per-detector day counts. 2a.4b's loss-of-access path calls both, plus `CheckRuns.forget_repo`, and revokes the repo's jobs.
 20. **The head a round line names is the committed fingerprint's**, read by `Committer.last_reviewed_head` from `state.reviewed`. There is no second record of it to drift.
 21. **A count moves in the transaction that settles its item**, so a crash cannot lose one. That covers acceptance's withheld row as well as the drain. The drain decides an item's fate inside its `try` and settles it after, so a check-run failure is never read as the comment's, and a failed publish waits for the next one. A head this process holds no pair state for is not repainted: after a restart the outbox still posts its findings, and an empty map would turn a finished run back to queued. Pair states sit under a lock, since a group's personas finish together, and a head's run is created under a second lock, so personas reaching a new head together make one run.
 
@@ -355,8 +355,8 @@ git commit -m "prompts: a hosted round line names the head last reviewed"
 - Produces:
   - The state names `QUEUED`, `RUNNING`, `REVIEWED`, `DEFERRED`, `USAGE_LIMITED`, `FAILED`, `FAILING`, `CAPPED`, `ROUND_CAP`, `REVOKED`, `CONFIG_INVALID`, and `STATES`.
   - `PairView(state, until=None)` (frozen) and `Counts(queued, posted, dropped, withheld, not_posted)` with `found() -> int`.
-  - `render(pairs: Dict[str, PairView], counts, rewritten=False, config_problem="") -> (status, conclusion, title, summary)`.
-  - `CheckRuns(records, installation_for, clock=time.time)` with `run_id`, `counts(repo, head, queued=0)`, `ensure(repo, head) -> int`, `set_pair(repo, head, persona, view, rewritten=None)`, `set_config_problem`, `add(repo, head, conn=None, **deltas)` (with `conn`, inside the caller's transaction), `publish(repo, head, queued=0)` (a no-op for a head with no pair state) and `forget_repo(repo)`; `lock` guards the pair states.
+  - `render(pairs: Dict[str, PairView], counts, rewritten=False, config_problem="", config_notice="") -> (status, conclusion, title, summary)`.
+  - `CheckRuns(records, installation_for, clock=time.time)` with `run_id`, `counts(repo, head, queued=0)`, `ensure(repo, head) -> int`, `set_pair(repo, head, persona, view, rewritten=None)`, `set_config_problem(repo, head, problem, notice=)`, `config_answer(repo, head) -> Optional[Tuple[str, str]]`, `view(repo, head, persona) -> Optional[PairView]`, `add(repo, head, conn=None, **deltas)` (with `conn`, inside the caller's transaction), `publish(repo, head, queued=0)` (a no-op for a head with no pair state) and `forget_repo(repo)`; `lock` guards the pair states.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -432,7 +432,7 @@ class RenderTest(unittest.TestCase):
 
     def test_an_invalid_config_says_so_and_carries_the_problem(self):
         status, conclusion, title, summary = render({}, Counts(), config_problem="code.personas: x")
-        self.assertEqual((status, title), ("completed", "Configuration invalid"))
+        self.assertEqual((status, title), ("completed", "Not reviewed: configuration"))
         self.assertIn("code.personas: x", summary)
 
     def test_every_settled_state_has_words(self):
@@ -563,6 +563,21 @@ class CheckRunsTest(unittest.TestCase):
         self.assertEqual(errors, [])
 
 
+class ConfigNoticeTest(unittest.TestCase):
+    def test_a_notice_shows_below_a_review_that_runs_and_is_never_green(self):
+        # The spec's fallback: one file broken, the other applied, the problem shown.
+        done = {"sage": PairView(checkruns.REVIEWED)}
+        status, conclusion, title, summary = render(done, Counts(),
+                                                    config_notice="org file: plan.label: x")
+        self.assertEqual((status, conclusion, title), ("completed", "neutral", "Reviewed"))
+        self.assertIn("org file: plan.label: x", summary)
+        self.assertEqual(render(done, Counts())[1], "success")
+
+    def test_the_problem_wording_claims_no_cause_the_text_below_does_not(self):
+        title, sentence = checkruns._WORDS[checkruns.CONFIG_INVALID]
+        self.assertNotIn("invalid", (title + sentence).lower())
+
+
 if __name__ == "__main__":
     unittest.main()
 ```
@@ -639,9 +654,12 @@ _WORDS = {
     REVOKED: ("Interrupted",
               "was interrupted (a timeout, an access change, or a restart). It runs again on its "
               "own."),
-    CONFIG_INVALID: ("Configuration invalid",
-                     "is not reviewing, because `.github/claudebox.json` on the default branch "
-                     "is invalid. Fixing the file clears it."),
+    # One sentence for every reason a repo's configuration stops a review: a
+    # file that is invalid, a setting this deployment cannot serve, or both
+    # files broken. The problem text below it says which.
+    CONFIG_INVALID: ("Not reviewed: configuration",
+                     "is not reviewing this PR, because of the configuration problem below. "
+                     "It reviews again on its own once the problem is gone."),
 }
 
 
@@ -670,11 +688,13 @@ def _utc(stamp: Optional[int]) -> str:
 
 
 def render(pairs: Dict[str, PairView], counts: Counts, rewritten: bool = False,
-           config_problem: str = "") -> Tuple[str, Optional[str], str, str]:
+           config_problem: str = "", config_notice: str = "") -> Tuple[str, Optional[str], str, str]:
     """(status, conclusion, title, summary) for one head.
 
     `pairs` maps persona to its view. An empty map with no config problem is a
-    head nothing has been scheduled for yet, which shows as queued.
+    head nothing has been scheduled for yet, which shows as queued. A config
+    problem stops the review; a config notice (one file broken, the other
+    applied) is shown below a review that runs.
     """
     for persona, view in pairs.items():
         if view.state not in STATES:
@@ -709,11 +729,15 @@ def render(pairs: Dict[str, PairView], counts: Counts, rewritten: bool = False,
                      "as a whole.")
     parts.append("\n".join(lines))
     parts.append(tally)
+    if config_notice:
+        parts.append("Configuration: one file was ignored, so this PR is reviewed under the "
+                     "other one.\n\n" + config_notice)
     summary = "\n\n".join(p for p in parts if p)
     conclusion = None
     if status == "completed":
         clean = all(v.state in (REVIEWED, ROUND_CAP) for v in pairs.values())
-        conclusion = "success" if clean and counts.found() == 0 else "neutral"
+        # A broken file shown in the summary is never a green check.
+        conclusion = "success" if clean and counts.found() == 0 and not config_notice else "neutral"
     return status, conclusion, title, summary
 
 
@@ -722,6 +746,7 @@ class _Head:
     pairs: Dict[str, PairView] = field(default_factory=dict)
     rewritten: bool = False
     config_problem: str = ""
+    config_notice: str = ""
 
 
 class CheckRuns:
@@ -785,9 +810,22 @@ class CheckRuns:
             if rewritten is not None:
                 h.rewritten = rewritten
 
-    def set_config_problem(self, repo: str, head: str, problem: str) -> None:
+    def set_config_problem(self, repo: str, head: str, problem: str, notice: str = "") -> None:
         with self.lock:
-            self._heads.setdefault((repo, head), _Head()).config_problem = problem
+            h = self._heads.setdefault((repo, head), _Head())
+            h.config_problem, h.config_notice = problem, notice
+
+    def view(self, repo: str, head: str, persona: str) -> Optional[PairView]:
+        """A persona's view on a head, or None when nothing has set one."""
+        with self.lock:
+            h = self._heads.get((repo, head))
+            return None if h is None else h.pairs.get(persona)
+
+    def config_answer(self, repo: str, head: str) -> Optional[Tuple[str, str]]:
+        """The (problem, notice) last set on a head, or None for a head with no state."""
+        with self.lock:
+            h = self._heads.get((repo, head))
+            return None if h is None else (h.config_problem, h.config_notice)
 
     def add(self, repo: str, head: str, conn=None, **deltas: int) -> None:
         """Move the head's counts: posted, dropped, withheld or not_posted.
@@ -821,10 +859,10 @@ class CheckRuns:
             if h is None:
                 return
             pairs = dict(h.pairs)
-            rewritten, problem = h.rewritten, h.config_problem
+            rewritten, problem, notice = h.rewritten, h.config_problem, h.config_notice
         run_id = self.ensure(repo, head)
         status, conclusion, title, summary = render(pairs, self.counts(repo, head, queued),
-                                                    rewritten, problem)
+                                                    rewritten, problem, notice)
         self.installation_for(repo).update_check_run(repo, run_id, status, title, summary,
                                                      conclusion)
 
@@ -837,7 +875,7 @@ class CheckRuns:
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_checkruns.py'`, then `./test-python.sh`
-Expected: PASS, 20 tests. The whole suite passes.
+Expected: PASS, 22 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
@@ -1580,6 +1618,7 @@ git commit -m "hosted: the outbox, its acceptance caps and its paced drain"
 
 **Files:**
 - Create: `hosted/commit.py`
+- Modify: `reviewer/state.py` (`StateStore.forget`)
 - Test: `tests/test_hosted_commit.py`
 
 **Interfaces:**
@@ -1590,7 +1629,7 @@ git commit -m "hosted: the outbox, its acceptance caps and its paced drain"
   - `ensure_record(conn, credential_id)`, `record_for(records, credential_id) -> Optional[Record]`, `apply_report(records, msg) -> {ack} | {error}`, `flush_complete(flush, record) -> bool`, `transcript_session(data: bytes) -> Optional[str]`.
   - `decide(record, flush_ok, transcript, reported_session, expected_session) -> str`, which never returns `REVOKED`.
   - `Park(reason, until=None, head=None)`; `Completion(repo, pair, head, profile, credential_id, transcript, session_id, expected_session, flush, signal=None, job_id=None)` (frozen).
-  - `Committer(records, blob_store, decider_for, backoff_for, clock=time.time, log=print, job_live=lambda job_id: True)` with `commit(completion) -> str`, `apply(completion, outcome, record)`, `revoke(repo, pair) -> str` (returns `REVOKED`; the caller publishes it), `parked(repo, pair, head) -> Optional[Park]`, `profile_parked_until(profile) -> int`, `transcript_for(repo, pair) -> Optional[bytes]`, `last_reviewed_head(repo, pair) -> Optional[str]` (the committed fingerprint's head), `forget_repo(repo)`, and the attributes `parks`, `transcripts`, `profiles` and `settled` (credential id to outcome: `commit` answers a settled credential with its first outcome and applies nothing).
+  - `Committer(records, blob_store, decider_for, backoff_for, clock=time.time, log=print, job_live=lambda job_id: True)` with `commit(completion) -> str`, `apply(completion, outcome, record)`, `revoke(repo, pair) -> str` (returns `REVOKED`; the caller publishes it), `parked(repo, pair, head) -> Optional[Park]`, `profile_parked_until(profile) -> int`, `transcript_for(repo, pair) -> Optional[bytes]`, `last_reviewed_head(repo, pair) -> Optional[str]` (the committed fingerprint's head), `forget_repo(repo)`, and the attributes `parks`, `transcripts` and `profiles`. `commit` answers `REVOKED` for a completion whose `job_id` is not `job_live`, and applies nothing.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1793,15 +1832,6 @@ class CommitterTest(unittest.TestCase):
             repo, pair, head, "ollama", cid, transcript() if data is None else data, session,
             expected, flush or {"last_seq": seq, "drained": True}, signal))
 
-    def test_a_settled_credential_is_a_replay_and_spends_no_second_round(self):
-        # A re-entered complete-pair (PR #21 review): the same credential twice.
-        self.complete({})
-        cid = next(iter(self.c.settled))
-        again = Completion("acme/web", self.pair, HEAD, "ollama", cid, transcript(), SID, None,
-                           {"last_seq": 0, "drained": False}, "fp1")
-        self.assertEqual(self.c.commit(again), "ok")    # not the deferred a fresh decision gives
-        self.assertEqual(self.state.rounds[self.pair], 1)
-
     def test_decider_for_is_never_called_under_the_committers_lock(self):
         # Lock order (PR #22 review): decider_for takes the scheduler's lock,
         # and the scheduler calls into the committer.
@@ -1833,6 +1863,21 @@ class CommitterTest(unittest.TestCase):
                        {"last_seq": 0, "drained": True}, "fp1", "job1")
         self.assertEqual(self.c.commit(c), "revoked")
         self.assertEqual((self.blobs.data, self.state.sessions, self.state.rounds), ({}, {}, {}))
+
+    def test_the_store_forgets_everything_but_rounds_and_clears_in_place(self):
+        from state import MemoryStateStore
+        store = MemoryStateStore()
+        owed = store.owed
+        store.sessions[self.pair], store.rounds[self.pair] = "s", 2
+        store.reviewed[self.pair], store.passes_done[self.pair] = "fp", 1
+        owed.add(self.pair)
+        store.cut_group = (7, "code")
+        store.forget()
+        self.assertEqual((store.sessions, store.reviewed, store.passes_done, store.cut_group),
+                         ({}, {}, {}, None))
+        self.assertIs(store.owed, owed)
+        self.assertEqual(owed, set())
+        self.assertEqual(store.rounds, {self.pair: 2})
 
     def test_ok_commits_everything_together(self):
         self.assertEqual(self.complete({}), "ok")
@@ -1947,6 +1992,44 @@ Run: `./test-python.sh -p 'test_hosted_commit.py'`
 Expected: FAIL: `ModuleNotFoundError: No module named 'commit'`.
 
 - [ ] **Step 3: Implement**
+
+Apply this change to `reviewer/state.py`:
+
+```diff
+diff --git a/reviewer/state.py b/reviewer/state.py
+index 56137dc..306452f 100644
+--- a/reviewer/state.py
++++ b/reviewer/state.py
+@@ -79,6 +79,17 @@ class StateStore(ABC):
+     @abstractmethod
+     def cut_group(self, value: Optional[Tuple[int, str]]) -> None: ...
+ 
++    @abstractmethod
++    def forget(self) -> None:
++        """Drop everything remembered except `rounds`.
++
++        The hosted control plane's answer to a repo losing access: sessions,
++        fingerprints, pass counts, owed pairs and the cut all go, and rounds
++        stay, since they hold no content and "survive a public flip" (the
++        hosted spec's "Visibility"). The policy lives here, beside the fields
++        it names, so a field added later is forgotten or kept on purpose.
++        """
++
+ 
+ class MemoryStateStore(StateStore):
+     """Today's dicts. Lost on restart, deliberately.
+@@ -128,3 +139,10 @@ class MemoryStateStore(StateStore):
+     @cut_group.setter
+     def cut_group(self, value: Optional[Tuple[int, str]]) -> None:
+         self._cut_group = value
++
++    def forget(self) -> None:
++        self._sessions.clear()
++        self._passes_done.clear()
++        self._reviewed.clear()
++        self._owed.clear()
++        self._cut_group = None
+```
 
 `hosted/commit.py`:
 
@@ -2194,34 +2277,28 @@ class Committer:
         self.lock = threading.RLock()   # commit holds it across apply, which takes it too
         self.parks: Dict[Tuple[str, Pair], Park] = {}
         self.transcripts: Dict[Tuple[str, Pair], str] = {}
-        # credential id -> its outcome. In memory: a restart revokes every credential.
-        self.settled: Dict[str, str] = {}
         self.profiles: Dict[str, _Profile] = {}
         self.defers_in_a_row: Dict[str, int] = {}
 
     def commit(self, c: Completion) -> str:
-        """Decide and apply a pair's outcome, once per provider credential.
+        """Decide and apply a pair's outcome.
 
-        A credential already settled answers its first outcome and applies
-        nothing: a re-entered complete-pair is a replay, never a second pass,
-        so it cannot spend a round twice.
+        The channel's `job.completed` is the one record that a pair is done, so
+        a resend never reaches here. A completion whose job has ended commits
+        nothing and answers `revoked`, checked under this lock, which
+        `forget_repo` and `revoke` also take.
         """
         # Lock order: the decider is resolved before this lock is taken, never
         # under it, because decider_for takes the scheduler's lock and the
-        # scheduler calls in here (PR #22 review).
+        # scheduler calls in here.
         decider = self.decider_for(c.repo)
         with self.lock:
-            settled = self.settled.get(c.credential_id)
-            if settled is not None:
-                return settled
             if c.job_id is not None and not self.job_live(c.job_id):
-                self.settled[c.credential_id] = REVOKED
                 return REVOKED
             record = record_for(self.records, c.credential_id)
             outcome = decide(record, flush_complete(c.flush, record), c.transcript, c.session_id,
                              c.expected_session)
             self.apply(c, outcome, record, decider)
-            self.settled[c.credential_id] = outcome
             return outcome
 
     def revoke(self, repo: str, pair: Pair) -> str:
@@ -2348,12 +2425,7 @@ class Committer:
             for profile in self.profiles.values():
                 for key in [k for k in profile.recent_limits if k[0] == repo]:
                     del profile.recent_limits[key]
-            state = decider.state
-            state.sessions.clear()
-            state.reviewed.clear()
-            state.passes_done.clear()
-            state.owed = set()
-            state.cut_group = None
+            decider.state.forget()   # the store's own policy: everything but rounds
 
 
 @dataclass(frozen=True)
@@ -2765,8 +2837,11 @@ class FindingAndCompleteTest(Base):
         with self.assertRaises(RuntimeError):
             self.complete(cap, data=transcript())
         self.ch._publish = real
+        self.assertEqual(self.runs.views["sme"].state, "running")
         self.assertEqual(self.complete(cap, data=transcript()), (200, {}))
         self.assertEqual(self.state.rounds[Pair(12, "code", "sme")], 1)
+        # The resend repaints from the recorded outcome (PR #21 review).
+        self.assertEqual(self.runs.views["sme"].state, "reviewed")
 
     def test_a_revoke_that_faults_still_leaves_the_true_outcome_on_the_run(self):
         # The view is set before the fallible revocations (PR #21 review).
@@ -2850,9 +2925,28 @@ class HttpTest(Base):
         self.assertEqual(self.post("/channel/complete-pair", "x", body=b"{}",
                                    length=channel.COMPLETE_BODY_MAX + 1)[0], 413)
 
+    def capability(self):
+        status, reply = self.post("/channel/fetch-job", self.boot)
+        return reply["capability"]
+
     def test_a_body_that_is_not_a_json_object_is_refused(self):
-        self.assertEqual(self.post("/channel/start-pair", "x", body=b"[1]")[0], 400)
-        self.assertEqual(self.post("/channel/start-pair", "x", body=b"nope")[0], 400)
+        cap = self.capability()
+        self.assertEqual(self.post("/channel/start-pair", cap, body=b"[1]")[0], 400)
+        self.assertEqual(self.post("/channel/start-pair", cap, body=b"nope")[0], 400)
+        self.assertEqual(self.post("/channel/start-pair", cap, body=b"[" * 100000)[0], 400)
+
+    def test_no_credential_is_refused_before_the_body_is_read(self):
+        # PR #21 review: a declared 90 MiB body from a caller with no live
+        # credential is answered from its headers, and the body never sent.
+        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)
+        conn.putrequest("POST", "/channel/complete-pair")
+        conn.putheader("Authorization", "Bearer x")
+        conn.putheader("Content-Length", str(90 * 1024 * 1024))
+        conn.endheaders()
+        resp = conn.getresponse()
+        self.assertEqual(resp.status, 401)
+        conn.close()
+        self.assertEqual(self.post("/channel/nope", "x")[0], 404)
 
 
 if __name__ == "__main__":
@@ -2995,6 +3089,30 @@ class Channel:
         self.clock = clock
         self.log = log
 
+    CALLS = ("/channel/fetch-job", "/channel/start-pair", "/channel/post-finding",
+             "/channel/complete-pair")
+
+    def refusal(self, path: str, token: str) -> Optional[Tuple[int, Dict[str, Any]]]:
+        """The answer for a request refused on its path and token alone, or None.
+
+        The handler asks this before it reads a body, so a caller with no live
+        credential costs no read and no parse: the bodies run to 96 MiB, and
+        the worker network that can reach this socket is the untrusted side.
+        `handle` checks again, since a token can die between the two.
+        """
+        if path not in self.CALLS:
+            return 404, {"reason": "no such call"}
+        if path == "/channel/fetch-job":
+            if self.creds.check(token, "bootstrap") is None:
+                return 401, {"reason": "the bootstrap token is used, expired or unknown"}
+            return None
+        cred = self.creds.check(token, "capability")
+        if cred is None:
+            return 401, {"reason": "the capability is not live"}
+        if self.jobs.get(cred.job_id) is None:
+            return 401, {"reason": "the job has ended"}
+        return None
+
     def handle(self, path: str, token: str, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
         if path == "/channel/fetch-job":
             return self.fetch_job(token)
@@ -3119,11 +3237,19 @@ class Channel:
             cid = job.started.get(pair.persona)
             if cid is None:
                 return 409, {"reason": "this pair never started"}
-            if pair.persona in job.completed:
-                return 200, {}   # a resend: the outcome is committed, as post-finding answers one
-            if pair.persona in job.busy:
-                return 409, {"reason": "this pair is completing"}
-            job.busy.add(pair.persona)
+            done = job.completed.get(pair.persona)
+            if done is None:
+                if pair.persona in job.busy:
+                    return 409, {"reason": "this pair is completing"}
+                job.busy.add(pair.persona)
+        if done is not None:
+            # A resend: the outcome is committed, and answered as post-finding
+            # answers one. The settle step runs again from the recorded outcome,
+            # since a fault in it the first time would otherwise leave the run
+            # showing this pair as running for good; every part of it is
+            # idempotent.
+            self._settle(job, pair, cid, done)
+            return 200, {}
         try:
             outcome = self._commit(job, pair, cid, body)
         except BaseException:
@@ -3224,9 +3350,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(413, {"reason": f"the body is over {limit} bytes"})
         auth = self.headers.get("Authorization", "")
         token = auth[len("Bearer "):] if auth.startswith("Bearer ") else ""
+        refused = self.channel.refusal(path, token)
+        if refused is not None:
+            self.close_connection = True   # the body is never read
+            return self._send(*refused)
         try:
             body = json.loads(self.rfile.read(length) or b"{}")
-        except ValueError:
+        except (ValueError, RecursionError, MemoryError):
             return self._send(400, {"reason": "the body is not JSON"})
         if not isinstance(body, dict):
             return self._send(400, {"reason": "the body is not a JSON object"})
@@ -3244,7 +3374,7 @@ def make_server(channel: Channel, host: str, port: int) -> http.server.Threading
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_channel.py'`, then `./test-python.sh`
-Expected: PASS, 28 tests. The whole suite passes.
+Expected: PASS, 29 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
