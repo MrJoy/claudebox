@@ -75,6 +75,7 @@ The spec and the overview leave these open, and each one changes code. They are 
 **Files:**
 - Create: `hosted/runner.py`
 - Create: `hosted/runnerd.py`
+- Modify: `Dockerfile` (pin the reviewer's uid: the other half of `WORKER_DISK`'s `uid=1001`)
 - Test: `tests/test_hosted_runner.py`
 
 **Interfaces:**
@@ -479,15 +480,36 @@ if __name__ == "__main__":
     sys.exit(0)
 ```
 
-- [ ] **Step 4: Run it to see it pass, then the whole suite**
+- [ ] **Step 4: Pin the reviewer's uid**
+
+`WORKER_DISK` mounts the clone directory owned by uid 1001, and the test above reads the image's `useradd` for the same number, so the pin lands in this task beside the constant it must match. Apply this change to `Dockerfile`:
+
+```diff
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -122,7 +122,10 @@ ENV KINDEX_PYTHON=/opt/kindex/bin/python \
+ # --- Non-root user ---------------------------------------------------------
+ # Claude Code refuses --dangerously-skip-permissions when running as root, so
+ # the loop must run unprivileged. This is also a defense-in-depth boundary.
+-RUN useradd --create-home --shell /bin/bash reviewer
++# The uid is pinned because the hosted job runner mounts the worker's clone
++# directory as a tmpfs owned by it (hosted/runner.py's WORKER_DISK), and root
++# in the worker holds no CAP_CHOWN to hand the mount over afterwards.
++RUN useradd --uid 1001 --create-home --shell /bin/bash reviewer
+ 
+ # Pre-create the top-level roots that host repo paths live under, owned by
+ # `reviewer`, so `--export-sessions` can clone the working copy at the *host*
+```
+
+- [ ] **Step 5: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_runner.py'`, then `./test-python.sh`
 Expected: PASS, 15 tests. The whole suite passes.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add hosted/runner.py hosted/runnerd.py tests/test_hosted_runner.py
+git add Dockerfile hosted/runner.py hosted/runnerd.py tests/test_hosted_runner.py
 git commit -m "hosted: the job runner, and runnerd, the one process holding the Docker socket"
 ```
 
@@ -2036,22 +2058,9 @@ Apply this change to `Dockerfile`:
 
 ```diff
 diff --git a/Dockerfile b/Dockerfile
-index 428e0ee..e252f8b 100644
 --- a/Dockerfile
 +++ b/Dockerfile
-@@ -122,7 +122,10 @@ ENV KINDEX_PYTHON=/opt/kindex/bin/python \
- # --- Non-root user ---------------------------------------------------------
- # Claude Code refuses --dangerously-skip-permissions when running as root, so
- # the loop must run unprivileged. This is also a defense-in-depth boundary.
--RUN useradd --create-home --shell /bin/bash reviewer
-+# The uid is pinned because the hosted job runner mounts the worker's clone
-+# directory as a tmpfs owned by it (hosted/runner.py's WORKER_DISK), and root
-+# in the worker holds no CAP_CHOWN to hand the mount over afterwards.
-+RUN useradd --uid 1001 --create-home --shell /bin/bash reviewer
- 
- # Pre-create the top-level roots that host repo paths live under, owned by
- # `reviewer`, so `--export-sessions` can clone the working copy at the *host*
-@@ -164,6 +167,17 @@ RUN python3 -c 'import sys; sys.path.insert(0, "/opt/claudebox/reviewer"); impor
+@@ -167,6 +167,17 @@ RUN python3 -c 'import sys; sys.path.insert(0, "/opt/claudebox/reviewer"); impor
  # installed above with no venv of its own. See the file header for why it exists.
  COPY --chown=reviewer:reviewer workersai-shim.py /usr/local/bin/workersai-shim.py
  RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/workersai-shim.py
