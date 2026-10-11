@@ -351,4 +351,6 @@ ticket, not a green check nobody refuted, not an executor's account of its own w
 `search` before every `add`. Capture decisions with tradeoffs, discoveries, new constraints,
 watches (owner + expiry), and open questions **as you go**. Link related nodes. Where the repo
 keeps a `.kin/` export, stage it with the code — ephemeral coordination is not durable
-knowledge. `tag_update` with a summary to close, and destroy the run dir.
+knowledge. `tag_update` with a summary to close. Leave the run directory
+(`.orchestrator-runs/<run>/`) in place: it holds both briefs and the lane logs that are the
+run's receipts, and it is the orchestrator's to keep or remove when the run closes.

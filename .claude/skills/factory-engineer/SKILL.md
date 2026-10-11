@@ -141,7 +141,8 @@ tell the Validator: the oracle is contaminated and the verdict depends on knowin
 The graph cuts both ways. What you capture in it during a run is readable by the Tester,
 and a note about how your implementation behaves is a statement of what to assert about
 it. So during a run you `search` the graph but do not `add` to it; hold your captures in
-your hand-over, and capture them once the verdict is signed.
+your hand-over, and capture them once the run closes. A slice's signed verdict is not
+that moment: the Tester stays up for the next slice.
 
 ## Hand over
 
@@ -184,7 +185,7 @@ An artifact set, not a narration:
    believe is under-specified; every spec-defect raised and its status; anything you touched
    that may reach a surface outside your brief.
 
-5. **Kindex captures, held for after the verdict** — decisions with tradeoffs, discoveries,
+5. **Kindex captures, held for after the run** — decisions with tradeoffs, discoveries,
    new constraints, watches with owner and expiry, open questions, listed here rather than
    added during the run (see *The boundary is yours to hold*). `search` before `add` when
    you do add them. Stage any `.kin/` export with the code.
@@ -201,7 +202,7 @@ signed boundaries, a blocking dependency appears, or the budget is spent.
 
 1. **Stop.** Do not continue down the failing path.
 2. **Record** what was tried and why it failed, in your report to the Validator (step 5)
-   and in your hand-over's held captures. Not in the graph: no verdict is signed yet, so the
+   and in your hand-over's held captures. Not in the graph: the run has not closed, so the
    rule in *The boundary is yours to hold* still applies.
 3. **Re-read the signed artifacts** and name the assumption that was wrong.
 4. **Fall back** to a reduced implementation preserving **every** hard constraint and owed

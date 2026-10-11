@@ -37,6 +37,6 @@ The brief's file appearing, or changing, is not your signal to start: only a DIS
 message in your own window is. Do not poll or watch the run directory.
 
 **The kindex graph is shared with the Tester.** Search it as your skill says, but do not
-`add` to it until the verdict is signed: a note about how your implementation behaves is
+`add` to it until the run closes: a note about how your implementation behaves is
 a statement of what to assert about it, and the Tester can read it. List your captures in
 your hand-over instead.

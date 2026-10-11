@@ -120,7 +120,8 @@ log, or what it captured in the shared kindex graph: same-user lanes are not sep
 design and for now. **Your oracle depends on you not looking**, and nothing but you enforces
 that. During a run, do not `search` or ask the kindex graph about the area under test: a
 note there may be the Coder's account of how its implementation behaves. And do not `add`
-to the graph until the verdict is signed, since the Coder can read it too. If you encounter
+to the graph until the run closes, since the Coder can read it too, and keeps working
+slice after slice. If you encounter
 the implementation, or such a note, incidentally, stop and tell the Validator immediately:
 the oracle is contaminated and the verdict depends on knowing.
 

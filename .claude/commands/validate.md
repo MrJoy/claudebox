@@ -74,11 +74,13 @@ session gives you.
   lanes can still address and read each other through the shared `tmux` server, the run
   directory, the process table and the kindex graph, and nothing prevents it.*
 - **Kindex captures while the lanes are live.** `factory-validate` tells you to capture
-  as you go. Here you `search` freely but `add` nothing until the verdict is signed: the
+  as you go. Here you `search` freely but `add` nothing until the run closes: the
   Coder is told to search the graph, you are the one lane that has read the suites, and
   a captured discovery naming a failing case is the failure detail Phase 5 forbids you
   to hand the Coder, by a route that outlives the run. Hold your captures in the verdict
-  package and add them after the signature.
+  package and add them when the run closes and the lanes are down. A slice's signature is
+  not that moment: the lanes stay up for the next slice, and the Coder's next brief starts
+  with a graph search.
 - **Phase 4's assembly.** The Coder and the Tester work in their own detached worktrees,
   which `/orchestrate` created. The launch found your checkout clean; check it again
   before each slice (`git status --porcelain` lists nothing but what this run committed

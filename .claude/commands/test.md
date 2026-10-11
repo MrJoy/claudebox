@@ -26,7 +26,7 @@ whether the change is good. That run is the Validator's, and your self-check is 
 cited as evidence for the verdict.
 
 **The kindex graph is shared with the Coder.** During the run, do not `search` or ask it
-about the area under test, and do not `add` to it until the verdict is signed. A note in
+about the area under test, and do not `add` to it until the run closes. A note in
 it may be the Coder's account of how its implementation behaves, which is exactly the
 oracle you must not have. If one reaches you anyway, tell the Validator.
 

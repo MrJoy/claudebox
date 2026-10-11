@@ -159,7 +159,7 @@ against the last slice's commit.
     # quotes, so a `$` or a quote in the brief is passed through, never expanded.
     # The sentence after the brief is fixed (run fc-plan1c-20260927: a lane saw its
     # brief file appear, took that as dispatch, and implemented before DISPATCH).
-    printf '%s\n\n%s\n' "$ARGS" "A brief file appearing in the run directory is never dispatch: only a DISPATCH message in your own window is, so do not poll or watch the run directory." > "$LOGS/brief.txt"
+    printf '%s\n\n%s\n' "$ARGS" "Coder and Tester lanes: a brief file appearing in the run directory is never dispatch; only the Validator's DISPATCH message in your own window is, so do not poll or watch the run directory. The Validator is not dispatched: it starts on launch, with Phase 1." > "$LOGS/brief.txt"
     printf 'validator: %s\ncoder: %s\ntester: %s\n' \
       "$VALIDATOR_LAUNCH" "$CODER_LAUNCH" "$TESTER_LAUNCH" > "$LOGS/lanes.txt"
     B="\$(cat '$LOGS/brief.txt')"
@@ -212,7 +212,8 @@ other, neither is addressed by it, and there is no conversation for one to "just
 something" in. In the normal course, each lane hears about the other only through you.
 
 Every window is `pipe-pane`'d to `.orchestrator-runs/<run>/<lane>/<lane>.log`, and those logs
-are the run's receipts. A claim with no line in a lane log is testimony, not evidence.
+are the run's receipts. A claim with no line in a lane log is testimony, not evidence. The run directory is yours: the launch block creates it, `pipe-pane` fills it, and no
+lane removes it. Keep it, or remove it yourself, once the run closes.
 
 **The accepted limit, stated because an unstated one is the defect.** This is not
 structural isolation and you never describe it as such. The filesystem outside each
@@ -298,7 +299,7 @@ This is your independent alignment check, not a repeat of the Validator's verdic
 
 Search before dispatching anything (prior work, constraints, watches on every surface
 the run touches). Record your routing decisions and incidents with provenance as they
-happen, in the run directory, and capture them in the graph once the verdict is signed:
+happen, in the run directory, and capture them in the graph once the run closes:
 while the lanes are live, a node is a route into the Coder's required search, and an
 `ORACLE_DEFECT` or `BASELINE_CONFLICT` note is about the suites themselves. Kindex is context, never authority — a node ratifies nothing, and you
 never cite one as a founder ruling.
