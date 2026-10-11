@@ -49,7 +49,7 @@ The spec and the overview leave these open, and each one changes code. They are 
 13. **Parks live beside the pair state, keyed by repo.** The profile's two-PR limit rule counts `(repo, pr)`, since a profile spans repos and every repo has a #1. A head park lifts when the PR's head differs. A timed park lifts at its time. A profile park stops `start-pair`, and its scheduling consequence is 2a.4b's. A page is one `PAGE:` line (overview decision 14).
 14. **`fetch-job` mints the read token and starts the 55-minute deadline in the same call**, so the token outlives the job, and a read token GitHub refuses revokes the new capability at once. A pair's committed transcript travels in the job spec with its session id, and a pair without one gets neither.
 15. **`start-pair` fails closed, and reserves the pair before any network call.** A visibility check that errors, a repo that is public or out of reach, a parked profile, a pair already started or starting, and a gateway that refuses the token all answer `409`. The check and the reservation happen under the job's lock, so two concurrent starts for one persona mint one token, and a refusal clears the reservation so the pair stays startable. The provider token lives until the job's deadline, and its `token_records` row exists before the gateway hears of it.
-16. **`complete-pair` records the pair completed as soon as the commit point returns**, with its outcome, in the same critical section that ends its reservation, and answers a resend `200 {}`, the way `post-finding` answers one. After the record, the pair's check-run view is set (in memory, and published), and only then is the token revoked, so a fault in the revocation leaves the run showing the true outcome and the token for the job's end to revoke. A fault before the commit point leaves the pair started, which a retry re-enters. A concurrent duplicate is `409`. Behind both, the commit point settles each provider credential once (`Committer.settled`), so any re-entry is a replay of the first outcome and never spends a round twice. It turns a bad transcript into one that will not parse. That covers bad base64, a transcript over 64 MiB, and the worker's own `over-cap` note, so all three are `failing`. A flush the gateway cannot answer is no flush, so the pair is `deferred`. The pair's token is revoked in the records store and then at the gateway, and a gateway that misses the revoke drops the token at its next `hello`.
+16. **`complete-pair` records the pair completed as soon as the commit point returns**, with its outcome, in the same critical section that ends its reservation, and answers a resend `200 {}`, the way `post-finding` answers one. After the record, the pair's check-run view is set (in memory, and published), and only then is the token revoked, so a fault in the revocation leaves the run showing the true outcome and the token for the job's end to revoke. A fault before the commit point leaves the pair started, which a retry re-enters. A concurrent duplicate is `409`. Behind both, the commit point settles each provider credential once (`Committer.settled`), so any re-entry is a replay of the first outcome and never spends a round twice. A completion whose job is no longer registered (`job_live`, checked under the commit point's lock) commits nothing and answers `revoked`: the job's end already revoked and showed the pair, and a loss of access may already have deleted what it would write back (2a.4b's review). It turns a bad transcript into one that will not parse. That covers bad base64, a transcript over 64 MiB, and the worker's own `over-cap` note, so all three are `failing`. A flush the gateway cannot answer is no flush, so the pair is `deferred`. The pair's token is revoked in the records store and then at the gateway, and a gateway that misses the revoke drops the token at its next `hello`.
 17. **Body caps are checked on the declared `Content-Length`, before reading.** A missing length is `411`, and a body over the cap is `413`. An oversized `complete-pair` is refused unread, so its pair is revoked when the job ends (the overview, as revised).
 18. **`revoked` is `Committer.revoke`.** A started pair whose job ended without `complete-pair` (the deadline, an access change, a restart) has its transcript discarded and its failure recorded, and stays owed. `revoke` returns `REVOKED` for the job-end handler, which knows the head, to show as `checkruns.REVOKED`. 2a.4b's job end is that handler.
 19. **Loss of access has two deleters, both here.** `Committer.forget_repo` deletes the repo's transcripts and parks and clears its `Decider` state: sessions, fingerprints, pass counts and owed pairs. Rounds hold no content and survive, as the spec says of a public flip. `Outbox.drop_repo` deletes the repo's queued items and its `withheld` rows in one transaction, and keeps the per-detector day counts. 2a.4b's loss-of-access path calls both, plus `CheckRuns.forget_repo`, and revokes the repo's jobs.
@@ -1589,8 +1589,8 @@ git commit -m "hosted: the outbox, its acceptance caps and its paced drain"
   - `Record` (frozen) with `from_row(row)` and `counts() -> dict` (the `counts` a gateway `hello` carries).
   - `ensure_record(conn, credential_id)`, `record_for(records, credential_id) -> Optional[Record]`, `apply_report(records, msg) -> {ack} | {error}`, `flush_complete(flush, record) -> bool`, `transcript_session(data: bytes) -> Optional[str]`.
   - `decide(record, flush_ok, transcript, reported_session, expected_session) -> str`, which never returns `REVOKED`.
-  - `Park(reason, until=None, head=None)`; `Completion(repo, pair, head, profile, credential_id, transcript, session_id, expected_session, flush, signal=None)` (frozen).
-  - `Committer(records, blob_store, decider_for, backoff_for, clock=time.time, log=print)` with `commit(completion) -> str`, `apply(completion, outcome, record)`, `revoke(repo, pair) -> str` (returns `REVOKED`; the caller publishes it), `parked(repo, pair, head) -> Optional[Park]`, `profile_parked_until(profile) -> int`, `transcript_for(repo, pair) -> Optional[bytes]`, `last_reviewed_head(repo, pair) -> Optional[str]` (the committed fingerprint's head), `forget_repo(repo)`, and the attributes `parks`, `transcripts`, `profiles` and `settled` (credential id to outcome: `commit` answers a settled credential with its first outcome and applies nothing).
+  - `Park(reason, until=None, head=None)`; `Completion(repo, pair, head, profile, credential_id, transcript, session_id, expected_session, flush, signal=None, job_id=None)` (frozen).
+  - `Committer(records, blob_store, decider_for, backoff_for, clock=time.time, log=print, job_live=lambda job_id: True)` with `commit(completion) -> str`, `apply(completion, outcome, record)`, `revoke(repo, pair) -> str` (returns `REVOKED`; the caller publishes it), `parked(repo, pair, head) -> Optional[Park]`, `profile_parked_until(profile) -> int`, `transcript_for(repo, pair) -> Optional[bytes]`, `last_reviewed_head(repo, pair) -> Optional[str]` (the committed fingerprint's head), `forget_repo(repo)`, and the attributes `parks`, `transcripts`, `profiles` and `settled` (credential id to outcome: `commit` answers a settled credential with its first outcome and applies nothing).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1822,6 +1822,17 @@ class CommitterTest(unittest.TestCase):
         self.c.revoke("acme/web", self.pair)
         self.c.forget_repo("acme/web")
         self.assertEqual(held and set(held), {False})
+
+    def test_a_completion_whose_job_has_ended_commits_nothing(self):
+        # A completion in flight when its repo is lost (PR #22 review) must not
+        # write back what the loss deleted.
+        self.c.job_live = lambda job_id: False
+        token = self.creds.mint("provider", "job1", 600, persona="sage")
+        cid = creds.credential_id_of(token)
+        c = Completion("acme/web", self.pair, HEAD, "ollama", cid, transcript(), SID, None,
+                       {"last_seq": 0, "drained": True}, "fp1", "job1")
+        self.assertEqual(self.c.commit(c), "revoked")
+        self.assertEqual((self.blobs.data, self.state.sessions, self.state.rounds), ({}, {}, {}))
 
     def test_ok_commits_everything_together(self):
         self.assertEqual(self.complete({}), "ok")
@@ -2161,13 +2172,20 @@ class Completion:
     expected_session: Optional[str]
     flush: Optional[Dict[str, Any]]
     signal: Any = None              # the fingerprint an ok commits, its head included
+    job_id: Optional[str] = None    # checked against job_live under the commit point's lock
 
 
 class Committer:
     def __init__(self, records, blob_store, decider_for: Callable[[str], Any],
                  backoff_for: Callable[[str], int], clock: Callable[[], float] = time.time,
-                 log: Callable[[str], None] = lambda line: print(line, flush=True)):
+                 log: Callable[[str], None] = lambda line: print(line, flush=True),
+                 job_live: Callable[[str], bool] = lambda job_id: True):
         self.records = records
+        # Whether a job is still registered. A completion whose job has ended
+        # (its repo lost, its deadline passed) commits nothing: the job's end
+        # already revoked the pair, and a loss may already have deleted what
+        # this would write back.
+        self.job_live = job_live
         self.blobs = blob_store
         self.decider_for = decider_for
         self.backoff_for = backoff_for
@@ -2196,6 +2214,9 @@ class Committer:
             settled = self.settled.get(c.credential_id)
             if settled is not None:
                 return settled
+            if c.job_id is not None and not self.job_live(c.job_id):
+                self.settled[c.credential_id] = REVOKED
+                return REVOKED
             record = record_for(self.records, c.credential_id)
             outcome = decide(record, flush_complete(c.flush, record), c.transcript, c.session_id,
                              c.expected_session)
@@ -2344,7 +2365,7 @@ class _Result:
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_commit.py'`, then `./test-python.sh`
-Expected: PASS, 28 tests. The whole suite passes.
+Expected: PASS, 29 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
@@ -2760,6 +2781,15 @@ class FindingAndCompleteTest(Base):
             self.complete(cap, data=transcript())
         self.assertEqual(self.runs.views["sme"].state, "reviewed")
 
+    def test_a_completion_for_an_ended_job_commits_nothing_and_shows_nothing(self):
+        cap, _ = self.fetch()
+        self.start(cap)
+        self.committer.job_live = lambda job_id: False
+        self.assertEqual(self.complete(cap, data=transcript()), (200, {}))
+        self.assertEqual(self.job.completed["sme"], "revoked")
+        self.assertNotIn("sme", self.state.rounds)
+        self.assertEqual(self.runs.views["sme"].state, "running")   # the job's end shows it
+
     def test_a_commit_that_faults_leaves_the_pair_completable(self):
         # The pair is recorded completed only after the commit point returns
         # (PR #21 review); a fault before then is re-entered by a retry.
@@ -3127,15 +3157,17 @@ class Channel:
         p = Pair(job.pr, job.mode, pair.persona)
         return self.committer.commit(commit_mod.Completion(
             job.repo, p, job.head, job.profile, cid, transcript, session, pair.session_id,
-            flush, pair.signal))
+            flush, pair.signal, job.job_id))
 
     def _settle(self, job: JobMaterial, pair: PairMaterial, cid: str, outcome: str) -> None:
         p = Pair(job.pr, job.mode, pair.persona)
-        park = self.committer.parked(job.repo, p, job.head)
-        state = _VIEW[outcome]
-        if outcome == commit_mod.OK and self.committer.decider_for(job.repo).capped(p):
-            state = checkruns.ROUND_CAP
-        self._publish(job, pair.persona, checkruns.PairView(state, park.until if park else None))
+        if outcome != commit_mod.REVOKED:
+            # A revoked completion's job has ended, and its end showed the pair.
+            park = self.committer.parked(job.repo, p, job.head)
+            state = _VIEW[outcome]
+            if outcome == commit_mod.OK and self.committer.decider_for(job.repo).capped(p):
+                state = checkruns.ROUND_CAP
+            self._publish(job, pair.persona, checkruns.PairView(state, park.until if park else None))
         self.creds.revoke(cid)
         try:
             self.gateway_call("revoke", credential_ids=[cid])
@@ -3212,7 +3244,7 @@ def make_server(channel: Channel, host: str, port: int) -> http.server.Threading
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_channel.py'`, then `./test-python.sh`
-Expected: PASS, 27 tests. The whole suite passes.
+Expected: PASS, 28 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
