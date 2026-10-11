@@ -34,7 +34,7 @@ The spec and the overview leave these open, and each one changes code. They are 
 1. **2a reviews in `auto` mode only.** A repo whose config asks for `trigger: requested` is shown as a config problem on its check runs ("arrives in phase 2b") rather than reviewed against its wishes.
 2. **The org file is `.github/claudebox.json` in `<owner>/.github`**, read at the default branch. A read that fails is "no org defaults". The org `.github` repo is never itself reviewed.
 3. **A poll per installation lists its repos.** A repo that is public is passed over, and one that turned public since the last poll is lost. A repo gone from the list is lost. An installation gone from `App.installations()`, or one carrying `suspended_at`, loses all its repos. Losing a repo ends its jobs (their started pairs `revoked`), calls 2a.4a's three deleters (`Outbox.drop_repo`, `Committer.forget_repo`, `CheckRuns.forget_repo`), and forgets its fingerprint cache. The jobs end with no scheduler lock held, since ending one calls into the committer, which calls `decider_for`, which takes that lock. After each poll, a sweep drops the outbox and withheld rows of any repo that no live installation's listing returned as private (one lost or made public while the control plane was down, which nothing in memory names). It keys on the listings, never on how far the poll's walk got before `max_concurrent_jobs` stopped it, and runs only when every live installation's listing succeeded. A loss forgets the repo's last published config answer too, so a repo that comes back publishes its problem again. A completion in flight when its job ends commits nothing (2a.4a's `job_live`, wired to the job registry). Its rounds survive, as the spec's "Visibility" says ("Rounds and asks survive a public flip, since they hold no content"). A returning pair starts a fresh session at its next round, as one does after `MAX_PASSES_PER_SESSION` rotation. Its earlier rounds' findings are still on the PR, signed, and with no committed fingerprint its round line reads the local wording, which works from those comments.
-4. **Every non-fork candidate head gets a check run**, created once, whether or not anything is dispatched for it. The config follows the spec's fallback, which `repo_config.resolve` implements: an invalid repo file falls back to the org defaults, an invalid org file under a valid repo file is dropped, and only both invalid stops the review. The dropped file's problems show on each head's run as a notice beside a review that runs. A problem (both files invalid, `trigger: requested`, or a setting the deployment cannot serve) shows on every head's run and dispatches nothing. A read of either file that fails is not a statement about the file: the repo is skipped for that poll and nothing is published. A head is published when its (problem, notice) differs from the one last set on it, a head with none included, so a new head shows a held problem, a fixed one clears without a push, and an unchanged answer costs no GitHub call. A pair at its round cap is painted `round-cap` once on a head no job will run at, or a capped plan PR's new head would read "Queued" for good.
+4. **Every non-fork candidate head gets a check run**, created once, whether or not anything is dispatched for it. The config follows the spec's fallback, which `repo_config.resolve` implements: an invalid repo file falls back to the org defaults, an invalid org file under a valid repo file is dropped, and only both invalid stops the review. The dropped file's problems show on each head's run as a notice beside a review that runs. A problem (both files invalid, `trigger: requested`, or a setting the deployment cannot serve) shows on every head's run and dispatches nothing. A read of either file that fails is not a statement about the file: the repo is skipped for that poll and nothing is published. A head is published when its (problem, notice) differs from the one last set on it, a head with none included, so a new head shows a held problem, a fixed one clears without a push, and an unchanged answer costs no GitHub call. A pair at its round cap is painted `round-cap-unread` once on a head no job will run at, or a capped plan PR's new head would read "Queued" for good. It is never painted `round-cap`, which counts as clean: a green check on a commit no persona read would claim a review that did not happen.
 5. **The change gate is local mode's**, `signals.Tracker`, one per repo since a Tracker keys by PR number. A PR's fingerprint is its head, its mode and the newest unsigned comment, and comments, reviews and the 30 newest inline comments are read only when the PR's `updated_at` has moved. A failed lookup is cached against that `updated_at` too, so an outage costs one lookup per change, and the PR gates on `updated_at` through `signals.degraded`. A PR younger than the deployment's `settle_seconds` waits.
 6. **Dispatch bounds.** A PR with a live job is not dispatched again. A pair parked by the commit point waits while its siblings run, and a parked profile dispatches nothing. `max_concurrent_jobs` counts jobs, and a profile's `concurrency` counts pairs in flight (dispatched and not completed) across its jobs. A poll stops dispatching at the first refusal by `max_concurrent_jobs`.
 7. **Visibility is checked again at dispatch**, uncached, and a check that errors dispatches nothing.
@@ -333,7 +333,7 @@ class FakeInst:
         return len(self.created)
 
     def update_check_run(self, repo, run_id, status, title, summary, conclusion=None):
-        self.updated.append((run_id, status, title, summary))
+        self.updated.append((run_id, status, title, summary, conclusion))
 
 
 class FakeRunner:
@@ -553,8 +553,10 @@ class GateTest(Base):
         self.finish(self.jobs.all()[0])
         self.inst.prs = [pr(head=NEW, labels=("plan",), updated="2025-10-09T08:10:00Z")]
         self.assertEqual(self.poll(), 0)
-        status, title = self.inst.updated[-1][1:3]
-        self.assertEqual((status, title), ("completed", "Reviewed; round cap reached"))
+        _, status, title, _, conclusion = self.inst.updated[-1]
+        # Never green: no pass read this commit (PR #22 review).
+        self.assertEqual((status, title, conclusion),
+                         ("completed", "Not reviewed: round cap reached", "neutral"))
         before = len(self.inst.updated)
         self.poll()
         self.assertEqual(len(self.inst.updated), before)   # painted once
@@ -591,7 +593,7 @@ class ConfigTest(Base):
     def test_an_invalid_config_shows_on_the_check_run_and_nothing_runs(self):
         self.inst.files[("acme/web", ".github/claudebox.json")] = b'{"profile": "nope"}'
         self.assertEqual(self.poll(), 0)
-        status, title, summary = self.inst.updated[-1][1:]
+        status, title, summary = self.inst.updated[-1][1:4]
         self.assertEqual((status, title), ("completed", "Not reviewed: configuration"))
         self.assertIn("'nope' is not a profile of this deployment", summary)
 
@@ -1112,11 +1114,12 @@ class Scheduler:
             # A pair at its round cap will not run at this head or any later
             # one, so nothing else would ever set its view: it is painted here,
             # once, or a capped plan PR's new head would read "Queued" for good.
+            # It is painted as unread, never as reviewed: no pass read this commit.
             capped = [p for p in group.pairs if decider.capped(p)
                       and self.check_runs.view(full, head, p.persona) is None]
             for p in capped:
                 self.check_runs.set_pair(full, head, p.persona,
-                                         checkruns.PairView(checkruns.ROUND_CAP))
+                                         checkruns.PairView(checkruns.CAP_UNREAD))
             if capped:
                 self._publish(full, head)
             pairs = [p for p in decider.pairs_to_run(group, signal)
@@ -3080,7 +3083,7 @@ git commit -m "hosted: the control-plane image and its compose file"
 In `CLAUDE.md`'s "Hosted App libraries" subsection, after the paragraph about the control plane's decisions, add:
 
 ```markdown
-Phase 2a.4b runs them. `scheduler.py` is the poll: per installation and repo it reads the config from the default branch (the repo file over the org `.github` repo's), checks it against the deployment, gives every non-fork head a check run, holds what the change gate and the parks hold, and dispatches one job per PR within `max_concurrent_jobs` and each profile's `concurrency`, counted in pairs in flight. It ends jobs (the worker gone, the 55-minute deadline, an unused bootstrap) and handles loss of access, which calls the three deleters 2a.4a provides. `control.py` is the control-plane process. Until it holds the records store's lock it answers `/healthz` as "waiting for lock" and does nothing else. Holding it, it revokes every credential, stops orphaned workers, deletes every transcript and sends the gateway an empty `hello`, then runs the poll, the outbox drain, the gateway's report socket and the worker channel, and on `SIGTERM` drains running jobs up to `CLAUDEBOX_DRAIN_SECONDS`. `supervisor.py` is PID 1 of `hosted/Dockerfile`'s image: it starts runnerd, the gateway and the control plane as three uids with only their own secrets (provider credentials go to the gateway, and to the control plane only as scan literals), and stays root with only `SETUID`, `SETGID` and `KILL`, because a process that changed uid could no longer signal its children. `hosted/compose.json` runs it for the local target.
+Phase 2a.4b runs them. `scheduler.py` is the poll: per installation and repo it reads the config from the default branch (the repo file over the org `.github` repo's), checks it against the deployment, gives every non-fork head a check run, holds what the change gate and the parks hold, and dispatches one job per PR within `max_concurrent_jobs` and each profile's `concurrency`, counted in pairs in flight. It ends jobs (the worker gone, the 55-minute deadline, an unused bootstrap) and handles loss of access, which calls the three deleters 2a.4a provides. `control.py` is the control-plane process. Until it holds the records store's lock it answers `/healthz` as "waiting for lock" and does nothing else. Holding it, it revokes every credential, stops orphaned workers, deletes every transcript and sends the gateway an empty `hello`, then runs the poll, the outbox drain, the gateway's report socket and the worker channel, and on `SIGTERM` drains running jobs up to `CLAUDEBOX_DRAIN_SECONDS`. `supervisor.py` is PID 1 of `hosted/Dockerfile`'s image: it starts runnerd, the gateway and the control plane as three uids with only their own secrets (provider credentials go to the gateway, and to the control plane only as scan literals), and, once its three children are running, drops to uid 9004 keeping `CAP_KILL` alone, so it can still signal their uids during the drain and can never be root again. `hosted/compose.json` runs it for the local target.
 ```
 
 - [ ] **Step 2: Add the history entry**
