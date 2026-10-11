@@ -16,7 +16,7 @@
 
 - **Standard library only**, and **Python 3.9 syntax** (overview decision 15). Flat modules, imported by plain name (overview decision 19). Nothing here runs a process: 2a.4b does.
 - **Overview decision 1:** pair state stays in memory in 2a. The control plane holds one `MemoryStateStore` and one `Decider` per repo, and this plan's parks and check-run pair states live in memory beside them. Token rows, check-run counts, outbox items and withheld records are the records store's.
-- **Overview decision 2:** 2a's outcomes are `ok`, `capped`, `usage-limited`, `deferred`, `failing`, `failed` and `revoked`. `usage_missing` is `capped`. A rejected-only record (`first_rejected`, no success, no failure) is `deferred`, with the transcript discarded and the session dropped (`commit.rejected_only`): a 4xx cannot say whether claudebox's request or an overgrown session was refused, so it is a claudebox fault, and resuming a refused session would be refused again. `first_abandoned` takes the place of `ok` and nothing else.
+- **Overview decision 2:** 2a's outcomes are `ok`, `capped`, `usage-limited`, `deferred`, `failing`, `failed` and `revoked`. `usage_missing` is `capped`. A rejected-only record (`first_rejected`, no success, no failure) is `deferred`, with the transcript discarded and the session dropped (`commit.rejected_only`): a 4xx cannot say whether claudebox's request or an overgrown session was refused, so it is a claudebox fault, and resuming a refused session would be refused again. `first_abandoned` takes the place of `ok` and nothing else. A record with traffic and no provider answer (`successes` 0 with no marker, such as a lone `count_tokens`) is `deferred` too: `ok` needs a `/v1/messages` the provider answered, or a head no pass read could conclude `success`.
 - **Overview decision 16:** `prompts.round_stanza(mode, round, since_head=None)` names the commits after `since_head` when it is given, and keeps today's wording otherwise. `Decider.system_prompt_for(pair, since_head=None, rewritten=False)` passes it through, so local mode's prompts stay byte-identical, which `tests/fixtures/` pins. A rewritten branch runs as round 1 at the `should-fix` floor, and the round count still advances.
 - **Overview decision 17:** hosted prompts are today's defaults with no Linear and no kindex stanza, plus one sentence in `GH_STANZA`: "If the deployment refuses a read, stop the review and say so; do not guess at the diff."
 - **Overview decision 18:** the check-run wording is decided here.
@@ -37,9 +37,9 @@ The spec and the overview leave these open, and each one changes code. They are 
 1. **2a.4 is two plans.** 2a.4a is the decision libraries, testable with fakes. 2a.4b is the processes: the scheduler, the control-plane main, the supervisor, `hosted/Dockerfile` and `hosted/compose.json`. Each is one factory run. The overview's split table says so.
 2. **A hosted round line from round 2 on reads "Read closely only the commits after `<head>`: the ones `git log --oneline <head>..HEAD` lists."** (plan mode: "the revisions after commit `<head>`", keeping its last sentence). `since_head` must be a full commit id. A rewritten branch gets round 1's line whatever the round, and the summary of the check run says the branch was rewritten.
 3. **`build_hosted` is `build({})` with `HOSTED_GH_SENTENCE` after every copy of `GH_STANZA`.** It raises if a default ever loses `GH_STANZA`, so the sentence can never silently go missing.
-4. **The check-run states in 2a** are queued, running, reviewed, deferred, usage-limited, failed, failing, capped, round-cap, round-cap-unread, revoked and config-invalid. `round-cap-unread` is a pair at its round cap on a head no pass ran at: it is titled "Not reviewed: round cap reached" and never concludes `success`, since `success` means a pass read this commit and found nothing. Budget, too-large and refused-read arrive with 2b. When a head's pairs differ, the title names the state that waits on a person before one that clears itself, before one that is done. The wording is the table in `checkruns._WORDS`, with a retry time in UTC where one exists. The summary has one line per persona and the counts: posted, waiting to post, dropped, withheld, and turned away by the per-pass limit. A config problem stops the review and is titled "Not reviewed: configuration", with one sentence true of every cause (an invalid file, a setting the deployment cannot serve) and the problem text below it. A config notice (one file broken and the other applied, the spec's fallback) shows below a review that runs and makes its conclusion `neutral`. Its producer is 2a.4b: `Scheduler.load_config` returns the dropped file's problems as the notice when `repo_config.resolve` falls back, and `poll_repo` passes it to `set_config_problem` with an empty problem, so the review runs. `CheckRuns.config_answer` and `CheckRuns.view` let 2a.4b publish a head only when its answer changes, and paint a pair no job will ever set. Both answer what the run shows, not what was last set: every change bumps the head's version, and only a publish GitHub has taken marks it shown, so while a publish is owed (a failed one included) both answer `None`, and the next poll publishes again rather than taking one failed write as final.
+4. **The check-run states in 2a** are queued, running, reviewed, deferred, usage-limited, failed, failing, capped, round-cap, round-cap-unread, revoked and config-invalid. `round-cap-unread` is a pair at its round cap on a head no pass ran at: it is titled "Not reviewed: round cap reached" and never concludes `success`, since `success` means a pass read this commit and found nothing. Budget, too-large and refused-read arrive with 2b. A run is queued until a pass starts, then in progress until no pair is queued or running (phase 2 waits for phase 1, so a head with a pass running, or some finished and the rest queued, is under review), then completed. When a head's pairs differ, the title names the state that waits on a person before one that clears itself, before one that is done. The wording is the table in `checkruns._WORDS`, with a retry time in UTC where one exists. The summary has one line per persona and the counts: posted, waiting to post, dropped, withheld, and turned away by the per-pass limit. A config problem stops the review and is titled "Not reviewed: configuration", with one sentence true of every cause (an invalid file, a setting the deployment cannot serve) and the problem text below it. A config notice (one file broken and the other applied, the spec's fallback) shows below a review that runs and makes its conclusion `neutral`. Its producer is 2a.4b: `Scheduler.load_config` returns the dropped file's problems as the notice when `repo_config.resolve` falls back, and `poll_repo` passes it to `set_config_problem` with an empty problem, so the review runs. `CheckRuns.config_answer` and `CheckRuns.view` let 2a.4b publish a head only when its answer changes, and paint a pair no job will ever set. Both answer what the run shows, not what was last set: every change bumps the head's version, and only a publish GitHub has taken marks it shown, so while a publish is owed (a failed one included) both answer `None`, and a later poll publishes again rather than taking one failed write as final. A failed write holds the head until the error's `retry_after`, or else 30 seconds doubling per failure up to 30 minutes, the outbox's rule, so an owed head is retried at a pace and not on every poll; a publish inside the hold returns without a call.
 5. **A head's conclusion is `success` only when every pair is reviewed (or at its round cap) and nothing was found**, counting findings queued, posted, dropped, withheld and turned away. Everything else that is complete is `neutral`.
-6. **Acceptance runs scan, then size, then the per-pass count.** A credential is withheld whatever else is wrong with the finding. Size is measured in UTF-8 bytes against `caps.comment_bytes`. A too-long finding is not counted against the pass, since the model is told to shorten it and post again. A finding past `caps.comments_per_pass` is counted on the check run as not posted. A retried `post-finding` with the same key answers what the first one did, and queues once. The key's result is kept in memory for the job's life.
+6. **Acceptance runs the per-pass count, then scan, then size.** A withheld finding counts against `caps.comments_per_pass`, so one pass writes at most that many rows of any kind into the shared store; the over-cap answer posts nothing, so nothing the scan would catch leaks past it. A credential is withheld whatever else is wrong with the finding. Size is measured in UTF-8 bytes against `caps.comment_bytes`. A too-long finding is not counted against the pass, since the model is told to shorten it and post again. A finding past `caps.comments_per_pass` is counted on the check run as not posted. A retried `post-finding` with the same key answers what the first one did, and queues once. The key's result is kept in memory for the job's life.
 7. **A withheld record stores a fresh 16-byte salt followed by `sha256(salt || body)`**, and the body with every match replaced by `[withheld:<detector>]`. The day's count per detector is a `withheld_counts` row.
 8. **The drain is one `Drainer` per installation, and `step()` posts at most one item** and returns how long to wait. Pacing is a sliding window: one second between posts and 400 in any hour. A retryable failure with no `Retry-After` waits 30 seconds, doubling per attempt up to 30 minutes. Every drop is an `audit` row (`outbox.drop`, the key and the reason) and a check-run count. Whether a repo is public is `github_app.is_public`, which reads GitHub's three-valued `visibility` field, so an internal repo counts as private (the spec's "Visibility") whatever `private` says for one. `private` is read only when `visibility` is absent, and a repo that says neither counts as public.
 9. **`Installation.pull(full_name, pr)` and `is_public(repo)` join 2a.1's client**, returning None on a 404, because the drain must see whether a PR is open before it posts.
@@ -372,6 +372,7 @@ import unittest
 
 import checkruns
 from checkruns import CheckRuns, Counts, PairView, render
+from github_app import GitHubError
 from records import Records
 
 HEAD = "a" * 40
@@ -384,9 +385,16 @@ class RenderTest(unittest.TestCase):
         self.assertEqual((status, conclusion, title), ("queued", None, "Queued"))
 
     def test_a_pass_in_flight_is_in_progress_and_names_each_persona(self):
+        # PR #21 review: phase 1 running with Sage still queued read "Queued".
         status, conclusion, title, summary = render(
             {"sage": PairView(checkruns.QUEUED), "sme": PairView(checkruns.RUNNING)}, Counts())
-        self.assertEqual((status, conclusion), ("queued", None))
+        self.assertEqual((status, conclusion, title), ("in_progress", None, "Reviewing"))
+        status, _, title, _ = render(
+            {"sage": PairView(checkruns.QUEUED), "sme": PairView(checkruns.REVIEWED)}, Counts())
+        self.assertEqual((status, title), ("in_progress", "Reviewing"))   # between phases
+        status, _, title, _ = render(
+            {"sage": PairView(checkruns.QUEUED), "sme": PairView(checkruns.QUEUED)}, Counts())
+        self.assertEqual((status, title), ("queued", "Queued"))
         status, _, title, summary = render(
             {"sage": PairView(checkruns.REVIEWED), "sme": PairView(checkruns.RUNNING)}, Counts())
         self.assertEqual((status, title), ("in_progress", "Reviewing"))
@@ -588,6 +596,62 @@ class ShownTest(unittest.TestCase):
         self.assertEqual(self.runs.view("acme/web", HEAD, "sage").state, checkruns.CAP_UNREAD)
 
 
+class PaceTest(unittest.TestCase):
+    def setUp(self):
+        CheckRunsTest.setUp(self)
+        self.now = [T]
+        self.runs.clock = lambda: self.now[0]
+        self.calls = []
+        real = self.inst.update_check_run
+        self.fail_with = None
+
+        def update(*a, **k):
+            self.calls.append(self.now[0])
+            if self.fail_with is not None:
+                raise self.fail_with
+            return real(*a, **k)
+        self.inst.update_check_run = update
+        self.runs.ensure("acme/web", HEAD)
+        self.runs.set_config_problem("acme/web", HEAD, "bad file")
+
+    def test_a_failed_write_is_retried_at_a_doubling_pace_not_every_poll(self):
+        # PR #21 review: an owed head was rewritten on every poll, spending
+        # the budget whose exhaustion was refusing it.
+        self.fail_with = GitHubError(403, "Resource not accessible by integration")
+        with self.assertRaises(GitHubError):
+            self.runs.publish("acme/web", HEAD)
+        self.runs.publish("acme/web", HEAD)          # held: no call
+        self.now[0] += 29
+        self.runs.publish("acme/web", HEAD)
+        self.assertEqual(len(self.calls), 1)
+        self.now[0] += 1
+        with self.assertRaises(GitHubError):
+            self.runs.publish("acme/web", HEAD)      # 30s on; the next wait is 60s
+        self.now[0] += 59
+        self.runs.publish("acme/web", HEAD)
+        self.assertEqual(len(self.calls), 2)
+        self.fail_with = None
+        self.now[0] += 1
+        self.runs.publish("acme/web", HEAD)
+        self.assertEqual(len(self.calls), 3)
+        self.assertEqual(self.runs.config_answer("acme/web", HEAD), ("bad file", ""))
+        self.runs.set_pair("acme/web", HEAD, "sage", PairView(checkruns.RUNNING))
+        self.runs.publish("acme/web", HEAD)          # a success clears the hold
+        self.assertEqual(len(self.calls), 4)
+
+    def test_retry_after_sets_the_hold(self):
+        self.fail_with = GitHubError(403, "secondary rate limit", retry_after=300)
+        with self.assertRaises(GitHubError):
+            self.runs.publish("acme/web", HEAD)
+        self.now[0] += 299
+        self.runs.publish("acme/web", HEAD)
+        self.assertEqual(len(self.calls), 1)
+        self.fail_with = None
+        self.now[0] += 1
+        self.runs.publish("acme/web", HEAD)
+        self.assertEqual(len(self.calls), 2)
+
+
 class ConfigNoticeTest(unittest.TestCase):
     def test_a_notice_shows_below_a_review_that_runs_and_is_never_green(self):
         # The spec's fallback: one file broken, the other applied, the problem shown.
@@ -634,6 +698,8 @@ import threading
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional, Tuple
+
+from github_app import GitHubError
 
 # A pair's state on a head. The first two are a pass in flight; the rest are
 # where its last pass left it. 2a has no budget, too-large or refused-read
@@ -736,9 +802,12 @@ def render(pairs: Dict[str, PairView], counts: Counts, rewritten: bool = False,
         title, sentence = _WORDS[CONFIG_INVALID]
         summary = f"claudebox {sentence}\n\n{config_problem}"
         return "completed", "neutral", title, summary
-    if not pairs or any(v.state == QUEUED for v in pairs.values()):
+    # Queued until a pass starts, then in progress until none is queued or
+    # running: phase 2 waits for phase 1, so a head with a pass running, or
+    # with some finished and the rest queued, is under review (PR #21 review).
+    if not pairs or all(v.state == QUEUED for v in pairs.values()):
         status, title = "queued", "Queued"
-    elif any(v.state == RUNNING for v in pairs.values()):
+    elif any(v.state in (QUEUED, RUNNING) for v in pairs.values()):
         status, title = "in_progress", "Reviewing"
     else:
         status = "completed"
@@ -783,6 +852,10 @@ class _Head:
     # They differ while a publish is owed, including one that failed.
     version: int = 0
     shown: int = 0
+    # A failed write holds the head until `retry_at`, so an owed publish is
+    # retried at a pace rather than on every poll (PR #21 review).
+    failures: int = 0
+    retry_at: float = 0.0
 
 
 class CheckRuns:
@@ -908,16 +981,28 @@ class CheckRuns:
             h = self._heads.get((repo, head))
             if h is None:
                 return
+            if h.retry_at > self.clock():
+                return   # still owed: a later publish past retry_at writes it
             pairs = dict(h.pairs)
             rewritten, problem, notice = h.rewritten, h.config_problem, h.config_notice
             version = h.version
-        run_id = self.ensure(repo, head)
-        status, conclusion, title, summary = render(pairs, self.counts(repo, head, queued),
-                                                    rewritten, problem, notice)
-        self.installation_for(repo).update_check_run(repo, run_id, status, title, summary,
-                                                     conclusion)
+        try:
+            run_id = self.ensure(repo, head)
+            status, conclusion, title, summary = render(pairs, self.counts(repo, head, queued),
+                                                        rewritten, problem, notice)
+            self.installation_for(repo).update_check_run(repo, run_id, status, title, summary,
+                                                         conclusion)
+        except GitHubError as exc:
+            # The outbox's rule: Retry-After when GitHub gives one, otherwise
+            # 30 seconds doubling per failure up to 30 minutes.
+            with self.lock:
+                h.failures += 1
+                h.retry_at = self.clock() + (exc.retry_after
+                                             or min(30 * 2 ** (h.failures - 1), 1800))
+            raise
         with self.lock:   # only once GitHub has taken it
             h.shown = max(h.shown, version)
+            h.failures, h.retry_at = 0, 0.0
 
     def forget_repo(self, repo: str) -> None:
         with self.lock:
@@ -928,7 +1013,7 @@ class CheckRuns:
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_checkruns.py'`, then `./test-python.sh`
-Expected: PASS, 23 tests. The whole suite passes.
+Expected: PASS, 25 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
@@ -1053,6 +1138,15 @@ class AcceptTest(Base):
         self.assertEqual(self.runs.counts[("acme/web", HEAD, "withheld")], 1)
         # The count moves in the transaction that writes the row (PR #21 review).
         self.assertEqual(self.runs.outside_tx, [])
+
+    def test_withheld_findings_count_against_the_per_pass_cap(self):
+        # PR #21 review: the withheld path skipped both caps, so one injected
+        # pass could write rows into the shared store without bound.
+        for seq in range(1, 6):
+            self.box.accept(JOB, "sage", seq, "the key is ghp_" + str(seq) * 36)
+        self.assertEqual(len(self.rows("withheld")), 2)
+        self.assertEqual(self.box.accept(JOB, "sage", 9, "a plain finding")[0], "enough")
+        self.assertEqual(self.rows("outbox"), [])
 
     def test_a_deployment_literal_is_withheld_by_name(self):
         self.box.accept(JOB, "sage", 1, "found olk-secret-value in config")
@@ -1255,7 +1349,7 @@ And apply this change to `tests/test_hosted_github_app.py`:
 
 ```diff
 diff --git a/tests/test_hosted_github_app.py b/tests/test_hosted_github_app.py
-index 5d64031..d7ea215 100644
+index a847eae..49a8454 100644
 --- a/tests/test_hosted_github_app.py
 +++ b/tests/test_hosted_github_app.py
 @@ -5,7 +5,7 @@ import json
@@ -1280,7 +1374,7 @@ index 5d64031..d7ea215 100644
      def test_repos_come_from_the_repositories_key(self):
          self.routes[("GET", "/installation/repositories?per_page=100")] = {
              "total_count": 1, "repositories": [{"full_name": "acme/web"}]}
-@@ -281,6 +287,25 @@ class RedirectTest(unittest.TestCase):
+@@ -293,6 +299,25 @@ class RedirectTest(unittest.TestCase):
          self.assertEqual(seen, [])
  
  
@@ -1319,10 +1413,10 @@ Apply this change to `hosted/github_app.py`:
 
 ```diff
 diff --git a/hosted/github_app.py b/hosted/github_app.py
-index 73f58ad..d8bdb86 100644
+index c4322f1..0cbd679 100644
 --- a/hosted/github_app.py
 +++ b/hosted/github_app.py
-@@ -248,6 +248,15 @@ class Installation(_Client):
+@@ -253,6 +253,15 @@ class Installation(_Client):
                  return None
              raise
  
@@ -1338,7 +1432,7 @@ index 73f58ad..d8bdb86 100644
      def open_prs(self, full_name: str) -> List[dict]:
          return self._pages(f"/repos/{check_repo(full_name)}/pulls?state=open&per_page=100")
  
-@@ -324,6 +333,20 @@ class Installation(_Client):
+@@ -329,6 +338,20 @@ class Installation(_Client):
          self._call("PATCH", f"/repos/{check_repo(full_name)}/check-runs/{int(run_id)}", payload)
  
  
@@ -1457,18 +1551,23 @@ class Outbox:
 
     def _decide(self, job: JobContext, persona: str, key: str, body: str) -> str:
         now = int(self.clock())
+        pair = (job.job_id, persona)
+        # The count comes first and a withheld finding counts against it, so
+        # one pass writes at most `comments_per_pass` rows of any kind. The
+        # over-cap answer posts nothing, so nothing the scan would catch can
+        # leak past it (PR #21 review).
+        if self._accepted.get(pair, 0) >= self.comments_per_pass:
+            self.check_runs.add(job.repo, job.head, not_posted=1)
+            return ENOUGH
         detector = self.scanner.first(body)
         if detector is not None:
             with self.records.tx() as c:
                 self._withhold(job.repo, job.pr, job.job_id, persona, detector, body, now, c)
                 self.check_runs.add(job.repo, job.head, conn=c, withheld=1)
+            self._accepted[pair] = self._accepted.get(pair, 0) + 1
             return WITHHELD
         if len(body.encode("utf-8")) > self.comment_bytes:
             return TOO_LONG
-        pair = (job.job_id, persona)
-        if self._accepted.get(pair, 0) >= self.comments_per_pass:
-            self.check_runs.add(job.repo, job.head, not_posted=1)
-            return ENOUGH
         with self.records.tx() as c:
             c.execute("INSERT INTO outbox (key, installation_id, repo, pr, head, body, "
                       "next_attempt_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1658,7 +1757,7 @@ class Drainer:
 - [ ] **Step 4: Run them to see them pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_outbox.py'`, `./test-python.sh -p 'test_hosted_github_app.py'`, then `./test-python.sh`
-Expected: PASS, 26 and 33 tests. The whole suite passes.
+Expected: PASS, 27 and 34 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
@@ -1736,6 +1835,7 @@ class DecideTest(unittest.TestCase):
             ("not the pair's session", dict(record=rec(), expected="another-session"), "failing"),
             ("incomplete flush", dict(record=rec(), flush_ok=False), "deferred"),
             ("empty record", dict(record=rec(requests=0, successes=0)), "deferred"),
+            ("traffic and no answer", dict(record=rec(requests=1, successes=0)), "deferred"),
             ("no record", dict(record=None), "deferred"),
             ("failures, no success", dict(record=rec(successes=0, first_failure="upstream 502")),
              "failed"),
@@ -2298,6 +2398,11 @@ def decide(record: Optional[Record], flush_ok: bool, transcript: Optional[bytes]
         # this. So it is a claudebox fault, never the pair's (PR #18 review).
         return DEFERRED
     if record.first_abandoned:
+        return DEFERRED
+    if record.successes == 0:
+        # Traffic and no provider answer (a count_tokens call alone, say) is
+        # not a review: committing it would paint a green check on a head no
+        # pass read (PR #21 review).
         return DEFERRED
     return OK
 
