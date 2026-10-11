@@ -57,6 +57,12 @@ A step with no substrate here is reported absent — never reported done.**
   from `main`; pull requests are opened by the human after the run. Pin the branch's base
   with `git -C <repo> rev-parse HEAD` at launch and record the SHA; every later claim
   about the base refers to it. Never push; that is the human's call.
+- **A clean checkout** — LOCAL, and it blocks the launch. The Validator applies every
+  slice in this checkout, which is the operator's own, so a slice would overwrite any
+  uncommitted edit on a path it touches, and gates run over unstaged work would judge a
+  tree the commit does not hold. `git -C <repo> status --porcelain` must print nothing,
+  ignored files aside; record that beside the base SHA. If it prints anything, stop, name
+  the paths, and launch nothing until the human commits or moves that work.
 - **Secret tripwire over transcripts and logs** — LOCAL. Run it as
   `HARNESS_DIR=.orchestrator-runs/.harness ~/jmc/factory/harness/tripwire.sh
   .orchestrator-runs` plus any other path this run wrote. It takes the paths to scan as

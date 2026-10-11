@@ -80,7 +80,10 @@ session gives you.
   to hand the Coder, by a route that outlives the run. Hold your captures in the verdict
   package and add them after the signature.
 - **Phase 4's assembly.** The Coder and the Tester work in their own detached worktrees,
-  which `/orchestrate` created. Before you run the gates, apply each lane's change set to
+  which `/orchestrate` created. The launch found your checkout clean; check it again
+  before each slice (`git status --porcelain` lists nothing but what this run committed
+  or staged), and if the human has edited anything since, judge nothing until they have
+  committed or moved it. Before you run the gates, apply each lane's change set to
   your own checkout, on the feature branch: copy the added and modified paths, and
   `git rm` the deleted ones (a rename is both), and stage them. The lane and your checkout
   sit at the same head, so the application is checked by comparing their staged diffs:
