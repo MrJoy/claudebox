@@ -44,7 +44,7 @@ The spec and the overview leave these open, and each one changes code. They are 
 7. **`claude` gets a built environment, never an inherited one**: `HOME`, `PATH`, `DISABLE_AUTOUPDATER=1`, `ANTHROPIC_BASE_URL` (the gateway), the pair's provider token under `auth_env`, `GH_TOKEN` (the read token), the channel URL, the capability, the persona and the PR number for the shim, and the job's model in every model-tier variable the local entrypoint pins. `ANTHROPIC_API_KEY` is never set. Every pass carries `--strict-mcp-config` and no other MCP flag, since hosted Linear is deferred and kindex is 3a.
 8. **Whether the personas share the worktree is decided once, by the control plane, and carried in the job spec as `shared_worktree`.** The control plane puts `WORKTREE_STANZA` in the prompts by that answer (2a.4), and the worker locks `.git` with `review_loop.lock_git_dir`, unchanged, exactly when it is true. The worker never recomputes it, so the stanza and the lock cannot disagree. The answer it must carry is whether more than one persona reads the clone, whatever their phases or the cap: Sage's phase-2 pass reads whatever a phase-1 pass left in the clone, so `red_team,sage` is a shared clone (overview, the job spec). A job spec without a boolean `shared_worktree` is refused at `fetch-job`.
 9. **The session id is read from the transcript.** The first line whose `sessionId` is a plausible id wins, and a session id that could escape the projects directory is refused. A transcript with no id starts a fresh session with a `WARN`. When the job's `session_id` disagrees with the transcript's, the transcript's resumes, with a `WARN`. A `session_id` with no transcript starts fresh.
-10. **A pass that cannot start is an ordinary failed pass**, as in local mode's `_run_one`: any exception from spawning `claude` (`EAGAIN` at the PID limit, `ENOMEM`, no `claude` on `PATH`) becomes a failed `PassResult`, and the pair still sends `complete-pair`. Letting it out would abort the pool, and the started pair, its siblings and the next phase would never complete.
+10. **A pass that cannot start is an ordinary failed pass**, as in local mode's `_run_one`: any exception from spawning `claude` (`EAGAIN` at the PID limit, `ENOMEM`, no `claude` on `PATH`) becomes a failed `PassResult`, and the pair still sends `complete-pair`. Letting it out would abort the pool, and the started pair, its siblings and the next phase would never complete. A job the worker cannot prepare (a clone that fills its tmpfs, a fetch that keeps failing) is the same rule one step earlier: having fetched the job and its capability, the worker starts each pair and completes it with no transcript and an empty record, noting why. 2a.4a's commit point reads that as `deferred`, which retries on the profile's backoff and pages on the third in a row; ending the job with no pair completed would instead commit nothing, count nothing and be dispatched again every poll.
 11. **A refused `start-pair` runs nothing and completes nothing**: the pair stays owed, and the log names the refusal's reason. A usage limit in phase 1 withholds phase 2, as `run_group` does, and those pairs are never started, so the control plane still owes them.
 12. **`complete-pair` notes are `{rc, limited, transcript}`**, where `transcript` is `ok`, `missing` or `over-cap`. They are evidence for the control plane, never an outcome. `complete-pair` is retried up to `COMPLETE_ATTEMPTS` (4) times, with a growing pause, when the channel answers `503` or cannot be reached: the channel bounds the large bodies it holds at once (2a.4a), and a burst of one job's own completions can meet that bound. Any other answer is final.
 13. **The shim allows a fixed set of reads** (`pr view|diff|list`, `issue view|list`, `repo view`, `search`, and `api`) and refuses everything else with one message that names `gh pr comment` as the only way to post. `gh api` is checked by allowlist, because `gh` parses flags with pflag, which accepts attached short values (`-XPOST`, `-fbody=x`) and combined flags, so no list of write spellings is complete. It takes exactly one REST path, and only `--paginate`, `--slurp`, `-i`/`--include`, `--silent`, `--verbose`, `-q`/`--jq`, `-t`/`--template` and `--cache`. Every other flag is refused, `--hostname`, `-H` and `--method` included, and so are `graphql` (always a `POST`) and a full URL. Reads the worker's token can never answer are refused with their own message, which tells the persona to carry on with the review: `pr checks` and `pr status` (check status, which `GH_STANZA` already says the token cannot read, and which `pr status` fetches with no flag to leave it out), `run view|list` (the App asks for no Actions permission), and `auth status` (it needs a user). GitHub's 403 for them would read as a refused read, which the hosted prompt tells a persona to stop the review over. That list is the readable message for the common cases, not the boundary: `gh api` takes any path, so the shim runs the real `gh` as a child, passes its output through, and adds the same "carry on" message whenever GitHub answers that the token has no permission ("Resource not accessible by integration" or "Must have admin rights", in REST and GraphQL alike). GitHub's answer is the one owner of which reads this token can make. A bare 403 is not that answer, since GitHub rate-limits with 403 too: a rate-limited read gets its own note, to wait and run it again, never to carry on past a read that has not succeeded.
@@ -1447,6 +1447,36 @@ class PrepareTest(unittest.TestCase):
         self.assertIn("share the worktree", str(ctx.exception))
 
 
+class UnpreparedTest(unittest.TestCase):
+    # PR #18 review: a clone that failed completed no pair, so nothing was
+    # committed or counted and the next poll dispatched the job again forever.
+    def test_a_failed_prepare_starts_and_completes_every_pair_empty(self):
+        channel = FakeChannel(refuse={"sme"})
+        w = Worker("/h", "/p", channel, run=FakeRun())
+        w.fail_unprepared(job(pairs=[{"persona": "red_team"}, {"persona": "sme"}]), "cap",
+                          "git clone: No space left on device")
+        paths = [(c[0], c[2]["persona"]) for c in channel.calls]
+        self.assertEqual(paths, [("/channel/start-pair", "red_team"),
+                                 ("/channel/complete-pair", "red_team"),
+                                 ("/channel/start-pair", "sme")])   # refused: stays owed
+        done = channel.calls[1][2]
+        self.assertIsNone(done["transcript_b64"])
+        self.assertEqual(done["notes"]["prepare"], "git clone: No space left on device")
+
+    def test_main_completes_the_pairs_when_prepare_fails(self):
+        fake = mock.MagicMock()
+        fake.fetch_job.return_value = ("cap", job(pairs=[{"persona": "red_team"}]))
+        fake.prepare.side_effect = WorkerError("git clone: No space left on device")
+        spec = {"channel_url": "http://c", "gateway_url": "http://g", "bootstrap_token": "b"}
+        with mock.patch.object(worker, "posture_problems", return_value=[]), \
+                mock.patch.object(worker, "read_job_spec", return_value=spec), \
+                mock.patch.object(worker, "Worker", return_value=fake), \
+                mock.patch.object(worker.os, "dup2"), mock.patch("sys.stderr", io.StringIO()):
+            self.assertEqual(worker.main(), 1)
+        fake.fail_unprepared.assert_called_once()
+        fake.run_group.assert_not_called()
+
+
 class FakeChannel:
     def __init__(self, refuse=()):
         self.calls = []
@@ -1940,8 +1970,35 @@ class Worker:
         self.complete(capability, tag, result)
         return result
 
-    def complete(self, capability: str, tag: Pair, result: passes.PassResult) -> None:
+    def fail_unprepared(self, job: Dict[str, Any], capability: str, reason: str) -> None:
+        """Complete every pair with an empty record when the job could not be prepared.
+
+        A clone that fails (an oversized repo filling the tmpfs, a fetch that
+        keeps failing) would otherwise end the job with no pair completed, no
+        outcome committed and nothing counting the repeats, and the next poll
+        would dispatch it again, forever (PR #18 review). An empty record
+        commits as `deferred`, which retries on the profile's backoff and
+        pages on the third in a row. complete-pair needs a started pair, so
+        each is started first.
+        """
+        for pair in job["pairs"]:
+            persona = pair["persona"]
+            if not _PERSONA_RE.fullmatch(persona or ""):
+                continue
+            tag = Pair(int(job["pr"]), job["mode"], persona)
+            status, data = self.channel.post("/channel/start-pair", capability, {"persona": persona})
+            if status != 200:
+                log(f"start-pair refused ({status}: {data.get('reason', 'no reason')}); this pair "
+                    "stays owed", pair=tag)
+                continue
+            self.complete(capability, tag, passes.PassResult(rc=1, session_id=None, limited=False,
+                                                             limit_line=""), prepare=reason)
+
+    def complete(self, capability: str, tag: Pair, result: passes.PassResult,
+                 prepare: Optional[str] = None) -> None:
         notes: Dict[str, Any] = {"rc": result.rc, "limited": result.limited, "transcript": "missing"}
+        if prepare:
+            notes["prepare"] = prepare[:200]
         payload: Dict[str, Any] = {"persona": tag.persona, "session_id": result.session_id,
                                    "transcript_b64": None, "notes": notes}
         if result.session_id:
@@ -2015,7 +2072,12 @@ def main() -> int:
         job.setdefault("channel_url", spec["channel_url"])
         log(f"job {job['job_id']}: PR #{job['pr']} at {job['head'][:12]}, "
             f"{len(job['pairs'])} pairs ({job['mode']})")
-        worker.prepare(job)
+        try:
+            worker.prepare(job)
+        except WorkerError as exc:
+            sys.stderr.write(f"ERROR: could not prepare the job: {exc}\n")
+            worker.fail_unprepared(job, capability, str(exc))
+            return 1
         worker.run_group(job, capability)
     except WorkerError as exc:
         sys.stderr.write(f"ERROR: {exc}\n")
@@ -2031,7 +2093,7 @@ if __name__ == "__main__":
 - [ ] **Step 5: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_worker.py'`, then `./test-python.sh`
-Expected: PASS, 33 tests. The whole suite passes.
+Expected: PASS, 35 tests. The whole suite passes.
 
 - [ ] **Step 6: Commit**
 
