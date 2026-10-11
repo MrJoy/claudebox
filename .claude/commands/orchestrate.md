@@ -111,13 +111,15 @@ checkout, runs the judging suites there, and on the human's signature commits ex
 those files, so the committed tree is the judged tree by construction. Before a later
 slice is dispatched, both lane worktrees move to the feature branch's new head so no lane
 builds on a stale base. A lane hands over uncommitted files, so its tree is dirty in
-exactly the paths the commit changed, and a plain checkout refuses. So, per lane: check
-that every file the lane handed over matches the commit (`git -C <worktree> diff --quiet
-<head> -- <paths>`), then discard the now-redundant copy and move it
+exactly the paths the commit changed, and a plain checkout refuses. So, per lane: stage
+everything (`git -C <worktree> add -A`, so a new, untracked file has an index entry to
+compare), then check that the handed-over files match the commit (`git -C <worktree> diff
+--cached --quiet <head> -- <paths>`) and that `git -C <worktree> status --porcelain` lists
+nothing outside `<paths>`. Only then discard the now-redundant copy and move it
 (`git -C <worktree> checkout --force --detach <head>` and `git -C <worktree> clean -fd`),
-then tell the lane it was re-pointed, so its next hand-over lists only the new slice's
-paths. A lane whose files do not match the commit is not moved: that is an anomaly for
-the Validator. You remove the two worktrees when the run closes, after the same check
+and tell the lane it was re-pointed, so its next hand-over lists only the new slice's
+paths. A lane that fails either check is not moved: that is an anomaly for the
+Validator, and nothing in its tree is discarded. You remove the two worktrees when the run closes, after the same check
 against the last slice's commit.
 
     # Substitute the run id, the lane brief, and one launcher per lane before running
