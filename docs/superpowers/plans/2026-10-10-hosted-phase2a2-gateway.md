@@ -45,7 +45,7 @@ The spec and the overview leave these open, and each one changes code. They are 
 7. **A starting gateway answers 503**, and that refusal is in no record: the spec's "a request ... a starting gateway turned away" is a claudebox fault.
 8. **Tokens are counted as every kind of input the provider reports** (`input_tokens`, `cache_creation_input_tokens` and `cache_read_input_tokens`) plus the largest `output_tokens` seen. Output is cumulative across `message_delta`s, and summing it would double-count.
 9. **Classification.** HTTP 429 or 529, or an error event of type `rate_limit_error` or `overloaded_error`, is a usage limit. A 401 or 403 is a failure: the provider refused the deployment's credential, which the operator must hear about. A 5xx is a failure. Any other 4xx is `rejected`. The request body is the worker's, so a rejected request is reported as `first_rejected` and never moves the profile's failure counter, which a worker could otherwise drive to park the profile for every repo on it. A transport error reaching upstream, or a read that breaks mid-response, is a failure named `upstream transport: <exception type>`. A 2xx stream that ends without `message_stop` is a failure (`the stream ended before message_stop`). A 2xx on `/v1/messages` is a success. A 2xx on `count_tokens` is neutral: it counts as a request, never as a pass.
-10. **A worker that hangs up mid-response** stops the relay. The request and the tokens seen so far are counted, and the report carries `first_abandoned`, which takes the place of `ok` and nothing else (overview decision 2): a record that would otherwise decide `ok` decides `deferred`, and every other outcome, a cap hit's `capped` included, stands over it. The worker chooses when to hang up, so the marker must never turn a cap into a retry, nor hide what upstream answered: a hang-up after a non-2xx status line is recorded as that status's outcome (a limit, a failure, a rejection), since the status alone decides it. Only a lost 2xx, whose outcome needs the body, is abandoned. On a tokens profile, an abandoned request whose usage was never seen is also `usage_missing` (decision 12): a non-streamed response is generated whole before it is sent, so hanging up cannot un-spend it, and the record decides `capped`, with the pair parked and paged rather than left to spend unmeasured.
+10. **A worker that hangs up mid-response** stops the relay. The request and the tokens seen so far are counted, and the report carries `first_abandoned`, which takes the place of `ok` and nothing else (overview decision 2): a record that would otherwise decide `ok` decides `deferred`, and every other outcome, a cap hit's `capped` included, stands over it. The worker chooses when to hang up, so the marker must never turn a cap into a retry, nor hide what upstream answered: a hang-up after a non-2xx status line is recorded as that status's outcome (a limit, a failure, a rejection), since the status alone decides it. So is any answer on a path that is never a pass: a lost `count_tokens` is `neutral`, and its body, which carries no `usage`, never fails a tokens profile closed. Only a lost 2xx on `/v1/messages`, whose outcome needs the body, is abandoned. On a tokens profile, an abandoned request whose usage was never seen is also `usage_missing` (decision 12): a non-streamed response is generated whole before it is sent, so hanging up cannot un-spend it, and the record decides `capped`, with the pair parked and paged rather than left to spend unmeasured.
 11. **A passes profile clamps `max_tokens` to 64,000** (`MAX_TOKENS_CEILING`), the spec's "caps ... `max_tokens`" for a provider that cannot report usage. A tokens profile clamps to whatever its pair has left after in-flight reservations.
 12. **A response without usage on a tokens profile** is passed through to the worker. The pair is marked `usage_missing`, reported, and paged (`PAGE:` on stdout, overview decision 14), and every later request on that token is refused. The control plane commits that record as `capped` (overview decision 2).
 13. **The token travels as `Authorization: Bearer`**, which is how Claude Code sends both `ANTHROPIC_AUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN`. `x-api-key` is accepted too. Neither is ever forwarded upstream.
@@ -92,7 +92,7 @@ Apply this change to `tests/test_deploy_config.py`. The existing custom-profile 
 
 ```diff
 diff --git a/tests/test_deploy_config.py b/tests/test_deploy_config.py
-index 8283e41..0bf2763 100644
+index 0325fa1..8a7e4f1 100644
 --- a/tests/test_deploy_config.py
 +++ b/tests/test_deploy_config.py
 @@ -24,6 +24,13 @@ def profile(**over):
@@ -109,7 +109,7 @@ index 8283e41..0bf2763 100644
  def load(doc):
      return deploy_config.load_deploy(json.dumps(doc).encode("utf-8"))
  
-@@ -151,8 +158,8 @@ class LoadTest(unittest.TestCase):
+@@ -157,8 +164,8 @@ class LoadTest(unittest.TestCase):
          # Oracle: tester-brief.md, Task 4, Interfaces and signed starting oracle line 656.
          # Mutation: Permit custom token budgets without usage reported.
          self.assertIn("profiles.c.budget.unit",
@@ -120,7 +120,7 @@ index 8283e41..0bf2763 100644
          self.assertTrue(d.profiles["c"].usage_reported)
  
      def test_usage_is_only_for_custom(self):
-@@ -376,6 +383,10 @@ class DeployLeafCoverageTest(unittest.TestCase):
+@@ -402,6 +409,10 @@ class DeployLeafCoverageTest(unittest.TestCase):
              ("profiles.*.concurrency", "concurrency", 2, 3, 2, 3),
              # None here means omitted: usage has only one accepted explicit value.
              ("profiles.*.usage", "usage_reported", None, "reported", False, True),
@@ -131,7 +131,7 @@ index 8283e41..0bf2763 100644
              ("profiles.*.limit_backoff_seconds", "limit_backoff_seconds", 17, 19, 17, 19),
              ("profiles.*.budget.unit", "budget_unit", "tokens", "passes", "tokens", "passes"),
              ("profiles.*.budget.daily", "budget_daily", 101, 103, 101, 103),
-@@ -406,8 +417,11 @@ class DeployLeafCoverageTest(unittest.TestCase):
+@@ -432,8 +443,11 @@ class DeployLeafCoverageTest(unittest.TestCase):
                  for value in (before, after):
                      doc = {"profiles": {"o": profile()}}
                      if path == "profiles.*.usage":
@@ -145,7 +145,7 @@ index 8283e41..0bf2763 100644
                      concrete = path.replace("profiles.*.", "profiles.o.")
                      concrete = concrete.replace("overrides.*", "overrides.api")
                      keys = concrete.split(".")
-@@ -421,3 +435,67 @@ class DeployLeafCoverageTest(unittest.TestCase):
+@@ -447,3 +461,67 @@ class DeployLeafCoverageTest(unittest.TestCase):
                      observed.append(getattr(target, field))
                  self.assertEqual(observed, [expected_before, expected_after])
                  self.assertNotEqual(observed[0], observed[1], "declared leaf has no observable effect")
@@ -226,7 +226,7 @@ Apply this change to `reviewer/deploy_config.py`:
 
 ```diff
 diff --git a/reviewer/deploy_config.py b/reviewer/deploy_config.py
-index 14c5193..eb0b482 100644
+index c748e1e..a547d13 100644
 --- a/reviewer/deploy_config.py
 +++ b/reviewer/deploy_config.py
 @@ -9,12 +9,13 @@ YAML, by founder ruling (2026-10-09).
@@ -310,7 +310,7 @@ index 14c5193..eb0b482 100644
  def _profile(problems: Problems, name: str, raw) -> Optional[Profile]:
      path = join("profiles", name)
      before = len(problems.lines())
-@@ -149,6 +188,30 @@ def _profile(problems: Problems, name: str, raw) -> Optional[Profile]:
+@@ -153,6 +192,30 @@ def _profile(problems: Problems, name: str, raw) -> Optional[Profile]:
          problems.add(join(path, "usage"), "only 'reported', and only on a custom profile")
      usage_reported = usage == "reported" and provider == "custom"
  
@@ -341,7 +341,7 @@ index 14c5193..eb0b482 100644
      budget = _section(problems, raw, "budget", path)
      bpath = join(path, "budget")
      unit = budget.get("unit")
-@@ -187,7 +250,8 @@ def _profile(problems: Problems, name: str, raw) -> Optional[Profile]:
+@@ -191,7 +254,8 @@ def _profile(problems: Problems, name: str, raw) -> Optional[Profile]:
      if len(problems.lines()) > before:
          return None
      return Profile(name, provider, tuple(models), default_model, credential, concurrency,
@@ -1581,6 +1581,25 @@ class GatewayTest(unittest.TestCase):
         self.assertIn("first_limit", report)
         self.assertNotIn("first_abandoned", report)
 
+    def test_a_hangup_on_count_tokens_is_neutral_and_fails_nothing_closed(self):
+        # PR #19 review: count_tokens is never a pass, and its body has no usage.
+        token, cid = self.hello()
+        self.up.reply = (200, "application/json", b'{"input_tokens": 12}' + b" " * 300000)
+        conn = socket.create_connection(("127.0.0.1", self.server.server_port))
+        body = b'{"messages": []}'
+        conn.sendall(b"POST /v1/messages/count_tokens HTTP/1.1\r\nHost: x\r\nAuthorization: "
+                     b"Bearer " + token.encode() + b"\r\nContent-Length: "
+                     + str(len(body)).encode() + b"\r\n\r\n" + body)
+        conn.recv(64)
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, b"\x01\x00\x00\x00\x00\x00\x00\x00")
+        conn.close()
+        time.sleep(0.5)
+        self.flush(cid)
+        report = self.reports[-1]
+        for key in ("first_abandoned", "usage_missing", "first_failure"):
+            self.assertNotIn(key, report)
+        self.assertFalse(any(line.startswith("PAGE: ") for line in self.logs))
+
     def test_a_flush_never_reads_a_seq_whose_report_is_not_queued(self):
         # PR #19 review: seq and enqueue are one step under the gateway's lock.
         token, cid = self.hello()
@@ -2284,8 +2303,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             meter.finish()
             # The status line was read before the worker left. A non-2xx is
             # decided by its status alone, so it is recorded as what upstream
-            # did; only a lost 2xx, whose outcome needs the body, is abandoned.
-            if resp.status >= 300:
+            # did, and so is any answer on a path that is never a pass
+            # (count_tokens is neutral). Only a lost 2xx on /v1/messages, whose
+            # outcome needs the body, is abandoned.
+            if resp.status >= 300 or path != "/v1/messages":
                 kind = classify(path, resp.status, meter)
                 self._complete(state, kind, granted, meter, detail=f"upstream {resp.status}"
                                + (f" {meter.error_type}" if meter.error_type else ""))
@@ -2419,7 +2440,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run them to see them pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_gateway.py'`, then `./test-python.sh`
-Expected: PASS, 61 tests. The whole suite passes.
+Expected: PASS, 62 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
