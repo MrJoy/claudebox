@@ -45,7 +45,7 @@ The spec and the overview leave these open, and each one changes code. They are 
 9. **`Installation.pull(full_name, pr)` and `is_public(repo)` join 2a.1's client**, returning None on a 404, because the drain must see whether a PR is open before it posts.
 10. **A pass with no transcript and an empty record is `deferred`**, ahead of the spec's transcript check. Nothing parsed badly: the pass never started `claude`. A missing transcript with real traffic is `failing`. A transcript parses when every non-empty line is a JSON object and its first `sessionId` is a plausible id. `decide` never returns `revoked`: the spec decides it "elsewhere, without a `complete pair`", and that is decision 18. A dead capability never reaches `decide`, because the channel answers it `401`.
 11. **Reports commit only in order.** A report whose seq is not the committed one plus one changes nothing, and the ack names the committed seq, so a resend is harmless and a gap is visible. A `first_*` marker is never overwritten, and its text is cut at 500 characters. A report for a token the control plane never minted is refused.
-12. **The commit point is in memory, under one lock.** The transcript blob is written first and the pair pointed at it second, so a crash between them leaves an unreferenced blob for 2b's sweep, and 2a.4b's startup deletes every transcript blob anyway (overview decision 1). A job does not outlive the control plane that started it because 2a.4b's startup makes it so: 2a.1's rule, "the successor revokes every outstanding row before it serves anything", revokes every capability and provider token (`Creds.revoke_all`), the restarted `hello` carries no live token so the gateway drops them all, and the runner's orphans are stopped. An in-flight pass is lost on a restart, and its pair stays owed. A newer transcript deletes the blob it replaces.
+12. **The commit point is in memory, under one lock, and never calls `decider_for` while holding it.** The decider is resolved first, because 2a.4b's `decider_for` takes the scheduler's lock and the scheduler calls into the committer; a call under the lock would deadlock the two (2a.4b's review). The transcript blob is written first and the pair pointed at it second, so a crash between them leaves an unreferenced blob for 2b's sweep, and 2a.4b's startup deletes every transcript blob anyway (overview decision 1). A job does not outlive the control plane that started it because 2a.4b's startup makes it so: 2a.1's rule, "the successor revokes every outstanding row before it serves anything", revokes every capability and provider token (`Creds.revoke_all`), the restarted `hello` carries no live token so the gateway drops them all, and the runner's orphans are stopped. An in-flight pass is lost on a restart, and its pair stays owed. A newer transcript deletes the blob it replaces.
 13. **Parks live beside the pair state, keyed by repo.** The profile's two-PR limit rule counts `(repo, pr)`, since a profile spans repos and every repo has a #1. A head park lifts when the PR's head differs. A timed park lifts at its time. A profile park stops `start-pair`, and its scheduling consequence is 2a.4b's. A page is one `PAGE:` line (overview decision 14).
 14. **`fetch-job` mints the read token and starts the 55-minute deadline in the same call**, so the token outlives the job, and a read token GitHub refuses revokes the new capability at once. A pair's committed transcript travels in the job spec with its session id, and a pair without one gets neither.
 15. **`start-pair` fails closed, and reserves the pair before any network call.** A visibility check that errors, a repo that is public or out of reach, a parked profile, a pair already started or starting, and a gateway that refuses the token all answer `409`. The check and the reservation happen under the job's lock, so two concurrent starts for one persona mint one token, and a refusal clears the reservation so the pair stays startable. The provider token lives until the job's deadline, and its `token_records` row exists before the gateway hears of it.
@@ -1802,6 +1802,27 @@ class CommitterTest(unittest.TestCase):
         self.assertEqual(self.c.commit(again), "ok")    # not the deferred a fresh decision gives
         self.assertEqual(self.state.rounds[self.pair], 1)
 
+    def test_decider_for_is_never_called_under_the_committers_lock(self):
+        # Lock order (PR #22 review): decider_for takes the scheduler's lock,
+        # and the scheduler calls into the committer.
+        import threading
+        held = []
+        real = self.c.decider_for
+
+        def probe(repo):
+            free = []
+            t = threading.Thread(target=lambda: free.append(self.c.lock.acquire(timeout=0.5)
+                                                            and (self.c.lock.release() or True)))
+            t.start()
+            t.join()
+            held.append(not free[0])
+            return real(repo)
+        self.c.decider_for = probe
+        self.complete({})
+        self.c.revoke("acme/web", self.pair)
+        self.c.forget_repo("acme/web")
+        self.assertEqual(held and set(held), {False})
+
     def test_ok_commits_everything_together(self):
         self.assertEqual(self.complete({}), "ok")
         self.assertEqual(self.state.sessions[self.pair], SID)
@@ -2167,6 +2188,10 @@ class Committer:
         nothing: a re-entered complete-pair is a replay, never a second pass,
         so it cannot spend a round twice.
         """
+        # Lock order: the decider is resolved before this lock is taken, never
+        # under it, because decider_for takes the scheduler's lock and the
+        # scheduler calls in here (PR #22 review).
+        decider = self.decider_for(c.repo)
         with self.lock:
             settled = self.settled.get(c.credential_id)
             if settled is not None:
@@ -2174,7 +2199,7 @@ class Committer:
             record = record_for(self.records, c.credential_id)
             outcome = decide(record, flush_complete(c.flush, record), c.transcript, c.session_id,
                              c.expected_session)
-            self.apply(c, outcome, record)
+            self.apply(c, outcome, record, decider)
             self.settled[c.credential_id] = outcome
             return outcome
 
@@ -2185,17 +2210,18 @@ class Committer:
         it stays owed. The caller, which knows the head, shows it on the check
         run (checkruns.REVOKED).
         """
+        decider = self.decider_for(repo)   # before the lock: see commit
         with self.lock:
-            decider = self.decider_for(repo)
             self._drop_transcript(repo, pair)
             decider.record_failure(pair)
             decider.state.owed.add(pair)
         return REVOKED
 
-    def apply(self, c: Completion, outcome: str, record: Optional[Record]) -> None:
+    def apply(self, c: Completion, outcome: str, record: Optional[Record],
+              decider=None) -> None:
         key = (c.repo, c.pair)
         now = int(self.clock())
-        decider = self.decider_for(c.repo)
+        decider = decider if decider is not None else self.decider_for(c.repo)
         with self.lock:
             if outcome in _KEEPS_TRANSCRIPT and c.transcript is not None:
                 name = blobs_mod.transcript_name(c.repo, c.pair.pr, c.pair.mode, c.pair.persona, now)
@@ -2291,6 +2317,7 @@ class Committer:
         content and "survive a public flip". Outbox items and withheld records
         are rows, and Outbox.drop_repo deletes them.
         """
+        decider = self.decider_for(repo)   # before the lock: see commit
         with self.lock:
             for key in [k for k in self.transcripts if k[0] == repo]:
                 self.blobs.delete(self.transcripts.pop(key))
@@ -2300,7 +2327,7 @@ class Committer:
             for profile in self.profiles.values():
                 for key in [k for k in profile.recent_limits if k[0] == repo]:
                     del profile.recent_limits[key]
-            state = self.decider_for(repo).state
+            state = decider.state
             state.sessions.clear()
             state.reviewed.clear()
             state.passes_done.clear()
@@ -2317,7 +2344,7 @@ class _Result:
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_commit.py'`, then `./test-python.sh`
-Expected: PASS, 27 tests. The whole suite passes.
+Expected: PASS, 28 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
