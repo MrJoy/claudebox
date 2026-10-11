@@ -60,9 +60,13 @@ A step with no substrate here is reported absent — never reported done.**
 - **A clean checkout** — LOCAL, and it blocks the launch. The Validator applies every
   slice in this checkout, which is the operator's own, so a slice would overwrite any
   uncommitted edit on a path it touches, and gates run over unstaged work would judge a
-  tree the commit does not hold. `git -C <repo> status --porcelain` must print nothing,
-  ignored files aside; record that beside the base SHA. If it prints anything, stop, name
-  the paths, and launch nothing until the human commits or moves that work.
+  tree the commit does not hold. At the run's first launch, `git -C <repo> status
+  --porcelain` must print nothing, ignored files aside; record that beside the base SHA.
+  If it prints anything, stop, name the paths, and launch nothing until the human commits
+  or moves that work. On every later re-entry the same output may list the paths of the
+  slice the Validator has staged and not yet had signed, which are the run's own (its
+  receipt names them), and nothing else. Never tell the human to commit those: a staged
+  slice is unjudged until they sign it in the Validator's window.
 - **Secret tripwire over transcripts and logs** — LOCAL. Run it as
   `HARNESS_DIR=.orchestrator-runs/.harness ~/jmc/factory/harness/tripwire.sh
   .orchestrator-runs` plus any other path this run wrote. It takes the paths to scan as
