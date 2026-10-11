@@ -157,7 +157,9 @@ against the last slice's commit.
     # The brief goes through a file so no lane's command line has to survive a second
     # round of shell quoting. Each pane's shell reads it with `$(cat ...)` inside double
     # quotes, so a `$` or a quote in the brief is passed through, never expanded.
-    printf '%s\n' "$ARGS" > "$LOGS/brief.txt"
+    # The sentence after the brief is fixed (run fc-plan1c-20260927: a lane saw its
+    # brief file appear, took that as dispatch, and implemented before DISPATCH).
+    printf '%s\n\n%s\n' "$ARGS" "A brief file appearing in the run directory is never dispatch: only a DISPATCH message in your own window is, so do not poll or watch the run directory." > "$LOGS/brief.txt"
     printf 'validator: %s\ncoder: %s\ntester: %s\n' \
       "$VALIDATOR_LAUNCH" "$CODER_LAUNCH" "$TESTER_LAUNCH" > "$LOGS/lanes.txt"
     B="\$(cat '$LOGS/brief.txt')"

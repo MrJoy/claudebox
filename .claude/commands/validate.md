@@ -130,7 +130,13 @@ implementation its oracle must not come from.
 
 So before Phase 4, derive two briefs from the plan, write each into this run's
 directory, the Coder's as `.orchestrator-runs/<run>/coder/brief.md` and the Tester's as
-`.orchestrator-runs/<run>/tester/brief.md`, and hand each lane only the path to its own:
+`.orchestrator-runs/<run>/tester/brief.md`, and hand each lane only the path to its own.
+Writing a brief is not dispatching it: a lane starts only on the DISPATCH message you send
+to its window, and a brief rewritten for a later slice re-fires nothing. The launch brief
+tells every lane so, because a lane that took a file's appearance as its signal has
+implemented before dispatch once already (run fc-plan1c-20260927).
+
+The two briefs:
 
 - **Coder brief**: the plan with every test file's contents and every
   "Write the failing test" and "Run ... test" step removed. Keep the header, Global

@@ -43,4 +43,6 @@ under `--dry-run`, under `/bin/bash`, which is 3.2 on macOS. No pip packages.
 `docs/superpowers/plans/` hold each task's implementation code and its test code side by
 side, so opening one shows you the implementation your oracle must not come from. The
 Validator derives a brief for your lane and hands you its path; if you open a plan
-anyway, say so and stop.
+anyway, say so and stop. The brief's file appearing, or changing, is not your signal to
+start: only a DISPATCH message in your own window is. Do not poll or watch the run
+directory.
