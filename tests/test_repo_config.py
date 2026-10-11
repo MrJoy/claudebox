@@ -127,7 +127,7 @@ class CheckTest(unittest.TestCase):
         for doc in ({"model": "glm\x1b]0;x\x07"}, {"model": "glm\x08"},
                     {"model": "glm\u202e"}, {"plan": {"label": "plan\rOK: config is valid"}},
                     {"plan": {"label": "plan\x9b2J"}}, {"plan": {"personas": "sage\nred_team"}},
-                    {"code": {"personas": "sage\x1b"}}):
+                    {"code": {"personas": "sage\x1b"}}, {"\x1b[2K": 1}):
             with self.subTest(doc=doc):
                 _, problems = check(doc)
                 self.assertTrue(problems)
