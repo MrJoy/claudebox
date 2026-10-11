@@ -37,7 +37,7 @@ The spec and the overview leave these open, and each one changes code. They are 
 1. **2a.4 is two plans.** 2a.4a is the decision libraries, testable with fakes. 2a.4b is the processes: the scheduler, the control-plane main, the supervisor, `hosted/Dockerfile` and `hosted/compose.json`. Each is one factory run. The overview's split table says so.
 2. **A hosted round line from round 2 on reads "Read closely only the commits after `<head>`: the ones `git log --oneline <head>..HEAD` lists."** (plan mode: "the revisions after commit `<head>`", keeping its last sentence). `since_head` must be a full commit id. A rewritten branch gets round 1's line whatever the round, and the summary of the check run says the branch was rewritten.
 3. **`build_hosted` is `build({})` with `HOSTED_GH_SENTENCE` after every copy of `GH_STANZA`.** It raises if a default ever loses `GH_STANZA`, so the sentence can never silently go missing.
-4. **The check-run states in 2a** are queued, running, reviewed, deferred, usage-limited, failed, failing, capped, round-cap, round-cap-unread, revoked and config-invalid. `round-cap-unread` is a pair at its round cap on a head no pass ran at: it is titled "Not reviewed: round cap reached" and never concludes `success`, since `success` means a pass read this commit and found nothing. Budget, too-large and refused-read arrive with 2b. A run is queued until a pass starts, then in progress until no pair is queued or running (phase 2 waits for phase 1, so a head with a pass running, or some finished and the rest queued, is under review), then completed. When a head's pairs differ, the title names the state that waits on a person before one that clears itself, before one that is done. The wording is the table in `checkruns._WORDS`, with a retry time in UTC where one exists. The summary has one line per persona and the counts: posted, waiting to post, dropped, withheld, and turned away by the per-pass limit. A config problem stops the review and is titled "Not reviewed: configuration", with one sentence true of every cause (an invalid file, a setting the deployment cannot serve) and the problem text below it. A config notice (one file broken and the other applied, the spec's fallback) shows below a review that runs and makes its conclusion `neutral`. Its producer is 2a.4b: `Scheduler.load_config` returns the dropped file's problems as the notice when `repo_config.resolve` falls back, and `poll_repo` passes it to `set_config_problem` with an empty problem, so the review runs. `CheckRuns.config_answer` and `CheckRuns.view` let 2a.4b publish a head only when its answer changes, and paint a pair no job will ever set. Both answer what the run shows, not what was last set: every change bumps the head's version, and only a publish GitHub has taken marks it shown, so while a publish is owed (a failed one included) both answer `None`, and a later poll publishes again rather than taking one failed write as final. A failed write holds the head until the error's `retry_after`, or else 30 seconds doubling per failure up to 30 minutes, the outbox's rule, so an owed head is retried at a pace and not on every poll; a publish inside the hold returns without a call.
+4. **The check-run states in 2a** are queued, running, reviewed, deferred, usage-limited, failed, failing, capped, round-cap, round-cap-unread, revoked and config-invalid. `round-cap-unread` is a pair at its round cap on a head no pass ran at: it is titled "Not reviewed: round cap reached" and never concludes `success`, since `success` means a pass read this commit and found nothing. Budget, too-large and refused-read arrive with 2b. A run is queued until a pass starts, then in progress until no pair is queued or running (phase 2 waits for phase 1, so a head with a pass running, or some finished and the rest queued, is under review), then completed. The `queued` entries come from 2a.4b's dispatch, which paints every pair of the PR's group for that head `queued` when it dispatches, the pairs a split group leaves for a later part included; a head therefore cannot conclude while a pair of its group has not run. When a head's pairs differ, the title names the state that waits on a person before one that clears itself, before one that is done. The wording is the table in `checkruns._WORDS`, with a retry time in UTC where one exists. The summary has one line per persona and the counts: posted, waiting to post, dropped, withheld, and turned away by the per-pass limit. A config problem stops the review and is titled "Not reviewed: configuration", with one sentence true of every cause (an invalid file, a setting the deployment cannot serve) and the problem text below it. A config notice (one file broken and the other applied, the spec's fallback) shows below a review that runs and makes its conclusion `neutral`. Its producer is 2a.4b: `Scheduler.load_config` returns the dropped file's problems as the notice when `repo_config.resolve` falls back, and `poll_repo` passes it to `set_config_problem` with an empty problem, so the review runs. `CheckRuns.config_answer` and `CheckRuns.view` let 2a.4b publish a head only when its answer changes, and paint a pair no job will ever set. `config_answer` answers what the run shows, not what was last set: every change bumps the head's version, and only a publish GitHub has taken marks it shown, so while a publish is owed (a failed one included) it answers `None`, and a later poll publishes again rather than taking one failed write as final. `view` answers what is set, owed or not: its consumer, 2a.4b's round-cap paint, reads `None` as "nothing has set this pair", and an owed publish read that way would repaint a pair that reviewed the head. A head's publishes hold a lock of its own across snapshot, render, write and mark, so they reach GitHub in the order they were rendered and the mark is the version written last. A failed write holds the head until the error's `retry_after`, or else 30 seconds doubling per failure up to 30 minutes, the outbox's rule, so an owed head is retried at a pace and not on every poll; a publish inside the hold returns without a call.
 5. **A head's conclusion is `success` only when every pair is reviewed (or at its round cap) and nothing was found**, counting findings queued, posted, dropped, withheld and turned away. Everything else that is complete is `neutral`.
 6. **Acceptance runs the per-pass count, then scan, then size.** A withheld finding counts against `caps.comments_per_pass`, so one pass writes at most that many rows of any kind into the shared store; the over-cap answer posts nothing, so nothing the scan would catch leaks past it. A credential is withheld whatever else is wrong with the finding. Size is measured in UTF-8 bytes against `caps.comment_bytes`. A too-long finding is not counted against the pass, since the model is told to shorten it and post again. A finding past `caps.comments_per_pass` is counted on the check run as not posted. A retried `post-finding` with the same key answers what the first one did, and queues once. The key's result is kept in memory for the job's life.
 7. **A withheld record stores a fresh 16-byte salt followed by `sha256(salt || body)`**, and the body with every match replaced by `[withheld:<detector>]`. The day's count per detector is a `withheld_counts` row.
@@ -46,7 +46,7 @@ The spec and the overview leave these open, and each one changes code. They are 
 10. **A pass with no transcript and an empty record is `deferred`**, ahead of the spec's transcript check. Nothing parsed badly: the pass never started `claude`. A missing transcript with real traffic is `failing`. A transcript parses when every non-empty line is a JSON object and its first `sessionId` is a plausible id. `decide` never returns `revoked`: the spec decides it "elsewhere, without a `complete pair`", and that is decision 18. A dead capability never reaches `decide`, because the channel answers it `401`.
 11. **Reports commit only in order.** A report whose seq is not the committed one plus one changes nothing, and the ack names the committed seq, so a resend is harmless and a gap is visible. A `first_*` marker is never overwritten, and its text is cut at 500 characters. A report for a token the control plane never minted is refused.
 12. **The commit point is in memory, under one lock, and never calls `decider_for` while holding it.** The decider is resolved first, because 2a.4b's `decider_for` takes the scheduler's lock and the scheduler calls into the committer; a call under the lock would deadlock the two (2a.4b's review). The transcript blob is written first and the pair pointed at it second, so a crash between them leaves an unreferenced blob for 2b's sweep, and 2a.4b's startup deletes every transcript blob anyway (overview decision 1). A job does not outlive the control plane that started it because 2a.4b's startup makes it so: 2a.1's rule, "the successor revokes every outstanding row before it serves anything", revokes every capability and provider token (`Creds.revoke_all`), the restarted `hello` carries no live token so the gateway drops them all, and the runner's orphans are stopped. An in-flight pass is lost on a restart, and its pair stays owed. A newer transcript deletes the blob it replaces.
-13. **Parks live beside the pair state, keyed by repo.** The profile's two-PR limit rule counts `(repo, pr)`, since a profile spans repos and every repo has a #1. A head park lifts when the PR's head differs. A timed park lifts at its time. A profile park stops `start-pair`, and its scheduling consequence is 2a.4b's. A page is one `PAGE:` line (overview decision 14). The commit point emits the pair outcomes that page (`capped`, `failing`), a repo deferred three times in a row, and both profile parks (three failed pairs, limits on two PRs), since "a profile parked for failures" is on the spec's paging list and a profile park stops every repo on it. Acceptance emits the spec's first page, a withheld finding, as `PAGE: <repo>#<pr>: a finding from <persona> was withheld (<detector>)`, naming the detector and never the body; the per-pass cap bounds how many one pass can raise.
+13. **Parks live beside the pair state, keyed by repo.** The profile's two-PR limit rule counts `(repo, pr)`, since a profile spans repos and every repo has a #1. A head park lifts when the PR's head differs. A timed park lifts at its time. A profile park stops `start-pair`, and its scheduling consequence is 2a.4b's. A page is one `PAGE:` line (overview decision 14). The commit point emits the pair outcomes that page (`capped`, `failing`), a repo deferred three times in a row, and both profile parks (three failed pairs, limits on two PRs), since "a profile parked for failures" is on the spec's paging list and a profile park stops every repo on it. `Outbox._withhold`, the one writer of a withheld record, emits the spec's first page, a withheld finding, as `PAGE: <repo>#<pr>: a finding from <persona> was withheld (<detector>)`, naming the detector and never the body, so the drain's second scan pages as acceptance does; the per-pass cap bounds how many one pass can raise.
 14. **`fetch-job` mints the read token and starts the 55-minute deadline in the same call**, so the token outlives the job, and a read token GitHub refuses revokes the new capability at once. A pair's committed transcript travels in the job spec with its session id, and a pair without one gets neither.
 15. **`start-pair` fails closed, and reserves the pair before any network call.** A visibility check that errors, a repo that is public or out of reach, a parked profile, a pair already started or starting, and a gateway that refuses the token all answer `409`. The check and the reservation happen under the job's lock, so two concurrent starts for one persona mint one token, and a refusal clears the reservation so the pair stays startable. The provider token lives until the job's deadline, and its `token_records` row exists before the gateway hears of it.
 16. **`complete-pair` records the pair completed as soon as the commit point returns**, with its outcome, in the same critical section that ends its reservation, and answers a resend `200 {}`, the way `post-finding` answers one. After the record, the pair's check-run view is set (in memory, and published), and only then is the token revoked, so a fault in the revocation leaves the run showing the true outcome and the token for the job's end to revoke. A fault before the commit point leaves the pair started, which a retry re-enters. A concurrent duplicate is `409`. The resend's sender is 2a.3's worker, which retries `complete-pair` on a `503` or a connection that dropped, and a fault on this side reaches it as a dropped connection. A resend runs the settle step again from the recorded outcome, since every part of it is idempotent. The view is set in memory before anything in that step can fail, so the run shows the true outcome at its next publish either way, and the resend is what gives a lost publish a next time without waiting for the job's end. `job.completed` is the one record that a pair is done. A fault inside `apply` itself, before the record, is re-entered and may spend its round twice: the window is accepted, and closing it needs a durable commit, which 2b's SQL state brings. A completion whose job is no longer registered (`job_live`, checked under the commit point's lock) commits nothing and answers `revoked`: the job's end already revoked and showed the pair, and a loss of access may already have deleted what it would write back (2a.4b's review). It turns a bad transcript into one that will not parse. That covers bad base64, a transcript over 64 MiB, and the worker's own `over-cap` note, so all three are `failing`. A flush the gateway cannot answer is no flush, so the pair is `deferred`. The pair's token is revoked in the records store and then at the gateway, and a gateway that misses the revoke drops the token at its next `hello`.
@@ -590,10 +590,12 @@ class ShownTest(unittest.TestCase):
         self.inst.update_check_run = real
         self.runs.publish("acme/web", HEAD)
         self.assertEqual(self.runs.config_answer("acme/web", HEAD), ("bad file", ""))
+        # view answers what is set, owed publish or not (PR #21 review): its
+        # consumer reads None as "never set".
         self.runs.set_pair("acme/web", HEAD, "sage", PairView(checkruns.CAP_UNREAD))
-        self.assertIsNone(self.runs.view("acme/web", HEAD, "sage"))
-        self.runs.publish("acme/web", HEAD)
         self.assertEqual(self.runs.view("acme/web", HEAD, "sage").state, checkruns.CAP_UNREAD)
+        self.assertIsNone(self.runs.config_answer("acme/web", HEAD))   # owed
+        self.assertIsNone(self.runs.view("acme/web", HEAD, "sme"))
 
 
 class PaceTest(unittest.TestCase):
@@ -650,6 +652,38 @@ class PaceTest(unittest.TestCase):
         self.now[0] += 1
         self.runs.publish("acme/web", HEAD)
         self.assertEqual(len(self.calls), 2)
+
+
+class OrderTest(unittest.TestCase):
+    def test_an_overtaken_publish_cannot_land_last(self):
+        # PR #21 review: two publishes for one head could reach GitHub out of
+        # render order, and `shown = max(...)` marked the stale one current.
+        import threading
+        CheckRunsTest.setUp(self)
+        self.runs.ensure("acme/web", HEAD)
+        self.runs.set_pair("acme/web", HEAD, "sage", PairView(checkruns.RUNNING))
+        inside, release = threading.Event(), threading.Event()
+        real = self.inst.update_check_run
+
+        def slow_first(*a, **k):
+            if not inside.is_set():
+                inside.set()
+                release.wait(5)
+            real(*a, **k)
+        self.inst.update_check_run = slow_first
+        first = threading.Thread(target=self.runs.publish, args=("acme/web", HEAD))
+        first.start()
+        inside.wait(5)                                  # the older render is in its write
+        self.runs.set_pair("acme/web", HEAD, "sage", PairView(checkruns.REVIEWED))
+        second = threading.Thread(target=self.runs.publish, args=("acme/web", HEAD))
+        second.start()
+        second.join(0.2)                                # it must wait for the first
+        release.set()
+        first.join(5)
+        second.join(5)
+        self.assertEqual([u[1] for u in self.inst.updated], ["in_progress", "completed"])
+        self.assertEqual(self.runs.view("acme/web", HEAD, "sage").state, checkruns.REVIEWED)
+        self.assertIsNotNone(self.runs.config_answer("acme/web", HEAD))   # nothing owed
 
 
 class ConfigNoticeTest(unittest.TestCase):
@@ -875,6 +909,11 @@ class CheckRuns:
         # read by the drain; one lock covers every change and every render.
         self.lock = threading.Lock()
         self._create_lock = threading.Lock()   # held across a GitHub call, so not `lock`
+        # One per head, held across snapshot, render, write and mark, so a
+        # head's writes reach GitHub in the order they were rendered and the
+        # last one to land is the newest (PR #21 review). Off `lock` for the
+        # same reason as _create_lock.
+        self._publish_locks: Dict[Tuple[str, str], threading.Lock] = {}
         self._heads: Dict[Tuple[str, str], _Head] = {}
 
     def run_id(self, repo: str, head: str) -> Optional[int]:
@@ -931,12 +970,16 @@ class CheckRuns:
     # caller that publishes only on a changed answer publishes again, and one
     # failed Checks API write is retried rather than final (PR #21 review).
     def view(self, repo: str, head: str, persona: str) -> Optional[PairView]:
-        """A persona's view as the run shows it, or None when not set or not yet shown."""
+        """A persona's view as last set, or None when nothing has set it.
+
+        Not "as shown": its one consumer, 2a.4b's round-cap paint, reads None
+        as "never set", and a held publish would otherwise repaint a pair that
+        reviewed this head (PR #21 review). The publish is retried through
+        config_answer, which does answer None while one is owed.
+        """
         with self.lock:
             h = self._heads.get((repo, head))
-            if h is None or h.version != h.shown:
-                return None
-            return h.pairs.get(persona)
+            return None if h is None else h.pairs.get(persona)
 
     def config_answer(self, repo: str, head: str) -> Optional[Tuple[str, str]]:
         """The (problem, notice) the run shows, or None for no state or one not yet shown."""
@@ -978,42 +1021,47 @@ class CheckRuns:
         shows them.
         """
         with self.lock:
-            h = self._heads.get((repo, head))
-            if h is None:
-                return
-            if h.retry_at > self.clock():
-                return   # still owed: a later publish past retry_at writes it
-            pairs = dict(h.pairs)
-            rewritten, problem, notice = h.rewritten, h.config_problem, h.config_notice
-            version = h.version
-        try:
-            run_id = self.ensure(repo, head)
-            status, conclusion, title, summary = render(pairs, self.counts(repo, head, queued),
-                                                        rewritten, problem, notice)
-            self.installation_for(repo).update_check_run(repo, run_id, status, title, summary,
-                                                         conclusion)
-        except GitHubError as exc:
-            # The outbox's rule: Retry-After when GitHub gives one, otherwise
-            # 30 seconds doubling per failure up to 30 minutes.
+            plock = self._publish_locks.setdefault((repo, head), threading.Lock())
+        with plock:
             with self.lock:
-                h.failures += 1
-                h.retry_at = self.clock() + (exc.retry_after
-                                             or min(30 * 2 ** (h.failures - 1), 1800))
-            raise
-        with self.lock:   # only once GitHub has taken it
-            h.shown = max(h.shown, version)
-            h.failures, h.retry_at = 0, 0.0
+                h = self._heads.get((repo, head))
+                if h is None:
+                    return
+                if h.retry_at > self.clock():
+                    return   # still owed: a later publish past retry_at writes it
+                pairs = dict(h.pairs)
+                rewritten, problem, notice = h.rewritten, h.config_problem, h.config_notice
+                version = h.version
+            try:
+                run_id = self.ensure(repo, head)
+                status, conclusion, title, summary = render(
+                    pairs, self.counts(repo, head, queued), rewritten, problem, notice)
+                self.installation_for(repo).update_check_run(repo, run_id, status, title,
+                                                             summary, conclusion)
+            except GitHubError as exc:
+                # The outbox's rule: Retry-After when GitHub gives one, otherwise
+                # 30 seconds doubling per failure up to 30 minutes.
+                with self.lock:
+                    h.failures += 1
+                    h.retry_at = self.clock() + (exc.retry_after
+                                                 or min(30 * 2 ** (h.failures - 1), 1800))
+                raise
+            with self.lock:   # only once GitHub has taken it, and this render was the last
+                h.shown = version
+                h.failures, h.retry_at = 0, 0.0
 
     def forget_repo(self, repo: str) -> None:
         with self.lock:
             for key in [k for k in self._heads if k[0] == repo]:
                 del self._heads[key]
+            for key in [k for k in self._publish_locks if k[0] == repo]:
+                del self._publish_locks[key]
 ```
 
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_checkruns.py'`, then `./test-python.sh`
-Expected: PASS, 25 tests. The whole suite passes.
+Expected: PASS, 26 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
@@ -1339,6 +1387,10 @@ class DrainTest(Base):
         self.assertEqual(self.rows("withheld", "detector, persona, job_id"),
                          [("literal:OLLAMA_API_KEY", "sage", "job1")])
         self.assertEqual(self.runs.counts[("acme/web", HEAD, "withheld")], 1)
+        # PR #21 review: the drain's withholding pages too, from _withhold.
+        self.assertEqual([l for l in self.logs if l.startswith("PAGE:")],
+                         ["PAGE: acme/web#12: a finding from sage was withheld "
+                          "(literal:OLLAMA_API_KEY)"])
 
     def test_an_unreachable_github_is_retried(self):
         self.box.accept(JOB, "sage", 1, "x")
@@ -1576,10 +1628,6 @@ class Outbox:
                 self._withhold(job.repo, job.pr, job.job_id, persona, detector, body, now, c)
                 self.check_runs.add(job.repo, job.head, conn=c, withheld=1)
             self._accepted[pair] = self._accepted.get(pair, 0) + 1
-            # The spec's first page: the earliest sign of a credential leaking
-            # through a comment. The detector is named; the body never is.
-            self.log(f"PAGE: {job.repo}#{job.pr}: a finding from {persona} was withheld "
-                     f"({detector})")
             return WITHHELD
         if len(body.encode("utf-8")) > self.comment_bytes:
             return TOO_LONG
@@ -1591,6 +1639,11 @@ class Outbox:
         return QUEUED
 
     def _withhold(self, repo, pr, job_id, persona, detector, body, now, conn=None) -> None:
+        # The spec's first page: the earliest sign of a credential leaking
+        # through a comment. Here, the one writer of a withheld record, so the
+        # drain's second scan pages too (PR #21 review). The detector is
+        # named; the body never is.
+        self.log(f"PAGE: {repo}#{pr}: a finding from {persona} was withheld ({detector})")
         salt = os.urandom(16)
         digest = salt + hashlib.sha256(salt + body.encode("utf-8")).digest()
         day = time.strftime("%Y-%m-%d", time.gmtime(now))
