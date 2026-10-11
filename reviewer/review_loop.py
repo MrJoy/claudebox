@@ -31,6 +31,7 @@ import passes
 import personas as personas_mod
 import prompts as prompts_mod
 import providers
+import repo_config
 import signals as signals_mod
 from common import ConfigError, Pair, die, log
 from decisions import Decider, Group
@@ -812,6 +813,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         plan_max_rounds = _positive_int(env, "PLAN_MAX_ROUNDS", DEFAULT_PLAN_MAX_ROUNDS)
         review_model = _required(env, "REVIEW_MODEL")
         work_repo = _required(env, "WORK_REPO")
+        notice = repo_config.local_mode_notice(work_repo)
+        if notice:
+            log(notice)
 
         # A clone this container has run before comes back LOCKED: the process
         # that locked it recorded the modes in memory and took them with it,
