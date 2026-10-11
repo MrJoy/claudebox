@@ -49,12 +49,12 @@ The spec and the overview leave these open, and each one changes code. They are 
 13. **Parks live beside the pair state, keyed by repo.** The profile's two-PR limit rule counts `(repo, pr)`, since a profile spans repos and every repo has a #1. A head park lifts when the PR's head differs. A timed park lifts at its time. A profile park stops `start-pair`, and its scheduling consequence is 2a.4b's. A page is one `PAGE:` line (overview decision 14).
 14. **`fetch-job` mints the read token and starts the 55-minute deadline in the same call**, so the token outlives the job, and a read token GitHub refuses revokes the new capability at once. A pair's committed transcript travels in the job spec with its session id, and a pair without one gets neither.
 15. **`start-pair` fails closed, and reserves the pair before any network call.** A visibility check that errors, a repo that is public or out of reach, a parked profile, a pair already started or starting, and a gateway that refuses the token all answer `409`. The check and the reservation happen under the job's lock, so two concurrent starts for one persona mint one token, and a refusal clears the reservation so the pair stays startable. The provider token lives until the job's deadline, and its `token_records` row exists before the gateway hears of it.
-16. **`complete-pair` records the pair completed only once the commit point has returned**, with its outcome, and answers a resend `200 {}`, the way `post-finding` answers one. A fault before then leaves the pair started, which a retry re-enters and the job's end revokes. A concurrent duplicate is `409`. It turns a bad transcript into one that will not parse. That covers bad base64, a transcript over 64 MiB, and the worker's own `over-cap` note, so all three are `failing`. A flush the gateway cannot answer is no flush, so the pair is `deferred`. The pair's token is revoked in the records store and then at the gateway, and a gateway that misses the revoke drops the token at its next `hello`.
+16. **`complete-pair` records the pair completed as soon as the commit point returns**, with its outcome, in the same critical section that ends its reservation, and answers a resend `200 {}`, the way `post-finding` answers one. The token's revocation and the check run follow the record, so a fault there leaves the outcome committed, the token for the job's end to revoke, and the run for its next publish. A fault before the commit point leaves the pair started, which a retry re-enters. A concurrent duplicate is `409`. Behind both, the commit point settles each provider credential once (`Committer.settled`), so any re-entry is a replay of the first outcome and never spends a round twice. It turns a bad transcript into one that will not parse. That covers bad base64, a transcript over 64 MiB, and the worker's own `over-cap` note, so all three are `failing`. A flush the gateway cannot answer is no flush, so the pair is `deferred`. The pair's token is revoked in the records store and then at the gateway, and a gateway that misses the revoke drops the token at its next `hello`.
 17. **Body caps are checked on the declared `Content-Length`, before reading.** A missing length is `411`, and a body over the cap is `413`. An oversized `complete-pair` is refused unread, so its pair is revoked when the job ends (the overview, as revised).
 18. **`revoked` is `Committer.revoke`.** A started pair whose job ended without `complete-pair` (the deadline, an access change, a restart) has its transcript discarded and its failure recorded, and stays owed. `revoke` returns `REVOKED` for the job-end handler, which knows the head, to show as `checkruns.REVOKED`. 2a.4b's job end is that handler.
 19. **Loss of access has two deleters, both here.** `Committer.forget_repo` deletes the repo's transcripts and parks and clears its `Decider` state: sessions, fingerprints, pass counts and owed pairs. Rounds hold no content and survive, as the spec says of a public flip. `Outbox.drop_repo` deletes the repo's queued items and its `withheld` rows in one transaction, and keeps the per-detector day counts. 2a.4b's loss-of-access path calls both, plus `CheckRuns.forget_repo`, and revokes the repo's jobs.
 20. **The head a round line names is the committed fingerprint's**, read by `Committer.last_reviewed_head` from `state.reviewed`. There is no second record of it to drift.
-21. **A count moves in the transaction that settles its item**, so a crash cannot lose one. The drain decides an item's fate inside its `try` and settles it after, so a check-run failure is never read as the comment's, and a failed publish waits for the next one. A head this process holds no pair state for is not repainted: after a restart the outbox still posts its findings, and an empty map would turn a finished run back to queued. Pair states sit under a lock, since a group's personas finish together.
+21. **A count moves in the transaction that settles its item**, so a crash cannot lose one. That covers acceptance's withheld row as well as the drain. The drain decides an item's fate inside its `try` and settles it after, so a check-run failure is never read as the comment's, and a failed publish waits for the next one. A head this process holds no pair state for is not repainted: after a restart the outbox still posts its findings, and an empty map would turn a finished run back to queued. Pair states sit under a lock, since a group's personas finish together, and a head's run is created under a second lock, so personas reaching a new head together make one run.
 
 ## Review Focus
 
@@ -494,6 +494,26 @@ class CheckRunsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.runs.add("acme/web", HEAD, run_id=5)
 
+    def test_two_threads_seeing_a_new_head_make_one_run(self):
+        # A group's personas start together on a new head (PR #21 review).
+        import threading
+        import time as time_mod
+        real = self.inst.create_check_run
+
+        def slow(*a, **k):
+            time_mod.sleep(0.05)
+            return real(*a, **k)
+        self.inst.create_check_run = slow
+        ids = []
+        threads = [threading.Thread(target=lambda: ids.append(self.runs.ensure("acme/web", HEAD)))
+                   for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len(self.inst.created), 1)
+        self.assertEqual(len(set(ids)), 1)
+
     def test_forget_repo_drops_its_pair_states(self):
         self.runs.set_pair("acme/web", HEAD, "sage", PairView(checkruns.CAPPED))
         self.runs.forget_repo("acme/web")
@@ -720,6 +740,7 @@ class CheckRuns:
         # Written by request threads (a group's personas finish together) and
         # read by the drain; one lock covers every change and every render.
         self.lock = threading.Lock()
+        self._create_lock = threading.Lock()   # held across a GitHub call, so not `lock`
         self._heads: Dict[Tuple[str, str], _Head] = {}
 
     def run_id(self, repo: str, head: str) -> Optional[int]:
@@ -736,17 +757,25 @@ class CheckRuns:
         return Counts(queued, row[0], row[1], row[2], row[3])
 
     def ensure(self, repo: str, head: str) -> int:
-        """The head's run id, creating the run when the head has none recorded."""
+        """The head's run id, creating the run when the head has none recorded.
+
+        The check and the create happen under one lock, so a group's personas
+        reaching a new head together make one run, never one each.
+        """
         existing = self.run_id(repo, head)
         if existing is not None:
             return existing
-        status, conclusion, title, summary = render({}, Counts())
-        run_id = self.installation_for(repo).create_check_run(repo, head, status, title, summary,
-                                                              conclusion)
-        with self.records.tx() as c:
-            c.execute("INSERT OR IGNORE INTO check_runs (repo, head, run_id, created_at) "
-                      "VALUES (?, ?, ?, ?)", (repo, head, run_id, int(self.clock())))
-        return self.run_id(repo, head)
+        with self._create_lock:
+            existing = self.run_id(repo, head)
+            if existing is not None:
+                return existing
+            status, conclusion, title, summary = render({}, Counts())
+            run_id = self.installation_for(repo).create_check_run(repo, head, status, title,
+                                                                  summary, conclusion)
+            with self.records.tx() as c:
+                c.execute("INSERT OR IGNORE INTO check_runs (repo, head, run_id, created_at) "
+                          "VALUES (?, ?, ?, ?)", (repo, head, run_id, int(self.clock())))
+            return self.run_id(repo, head)
 
     def set_pair(self, repo: str, head: str, persona: str, view: PairView,
                  rewritten: Optional[bool] = None) -> None:
@@ -808,7 +837,7 @@ class CheckRuns:
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_checkruns.py'`, then `./test-python.sh`
-Expected: PASS, 19 tests. The whole suite passes.
+Expected: PASS, 20 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
@@ -931,6 +960,8 @@ class AcceptTest(Base):
         self.assertNotIn("ghp_", redacted)
         self.assertEqual(self.rows("withheld_counts", "detector, count"), [(detector, 1)])
         self.assertEqual(self.runs.counts[("acme/web", HEAD, "withheld")], 1)
+        # The count moves in the transaction that writes the row (PR #21 review).
+        self.assertEqual(self.runs.outside_tx, [])
 
     def test_a_deployment_literal_is_withheld_by_name(self):
         self.box.accept(JOB, "sage", 1, "found olk-secret-value in config")
@@ -1337,8 +1368,9 @@ class Outbox:
         now = int(self.clock())
         detector = self.scanner.first(body)
         if detector is not None:
-            self._withhold(job.repo, job.pr, job.job_id, persona, detector, body, now)
-            self.check_runs.add(job.repo, job.head, withheld=1)
+            with self.records.tx() as c:
+                self._withhold(job.repo, job.pr, job.job_id, persona, detector, body, now, c)
+                self.check_runs.add(job.repo, job.head, conn=c, withheld=1)
             return WITHHELD
         if len(body.encode("utf-8")) > self.comment_bytes:
             return TOO_LONG
@@ -1558,7 +1590,7 @@ git commit -m "hosted: the outbox, its acceptance caps and its paced drain"
   - `ensure_record(conn, credential_id)`, `record_for(records, credential_id) -> Optional[Record]`, `apply_report(records, msg) -> {ack} | {error}`, `flush_complete(flush, record) -> bool`, `transcript_session(data: bytes) -> Optional[str]`.
   - `decide(record, flush_ok, transcript, reported_session, expected_session) -> str`, which never returns `REVOKED`.
   - `Park(reason, until=None, head=None)`; `Completion(repo, pair, head, profile, credential_id, transcript, session_id, expected_session, flush, signal=None)` (frozen).
-  - `Committer(records, blob_store, decider_for, backoff_for, clock=time.time, log=print)` with `commit(completion) -> str`, `apply(completion, outcome, record)`, `revoke(repo, pair) -> str` (returns `REVOKED`; the caller publishes it), `parked(repo, pair, head) -> Optional[Park]`, `profile_parked_until(profile) -> int`, `transcript_for(repo, pair) -> Optional[bytes]`, `last_reviewed_head(repo, pair) -> Optional[str]` (the committed fingerprint's head), `forget_repo(repo)`, and the attributes `parks`, `transcripts`, `profiles`.
+  - `Committer(records, blob_store, decider_for, backoff_for, clock=time.time, log=print)` with `commit(completion) -> str`, `apply(completion, outcome, record)`, `revoke(repo, pair) -> str` (returns `REVOKED`; the caller publishes it), `parked(repo, pair, head) -> Optional[Park]`, `profile_parked_until(profile) -> int`, `transcript_for(repo, pair) -> Optional[bytes]`, `last_reviewed_head(repo, pair) -> Optional[str]` (the committed fingerprint's head), `forget_repo(repo)`, and the attributes `parks`, `transcripts`, `profiles` and `settled` (credential id to outcome: `commit` answers a settled credential with its first outcome and applies nothing).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1760,6 +1792,15 @@ class CommitterTest(unittest.TestCase):
         return self.c.commit(Completion(
             repo, pair, head, "ollama", cid, transcript() if data is None else data, session,
             expected, flush or {"last_seq": seq, "drained": True}, signal))
+
+    def test_a_settled_credential_is_a_replay_and_spends_no_second_round(self):
+        # A re-entered complete-pair (PR #21 review): the same credential twice.
+        self.complete({})
+        cid = next(iter(self.c.settled))
+        again = Completion("acme/web", self.pair, HEAD, "ollama", cid, transcript(), SID, None,
+                           {"last_seq": 0, "drained": False}, "fp1")
+        self.assertEqual(self.c.commit(again), "ok")    # not the deferred a fresh decision gives
+        self.assertEqual(self.state.rounds[self.pair], 1)
 
     def test_ok_commits_everything_together(self):
         self.assertEqual(self.complete({}), "ok")
@@ -2111,18 +2152,31 @@ class Committer:
         self.backoff_for = backoff_for
         self.clock = clock
         self.log = log
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()   # commit holds it across apply, which takes it too
         self.parks: Dict[Tuple[str, Pair], Park] = {}
         self.transcripts: Dict[Tuple[str, Pair], str] = {}
+        # credential id -> its outcome. In memory: a restart revokes every credential.
+        self.settled: Dict[str, str] = {}
         self.profiles: Dict[str, _Profile] = {}
         self.defers_in_a_row: Dict[str, int] = {}
 
     def commit(self, c: Completion) -> str:
-        record = record_for(self.records, c.credential_id)
-        outcome = decide(record, flush_complete(c.flush, record), c.transcript, c.session_id,
-                         c.expected_session)
-        self.apply(c, outcome, record)
-        return outcome
+        """Decide and apply a pair's outcome, once per provider credential.
+
+        A credential already settled answers its first outcome and applies
+        nothing: a re-entered complete-pair is a replay, never a second pass,
+        so it cannot spend a round twice.
+        """
+        with self.lock:
+            settled = self.settled.get(c.credential_id)
+            if settled is not None:
+                return settled
+            record = record_for(self.records, c.credential_id)
+            outcome = decide(record, flush_complete(c.flush, record), c.transcript, c.session_id,
+                             c.expected_session)
+            self.apply(c, outcome, record)
+            self.settled[c.credential_id] = outcome
+            return outcome
 
     def revoke(self, repo: str, pair: Pair) -> str:
         """`revoked`: a started pair whose job ended without complete-pair.
@@ -2263,7 +2317,7 @@ class _Result:
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_commit.py'`, then `./test-python.sh`
-Expected: PASS, 26 tests. The whole suite passes.
+Expected: PASS, 27 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
@@ -2377,7 +2431,7 @@ class FakeRuns:
     def set_pair(self, repo, head, persona, view, rewritten=None):
         self.views[persona] = view
 
-    def add(self, repo, head, **deltas):
+    def add(self, repo, head, conn=None, **deltas):
         for k, v in deltas.items():
             self.counts[k] = self.counts.get(k, 0) + v
 
@@ -2626,6 +2680,45 @@ class FindingAndCompleteTest(Base):
         # A resend is answered as committed, and commits nothing again.
         self.assertEqual(self.complete(cap, data=transcript()), (200, {}))
         self.assertEqual(self.state.rounds, rounds)
+
+    def test_a_concurrent_duplicate_complete_commits_once(self):
+        import threading
+        cap, _ = self.fetch()
+        self.start(cap)
+        self.report(self.job.started["sme"])
+        entered, release = threading.Event(), threading.Event()
+        real = self.committer.commit
+
+        def slow(c):
+            entered.set()
+            release.wait(5)
+            return real(c)
+        self.committer.commit = slow
+        first = threading.Thread(target=lambda: self.complete(cap, data=transcript()))
+        first.start()
+        self.assertTrue(entered.wait(5))
+        self.assertEqual(self.complete(cap, data=transcript())[0], 409)
+        release.set()
+        first.join()
+        self.assertEqual(self.complete(cap, data=transcript()), (200, {}))
+        self.assertEqual(self.state.rounds[Pair(12, "code", "sme")], 1)
+
+    def test_a_fault_after_the_commit_point_is_not_a_second_pass(self):
+        # A fault in the tail (PR #21 review): the outcome is already recorded,
+        # so the retry is answered as a resend and spends no second round.
+        cap, _ = self.fetch()
+        self.start(cap)
+        self.report(self.job.started["sme"])
+        real = self.ch._publish
+
+        def broken(*a, **k):
+            raise RuntimeError("render failed")
+        self.ch._publish = broken
+        with self.assertRaises(RuntimeError):
+            self.complete(cap, data=transcript())
+        self.ch._publish = real
+        self.assertEqual(self.complete(cap, data=transcript()), (200, {}))
+        self.assertEqual(self.state.rounds[Pair(12, "code", "sme")], 1)
 
     def test_a_commit_that_faults_leaves_the_pair_completable(self):
         # The pair is recorded completed only after the commit point returns
@@ -2962,19 +3055,26 @@ class Channel:
                 return 409, {"reason": "this pair is completing"}
             job.busy.add(pair.persona)
         try:
-            outcome = self._complete(job, pair, cid, body)
-        finally:
+            outcome = self._commit(job, pair, cid, body)
+        except BaseException:
+            # A fault leaves the pair started and not completed, which a retry
+            # re-enters and the job's end revokes.
             with job.lock:
                 job.busy.discard(pair.persona)
-        # Recorded once the commit point has returned: a fault before it leaves
-        # the pair started and not completed, which a retry re-enters and the
-        # job's end revokes.
+            raise
+        # One critical section, so no duplicate can pass between the
+        # reservation's end and the record it protects.
         with job.lock:
+            job.busy.discard(pair.persona)
             job.completed[pair.persona] = outcome
+        # The rest follows the record: a fault here leaves the outcome committed
+        # and recorded, the token revoked by the job's end, and the check run
+        # caught up by its next publish.
+        self._settle(job, pair, cid, outcome)
         return 200, {}
 
-    def _complete(self, job: JobMaterial, pair: PairMaterial, cid: str,
-                  body: Dict[str, Any]) -> str:
+    def _commit(self, job: JobMaterial, pair: PairMaterial, cid: str,
+                body: Dict[str, Any]) -> str:
         transcript = self._transcript(body.get("transcript_b64"))
         notes = body.get("notes") if isinstance(body.get("notes"), dict) else {}
         if transcript is None and notes.get("transcript") == "over-cap":
@@ -2985,9 +3085,12 @@ class Channel:
             flush = None
         session = body.get("session_id") if isinstance(body.get("session_id"), str) else None
         p = Pair(job.pr, job.mode, pair.persona)
-        outcome = self.committer.commit(commit_mod.Completion(
+        return self.committer.commit(commit_mod.Completion(
             job.repo, p, job.head, job.profile, cid, transcript, session, pair.session_id,
             flush, pair.signal))
+
+    def _settle(self, job: JobMaterial, pair: PairMaterial, cid: str, outcome: str) -> None:
+        p = Pair(job.pr, job.mode, pair.persona)
         self.creds.revoke(cid)
         try:
             self.gateway_call("revoke", credential_ids=[cid])
@@ -2999,7 +3102,6 @@ class Channel:
             state = checkruns.ROUND_CAP
         self._publish(job, pair.persona, checkruns.PairView(state, park.until if park else None))
         self.log(f"{job.repo}#{job.pr} {job.mode}/{pair.persona}: {outcome}")
-        return outcome
 
     def _transcript(self, value: Any) -> Optional[bytes]:
         """The decoded transcript; b"" (which will not parse) when it is bad or over the cap."""
@@ -3070,7 +3172,7 @@ def make_server(channel: Channel, host: str, port: int) -> http.server.Threading
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_channel.py'`, then `./test-python.sh`
-Expected: PASS, 24 tests. The whole suite passes.
+Expected: PASS, 26 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
