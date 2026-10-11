@@ -1927,7 +1927,7 @@ class RedirectTest(unittest.TestCase):
         import http.server
         import threading
         server = http.server.HTTPServer(("127.0.0.1", 0), handler_cls)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
+        threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         return server
