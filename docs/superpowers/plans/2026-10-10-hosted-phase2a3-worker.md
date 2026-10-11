@@ -4,7 +4,7 @@
 
 **Goal:** The hosted worker, which reviews one PR group as an unprivileged reviewer that holds no provider credential, and the local Docker job runner, which starts and stops workers from a process the control plane can reach only through a unix socket.
 
-**Architecture:** A worker is today's image started with `--user 0` and `--entrypoint /opt/claudebox/worker/entrypoint.sh`. As root, that entrypoint writes the job spec to a mode-600 file and runs `setpriv`, which empties the bounding set, sets `no_new_privs`, changes to the reviewer and resets the environment. `wrapper.sh` then sets exactly `HOME` and `PATH` and runs `worker.py`. `worker.py` proves its posture, exchanges the single-use bootstrap token for the job's capability over the worker channel, clones the PR head, and runs each pair's persona through `reviewer/passes.py`, phase 1 together and then phase 2. Each pair first asks the channel for its own provider token, and afterwards hands back its transcript and session id. It never reports an outcome. A pair with a session gets its transcript written where `claude --resume` looks for it. The `gh` shim, first on `PATH`, turns `gh pr comment` into the channel's `post-finding`, sends reads to the real `gh`, and refuses everything that writes. `hosted/runner.py` holds the job-runner interface and its local Docker implementation, which builds every `docker` command from one fixed template. `hosted/runnerd.py` is the only process holding the Docker socket, and serves four requests over `gwproto`.
+**Architecture:** A worker is today's image started with `--user 0` and `--entrypoint /opt/claudebox/worker/entrypoint.sh`. As root, that entrypoint hands the job spec to `setpriv` on stdin and runs it, which empties the bounding set, sets `no_new_privs`, changes to the reviewer and resets the environment. `wrapper.sh` then sets exactly `HOME` and `PATH` and runs `worker.py`. `worker.py` proves its posture, exchanges the single-use bootstrap token for the job's capability over the worker channel, clones the PR head, and runs each pair's persona through `reviewer/passes.py`, phase 1 together and then phase 2. Each pair first asks the channel for its own provider token, and afterwards hands back its transcript and session id. It never reports an outcome. A pair with a session gets its transcript written where `claude --resume` looks for it. The `gh` shim, first on `PATH`, turns `gh pr comment` into the channel's `post-finding`, sends reads to the real `gh`, and refuses everything that writes. `hosted/runner.py` holds the job-runner interface and its local Docker implementation, which builds every `docker` command from one fixed template. `hosted/runnerd.py` is the only process holding the Docker socket, and serves four requests over `gwproto`.
 
 **Tech Stack:** Python 3.9+ standard library (`subprocess`, `urllib`, `concurrent.futures`, `fcntl`, `unittest`); bash and POSIX `sh`; `setpriv` from util-linux.
 
@@ -19,7 +19,7 @@
 - **Overview decision 6:** a worker starts as root on every target. On local Docker the runner passes `--cap-drop ALL --cap-add SETUID --cap-add SETGID --cap-add SETPCAP --security-opt no-new-privileges --pids-limit 512 --memory 4g --user 0`, and `setpriv` spends those three capabilities before the reviewer runs.
 - **Overview decision 7:** the worker image is today's `claudebox` image with `worker/` added, started with `--entrypoint /opt/claudebox/worker/entrypoint.sh`. `worker/` is root-owned in the image, like `reviewer/`.
 - The spec's `setpriv` line: `setpriv --no-new-privs --bounding-set=-all --inh-caps=-all --reuid=reviewer --regid=reviewer --init-groups --reset-env`.
-- The spec's job spec handling: "before the uid change root writes the job spec to a mode-600 file in the reviewer's home, which the worker reads and unlinks; the single-use token never reaches the worker's environment or its argv. After the change a fixed wrapper sets exactly `HOME=/home/reviewer` and a `PATH` that puts the `gh` shim's directory first, and execs the worker."
+- The spec's job spec handling: "the single-use token never reaches the worker's environment or its argv. After the change a fixed wrapper sets exactly `HOME=/home/reviewer` and a `PATH` that puts the `gh` shim's directory first, and execs the worker." The spec has root write the spec to a mode-600 file in the reviewer's home; this plan hands it over on stdin instead (decision 2), because root holding only overview decision 6's three capabilities cannot write that file.
 - The spec's posture rule: "`ALLOW_UNHARDENED` is never set in a worker's environment on any target, so a target that cannot provide the posture fails its first job loudly."
 - The spec's resume: "`~/.claude/projects/<encoded cwd>/<session id>.jsonl`. So the cwd and `$HOME` must be identical on every target. The worker clones to `/home/reviewer/work/repo` ... it creates and proves that directory as the reviewer ..., dying if it cannot." "The session id is read from the transcript itself." "The worker suite asserts that a pair run twice against a fake control plane produces a second transcript containing the first one's turns".
 - The spec's clone: "blobless (`--filter=blob:none`) with a full checkout of the PR head". The spec's group: "phase 1 together and then phase 2", and "the shared-clone defenses in `review_loop.py` (`WORKTREE_STANZA`, `lock_git_dir`) carry over".
@@ -36,7 +36,7 @@
 The spec and the overview leave these open, and each one changes code. They are this plan's answers, for the founder to ratify in Phase 1 of the factory run:
 
 1. **The job spec reaches the container in `CLAUDEBOX_JOB`**, passed to `docker run` as `-e CLAUDEBOX_JOB` with the value in `docker`'s own environment, so it never appears in `runnerd`'s argv or in `ps`. It is still in the container's metadata (`docker inspect`), which is why the bootstrap token in it is single-use. The worker file holds `{job_id, bootstrap_token, channel_url, gateway_url}`, and everything else comes from `fetch-job`.
-2. **The entrypoint removes whatever sits at the job file's path before writing it**, under `umask 077`, so a symlink planted there is replaced rather than written through. `worker.py` opens it with `O_NOFOLLOW`, and refuses it unless it is the reviewer's own and mode 600.
+2. **Root hands the job spec to the worker on stdin and writes no file.** The spec says root writes it to a mode-600 file in the reviewer's home, but root here holds only `SETUID`, `SETGID` and `SETPCAP` (overview decision 6): writing into `/home/reviewer` (owned by the reviewer, mode 755) needs `CAP_DAC_OVERRIDE`, and handing the file over needs `CAP_CHOWN`. Run under exactly the runner's flags, the file-writing entrypoint dies with `Permission denied` before `setpriv`. So the entrypoint copies the spec into an unexported shell variable, unsets `CLAUDEBOX_JOB`, and runs `exec setpriv ... "$WRAPPER" <<<"$job"`. The spec still never touches the reviewer's environment or argv, and there is no file left to plant a symlink at. `worker.py` reads at most 64 KiB from stdin, then points fd 0 at `/dev/null` so neither `claude` nor any shell a pass spawns inherits the pipe.
 3. **The posture check lives in `worker.py`.** The image's three checks live in `entrypoint.sh`, which a worker never runs. `posture_problems` repeats them (not root, `NoNewPrivs: 1`, `CapBnd` zero) with no escape hatch, reading `/proc/self/status`. An unreadable status fails both kernel checks.
 4. **Every `docker` field is checked before `docker` runs.** A job id matches `[a-z0-9][a-z0-9-]{0,62}`, the bootstrap token must be a `cbx_b_` token by 2a.1's pattern, and both URLs must be plain `http(s)` URLs with no spaces or query. The container is named `claudebox-job-<job_id>` and labelled `claudebox.job=<job_id>`, and `list` reads only containers carrying that label. `runnerd` passes `docker` only `PATH`, `HOME` and `DOCKER_*` from its own environment.
 5. **`stop` is `docker rm -f`**, and a container that is already gone is a success, so `stop_all` after a crash is idempotent.
@@ -53,7 +53,7 @@ The spec and the overview leave these open, and each one changes code. They are 
 
 ## Review Focus
 
-- **A job file planted as a symlink before root writes it.** Expected: replaced, never written through. Pinned in Task 2.
+- **The root phase needing a capability it was not given.** Expected: the entrypoint writes nothing and changes no owner, so `SETUID`, `SETGID` and `SETPCAP` are all it spends. Pinned in Task 2, and run for real under the runner's flags before this plan went up (below).
 - **A token reaching the reviewer's environment or argv.** Expected: `CLAUDEBOX_JOB` is unset before `setpriv`, and the token is in neither `setpriv`'s argv nor the wrapper's environment. Pinned in Task 2.
 - **A field crafted to smuggle a `docker` flag or path through `start` or `stop`.** Expected: refused before `docker` runs. Pinned in Task 1.
 - **A prompt-injected reviewer writing to GitHub through `gh`.** Expected: every write verb, `gh api` with a method, field, header or host in any spelling (`-XPOST`, `-fbody=x`, `-iXPOST`), and a comment on another PR are refused without reaching the real `gh` or the channel. Pinned in Task 3.
@@ -62,7 +62,7 @@ The spec and the overview leave these open, and each one changes code. They are 
 
 ## Not run here
 
-- **Whether the kernel honours the `setpriv` sequence.** `test-worker.sh` stubs `setpriv` and checks the flags it is handed. `worker.py`'s posture check is what proves them, and it only runs in a real container. The Validator runs one worker with `./claudebox.sh build` and a hand-made job file against a stub channel, and records the posture line as evidence. Fly and Cloud Run are spike S7's.
+- **The full worker image under the runner's flags.** `test-worker.sh` stubs `setpriv`. Before this plan went up, the entrypoint ran for real in `node:22-bookworm-slim` (the image's base) under `HARDENING` exactly, against a stand-in user and a wrapper that printed its state: uid 1000, `CapInh`/`CapPrm`/`CapEff`/`CapBnd`/`CapAmb` all zero, `NoNewPrivs: 1`, only `setpriv`'s reset environment, and the spec on stdin. The Validator repeats that against the built image with the real wrapper and `worker.py`, whose posture line is the evidence, against a stub channel. Fly and Cloud Run are spike S7's.
 - **`runnerd` against a real Docker daemon.** The tests drive it with a fake `subprocess.run`. The first real start is 2a.4's, when a control plane can mint a bootstrap token.
 - **A real `claude` resuming a transcript written by another container.** The tests use a fake `claude` that appends to the transcript at the path the real one uses. 2a.5's end-to-end run is the first live check.
 
@@ -481,9 +481,9 @@ git commit -m "hosted: the job runner, and runnerd, the one process holding the 
 **Interfaces:**
 - Consumes: nothing from earlier tasks. `wrapper.sh` names `/opt/claudebox/worker/worker.py`, which Task 4 creates.
 - Produces:
-  - `worker/entrypoint.sh`: needs root and `CLAUDEBOX_JOB`; writes `/home/reviewer/.claudebox-job.json` (mode 600, owned by `reviewer`), unsets `CLAUDEBOX_JOB`, and execs `setpriv` with the spec's flags and `/opt/claudebox/worker/wrapper.sh`. Its two fixed paths are the lines `REVIEWER_HOME=` and `WRAPPER=`, which the suite rewrites.
+  - `worker/entrypoint.sh`: needs root and `CLAUDEBOX_JOB`; unsets `CLAUDEBOX_JOB` and execs `setpriv` with the spec's flags and `/opt/claudebox/worker/wrapper.sh`, with the spec on stdin. It writes no file. Its one fixed path is the line `WRAPPER=`, which the suite rewrites.
   - `worker/wrapper.sh`: `exec env -i HOME=/home/reviewer PATH=/opt/claudebox/worker/bin:/usr/local/bin:/usr/bin:/bin python3 /opt/claudebox/worker/worker.py`.
-  - `test-worker.sh`: the sixth suite, 12 checks, runnable under `/bin/bash` 3.2.
+  - `test-worker.sh`: the sixth suite, 10 checks, runnable under `/bin/bash` 3.2.
 
 - [ ] **Step 1: Write the failing suite**
 
@@ -493,11 +493,12 @@ git commit -m "hosted: the job runner, and runnerd, the one process holding the 
 #!/usr/bin/env bash
 # Tests worker/entrypoint.sh and worker/wrapper.sh, the hosted worker's two
 # shell steps, with no Docker and no root: `id`, `chown` and `setpriv` are
-# stubbed onto PATH, and the two fixed paths at the top of each script are
+# stubbed onto PATH, and the fixed path at the top of each script is
 # rewritten to a temp dir. What this proves is the hand-off: the job spec
-# lands in a mode-600 file, CLAUDEBOX_JOB is gone before setpriv runs, setpriv
-# gets exactly the flags that give the reviewer its posture, and the wrapper
-# hands the worker exactly HOME and PATH. Whether the kernel then honours
+# reaches setpriv on stdin and nowhere else, CLAUDEBOX_JOB is gone before
+# setpriv runs, root writes no file and changes no owner (it holds no
+# capability that would let it), setpriv gets exactly the flags that give the
+# reviewer its posture, and the wrapper hands the worker exactly HOME and PATH. Whether the kernel then honours
 # those flags is the worker's own posture check, run in the image (test the
 # image with `claudebox.sh` before trusting a new runtime).
 set -uo pipefail
@@ -511,8 +512,8 @@ bad() { fail=$((fail + 1)); printf 'FAIL %s\n     %s\n' "$1" "$2"; }
 setup() {
   T="$(mktemp -d)"
   mkdir -p "$T/bin" "$T/home"
-  # id -u answers $FAKE_UID; chown records its arguments; setpriv records its
-  # argv and the environment it was handed, then stops.
+  # id -u answers $FAKE_UID; chown records that it ran at all; setpriv records
+  # its argv, the environment it was handed and its stdin, then stops.
   cat > "$T/bin/id" <<STUB
 #!/bin/sh
 [ "\$1" = "-u" ] && { echo "\${FAKE_UID:-0}"; exit 0; }
@@ -526,16 +527,17 @@ STUB
 #!/bin/sh
 printf '%s\n' "\$@" > "$T/setpriv.argv"
 env > "$T/setpriv.env"
+cat > "$T/setpriv.stdin"
 STUB
   chmod +x "$T/bin/"*
-  sed -e "s|^REVIEWER_HOME=.*|REVIEWER_HOME=$T/home|" \
-      -e "s|^WRAPPER=.*|WRAPPER=$T/wrapper.sh|" \
+  sed -e "s|^WRAPPER=.*|WRAPPER=$T/wrapper.sh|" \
       "$SCRIPT_DIR/worker/entrypoint.sh" > "$T/entrypoint.sh"
   chmod +x "$T/entrypoint.sh"
 }
 
 run_entrypoint() {
-  env -i PATH="$T/bin:/usr/bin:/bin" "$@" bash "$T/entrypoint.sh" > "$T/out" 2>&1
+  (cd "$T/home" && env -i PATH="$T/bin:/usr/bin:/bin" HOME="$T/home" "$@" bash "$T/entrypoint.sh" \
+    > "$T/out" 2>&1 < /dev/null)
   echo $? > "$T/rc"
 }
 
@@ -564,21 +566,15 @@ rm -rf "$T"
 setup
 spec='{"job_id":"j1","bootstrap_token":"cbx_b_0123456789abcdef_SECRET"}'
 run_entrypoint FAKE_UID=0 CLAUDEBOX_JOB="$spec" OTHER=leftover
-job="$T/home/.claudebox-job.json"
-if [ "$(cat "$T/rc")" = 0 ] && [ "$(cat "$job")" = "$spec" ]; then
-  ok "the spec is written to the reviewer's job file verbatim"
+if [ "$(cat "$T/rc")" = 0 ] && [ "$(cat "$T/setpriv.stdin")" = "$spec" ]; then
+  ok "the spec reaches setpriv on stdin, verbatim"
 else
-  bad "the spec is written to the reviewer's job file verbatim" "rc=$(cat "$T/rc") out=$(cat "$T/out")"
+  bad "the spec reaches setpriv on stdin" "rc=$(cat "$T/rc") out=$(cat "$T/out") stdin=$(cat "$T/setpriv.stdin" 2>/dev/null)"
 fi
-if [ "$(file_mode "$job")" = 600 ]; then
-  ok "the job file is mode 600"
+if [ ! -e "$T/chown.log" ] && [ -z "$(ls -A "$T/home")" ]; then
+  ok "root writes no file and changes no owner"
 else
-  bad "the job file is mode 600" "mode $(file_mode "$job")"
-fi
-if grep -qx "reviewer:reviewer $job" "$T/chown.log"; then
-  ok "the job file is handed to the reviewer"
-else
-  bad "the job file is handed to the reviewer" "chown: $(cat "$T/chown.log" 2>/dev/null)"
+  bad "root writes no file and changes no owner" "chown: $(cat "$T/chown.log" 2>/dev/null) home: $(ls -A "$T/home")"
 fi
 if ! grep -q '^CLAUDEBOX_JOB=' "$T/setpriv.env" && ! grep -q SECRET "$T/setpriv.env"; then
   ok "CLAUDEBOX_JOB is unset before setpriv, so the token never reaches the reviewer's environment"
@@ -602,17 +598,6 @@ if ! grep -q SECRET "$T/setpriv.argv"; then
   ok "the token is not in setpriv's argv"
 else
   bad "the token is not in setpriv's argv" "$(cat "$T/setpriv.argv")"
-fi
-rm -rf "$T"
-
-setup
-mkdir -p "$T/home"
-ln -s "$T/elsewhere" "$T/home/.claudebox-job.json"
-run_entrypoint FAKE_UID=0 CLAUDEBOX_JOB='{"x":1}'
-if [ ! -e "$T/elsewhere" ] && [ -f "$T/home/.claudebox-job.json" ] && [ ! -L "$T/home/.claudebox-job.json" ]; then
-  ok "a planted symlink at the job file is replaced, never written through"
-else
-  bad "a planted symlink at the job file is replaced" "$(ls -l "$T/home" "$T" 2>&1)"
 fi
 rm -rf "$T"
 
@@ -669,13 +654,13 @@ Expected: FAIL: `sed` cannot read `worker/entrypoint.sh`, and every check fails.
 # Docker runner starts the container with exactly those three and no others.
 #
 # The job spec arrives in CLAUDEBOX_JOB. setpriv --reset-env clears the
-# environment, so root first writes the spec to a mode-600 file in the
-# reviewer's home, which the worker reads and unlinks: the single-use
-# bootstrap token never reaches the reviewer's environment or argv.
+# environment, and the spec must not reach the reviewer's environment or argv
+# anyway, so root hands it to the worker on stdin. Root writes no file: with
+# only those three capabilities it holds neither CAP_DAC_OVERRIDE, to write
+# into the reviewer's home, nor CAP_CHOWN, to hand a file over.
 set -euo pipefail
 
-# Fixed paths, not configuration. test-worker.sh rewrites these two lines.
-REVIEWER_HOME=/home/reviewer
+# A fixed path, not configuration. test-worker.sh rewrites this line.
 WRAPPER=/opt/claudebox/worker/wrapper.sh
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -683,16 +668,11 @@ die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || die "the worker entrypoint must start as root; it drops to the reviewer itself"
 [ -n "${CLAUDEBOX_JOB:-}" ] || die "CLAUDEBOX_JOB is not set; the job runner passes the job spec in it"
 
-umask 077
-spec="$REVIEWER_HOME/.claudebox-job.json"
-rm -f "$spec"
-printf '%s' "$CLAUDEBOX_JOB" > "$spec"
-chown reviewer:reviewer "$spec"
-chmod 600 "$spec"
+job="$CLAUDEBOX_JOB"
 unset CLAUDEBOX_JOB
 
 exec setpriv --no-new-privs --bounding-set=-all --inh-caps=-all \
-  --reuid=reviewer --regid=reviewer --init-groups --reset-env "$WRAPPER"
+  --reuid=reviewer --regid=reviewer --init-groups --reset-env "$WRAPPER" <<<"$job"
 ```
 
 `worker/wrapper.sh` (mode 755):
@@ -709,7 +689,7 @@ exec env -i HOME=/home/reviewer PATH=/opt/claudebox/worker/bin:/usr/local/bin:/u
 - [ ] **Step 4: Run it to see it pass**
 
 Run: `/bin/bash ./test-worker.sh` and `bash -n worker/entrypoint.sh && sh -n worker/wrapper.sh`
-Expected: `12 passed, 0 failed`.
+Expected: `10 passed, 0 failed`.
 
 - [ ] **Step 5: Commit**
 
@@ -1102,7 +1082,7 @@ git commit -m "worker: the gh shim, which turns gh pr comment into post-finding"
 - Consumes: `passes.run_pass` and `passes.PassResult`, `common.Pair`, `common.log`, `common.ConfigError`, and `review_loop.lock_git_dir`, all from `reviewer/` unchanged. Task 3's environment variables.
 - Produces:
   - `WorkerError(Exception)`; `TRANSCRIPT_MAX = 64 * 1024 * 1024`; `MODEL_VARS`; `AUTH_ENVS = ("ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")`.
-  - `posture_problems(status_text, uid) -> List[str]`; `encode_cwd(path) -> str`; `transcript_path(home, cwd, session_id) -> str`; `session_id_of(transcript: bytes) -> Optional[str]`; `read_job_file(path) -> dict`.
+  - `posture_problems(status_text, uid) -> List[str]`; `encode_cwd(path) -> str`; `transcript_path(home, cwd, session_id) -> str`; `session_id_of(transcript: bytes) -> Optional[str]`; `JOB_SPEC_MAX = 65536`; `read_job_spec(stream) -> dict`, from the binary stdin.
   - `Channel(base_url, opener=None)` with `post(path, token, payload) -> (status, dict)`, following no redirect.
   - `git(args, cwd=None, run=subprocess.run) -> str`, `clone(job, repo_dir, run=subprocess.run)`, and `claude_env(job, home, path, provider_token, capability, persona) -> Dict[str, str]`.
   - `Worker(home, path, channel, run=subprocess.run, popen=subprocess.Popen)` with `repo_dir` (`<home>/work/repo`), `fetch_job(bootstrap_token) -> (capability, job)`, `prepare(job)`, `run_pair(job, capability, pair) -> Optional[PassResult]`, `complete(capability, tag, result)` and `run_group(job, capability)`.
@@ -1156,7 +1136,7 @@ from unittest import mock
 
 import worker
 from worker import (Worker, session_id_of, WorkerError, claude_env, clone, encode_cwd,
-                    posture_problems, read_job_file, transcript_path)
+                    posture_problems, read_job_spec, transcript_path)
 
 GOOD_STATUS = "Name:\tpython3\nNoNewPrivs:\t1\nCapBnd:\t0000000000000000\n"
 HEAD = "a" * 40
@@ -1194,45 +1174,29 @@ class PathTest(unittest.TestCase):
                 transcript_path("/h", "/h/w", bad)
 
 
-class JobFileTest(unittest.TestCase):
-    def setUp(self):
-        self.dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, self.dir)
-        self.path = os.path.join(self.dir, ".claudebox-job.json")
-        self.spec = {"job_id": "j1", "bootstrap_token": "cbx_b_x", "channel_url": "http://c",
-                     "gateway_url": "http://g"}
+class JobSpecTest(unittest.TestCase):
+    SPEC = {"job_id": "j1", "bootstrap_token": "cbx_b_x", "channel_url": "http://c",
+            "gateway_url": "http://g"}
 
-    def write(self, mode=0o600, data=None):
-        with open(self.path, "w") as f:
-            f.write(json.dumps(self.spec) if data is None else data)
-        os.chmod(self.path, mode)
+    def test_the_spec_is_read_from_stdin_with_the_here_strings_newline(self):
+        self.assertEqual(read_job_spec(io.BytesIO(json.dumps(self.SPEC).encode() + b"\n")),
+                         self.SPEC)
 
-    def test_a_mode_600_file_is_read_and_unlinked(self):
-        self.write()
-        self.assertEqual(read_job_file(self.path), self.spec)
-        self.assertFalse(os.path.exists(self.path))
-
-    def test_a_file_others_can_read_is_refused(self):
-        self.write(0o644)
+    def test_an_empty_stdin_says_where_the_spec_should_come_from(self):
         with self.assertRaises(WorkerError) as ctx:
-            read_job_file(self.path)
-        self.assertIn("mode 600", str(ctx.exception))
+            read_job_spec(io.BytesIO(b""))
+        self.assertIn("no job spec on stdin", str(ctx.exception))
 
-    def test_a_symlink_is_refused(self):
-        target = os.path.join(self.dir, "elsewhere")
-        with open(target, "w") as f:
-            f.write(json.dumps(self.spec))
-        os.chmod(target, 0o600)
-        os.symlink(target, self.path)
+    def test_an_oversized_spec_is_refused(self):
         with self.assertRaises(WorkerError):
-            read_job_file(self.path)
+            read_job_spec(io.BytesIO(b" " * (worker.JOB_SPEC_MAX + 1)))
 
-    def test_a_missing_field_is_refused_by_name(self):
-        del self.spec["gateway_url"]
-        self.write()
-        with self.assertRaises(WorkerError) as ctx:
-            read_job_file(self.path)
-        self.assertIn("no gateway_url", str(ctx.exception))
+    def test_a_spec_that_is_not_an_object_or_lacks_a_field_is_refused(self):
+        for raw, words in ((b"[1]", "not a JSON object"), (b"nope", "not JSON"),
+                           (json.dumps(dict(self.SPEC, gateway_url="")).encode(), "no gateway_url")):
+            with self.subTest(raw=raw), self.assertRaises(WorkerError) as ctx:
+                read_job_spec(io.BytesIO(raw))
+            self.assertIn(words, str(ctx.exception))
 
 
 class FakeRun:
@@ -1509,8 +1473,8 @@ Expected: FAIL: `ModuleNotFoundError: No module named 'worker'`.
 """The hosted worker: one PR group, reviewed as the reviewer uid.
 
 Started by wrapper.sh after setpriv, with exactly HOME and PATH set. It
-proves its posture (not root, NoNewPrivs, an empty bounding set), reads and
-unlinks the job file root left it, exchanges the bootstrap token for the
+proves its posture (not root, NoNewPrivs, an empty bounding set), reads the
+job spec root handed it on stdin, exchanges the bootstrap token for the
 job's capability, clones the PR head, and runs each pair's persona as
 run_group does in local mode: phase 1 together, then phase 2. Every pair
 asks the control plane for its own provider token first, and hands its
@@ -1526,7 +1490,6 @@ import base64
 import json
 import os
 import re
-import stat
 import subprocess
 import sys
 import threading
@@ -1545,7 +1508,7 @@ from review_loop import lock_git_dir  # noqa: E402
 
 # test-worker.sh rewrites this line to a fixture.
 PROC_STATUS = "/proc/self/status"
-JOB_FILE_NAME = ".claudebox-job.json"
+JOB_SPEC_MAX = 65536
 # The overview's channel cap: a decoded transcript of at most 64 MiB.
 TRANSCRIPT_MAX = 64 * 1024 * 1024
 REQUEST_TIMEOUT = 120
@@ -1612,30 +1575,26 @@ def session_id_of(transcript: bytes) -> Optional[str]:
     return None
 
 
-def read_job_file(path: str) -> Dict[str, Any]:
-    """The job spec root wrote: ours, mode 600, not a link. Unlinked once read."""
-    try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    except OSError as exc:
-        raise WorkerError(f"cannot open the job file {path}: {exc.strerror}") from None
-    try:
-        st = os.fstat(fd)
-        if st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) & 0o077:
-            raise WorkerError(f"the job file {path} must be the reviewer's own and mode 600")
-        with os.fdopen(fd, "rb") as f:
-            fd = -1
-            raw = f.read(65536)
-    finally:
-        if fd != -1:
-            os.close(fd)
-    os.unlink(path)
+def read_job_spec(stream) -> Dict[str, Any]:
+    """The job spec root handed over on stdin. Read once, capped, then stdin is closed.
+
+    The spec carries the single-use bootstrap token, so it never travels in the
+    environment or argv; stdin is a pipe only this process holds.
+    """
+    raw = stream.read(JOB_SPEC_MAX + 1)
+    if len(raw) > JOB_SPEC_MAX:
+        raise WorkerError("the job spec on stdin is too large")
+    if not raw.strip():
+        raise WorkerError("no job spec on stdin; the worker entrypoint passes it there")
     try:
         spec = json.loads(raw)
     except ValueError:
-        raise WorkerError("the job file is not JSON") from None
+        raise WorkerError("the job spec on stdin is not JSON") from None
+    if not isinstance(spec, dict):
+        raise WorkerError("the job spec on stdin is not a JSON object")
     for key in ("job_id", "bootstrap_token", "channel_url", "gateway_url"):
         if not isinstance(spec.get(key), str) or not spec[key]:
-            raise WorkerError(f"the job file has no {key}")
+            raise WorkerError(f"the job spec has no {key}")
     return spec
 
 
@@ -1853,7 +1812,11 @@ def main() -> int:
         sys.stderr.write("ERROR: the worker's posture is wrong: " + "; ".join(problems) + "\n")
         return 1
     try:
-        spec = read_job_file(os.path.join(home, JOB_FILE_NAME))
+        spec = read_job_spec(sys.stdin.buffer)
+        # Release the pipe: claude and every shell a pass spawns inherit fd 0.
+        devnull = os.open(os.devnull, os.O_RDONLY)
+        os.dup2(devnull, 0)
+        os.close(devnull)
         worker = Worker(home, os.environ.get("PATH", ""), Channel(spec["channel_url"]))
         capability, job = worker.fetch_job(spec["bootstrap_token"])
         job.setdefault("gateway_url", spec["gateway_url"])
@@ -1938,7 +1901,7 @@ Expected: every line starts `root`. `gh` and `entrypoint.sh` are `755`.
 In `CLAUDE.md`'s "Hosted App libraries" subsection, after the paragraph about the gateway, add:
 
 ```markdown
-Phase 2a.3 adds the worker and the job runner. A worker is this image started by the runner with `--user 0` and `--entrypoint /opt/claudebox/worker/entrypoint.sh`, holding only `SETUID`, `SETGID` and `SETPCAP`. The entrypoint writes the job spec from `CLAUDEBOX_JOB` to a mode-600 file in the reviewer's home, unsets the variable, and runs `setpriv`, which empties the bounding set, sets `no_new_privs`, changes to the reviewer and resets the environment. `wrapper.sh` hands `worker.py` exactly `HOME` and `PATH`. `worker.py` proves its posture with the image's three checks and no `ALLOW_UNHARDENED`, trades the single-use bootstrap token for the job's capability, makes a blobless clone of the PR head at `/home/reviewer/work/repo`, and runs each pair through `passes.run_pass`, phase 1 together and then phase 2. It locks `.git` exactly when the job spec's `shared_worktree` says the personas share the worktree, an answer the control plane computes once and also uses to put `WORKTREE_STANZA` in the prompts, and it refuses a spec that does not say. Each pair asks the control plane for its own provider token first and hands back its transcript and session id after; the worker never reports an outcome, because the gateway decides that. A pair with a session has its transcript written where `--resume` looks for it, and its session id is read from the transcript. `worker/bin/gh` is first on `PATH`: `gh pr comment` becomes the channel's `post-finding`, a fixed set of reads goes to the real `gh` with the job's read token, and everything that writes is refused. `hosted/runner.py` is the job-runner interface and its local Docker implementation, which builds every `docker` command from one template and checks every field first. `hosted/runnerd.py` is the only process holding the Docker socket, and serves start, list, stop and stop-all over `gwproto`. `test-worker.sh` covers the two shell steps with `id`, `chown` and `setpriv` stubbed, so it needs neither Docker nor root, and it runs on the host's bash 3.2.
+Phase 2a.3 adds the worker and the job runner. A worker is this image started by the runner with `--user 0` and `--entrypoint /opt/claudebox/worker/entrypoint.sh`, holding only `SETUID`, `SETGID` and `SETPCAP`. The entrypoint unsets `CLAUDEBOX_JOB` and runs `setpriv` with the job spec on its stdin, writing no file, since root holds no capability that would let it write into the reviewer's home. `setpriv` empties the bounding set, sets `no_new_privs`, changes to the reviewer and resets the environment. `wrapper.sh` hands `worker.py` exactly `HOME` and `PATH`. `worker.py` proves its posture with the image's three checks and no `ALLOW_UNHARDENED`, trades the single-use bootstrap token for the job's capability, makes a blobless clone of the PR head at `/home/reviewer/work/repo`, and runs each pair through `passes.run_pass`, phase 1 together and then phase 2. It locks `.git` exactly when the job spec's `shared_worktree` says the personas share the worktree, an answer the control plane computes once and also uses to put `WORKTREE_STANZA` in the prompts, and it refuses a spec that does not say. Each pair asks the control plane for its own provider token first and hands back its transcript and session id after; the worker never reports an outcome, because the gateway decides that. A pair with a session has its transcript written where `--resume` looks for it, and its session id is read from the transcript. `worker/bin/gh` is first on `PATH`: `gh pr comment` becomes the channel's `post-finding`, a fixed set of reads goes to the real `gh` with the job's read token, and everything that writes is refused. `hosted/runner.py` is the job-runner interface and its local Docker implementation, which builds every `docker` command from one template and checks every field first. `hosted/runnerd.py` is the only process holding the Docker socket, and serves start, list, stop and stop-all over `gwproto`. `test-worker.sh` covers the two shell steps with `id`, `chown` and `setpriv` stubbed, so it needs neither Docker nor root, and it runs on the host's bash 3.2.
 ```
 
 In "Commands", where the suites are listed, change "the five test suites" to "the six test suites" in the opening paragraph's file list and add `test-worker.sh` after `test-launcher.sh`, and add to the sentence that lists how to run them: `, and \`/bin/bash ./test-worker.sh\` (the hosted worker's root entrypoint and wrapper, with \`setpriv\` stubbed)`.
