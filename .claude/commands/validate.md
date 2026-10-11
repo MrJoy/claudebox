@@ -88,7 +88,10 @@ session gives you.
   equal your `git diff --cached --binary` (with two lanes, the lanes' union). A mismatch is
   an anomaly, and nothing is judged until it is resolved. Run every gate there. On the
   human's signature, commit exactly that change set, so the commit is the tree you judged. A
-  slice the human rejects is reverted with `git restore`. Leave the lane worktrees for
+  slice the human rejects is reverted in both the index and the working tree, since the
+  change set is staged: `git reset --hard HEAD`, then `git clean -fd -- <paths>` for the
+  paths the slice added, which HEAD never had. Your checkout holds nothing else the run
+  needs, so nothing is lost. Leave the lane worktrees for
   `/orchestrate` to remove, and before dispatching a later slice ask it to move them to
   the branch's new head.
 
