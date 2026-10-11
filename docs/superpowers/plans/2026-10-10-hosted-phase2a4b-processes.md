@@ -33,8 +33,8 @@ The spec and the overview leave these open, and each one changes code. They are 
 
 1. **2a reviews in `auto` mode only.** A repo whose config asks for `trigger: requested` is shown as a config problem on its check runs ("arrives in phase 2b") rather than reviewed against its wishes.
 2. **The org file is `.github/claudebox.json` in `<owner>/.github`**, read at the default branch. A read that fails is "no org defaults". The org `.github` repo is never itself reviewed.
-3. **A poll per installation lists its repos.** A repo that is public is passed over, and one that turned public since the last poll is lost. A repo gone from the list is lost. An installation gone from `App.installations()`, or one carrying `suspended_at`, loses all its repos. Losing a repo ends its jobs (their started pairs `revoked`), calls 2a.4a's three deleters (`Outbox.drop_repo`, `Committer.forget_repo`, `CheckRuns.forget_repo`), and forgets its fingerprint cache. Its rounds survive, as the spec's "Visibility" says ("Rounds and asks survive a public flip, since they hold no content"). A returning pair starts a fresh session at its next round, as one does after `MAX_PASSES_PER_SESSION` rotation. Its earlier rounds' findings are still on the PR, signed, and with no committed fingerprint its round line reads the local wording, which works from those comments.
-4. **Every non-fork candidate head gets a check run**, created once, whether or not anything is dispatched for it. A repo with a config problem shows it on every head's run and dispatches nothing. A problem in either file is a config problem, even when the other file is valid: `repo_config.resolve` would fall back to the other's config, and a broken file must never be replaced in silence. Each poll writes its answer onto the head, so a problem fixed since (a `config apply`, an edit on the default branch) stops showing without a push.
+3. **A poll per installation lists its repos.** A repo that is public is passed over, and one that turned public since the last poll is lost. A repo gone from the list is lost. An installation gone from `App.installations()`, or one carrying `suspended_at`, loses all its repos. Losing a repo ends its jobs (their started pairs `revoked`), calls 2a.4a's three deleters (`Outbox.drop_repo`, `Committer.forget_repo`, `CheckRuns.forget_repo`), and forgets its fingerprint cache. The jobs end with no scheduler lock held, since ending one calls into the committer, which calls `decider_for`, which takes that lock. After each poll, a sweep drops the outbox and withheld rows of any repo no live installation lists (one lost while the control plane was down, which nothing in memory names), and runs only when every live installation's listing succeeded. Its rounds survive, as the spec's "Visibility" says ("Rounds and asks survive a public flip, since they hold no content"). A returning pair starts a fresh session at its next round, as one does after `MAX_PASSES_PER_SESSION` rotation. Its earlier rounds' findings are still on the PR, signed, and with no committed fingerprint its round line reads the local wording, which works from those comments.
+4. **Every non-fork candidate head gets a check run**, created once, whether or not anything is dispatched for it. A repo with a config problem shows it on every head's run and dispatches nothing. A problem in either file is a config problem, even when the other file is valid: `repo_config.resolve` would fall back to the other's config, and a broken file must never be replaced in silence. Each poll writes its answer onto the head and publishes it while the problem holds and on the poll it changes, so a problem fixed since (a `config apply`, an edit on the default branch) stops showing without a push, and an unchanged answer costs no GitHub call.
 5. **The change gate is local mode's**, `signals.Tracker`, one per repo since a Tracker keys by PR number. A PR's fingerprint is its head, its mode and the newest unsigned comment, and comments, reviews and the 30 newest inline comments are read only when the PR's `updated_at` has moved. A failed lookup is cached against that `updated_at` too, so an outage costs one lookup per change, and the PR gates on `updated_at` through `signals.degraded`. A PR younger than the deployment's `settle_seconds` waits.
 6. **Dispatch bounds.** A PR with a live job is not dispatched again. A pair parked by the commit point waits while its siblings run, and a parked profile dispatches nothing. `max_concurrent_jobs` counts jobs, and a profile's `concurrency` counts pairs in flight (dispatched and not completed) across its jobs. A poll stops dispatching at the first refusal by `max_concurrent_jobs`.
 7. **Visibility is checked again at dispatch**, uncached, and a check that errors dispatches nothing.
@@ -603,6 +603,21 @@ class ConfigTest(Base):
                 self.assertEqual(self.poll(), 0)
                 self.assertIn(words, self.inst.updated[-1][3])
 
+    def test_a_cleared_problem_is_published_on_a_head_the_gate_holds(self):
+        # PR #22 review: nothing else would publish a reviewed, unchanged head.
+        self.poll()
+        GateTest.finish(self, self.jobs.all()[0])
+        self.inst.files[("acme/web", ".github/claudebox.json")] = b'{"profile": "nope"}'
+        self.poll()
+        self.assertEqual(self.inst.updated[-1][2], "Configuration invalid")
+        self.inst.files[("acme/web", ".github/claudebox.json")] = json.dumps(
+            {"profile": "ollama", "code": {"personas": "red_team,sage"}}).encode()
+        self.assertEqual(self.poll(), 0)
+        self.assertNotEqual(self.inst.updated[-1][2], "Configuration invalid")
+        before = len(self.inst.updated)
+        self.poll()
+        self.assertEqual(len(self.inst.updated), before)   # unchanged: no extra GitHub call
+
     def test_requested_mode_is_shown_as_not_yet_supported(self):
         self.inst.files[("acme/web", ".github/claudebox.json")] = json.dumps(
             {"profile": "ollama", "trigger": "requested"}).encode()
@@ -665,6 +680,47 @@ class JobEndTest(Base):
 
 
 class AccessTest(Base):
+    def test_lose_repo_ends_jobs_without_holding_the_scheduler_lock(self):
+        # end_job calls into the committer, which calls decider_for (PR #22 review).
+        import threading
+        self.poll()
+        free = []
+        real = self.sched.end_job
+
+        def probe(job, reason):
+            t = threading.Thread(target=lambda: free.append(self.sched.lock.acquire(timeout=0.5)
+                                                            and (self.sched.lock.release() or True)))
+            t.start()
+            t.join()
+            return real(job, reason)
+        self.sched.end_job = probe
+        self.sched.lose_repo("acme/web", "test")
+        self.assertEqual(free, [True])
+
+    def test_orphaned_rows_are_swept_once_every_live_listing_succeeded(self):
+        # Lost while the control plane was down: nothing in memory names them.
+        from outbox import JobContext
+        self.box.accept(JobContext("old", 3, "gone/repo", 1, HEAD), "sage", 1, "x")
+        self.box.accept(JobContext("old", 3, "gone/repo", 1, HEAD), "sme", 1, "token olk-x")
+        self.assertEqual(self.sched.sweep_orphans({7}), 0)   # installation 7 not listed yet
+        self.poll()
+        self.assertEqual(self.sched.sweep_orphans({7}), 1)
+        self.assertEqual(self.box.queued("gone/repo", HEAD), 0)
+        self.assertEqual(self.records.conn().execute(
+            "SELECT COUNT(*) FROM withheld WHERE repo = 'gone/repo'").fetchone()[0], 0)
+
+    def test_a_failed_listing_blocks_the_sweep(self):
+        from outbox import JobContext
+        self.box.accept(JobContext("old", 3, "gone/repo", 1, HEAD), "sage", 1, "x")
+        self.poll()
+
+        def broken():
+            raise GitHubError(502, "x")
+        self.inst.repos = broken
+        self.poll()
+        self.assertEqual(self.sched.sweep_orphans({7}), 0)
+        self.assertEqual(self.box.queued("gone/repo", HEAD), 1)
+
     def test_a_repo_gone_public_loses_its_jobs_findings_and_sessions_but_keeps_rounds(self):
         self.poll()
         job = self.jobs.all()[0]
@@ -744,7 +800,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import checkruns
 import creds as creds_mod
@@ -809,6 +865,10 @@ class Scheduler:
         self.config_problems: Dict[str, str] = {}
         self.trackers: Dict[str, signals_mod.Tracker] = {}   # one per repo: a Tracker keys by PR number
         self._full = False
+        # Installations whose last poll listed their repos. The orphan sweep
+        # runs only when every live one did, or it would drop a repo whose
+        # listing merely failed.
+        self.listed: Set[int] = set()
 
     # -- the decision core per repo ----------------------------------------------
     def decider_for(self, repo: str) -> Decider:
@@ -879,7 +939,9 @@ class Scheduler:
             repos = inst.repos()
         except GitHubError as exc:
             self.log(f"WARN: installation {installation_id}: could not list repositories: {exc}")
+            self.listed.discard(installation_id)
             return 0
+        self.listed.add(installation_id)
         seen = {r["full_name"] for r in repos}
         with self.lock:
             for repo in [r for r, i in self.installation_of.items()
@@ -910,6 +972,7 @@ class Scheduler:
             self.installation_of[full] = installation_id
         cfg, model, problem = self.load_config(inst, full, deploy)
         with self.lock:
+            changed = self.config_problems.get(full, "") != problem
             self.config_problems[full] = problem
         label = cfg.plan_label if cfg is not None else repo_config.RepoConfig().plan_label
         dispatched = 0
@@ -923,9 +986,12 @@ class Scheduler:
             self.check_runs.ensure(full, head)
             # Every poll writes its answer, so a problem fixed since (a config
             # apply, an edit on the default branch) stops showing on this head.
+            # It is published when it changes as well as while it holds, so a
+            # cleared problem reaches a head that nothing else would publish.
             self.check_runs.set_config_problem(full, head, problem)
+            if problem or changed:
+                self._publish(full, head)
             if problem:
-                self.check_runs.publish(full, head)
                 continue
             if any(j.repo == full and j.pr == n for j in self.jobs.all()):
                 continue
@@ -1102,9 +1168,11 @@ class Scheduler:
 
     def lose_repo(self, repo: str, reason: str) -> None:
         """Access changed: end the repo's jobs and delete what it holds, keeping its rounds."""
+        # The jobs end with no scheduler lock held: end_job calls into the
+        # committer, which calls decider_for, which takes this lock (PR #22 review).
+        for job in [j for j in self.jobs.all() if j.repo == repo]:
+            self.end_job(job, f"access changed: {reason}")
         with self.lock:
-            for job in [j for j in self.jobs.all() if j.repo == repo]:
-                self.end_job(job, f"access changed: {reason}")
             dropped = self.outbox.drop_repo(repo, reason)
             self.committer.forget_repo(repo)
             self.check_runs.forget_repo(repo)
@@ -1118,6 +1186,24 @@ class Scheduler:
             self.installation_of.pop(repo, None)
             self.trackers.pop(repo, None)
         self.log(f"{repo}: not reviewed, because {reason}; dropped {dropped} queued finding(s)")
+
+    def sweep_orphans(self, live: Set[int]) -> int:
+        """Rows of repos no live installation lists: lost while this process was down.
+
+        `installation_of` is in memory, so an uninstall during a restart leaves
+        outbox and withheld rows nothing else would ever drop. Runs only after
+        every live installation's listing succeeded. Returns how many repos.
+        """
+        if not live <= self.listed:
+            return 0
+        known = set(self.installation_of)
+        conn = self.records.conn()
+        rows = {r[0] for r in conn.execute("SELECT DISTINCT repo FROM outbox")}
+        rows |= {r[0] for r in conn.execute("SELECT DISTINCT repo FROM withheld")}
+        orphans = sorted(rows - known)
+        for repo in orphans:
+            self.lose_repo(repo, "no installation lists it any more")
+        return len(orphans)
 
     def _publish(self, repo: str, head: str) -> None:
         try:
@@ -1138,7 +1224,7 @@ class _Snapshot:
 - [ ] **Step 4: Run it to see it pass, then the whole suite**
 
 Run: `./test-python.sh -p 'test_hosted_scheduler.py'`, then `./test-python.sh`
-Expected: PASS, 36 tests. The whole suite passes.
+Expected: PASS, 40 tests. The whole suite passes.
 
 - [ ] **Step 5: Commit**
 
@@ -1771,6 +1857,7 @@ class ControlPlane:
                 self._drainers[inst_id] = Drainer(self.outbox, self.installation(inst_id), inst_id,
                                                   clock=self.clock)
             dispatched += self.scheduler.poll(inst_id)
+        self.scheduler.sweep_orphans(live)
         return dispatched
 
     def _poll_loop(self) -> None:
