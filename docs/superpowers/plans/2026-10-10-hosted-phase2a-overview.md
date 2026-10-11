@@ -1,6 +1,6 @@
 # Hosted Phase 2a: Overview and Cross-Cutting Decisions
 
-This is the index for Phase 2a of `docs/superpowers/specs/2026-10-09-hosted-github-app-design.md` ("Phase 2a: the trial pipeline"). Phase 2a is too large for one plan, so it ships as six stacked sub-plans. Each one is a factory run of its own and produces something testable without the ones after it. This file holds what more than one sub-plan depends on: the split, the decisions the spec leaves open, the module map, the records schema, and the three wire protocols. A sub-plan restates the parts it uses, so an executor never needs this file open next to their task. If the two ever disagree, this file wins, and the sub-plan is the one to fix.
+This is the index for Phase 2a of `docs/superpowers/specs/2026-10-09-hosted-github-app-design.md` ("Phase 2a: the trial pipeline"). Phase 2a is too large for one plan, so it ships as seven stacked sub-plans. Each one is a factory run of its own and produces something testable without the ones after it. This file holds what more than one sub-plan depends on: the split, the decisions the spec leaves open, the module map, the records schema, and the three wire protocols. A sub-plan restates the parts it uses, so an executor never needs this file open next to their task. If the two ever disagree, this file wins, and the sub-plan is the one to fix.
 
 **Spec:** `docs/superpowers/specs/2026-10-09-hosted-github-app-design.md`. The founder rulings of 2026-10-09 still bind: hosted files are JSON for now, and `config validate` runs inside the image.
 
@@ -17,9 +17,10 @@ The spec's own words: "At the end an org can create an App, install it, and get 
 | 2a.1 foundations | `hosted/crypto.py`, `records.py`, `creds.py`, `blobs.py`, `scan.py`, `github_app.py`: libraries with no process of their own | Phase 1 |
 | 2a.2 gateway | `hosted/gateway.py`, `gwproto.py`, the provider route for `ollama`, `anthropic` and `custom`, per-token records, per-pair caps; `deploy_config` gains `base_url` and `auth` | 2a.1 |
 | 2a.3 worker and job runner | `worker/` (root entrypoint with `setpriv`, wrapper, `worker.py`, the `gh` shim, transcript placement for `--resume`), `hosted/runner.py` and `runnerd.py` (local Docker) | 2a.1, 2a.2's token shape |
-| 2a.4 control plane | `hosted/control.py`, `scheduler.py`, `channel.py`, `commit.py`, `outbox.py`, `checkruns.py`, `supervisor.py`, `/healthz`, `hosted/Dockerfile`, `hosted/compose.json` | 2a.1–2a.3 |
-| 2a.5 operator surface | `hosted/admin.py`, `hosted/hosted_cli.py`, and in `claudebox.sh`: `hosted deploy --target local [--admins FILE]`, `app create --target local`, `hosted whois`, `hosted login`, `hosted status`, `hosted config apply` | 2a.4 |
-| 2a.6 the remaining providers | `cloudflare` (all three upstreams) and `workersai` behind the gateway, with LiteLLM and `workersai-shim.py` moved into the control-plane image | 2a.2, 2a.4 |
+| 2a.4a control-plane decisions | `hosted/checkruns.py`, `outbox.py`, `commit.py`, `channel.py`; in `reviewer/`, the hosted round line and prompts; `Installation.pull` in 2a.1's client: libraries, testable with fakes | 2a.1–2a.3 |
+| 2a.4b control-plane processes | `hosted/scheduler.py`, `control.py`, `supervisor.py`, `/healthz`, `hosted/Dockerfile`, `hosted/compose.json` | 2a.4a |
+| 2a.5 operator surface | `hosted/admin.py`, `hosted/hosted_cli.py`, and in `claudebox.sh`: `hosted deploy --target local [--admins FILE]`, `app create --target local`, `hosted whois`, `hosted login`, `hosted status`, `hosted config apply` | 2a.4b |
+| 2a.6 the remaining providers | `cloudflare` (all three upstreams) and `workersai` behind the gateway, with LiteLLM and `workersai-shim.py` moved into the control-plane image | 2a.2, 2a.4b |
 
 The first end-to-end review happens at the end of 2a.5, with an `ollama`, `anthropic` or `custom` profile. 2a.6 completes the provider list. Splitting it off keeps 2a.2 to the three Anthropic-shaped types, and those three need nothing but header rewriting.
 
@@ -42,19 +43,19 @@ The spec leaves these open, and each one changes code. They are this overview's 
 13. **The single-instance lock is `fcntl.flock(LOCK_EX | LOCK_NB)` on `<data>/control.lock`**, taken before the records store is opened for writing. The spec says "on SQLite, the file lock of a single writer". SQLite's own locks are per transaction, so a long-held lock file is how one process holds the database between transactions.
 14. **"Pages" in 2a means one `PAGE:` line in the control plane's log and an entry in `hosted status`.** `/metrics` and the paging conditions are 2b's. Every page in the spec still produces its line in 2a, so 2b only adds the metric.
 15. **The hosted code runs under the host's Python 3.9.** `test-python.sh` runs on the host, so nothing under `hosted/` or `worker/` may use syntax newer than 3.9: no `match`, no `X | Y` in annotations evaluated at runtime, no `datetime.UTC` (use `datetime.timezone.utc`). The images run 3.11.
-16. **The decision core takes the head a pair last reviewed as an optional input, and the control plane owns the rewrite test.** This is the spec's "The decision core takes the head as an optional input". `prompts.round_stanza(mode, round, since_head=None)` names the commits after `since_head` when it is given, and keeps today's wording otherwise. `Decider.system_prompt_for(pair, since_head=None, rewritten=False)` passes it through, so local mode's prompts stay byte-identical, which `tests/fixtures/` pins. The spec widens the scope in two cases, and both are the control plane's to decide, because it composes the round line and writes the check run. (a) When the pair's last reviewed head is no longer an ancestor of the current head, the pass runs as round 1 at the `should-fix` floor, the check run says the branch was rewritten, and the pair's round count still advances. The test is `Installation.is_ancestor` (2a.1), a compare call made per dispatched pair whose fingerprint head differs from the current head. A 404 counts as rewritten. (b) A pass that answers an ask at an already-reviewed head is whole-PR at the current rung, but asks are 2b's. This lands in 2a.4, the first sub-plan that has a head to pass.
+16. **The decision core takes the head a pair last reviewed as an optional input, and the control plane owns the rewrite test.** This is the spec's "The decision core takes the head as an optional input". `prompts.round_stanza(mode, round, since_head=None)` names the commits after `since_head` when it is given, and keeps today's wording otherwise. `Decider.system_prompt_for(pair, since_head=None, rewritten=False)` passes it through, so local mode's prompts stay byte-identical, which `tests/fixtures/` pins. The spec widens the scope in two cases, and both are the control plane's to decide, because it composes the round line and writes the check run. (a) When the pair's last reviewed head is no longer an ancestor of the current head, the pass runs as round 1 at the `should-fix` floor, the check run says the branch was rewritten, and the pair's round count still advances. The test is `Installation.is_ancestor` (2a.1), a compare call made per dispatched pair whose fingerprint head differs from the current head. A 404 counts as rewritten. (b) A pass that answers an ask at an already-reviewed head is whole-PR at the current rung, but asks are 2b's. The round line lands in 2a.4a, and the rewrite test in 2a.4b, the first sub-plan that has a head to pass.
 17. **Hosted prompts are today's defaults** with no Linear stanza (hosted Linear is deferred) and no kindex stanza (3a), plus one added sentence in the hosted `GH_STANZA`: "If the deployment refuses a read, stop the review and say so; do not guess at the diff." Operator prompt overrides have no hosted equivalent in v1 (spec, "Caps": "Neither do the prompt overrides or `MAX_CYCLES` in v1").
-18. **The check-run wording table is decided in 2a.4**, which the spec defers to "the phase 2a spec".
+18. **The check-run wording table is decided in 2a.4a**, which the spec defers to "the phase 2a spec".
 19. **Hosted modules are flat, imported by plain name, like `reviewer/`.** `hosted/` and `worker/` each put themselves and `reviewer/` on `sys.path`. `tests/_path.py` adds both directories. New test modules are `tests/test_hosted_*.py` and `tests/test_worker_*.py`, discovered by the existing `test-python.sh`.
 
 ## Carried from Phase 1
 
 Phase 1's verdict deferred four items to the Phase 2a plan (kindex watch `fdfd1cd2865b`). Each has an owner here:
 
-- **F5, `plan.label` with an internal newline.** The loader accepts `"a\nb"` and the schema rejects it, and a label no GitHub label can equal routes every plan PR to code mode. 2a.4, when it first serves repo config: the loader refuses any whitespace other than a plain space inside `plan.label`, so the loader and the schema's `^\S(?:.*\S)?$` agree, and a test pins the agreement on the shared cases.
-- **F6, the empty persona selector's message.** It tells a repo author to unset `PERSONAS`, an environment variable a hosted author cannot set. 2a.4: the hosted config path reports the repo-file key (`code.personas` or `plan.personas`) and an empty selector in its own words, and never passes `personas.resolve`'s environment wording through to a check run.
+- **F5, `plan.label` with an internal newline.** The loader accepts `"a\nb"` and the schema rejects it, and a label no GitHub label can equal routes every plan PR to code mode. 2a.4b, when it first serves repo config: the loader refuses any whitespace other than a plain space inside `plan.label`, so the loader and the schema's `^\S(?:.*\S)?$` agree, and a test pins the agreement on the shared cases.
+- **F6, the empty persona selector's message.** It tells a repo author to unset `PERSONAS`, an environment variable a hosted author cannot set. 2a.4b: the hosted config path reports the repo-file key (`code.personas` or `plan.personas`) and an empty selector in its own words, and never passes `personas.resolve`'s environment wording through to a check run.
 - **F7, `claudebox.sh config` ignoring `--repo` and trailing extras.** 2a.5, which edits `claudebox.sh`: `config` refuses any argument it does not take, `--repo` included, naming `--repo-name` as the likely intent.
-- **The `rounds.cap` default** (4, where the spec's example shows 6). The founder kept 4 for Phase 1 and recorded an objection. 2a.4 makes it the hosted default the moment it builds a `Decider` per repo, so 2a.4's ratification asks the founder for a ruling, and the default is whatever that ruling says. It is not inherited.
+- **The `rounds.cap` default** (4, where the spec's example shows 6). The founder kept 4 for Phase 1 and recorded an objection. 2a.4b makes it the hosted default the moment it builds a `Decider` per repo, so 2a.4b's ratification asks the founder for a ruling, and the default is whatever that ruling says. It is not inherited.
 
 ## Module map
 
@@ -70,13 +71,13 @@ Phase 1's verdict deferred four items to the Phase 2a plan (kindex watch `fdfd1c
 | `hosted/gateway.py` | 2a.2 | provider route, per-token records, caps |
 | `hosted/runner.py`, `hosted/runnerd.py` | 2a.3 | job-runner interface and local Docker implementation behind its own uid |
 | `worker/entrypoint.sh`, `worker/wrapper.sh`, `worker/worker.py`, `worker/bin/gh` | 2a.3 | the worker |
-| `hosted/checkruns.py` | 2a.4 | check-run states and wording |
-| `hosted/outbox.py` | 2a.4 | acceptance and drain |
-| `hosted/commit.py` | 2a.4 | the outcome order and what each outcome does to pair state |
-| `hosted/scheduler.py` | 2a.4 | the poll, repo config, fork rule, dispatch bounds |
-| `hosted/channel.py` | 2a.4 | the worker channel's HTTP handlers |
-| `hosted/control.py` | 2a.4 | control-plane main: lock, startup revocation, threads, `/healthz` |
-| `hosted/supervisor.py` | 2a.4 | PID 1: per-process secrets and uids, drain on `SIGTERM` |
+| `hosted/checkruns.py` | 2a.4a | check-run states and wording |
+| `hosted/outbox.py` | 2a.4a | acceptance and drain |
+| `hosted/commit.py` | 2a.4a | the outcome order and what each outcome does to pair state |
+| `hosted/scheduler.py` | 2a.4b | the poll, repo config, fork rule, dispatch bounds |
+| `hosted/channel.py` | 2a.4a | the worker channel's HTTP handlers |
+| `hosted/control.py` | 2a.4b | control-plane main: lock, startup revocation, threads, `/healthz` |
+| `hosted/supervisor.py` | 2a.4b | PID 1: per-process secrets and uids, drain on `SIGTERM` |
 | `hosted/admin.py` | 2a.5 | admin API: user-token auth, roles, `status`, `config apply` |
 | `hosted/hosted_cli.py` | 2a.5 | the in-image half of `app create`, `whois`, `login`, `status`, `config apply` |
 
@@ -149,7 +150,7 @@ An outbox row is deleted when it posts or drops. The posted or dropped count mov
 
 **Credentials.** Every claudebox-minted secret has the form `cbx_<k>_<id>_<secret>`. `<k>` is `b` (bootstrap), `c` (capability) or `p` (provider). `<id>` is 16 lowercase hex characters and is the row's primary key. `<secret>` is 43 URL-safe base64 characters (32 random bytes). The row stores a 16-byte random salt and `sha256(salt || secret)`, and checks with `hmac.compare_digest`. The prefix lets the scanner find a leaked claudebox credential by shape.
 
-**Worker channel** (HTTP, JSON, `Authorization: Bearer <token>`; 2a.3 is the client, 2a.4 the server):
+**Worker channel** (HTTP, JSON, `Authorization: Bearer <token>`; 2a.3 is the client, 2a.4a the server):
 
 | Call | Token | Request | Response |
 |---|---|---|---|
