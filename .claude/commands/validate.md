@@ -47,9 +47,11 @@ to one confirmation with the human against those documents; they are not skipped
 
 ## Promotion here is a commit on the run's feature branch
 
-Work happens on the feature branch the run names (Phase 1 of the hosted App:
-`feat/hosted-phase1`). "Promote" means you commit the accepted slice on that branch after
-the human signs the verdict. Nothing is pushed and no pull request is opened by you;
+Work happens on the feature branch the launch recorded in
+`.orchestrator-runs/<run>/branch.txt` (Phase 1 of the hosted App: `feat/hosted-phase1`),
+after checking that the checkout is on it. "Promote" means you commit the accepted slice on
+that branch after the human signs the verdict, and before each commit `git symbolic-ref
+--short -q HEAD` must still print that name; if it does not, commit nothing and say so. Nothing is pushed and no pull request is opened by you;
 both are the human's call, and the pull request is where claudebox reviews its own
 change. Commit messages follow the repo's style, as `git log` shows it: `<area>: <a short
 lowercase summary>`, then a blank line, a short body, and the attribution trailers the
@@ -87,11 +89,16 @@ session gives you.
   or staged), and if the human has edited anything since, judge nothing until they have
   committed or moved it. Before you run the gates, apply each lane's change set to
   your own checkout, on the feature branch: copy the added and modified paths, and
-  `git rm` the deleted ones (a rename is both), and stage them. The lane and your checkout
-  sit at the same head, so the application is checked by comparing their staged diffs:
-  after `git -C <lane> add -A`, the output of `git -C <lane> diff --cached --binary` must
-  equal your `git diff --cached --binary` (with two lanes, the lanes' union). A mismatch is
-  an anomaly, and nothing is judged until it is resolved. Run every gate there. On the
+  `git rm` the deleted ones (a rename is both), and stage them. First check that the two
+  lanes' path sets do not intersect: a path both lanes touched cannot be applied from both
+  by a copy, so an intersection is an anomaly and nothing is applied. The lane and your
+  checkout sit at the same head, so the application is checked per lane, over that lane's
+  own paths: after `git -C <lane> add -A`, `git -C <lane> diff --cached --binary --
+  <that lane's paths>` must equal your `git diff --cached --binary -- <that lane's paths>`,
+  and `git -C <lane> status --porcelain` must list nothing outside them. Restricting both
+  sides to the same paths keeps git's path ordering out of the comparison, which two
+  lanes' whole diffs would not. A mismatch is an anomaly, and nothing is judged until it is
+  resolved. Run every gate there. On the
   human's signature, commit exactly that change set, so the commit is the tree you judged. A
   slice the human rejects is reverted in both the index and the working tree, and only on
   the slice's own paths, since this is the operator's checkout and may hold their
@@ -139,6 +146,9 @@ tells every lane so, because a lane that took a file's appearance as its signal 
 implemented before dispatch once already (run fc-plan1c-20260927).
 
 The two briefs:
+
+Both briefs name the run's feature branch from `branch.txt`, which `factory-engineer`
+tells the Coder to expect in its dispatch.
 
 - **Coder brief**: the plan with every test file's contents and every
   "Write the failing test" and "Run ... test" step removed. Keep the header, Global

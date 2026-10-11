@@ -53,10 +53,16 @@ a `.factory/` control root this repo does not have. So perform the steps by hand
 say per step which of the two kinds it is. **Only a LOCAL step can block a lane launch.
 A step with no substrate here is reported absent — never reported done.**
 
-- **Pin the base by SHA** — LOCAL. Work happens on the run's feature branch, cut
-  from `main`; pull requests are opened by the human after the run. Pin the branch's base
-  with `git -C <repo> rev-parse HEAD` at launch and record the SHA; every later claim
-  about the base refers to it. Never push; that is the human's call.
+- **Check the branch, then pin the base by SHA** — LOCAL, and the branch check blocks
+  the launch. Work happens on the run's feature branch, cut from `main`; pull requests are
+  opened by the human after the run. The run does not cut that branch: the operator cuts
+  it and checks it out before launching, and names it in the run request. `git -C <repo>
+  symbolic-ref --short -q HEAD` must print exactly that name. If it prints nothing (a
+  detached HEAD) or `main`, or any other name, stop and launch nothing: every accepted
+  slice is committed wherever HEAD points, and `rev-parse HEAD` alone cannot tell a branch
+  just cut from `main` from `main` itself. Record the name in `branch.txt` beside the base.
+  Then pin the base with `git -C <repo> rev-parse HEAD` and record the SHA; every later
+  claim about the base refers to it. Never push; that is the human's call.
 - **A clean checkout** — LOCAL, and it blocks the launch. The Validator applies every
   slice in this checkout, which is the operator's own, so a slice would overwrite any
   uncommitted edit on a path it touches, and gates run over unstaged work would judge a
@@ -136,10 +142,11 @@ leaves the tree staged, and a plain `remove` refuses a tree with changes. `--for
 here only because the check just proved the tree holds the committed slice and nothing else.
 A lane that fails the check keeps its worktree, for the Validator.
 
-    # Substitute the run id, the lane brief, and one launcher per lane before running
+    # Substitute the run id, the lane brief, the feature branch, and one launcher per lane before running
     # this. It is written to fail loudly rather than create a session literally named
     # `<run>` or start a lane on a model nobody chose.
     RUN="${1:?run id required}"; ARGS="${2:?lane brief required}"
+    BRANCH="${3:?feature branch required, cut from main and checked out first}"
     VALIDATOR_LAUNCH="${VALIDATOR_LAUNCH:?validator launcher required}"
     CODER_LAUNCH="${CODER_LAUNCH:?coder launcher required}"
     TESTER_LAUNCH="${TESTER_LAUNCH:?tester launcher required}"
@@ -153,6 +160,12 @@ A lane that fails the check keeps its worktree, for the Validator.
     # and its log, so opening its own brief's directory never shows a lane the other
     # lane's brief or transcript.
     mkdir -p "$LOGS/validator" "$LOGS/coder" "$LOGS/tester"
+    HEAD_BRANCH="$(git symbolic-ref --short -q HEAD || true)"
+    if [ "$HEAD_BRANCH" != "$BRANCH" ] || [ "$BRANCH" = main ]; then
+      echo "checkout is on '${HEAD_BRANCH:-a detached HEAD}', not the run's branch '$BRANCH'" >&2
+      exit 1
+    fi
+    printf '%s\n' "$BRANCH" > "$LOGS/branch.txt"
     BASE="$(git rev-parse HEAD)"; printf '%s\n' "$BASE" > "$LOGS/base-sha.txt"
     for lane in coder tester; do
       git worktree add --detach "$PWD/../$(basename "$PWD")-$RUN-$lane" "$BASE"
