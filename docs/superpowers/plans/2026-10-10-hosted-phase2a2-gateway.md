@@ -1163,7 +1163,7 @@ git commit -m "hosted: the gateway route's profiles, headers and usage meter"
 - Produces:
   - `TokenState` (a mutable dataclass) with `TokenState.from_row(row, env, upstreams)`. The row is a token row, which carries its own `route`, and its `counts` are the committed record. It raises `ValueError` when the route cannot be served.
   - `Reporter(call, retry_seconds=1.0)` with `start()`, `stop()`, `enqueue(report)`, `pending(credential_id=None) -> int`, `acked(credential_id) -> int` and `flush(credential_id_or_None, timeout=FLUSH_SECONDS) -> bool` (True when drained). `call` is a `gwproto.Client.call`.
-  - `Gateway(env, reporter, upstreams=UPSTREAMS, clock=time.time, log=print, flush_seconds=FLUSH_SECONDS)` with `handle_control(msg) -> dict` (ops `hello` → `{ok, tokens, refused}`; `add_token`; `revoke`; `flush` → `{last_seq, drained}`; anything but `hello` before the first `hello` → `{error: "hello first", ready: false}`), `find(token) -> Optional[TokenState]`, `admit(state, path, requested_max) -> (refusal, max_tokens)`, where a refusal is `capped`, `requests`, `tokens` or `pacing`, `refuse_cap(state, cap)` and `complete(state, kind, granted, meter=None, detail="")`.
+  - `Gateway(env, reporter, upstreams=UPSTREAMS, clock=time.time, log=print, flush_seconds=FLUSH_SECONDS)` with `handle_control(msg) -> dict` (ops `hello` → `{ok, tokens, refused}`; `add_token`; `revoke`; `flush` → `{last_seq, drained}`; anything but `hello` before the first `hello` → `{error: "hello first", ready: false}`), `find(token) -> Optional[TokenState]`, `admit(state, path, requested_max) -> (refusal, max_tokens)`, where a refusal is `capped`, `requests`, `tokens` or `pacing`, `refuse_cap(state, cap)`, `refuse_pacing(state)` (reports the first pacing on a token as `first_abandoned`, with a zero delta) and `complete(state, kind, granted, meter=None, detail="")`.
   - A report is `{credential_id, seq, delta: {requests, successes, input_tokens, output_tokens}}`, plus whichever of `first_limit`, `first_failure`, `first_rejected`, `first_abandoned`, `cap_hit` and `usage_missing` this response set for the first time.
   - `BoundedServer` (a `ThreadingHTTPServer` with `max_connections` and `max_per_peer`, both charged at accept), `make_server(gateway, host, port) -> BoundedServer` and `main(env=os.environ)`. `main` reads `GATEWAY_SECRET`, `GATEWAY_SOCKET`, `CONTROL_SOCKET` and `GATEWAY_LISTEN` (default `0.0.0.0:8090`). Its first stdout line is `gateway listening on <host>:<port>; waiting for the control plane's hello`, and on `SIGTERM` it drains reports and prints `gateway stopping; reports drained` (or `NOT drained`).
 
@@ -1478,7 +1478,29 @@ class GatewayTest(unittest.TestCase):
         self.assertIn(b"reached a cap", body)
         self.assertEqual(len(self.up.seen), 1)
 
-    def test_a_token_past_its_in_flight_bound_is_paced_and_nothing_is_recorded(self):
+    def test_a_control_byte_in_the_request_target_is_refused_and_recorded_nowhere(self):
+        # PR #19 review: forwarded, it raised InvalidURL inside the transport
+        # arm and became first_failure, which parks a profile in three.
+        import socket
+        token, cid = self.hello(self.profile())
+        for raw in (b"\x01", b"\x7f", b"\x1b", b"\x80"):
+            with self.subTest(byte=raw):
+                body = b'{"max_tokens": 5, "messages": []}'
+                req = (b"POST /v1/messages?a=" + raw + b" HTTP/1.1\r\nHost: x\r\n"
+                       b"Authorization: Bearer " + token.encode() + b"\r\n"
+                       b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+                       b"Connection: close\r\n\r\n" + body)
+                with socket.create_connection(("127.0.0.1", self.server.server_port), 5) as s:
+                    s.sendall(req)
+                    reply = s.recv(4096)
+                self.assertTrue(reply.startswith(b"HTTP/1.0 400") or reply.startswith(b"HTTP/1.1 400"),
+                                reply[:40])
+        self.flush(cid)
+        self.assertEqual(self.up.seen, [])
+        self.assertFalse(any(r.get("first_failure") for r in self.reports))
+        self.assertEqual(sum(r["delta"]["requests"] for r in self.reports), 0)
+
+    def test_a_token_past_its_in_flight_bound_is_paced_and_only_the_pacing_is_recorded(self):
         token, cid = self.hello(self.profile(per_pair_requests=100, per_pair_tokens=None,
                                              budget_unit="passes"))
         self.up.delay = 0.3
@@ -1493,6 +1515,12 @@ class GatewayTest(unittest.TestCase):
         self.assertIn(429, results)
         self.flush(cid)
         self.assertEqual(sum(r["delta"]["requests"] for r in self.reports), len(self.up.seen))
+        # PR #19 review: a pass cut short by pacing must not commit ok, so the
+        # record carries it, once, as first_abandoned.
+        marked = [r for r in self.reports if r.get("first_abandoned")]
+        self.assertEqual([r["first_abandoned"] for r in marked],
+                         ["the gateway paced this pair's requests"])
+        self.assertFalse(any(r.get("cap_hit") for r in self.reports))
 
     def test_a_passes_profile_clamps_to_the_ceiling(self):
         token, _ = self.hello(self.profile(budget_unit="passes", per_pair_tokens=None))
@@ -2166,6 +2194,25 @@ class Gateway:
             # queue empty never reads a seq whose report is not yet in it.
             self.reporter.enqueue(report)
 
+    def refuse_pacing(self, state: TokenState) -> None:
+        """Record that the gateway paced this pair, once, as `first_abandoned`.
+
+        Nothing reached upstream and nothing is counted, but a pass whose
+        retries ran out against pacing stopped because of the gateway, and a
+        record silent about that could commit `ok` (PR #19 review).
+        `first_abandoned` replaces `ok` and nothing else, so a pass that
+        recovers and ends otherwise is decided as it would have been.
+        """
+        with self.lock:
+            if state.first_abandoned is not None:
+                return
+            state.first_abandoned = "the gateway paced this pair's requests"
+            state.seq += 1
+            self.reporter.enqueue({"credential_id": state.credential_id, "seq": state.seq,
+                                   "first_abandoned": state.first_abandoned,
+                                   "delta": {"requests": 0, "successes": 0, "input_tokens": 0,
+                                             "output_tokens": 0}})
+
     def complete(self, state: TokenState, kind: str, granted: int,
                  meter: Optional[UsageMeter] = None, detail: str = "") -> None:
         """Release an admitted request's reservation and report what it did.
@@ -2256,6 +2303,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = urllib.parse.urlsplit(self.path).path
         if not gw.ready:
             return self._refuse(503, "overloaded_error", "starting; no provider traffic yet")
+        if any(not "\x21" <= ch <= "\x7e" for ch in self.path):
+            # The query is forwarded, and http.client refuses a control byte
+            # or a non-ASCII one on a request line. Refused here, as the
+            # worker's request it is, so it never reaches the failure counter
+            # (PR #19 review).
+            return self._refuse(400, "invalid_request_error",
+                                "the request target carries a byte a request line cannot")
         if path not in ROUTES:
             return self._refuse(404, "not_found_error",
                                 "only POST /v1/messages and /v1/messages/count_tokens")
@@ -2282,7 +2336,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                 "this pair was failed closed: a response carried no usage")
         refusal, granted = gw.admit(state, path, body.get("max_tokens"))
         if refusal == "pacing":
-            # Not an outcome: nothing reached upstream, so nothing is recorded.
+            # Nothing reached upstream, so nothing is counted, but the record
+            # says it happened: a pass cut short by pacing must not commit ok.
+            gw.refuse_pacing(state)
             return self._refuse(429, "rate_limit_error",
                                 "this pair's requests in flight hold its whole allowance; retry")
         if refusal == "capped":
@@ -2329,6 +2385,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             conn.request("POST", upstream_path, body=payload, headers=headers)
             resp = conn.getresponse()
+        except (http.client.InvalidURL, UnicodeError) as exc:
+            # Raised by putrequest before any connection: the gateway built a
+            # request line it cannot send, which is claudebox's fault and never
+            # the provider's. The door check above makes it unreachable.
+            conn.close()
+            self._complete(state, "abandoned", granted, detail=f"gateway request line: {type(exc).__name__}")
+            return self._refuse(400, "invalid_request_error", "the request could not be forwarded")
         except (OSError, http.client.HTTPException, ssl.SSLError) as exc:
             conn.close()
             self._complete(state, "failure", granted, detail=f"upstream transport: {type(exc).__name__}")
