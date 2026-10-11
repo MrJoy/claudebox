@@ -40,6 +40,14 @@ USAGE_LIMIT_RE = re.compile(
 
 _WHITESPACE = re.compile(r"[\n\t ]+")
 
+# Claude Code's own prefix for a request the provider rejected. Some providers'
+# limits never reach stderr: Ollama Cloud's 429 arrives as the result event's
+# text on stdout ("API Error: Request rejected (429) · you have reached your
+# session usage limit"), with rc 1 and a subtype of "success". Only a result
+# carrying this prefix is classified, because an ordinary result is the
+# review's own prose, and a review that discusses rate limiting is not a limit.
+_API_ERROR_PREFIX = "API Error:"
+
 
 def is_usage_limit(text: str) -> bool:
     return bool(USAGE_LIMIT_RE.search(text or ""))
@@ -172,6 +180,7 @@ def run_pass(
 ) -> PassResult:
     argv = build_argv(session_id, model, persona_prompt, mcp_args, prompt)
     recovered = session_id
+    api_error = ""
 
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as errfile:
         proc = popen(
@@ -197,6 +206,10 @@ def run_pass(
             # arrives, so it is in hand before the exit code is judged.
             if event.get("session_id"):
                 recovered = event["session_id"]
+            if event.get("type") == "result":
+                text = event.get("result")
+                if isinstance(text, str) and text.startswith(_API_ERROR_PREFIX):
+                    api_error = text
             for out in format_event(event):
                 log(out, pair=pair)
         proc.stdout.close()
@@ -206,8 +219,10 @@ def run_pass(
         stderr = errfile.read()
 
     if rc != 0:
-        limited = is_usage_limit(stderr)
-        line = usage_limit_line(stderr) if limited else ""
+        # stderr first, so a limit both streams report logs stderr's line.
+        evidence = stderr + "\n" + api_error if api_error else stderr
+        limited = is_usage_limit(evidence)
+        line = usage_limit_line(evidence) if limited else ""
         log(f"WARN: claude exited {rc}:", pair=pair)
         # Truncated at the same 400 characters as usage_limit_line above and
         # gh._stderr_tail, and for the same reason: claude's stderr is not a
