@@ -83,6 +83,12 @@ class LoadTest(unittest.TestCase):
         self.assertIn("timeing: unknown key (did you mean 'timing'?)",
                       problems({"profiles": {"o": profile()}, "timeing": {}}))
 
+    def test_an_unknown_key_inside_a_profile_is_an_error(self):
+        # PR #17 review: profiles are the one tree reached through "*", so only
+        # this case pins the descent into a member's body.
+        # Mutation: Skip the descent for members reached through "*".
+        self.assertIn("profiles.o.typo: unknown key", problems({"profiles": {"o": profile(typo=1)}}))
+
     def test_voyage_credential_is_unknown_until_phase_3b(self):
         # Oracle: tester-brief.md, Task 4, Interfaces and signed starting oracle line 612.
         # Mutation: Accept kindex.voyage_credential prematurely.
