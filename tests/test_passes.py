@@ -320,6 +320,46 @@ class RunPassTest(unittest.TestCase):
         self.assertFalse(got.limited)
         self.assertEqual(got.limit_line, "")
 
+    def test_a_limit_reported_only_in_the_result_event_is_a_limit(self):
+        # Ollama Cloud's 429, as claude 2.1 reported it on 2026-10-11: the
+        # limit is the result event's text on stdout, subtype "success", rc 1,
+        # and stderr carries an unrelated line. Classifying stderr alone
+        # dropped every session and abandoned the cycle as unhealthy.
+        script = self._fake_claude(
+            """
+            import json, sys
+            msg = ("API Error: Request rejected (429) \u00b7 you have reached "
+                   "your session usage limit, add usage credits")
+            print(json.dumps({"type": "system", "subtype": "init", "session_id": "S1"}))
+            print(json.dumps({"type": "result", "subtype": "success",
+                              "session_id": "S1", "result": msg}))
+            sys.stderr.write("[claude-code:unrecognized_model] {}\\n")
+            sys.exit(1)
+            """
+        )
+        got = self._run(script)
+        self.assertEqual(got.rc, 1)
+        self.assertEqual(got.session_id, "S1")
+        self.assertTrue(got.limited)
+        self.assertIn("usage limit", got.limit_line)
+
+    def test_a_failed_passs_own_prose_about_limits_is_not_a_limit(self):
+        # Only Claude Code's "API Error:" result is evidence. A review whose
+        # final text discusses rate limiting, from a pass that then failed for
+        # some other reason, must keep the ordinary failure path.
+        script = self._fake_claude(
+            """
+            import json, sys
+            print(json.dumps({"type": "result", "subtype": "success",
+                              "result": "The retry loop ignores 429 and the rate limit."}))
+            sys.stderr.write("connection reset\\n")
+            sys.exit(1)
+            """
+        )
+        got = self._run(script)
+        self.assertFalse(got.limited)
+        self.assertEqual(got.limit_line, "")
+
     def test_a_resumed_pass_keeps_the_session_id_when_none_is_reported(self):
         script = self._fake_claude("import sys; sys.exit(0)")
         got = self._run(script, session_id="S-prior")
