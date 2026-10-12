@@ -198,6 +198,7 @@ Three failures in a row that are **not** limits — connection refused, a dead t
 ./claudebox.sh logs                            # follow the play-by-play
 ./claudebox.sh test --repo /path/to/your/repo  # one-off, foreground, --rm
 ./claudebox.sh stop
+./claudebox.sh config validate .github/claudebox.json   # check a hosted-App config offline
 ```
 
 **Per-repo config & naming.** Run the launcher from inside a repo's working copy and it
@@ -486,6 +487,39 @@ Both overrides work under `--no-repo` too. `--kindex-profile` then resolves from
 The container never opens your live store: it's mounted read-only as a source, and the loop copies it into the container before anything queries it, verifying the copy before use. Nothing the reviewer does can write back to your host graph.
 
 Rebuild after upgrading kindex on the host. `claudebox.sh build` pins the image's kindex to your host's `kin --version`, so an image older than the schema your store was written with fails the first snapshot at startup with a message telling you to rebuild; an older host schema is migrated into the copy instead of refused. Upgrading kindex on the host while a container is already running shows up later instead, at the next cycle's refresh, as a WARN that keeps the last good snapshot until you rebuild.
+
+## Hosted config (preview)
+
+`.github/claudebox.json` configures the hosted GitHub App, which is still being built. When the App reviews a repo, it will read this file from the repo's default branch, and org-wide defaults from the same path in the org's `.github` repository. Local mode doesn't read it. A container started with `run` or `test` logs one line at startup when the reviewed repo carries the file, and keeps taking its configuration from the env file (`.env.claudebox`).
+
+The design names YAML for this file. It's JSON for now, by a founder ruling, with the design's keys, nesting and meaning:
+
+```json
+{
+  "$schema": "https://raw.githubusercontent.com/MrJoy/claudebox/main/schema/claudebox.schema.json",
+  "version": 1,
+  "trigger": "auto",
+  "profile": "main",
+  "plan": { "label": "plan", "personas": "all" },
+  "code": { "personas": "red_team,adversarial,sme,sage" },
+  "max_concurrent_personas": 0,
+  "rounds": { "cap": 4 },
+  "kindex": { "store": "none" }
+}
+```
+
+The `$schema` line points an editor at `schema/claudebox.schema.json` for completion and squiggles. The loader is stricter than the schema, and the loader decides. An unknown key is an error rather than a silent fall back to the org default, and so is an unknown `version` (a missing one means 1). A repo file overrides the org file key by key. An invalid repo file falls back to the org defaults; when the org file is invalid too, the repo isn't reviewed. The persona fields take the same selector syntax as `PERSONAS` and `PLAN_PERSONAS`.
+
+Check a file before you commit it:
+
+```bash
+./claudebox.sh build                                    # once: validation runs inside the image
+./claudebox.sh config validate .github/claudebox.json
+./claudebox.sh config validate .github/claudebox.json --org path/to/org-defaults.json
+./claudebox.sh config validate .github/claudebox.json --deploy claudebox.deploy.json --repo-name OWNER/NAME
+```
+
+It runs in a throwaway container with no network, the files mounted read-only, so it needs a built image. Without `--deploy` it checks the file's shape alone and says plainly that `profile`, `model`, `team` and `kindex.store` went unchecked, since only a deployment can judge those. With `--deploy`, it also checks the merged config against the operator's deployment file (`claudebox.deploy.json`): the profile exists, the model is one the profile allows, and the org kindex store is there and shared with this repo (that last check needs `--repo-name`). Whatever only the running App can know, such as whether a team exists or the repo is private, is printed as `NOT CHECKED HERE` and never counted as a pass. The repo file is judged strictly. A problem in it fails the run even though the App would fall back to the org defaults, and the output says which fallback would apply.
 
 ## Notes & caveats
 

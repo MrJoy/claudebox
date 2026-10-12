@@ -284,5 +284,206 @@ if selected "$L"; then
   expect "$L" 1 -- "ERROR:" "--new cannot be combined with --all"
 fi
 
+CFG="$WORK/claudebox.json"; printf '{}\n' >"$CFG"
+DEP="$WORK/claudebox.deploy.json"; printf '{}\n' >"$DEP"
+
+# Oracle: tester-brief.md Task 8 Interfaces (command, mounts and rejection rules).
+# Mutation: Drop --network none or the capability/no-new-privileges hardening flags.
+L="config validate: runs the validator in a hardened, network-less throwaway container"
+if selected "$L"; then
+  launch "$L" 0 -- -- config validate "$CFG"
+  expect "$L" 0 -- "docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges" \
+    "$CFG:/config/claudebox.json:ro" "--entrypoint python3 claudebox /opt/claudebox/reviewer/config_cli.py validate /config/claudebox.json" \
+    '!--deploy' '!--env-file'
+fi
+
+# Oracle: tester-brief.md Task 8 Interfaces (command, mounts and rejection rules).
+# Mutation: Drop the deployment bind mount or the repo-name argument.
+L="config validate: --deploy and --repo-name reach the validator"
+if selected "$L"; then
+  launch "$L" 0 -- -- config validate "$CFG" --deploy "$DEP" --repo-name acme/api
+  expect "$L" 0 -- "$DEP:/config/claudebox.deploy.json:ro" "--deploy /config/claudebox.deploy.json" "--repo-name acme/api"
+fi
+
+# Oracle: tester-brief.md Task 8 Interfaces (command, mounts and rejection rules).
+# Mutation: Drop the org bind mount or pass its host path inside the container.
+L="config validate: --org is mounted and passed"
+if selected "$L"; then
+  launch "$L" 0 -- -- config validate "$CFG" --org "$DEP"
+  expect "$L" 0 -- "$DEP:/config/org.json:ro" "--org /config/org.json"
+fi
+
+# Oracle: tester-brief.md Task 8 Interfaces (command, mounts and rejection rules).
+# Mutation: Leave a relative config path relative on the Docker host.
+L="config validate: a relative FILE is made absolute"
+if selected "$L"; then
+  (cd "$WORK" && env -i PATH="$BASE_PATH" HOME="$WORK" /bin/bash "$LAUNCHER" --dry-run config validate claudebox.json >"$WORK/out" 2>&1); RC=$?
+  expect "$L" 0 -- "$WORK/claudebox.json:/config/claudebox.json:ro"
+fi
+
+# Oracle: tester-brief.md Task 8 Interfaces (command, mounts and rejection rules).
+# Mutation: Name Docker before rejecting a missing config file.
+L="config validate: a missing FILE dies before docker"
+if selected "$L"; then
+  launch "$L" 0 -- -- config validate "$WORK/nope.json"
+  expect "$L" 1 -- "FILE not found: $WORK/nope.json" '!docker run'
+fi
+
+# Oracle: tester-brief.md Task 8 Interfaces (command, mounts and rejection rules).
+# Mutation: Skip existence validation for --deploy.
+L="config validate: a missing --deploy dies"
+if selected "$L"; then
+  launch "$L" 0 -- -- config validate "$CFG" --deploy "$WORK/nope.json"
+  expect "$L" 1 -- "--deploy not found"
+fi
+
+# Oracle: tester-brief.md Task 8 Interfaces (command, mounts and rejection rules).
+# Mutation: Accept config without a subcommand.
+L="config: no subcommand dies"
+if selected "$L"; then
+  launch "$L" 0 -- -- config
+  expect "$L" 1 -- "config needs a subcommand"
+fi
+
+# Oracle: tester-brief.md Task 8 Interfaces (command, mounts and rejection rules).
+# Mutation: Accept config check as an alias for validate.
+L="config: an unknown subcommand dies"
+if selected "$L"; then
+  launch "$L" 0 -- -- config check "$CFG"
+  expect "$L" 1 -- "unknown config subcommand 'check'"
+fi
+
+# Oracle: tester-brief.md Task 8 Interfaces (command, mounts and rejection rules).
+# Mutation: Accept config validate without a file.
+L="config validate: no FILE dies"
+if selected "$L"; then
+  launch "$L" 0 -- -- config validate
+  expect "$L" 1 -- "config validate needs a FILE"
+fi
+
+# Oracle: tester-brief.md Task 8 Interfaces (command, mounts and rejection rules).
+# Mutation: Ignore a second config file argument.
+L="config validate: two FILEs die"
+if selected "$L"; then
+  launch "$L" 0 -- -- config validate "$CFG" "$DEP"
+  expect "$L" 1 -- "config validate takes one FILE"
+fi
+
+# Oracle: tester-brief.md Task 8 Interfaces (command, mounts and rejection rules).
+# Mutation: Allow deployment config flags on run.
+L="config flags with another command die"
+if selected "$L"; then
+  launch "$L" 0 -- -- "${RUN[@]}" --deploy "$DEP"
+  expect "$L" 1 -- "only apply to config validate"
+fi
+
+# Oracle: tester-brief.md Task 8 Interfaces (command, mounts and rejection rules).
+# Mutation: Reparse a FILE named run as another command.
+L="config validate: a FILE named like a command is still a FILE"
+if selected "$L"; then
+  printf '{}\n' >"$WORK/run"
+  (cd "$WORK" && env -i PATH="$BASE_PATH" HOME="$WORK" /bin/bash "$LAUNCHER" --dry-run config validate run >"$WORK/out" 2>&1); RC=$?
+  expect "$L" 0 -- "$WORK/run:/config/claudebox.json:ro" '!more than one command'
+fi
+
+# Oracle: tester-brief.md Task 8 Interfaces (command, mounts and rejection rules).
+# Mutation: Require an env file or repo for config validation.
+L="config validate: needs no env file and no repo"
+if selected "$L"; then
+  (cd "$WORK" && env -i PATH="$BASE_PATH" HOME="$WORK" /bin/bash "$LAUNCHER" --dry-run --no-repo config validate "$CFG" >"$WORK/out" 2>&1); RC=$?
+  expect "$L" 0 -- "config_cli.py validate"
+fi
+
+
+# Oracle: Task 8 Interfaces, FILE/--org/--deploy must be regular files before docker.
+# Mutation: check existence only, allowing directories through as config mounts.
+L="config validate: directories are not config files"
+if selected "$L"; then
+  launch "$L" 0 -- -- config validate "$WORK"
+  expect "$L" 1 -- "FILE not found: $WORK" '!docker run'
+  launch "$L" 0 -- -- config validate "$CFG" --org "$WORK"
+  expect "$L (org)" 1 -- "--org not found: $WORK" '!docker run'
+  launch "$L" 0 -- -- config validate "$CFG" --deploy "$WORK"
+  expect "$L (deploy)" 1 -- "--deploy not found: $WORK" '!docker run'
+fi
+
+# Oracle: Task 8 Interfaces, missing --org is refused before docker.
+# Mutation: omit --org file validation while validating --deploy only.
+L="config validate: missing org file dies before docker"
+if selected "$L"; then
+  launch "$L" 0 -- -- config validate "$CFG" --org "$WORK/no-org.json"
+  expect "$L" 1 -- "--org not found: $WORK/no-org.json" '!docker run'
+fi
+
+# Oracle: Task 8 Interfaces, all three flags belong only to config validate.
+# Mutation: scope-check --deploy alone and accept --org or --repo-name with run.
+L="config flags: org and repo-name are refused with run"
+if selected "$L"; then
+  launch "$L" 0 -- -- "${RUN[@]}" --org "$DEP"
+  expect "$L (org)" 1 -- "only apply to config validate" '!docker run'
+  launch "$L" 0 -- -- "${RUN[@]}" --repo-name acme/api
+  expect "$L (repo-name)" 1 -- "only apply to config validate" '!docker run'
+fi
+
+# Oracle: Task 8 exact docker contract; CLAUDE.md resource flags 512 and 4g.
+# Mutation: config branch omits --pids-limit or --memory.
+L="config validate: resource limits survive the config branch"
+if selected "$L"; then
+  launch "$L" 0 -- -- config validate "$CFG"
+  expect "$L" 0 -- '--pids-limit 512' '--memory 4g'
+fi
+
+# Oracle: Validator DISPATCH 2: base 27dd46a claudebox.sh argument-loop
+# final *) arm rejects stray bare words; Task 8 admits positionals only for config.
+# Guard: green-now compatibility guard; Validator owns base/head observations.
+# Mutation: accumulate or ignore bare positionals for run as well as config.
+L="arguments: a stray bare word after run is unknown"
+if selected "$L"; then
+  launch "$L" 0 -- -- "${RUN[@]}" stray-word
+  expect "$L" 1 -- "unknown argument: stray-word (see --help)." '!docker run'
+fi
+
+# Oracle: Validator DISPATCH 2: base 27dd46a claudebox.sh argument-loop
+# final *) arm rejects stray bare words; Task 8 admits positionals only for config.
+# Guard: green-now compatibility guard; Validator owns base/head observations.
+# Mutation: collect a bare word before command selection as a deferred positional.
+L="arguments: a stray bare word before any command is unknown"
+if selected "$L"; then
+  launch "$L" 0 -- -- stray-word "${RUN[@]}"
+  expect "$L" 1 -- "unknown argument: stray-word (see --help)." '!docker run'
+fi
+
+# Oracle: spec-amendment-1.md observable contract (ratified Task 8): CDPATH
+# must not redirect the source away from the relative file the operator named.
+# Mutation: use plain cd on dirname without neutralizing CDPATH or prefixing ./.
+# Reachability: both cwd and CDPATH contain shared/input.json; only cwd is right.
+L="config validate: CDPATH cannot redirect a relative FILE mount"
+if selected "$L"; then
+  mkdir -p "$WORK/path-operator/shared" "$WORK/path-shadow/shared"
+  printf '{}\n' >"$WORK/path-operator/shared/input.json"
+  printf '{"trigger":"requested"}\n' >"$WORK/path-shadow/shared/input.json"
+  (CDPATH= cd "$WORK/path-operator" && env -i PATH="$BASE_PATH" HOME="$WORK" \
+    CDPATH="$WORK/path-shadow" /bin/bash "$LAUNCHER" --dry-run \
+    config validate shared/input.json >"$WORK/out" 2>&1); RC=$?
+  expect "$L" 0 -- "$WORK/path-operator/shared/input.json:/config/claudebox.json:ro" \
+    "!$WORK/path-shadow/shared"
+fi
+
+# Oracle: spec-amendment-1.md observable contract (ratified Task 8): a named
+# file under a directory literally '-' remains that file, including for --org.
+# Mutation: feed '-' to cd as directory operand, following OLDPWD instead.
+# Reachability: '-/o.json' exists and OLDPWD names a distinct existing directory.
+L="config validate: org path under dash directory mounts the named file"
+if selected "$L"; then
+  mkdir -p "$WORK/dash-operator/-" "$WORK/dash-oldpwd"
+  printf '{}\n' >"$WORK/dash-operator/-/o.json"
+  (CDPATH= cd "$WORK/dash-operator" && env -i PATH="$BASE_PATH" HOME="$WORK" \
+    OLDPWD="$WORK/dash-oldpwd" /bin/bash "$LAUNCHER" --dry-run \
+    config validate "$CFG" --org -/o.json >"$WORK/out" 2>&1); RC=$?
+  expect "$L" 0 -- "$WORK/dash-operator/-/o.json:/config/org.json:ro" \
+    '--org /config/org.json' "!$WORK/dash-oldpwd:/config/org.json:ro" \
+    "!$WORK/dash-operator/-:/config/org.json:ro"
+fi
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = 0 ] || { printf 'Failed:%s\n' "$FAILED"; exit 1; }

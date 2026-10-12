@@ -30,6 +30,12 @@ PIDS="512"
 TAIL=0
 DRY_RUN=0
 
+# `config validate` (the hosted App's repo config; run inside the image).
+CONFIG_POS=()
+CONFIG_ORG=""
+CONFIG_DEPLOY=""
+CONFIG_REPO_NAME=""
+
 # PR selectors (mutually exclusive; passed through to the container as -e VARs).
 PR_ALL=0
 PR_ASSIGNEE=""
@@ -76,6 +82,13 @@ COMMANDS
   shell     Open a bash shell inside the running container.
   stop      Stop and remove the container.
   status    Show the container's state (and live resource stats if running).
+  config validate FILE [--org FILE] [--deploy FILE] [--repo-name NAME]
+            Check a hosted-App repo config (.github/claudebox.json) offline,
+            inside the image, in a network-less throwaway container. --org
+            merges org defaults under it; --deploy also checks it against a
+            deployment file (claudebox.deploy.json); --repo-name OWNER/NAME
+            lets that check read the org kindex store's share_with list.
+            Local mode (run/test) does not read this file.
 
 OPTIONS
   --repo PATH       Host repo to seed the reviewer from (default: current dir).
@@ -185,9 +198,17 @@ COMMAND=""
 EXTRA=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    build|run|test|logs|shell|stop|status)
-      [ -z "$COMMAND" ] || die "more than one command given ('$COMMAND' and '$1')."
-      COMMAND="$1" ;;
+    build|run|test|logs|shell|stop|status|config)
+      # After `config`, every bare word is its own positional: a file may
+      # be called `run` or `test`.
+      if [ "$COMMAND" = config ]; then CONFIG_POS+=("$1")
+      else
+        [ -z "$COMMAND" ] || die "more than one command given ('$COMMAND' and '$1')."
+        COMMAND="$1"
+      fi ;;
+    --org)         CONFIG_ORG="${2:?--org requires a FILE}"; shift ;;
+    --deploy)      CONFIG_DEPLOY="${2:?--deploy requires a FILE}"; shift ;;
+    --repo-name)   CONFIG_REPO_NAME="${2:?--repo-name requires OWNER/NAME}"; shift ;;
     --repo)        REPO="${2:?--repo requires a PATH}"; MOUNT_REPO=1; REPO_EXPLICIT=1; shift ;;
     --no-repo)     MOUNT_REPO=0 ;;
     --env-file)    ENV_FILE="${2:?--env-file requires a PATH}"; ENV_FILE_EXPLICIT=1; shift ;;
@@ -215,12 +236,19 @@ while [ $# -gt 0 ]; do
     -h|--help)     usage; exit 0 ;;
     --)            shift; EXTRA=("$@"); break ;;
     -*)            die "unknown option: $1 (see --help)." ;;
-    *)             die "unknown argument: $1 (see --help)." ;;
+    *)
+      if [ "$COMMAND" = config ]; then CONFIG_POS+=("$1")
+      else die "unknown argument: $1 (see --help)."
+      fi ;;
   esac
   shift
 done
 
 [ -n "$COMMAND" ] || { usage; exit 2; }
+
+if [ "$COMMAND" != config ] && { [ -n "$CONFIG_ORG" ] || [ -n "$CONFIG_DEPLOY" ] || [ -n "$CONFIG_REPO_NAME" ]; }; then
+  die "--org/--deploy/--repo-name only apply to config validate."
+fi
 
 # Selector flags are mutually exclusive (the entrypoint is authoritative and
 # also errors when none/multiple are set via the env file; this is the friendly
@@ -297,10 +325,10 @@ derive_name() {
   announce "container name: $NAME (from $src)"
 }
 
-# Run the resolution appropriate to the command. build needs nothing; test is
-# ephemeral/unnamed so it skips name derivation.
+# Run the resolution appropriate to the command. build and config need
+# nothing; test is ephemeral/unnamed so it skips name derivation.
 case "$COMMAND" in
-  build) : ;;
+  build|config) : ;;
   test)  resolve_env_file; resolve_repo ;;
   *)     resolve_env_file; resolve_repo; derive_name ;;
 esac
@@ -508,5 +536,32 @@ case "$COMMAND" in
     if [ "$DRY_RUN" != 1 ] && docker ps --filter "name=^/${NAME}$" --format '{{.Names}}' | grep -q "^${NAME}$"; then
       docker stats --no-stream "$NAME"
     fi
+    ;;
+  config)
+    abs() {
+      case "$1" in /*) set -- "$1" ;; *) set -- "./$1" ;; esac
+      (CDPATH= cd "$(dirname "$1")" && printf '%s/%s' "$(pwd)" "$(basename "$1")")
+    }
+    [ "${#CONFIG_POS[@]}" -gt 0 ] || die "config needs a subcommand: config validate FILE"
+    [ "${CONFIG_POS[0]}" = validate ] || die "unknown config subcommand '${CONFIG_POS[0]}' (the only one is validate)."
+    [ "${#CONFIG_POS[@]}" -ge 2 ] || die "config validate needs a FILE."
+    [ "${#CONFIG_POS[@]}" -le 2 ] || die "config validate takes one FILE."
+    cfg_file="${CONFIG_POS[1]}"
+    [ -f "$cfg_file" ] || die "FILE not found: $cfg_file"
+    [ -z "$CONFIG_ORG" ] || [ -f "$CONFIG_ORG" ] || die "--org not found: $CONFIG_ORG"
+    [ -z "$CONFIG_DEPLOY" ] || [ -f "$CONFIG_DEPLOY" ] || die "--deploy not found: $CONFIG_DEPLOY"
+    mounts=(-v "$(abs "$cfg_file"):/config/claudebox.json:ro")
+    cli_args=(validate /config/claudebox.json)
+    if [ -n "$CONFIG_ORG" ]; then
+      mounts+=(-v "$(abs "$CONFIG_ORG"):/config/org.json:ro"); cli_args+=(--org /config/org.json)
+    fi
+    if [ -n "$CONFIG_DEPLOY" ]; then
+      mounts+=(-v "$(abs "$CONFIG_DEPLOY"):/config/claudebox.deploy.json:ro")
+      cli_args+=(--deploy /config/claudebox.deploy.json)
+    fi
+    [ -z "$CONFIG_REPO_NAME" ] || cli_args+=(--repo-name "$CONFIG_REPO_NAME")
+    show_and_run docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges \
+      --pids-limit "$PIDS" --memory "$MEMORY" "${mounts[@]}" \
+      --entrypoint python3 "$IMAGE" /opt/claudebox/reviewer/config_cli.py "${cli_args[@]}"
     ;;
 esac
