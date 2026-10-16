@@ -24,6 +24,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
 
+import codex_pass
 import gh
 import graph_snapshot
 import kindex_tools
@@ -50,6 +51,19 @@ CYCLE_UNHEALTHY = "unhealthy"
 # walking a whole list into a dead endpoint costs a duplicate-comment burst per
 # pair.
 MAX_CONSECUTIVE_FAILURES = 3
+
+
+# Which CLI runs a review pass. Claude Code by default; Codex runs on a ChatGPT
+# subscription login (docs/superpowers/specs/2026-10-16-codex-agent-design.md).
+AGENTS = ("claude", "codex")
+
+
+def parse_agent(env: Mapping[str, str]) -> str:
+    """AGENT, validated. Unset or empty is claude."""
+    agent = env.get("AGENT", "").strip() or "claude"
+    if agent not in AGENTS:
+        raise ConfigError(f"unknown AGENT='{agent}'; use one of: " + ", ".join(AGENTS) + ".")
+    return agent
 
 
 def parse_max_concurrent(env: Mapping[str, str]) -> int:
@@ -399,7 +413,9 @@ class Supervisor:
         max_concurrent: int = 0,
         persona_phases: Optional[Dict[Tuple[str, str], int]] = None,
         plan_max_rounds: int = 0,
+        agent: str = "claude",
     ):
+        self.agent = agent
         self.review_prompts = review_prompts
         self.followup_prompts = followup_prompts
         self.model = model
@@ -553,6 +569,16 @@ class Supervisor:
 
     def _run_one(self, pair: Pair, prompt: str, session_id: Optional[str]):
         try:
+            if self.agent == "codex":
+                # No MCP flags: kindex and Linear are not wired under Codex yet.
+                return codex_pass.run_pass(
+                    pair=pair,
+                    prompt=prompt,
+                    session_id=session_id,
+                    persona_prompt=self.system_prompt_for(pair),
+                    model=self.model,
+                    cwd=self.cwd,
+                )
             return passes.run_pass(
                 pair=pair,
                 prompt=prompt,
@@ -569,7 +595,7 @@ class Supervisor:
             # non-zero rc for all three. Letting the exception out instead exits
             # PID 1, and since the session map lives only in memory the restart
             # makes every pair re-post findings it already posted.
-            log(f"WARN: could not run claude: {exc}", pair=pair)
+            log(f"WARN: could not run {self.agent}: {exc}", pair=pair)
             return passes.PassResult(rc=1, session_id=session_id, limited=False, limit_line="")
 
     # Decisions, delegated to the Decider.
@@ -662,6 +688,10 @@ class Supervisor:
             any_success = False
             group_failures = 0
             limited_here = set()
+            # Pairs that succeeded on a model Codex substituted. Their comments
+            # are posted, so they are successes, but nothing more should run on
+            # that model this cycle.
+            switched_here = set()
             # A pair the pool could not accept. It did not run, so it is neither
             # a success nor a failure, and its session stands.
             unstarted = [p for p in to_run if p not in results]
@@ -673,6 +703,8 @@ class Supervisor:
                 if result.rc == 0:
                     any_success = True
                     self._record_success(pair, result, signal)
+                    if result.switched:
+                        switched_here.add(pair)
                 elif result.limited:
                     limited_here.add(pair)
                     self._record_limit(pair, result)
@@ -699,14 +731,14 @@ class Supervisor:
                 p for p in self.debt_for(group, signal) if p not in results
             }
 
-            if limited_here or unstarted:
+            if limited_here or unstarted or switched_here:
                 # limited_here is unioned in rather than filtered: a pair that
                 # reported a limit ran, so it has a result and debt_for
                 # cannot see it. The pool's refusals need no such treatment --
                 # they were selected to run, so the gate does not hold them.
-                if unstarted and not limited_here:
+                if unstarted and not (limited_here or switched_here):
                     log("WARN: the worker pool refused a pass; abandoning this cycle.")
-                outcome = CYCLE_LIMITED if limited_here else CYCLE_OK
+                outcome = CYCLE_LIMITED if (limited_here or switched_here) else CYCLE_OK
                 cut_index, cut_owes = index, limited_here | still_owed
                 break
 
@@ -751,6 +783,7 @@ def preflight(env: Mapping[str, str]) -> Tuple[str, Dict[str, List[personas_mod.
     Which means it may read only what the environment already holds at that
     point: nothing entrypoint.sh exports on its way to the exec.
     """
+    parse_agent(env)
     selector = gh.resolve_pr_selection(env)
     persona_dir = env.get("PERSONA_DIR") or "/opt/claudebox/personas"
     resolved = {
@@ -784,7 +817,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     try:
         selector, resolved = preflight(env)
-        if check_provider:
+        if check_provider and parse_agent(env) == "claude":
             # Opt-in rather than part of --check itself: entrypoint.sh asks for
             # it, ahead of the provider case block that used to do this, and a
             # caller with no provider in its environment (the hosted control
@@ -792,6 +825,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             providers.validate(env)
         if check_only:
             return 0
+        agent = parse_agent(env)
+        log(f"Review agent: {agent}")
         for mode in personas_mod.REVIEW_MODES:
             log(f"{mode} personas: " + " ".join(p.id for p in resolved[mode]))
 
@@ -900,6 +935,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_concurrent=max_concurrent,
         persona_phases={(m, p.id): p.phase for m, ps in resolved.items() for p in ps},
         plan_max_rounds=plan_max_rounds,
+        agent=agent,
     )
     tracker = signals_mod.Tracker()
 
