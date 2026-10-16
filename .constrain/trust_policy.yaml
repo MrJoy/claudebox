@@ -26,12 +26,12 @@ classifications:
     canary_eligible: false
     canary_pattern: null
     rationale: "The real safety boundary. Its scope cannot be introspected from inside the container, so it is trusted by construction and verified by the operator before an unattended run."
-  - field_pattern: "provider credential (OLLAMA_API_KEY, ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, CLOUDFLARE_API_TOKEN, ANTHROPIC_CUSTOM_HEADERS)"
+  - field_pattern: "provider credential (OLLAMA_API_KEY, ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, CLOUDFLARE_API_TOKEN, OPENAI_API_KEY, ANTHROPIC_CUSTOM_HEADERS)"
     tier: AUTH
     authoritative_component: "provider-wiring"
     canary_eligible: false
     canary_pattern: null
-    rationale: "Never logged. For workersai the real Cloudflare token is withheld from the review session and replaced by a per-container LiteLLM master key, precisely so a prompt-injected review cannot read it."
+    rationale: "Never logged. For workersai and openai the real upstream token is withheld from the review session's environment and replaced by a per-container LiteLLM master key, so a prompt-injected review cannot read it from env. The translator runs as the same uid, so /proc/<pid>/environ still exposes it to a determined one."
   - field_pattern: "LINEAR_API_KEY"
     tier: AUTH
     authoritative_component: "supervisor"

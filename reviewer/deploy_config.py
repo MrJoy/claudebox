@@ -22,7 +22,7 @@ DEPLOY_FILE_CAP = 256 * 1024
 # Provisional (plan decision 6): which provider types report usage on every
 # response, so a `tokens` budget can be counted. Phase 2a narrows this from
 # live responses. `custom` joins only when its profile says `usage: reported`.
-TOKEN_REPORTING = frozenset({"ollama", "anthropic", "cloudflare", "workersai"})
+TOKEN_REPORTING = frozenset({"ollama", "anthropic", "cloudflare", "workersai", "openai"})
 
 KEYS = {
     "profiles": {"*": {

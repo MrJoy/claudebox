@@ -326,7 +326,7 @@ def partition_settling(snapshots, settle_seconds: int, now: float):
 
 
 def check_litellm(env: Mapping[str, str]) -> None:
-    """Are the workersai translators still up?
+    """Are the LiteLLM translator and the Workers AI normalizer still up?
 
     Called each cycle so a dead one is a loud, fatal error rather than every
     review pass failing on connection refused. No-op for every other provider.

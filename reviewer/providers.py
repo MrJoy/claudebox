@@ -5,7 +5,7 @@ module decides it for both of the places that need to: local mode, through
 `review_loop.py --check --provider` ahead of the entrypoint's auth, clone and
 translator startup, and the hosted gateway's profile loader. Validation only.
 Wiring the environment Claude Code is handed (the exports, the blanking and
-unsetting of the credential vars, the model-tier pinning, the Workers AI
+unsetting of the credential vars, the model-tier pinning, the LiteLLM
 translator) stays in entrypoint.sh, which runs it after this has passed.
 
 Every check reads only what the environment holds before the entrypoint wires
@@ -19,7 +19,7 @@ from typing import Mapping, Optional
 
 from common import ConfigError
 
-PROVIDERS = ("ollama", "anthropic", "custom", "cloudflare", "workersai")
+PROVIDERS = ("ollama", "anthropic", "custom", "cloudflare", "workersai", "openai")
 GATEWAY_UPSTREAMS = ("anthropic", "bedrock", "vertex")
 CUSTOM_HEADER_MAX = 20
 
@@ -219,6 +219,12 @@ def _workersai(env: Mapping[str, str]) -> None:
               f"https://api.cloudflare.com/client/v4/accounts/{account}/ai/v1")
 
 
+def _openai(env: Mapping[str, str]) -> None:
+    _require(env, "OPENAI_API_KEY",
+             "set OPENAI_API_KEY to an OpenAI API key "
+             "(platform.openai.com/api-keys) for PROVIDER=openai")
+
+
 def validate(env: Mapping[str, str]) -> str:
     """Refuse a provider configuration Claude Code cannot use. Returns the provider.
 
@@ -238,6 +244,8 @@ def validate(env: Mapping[str, str]) -> str:
         _cloudflare(env)
     elif provider == "workersai":
         _workersai(env)
+    elif provider == "openai":
+        _openai(env)
     else:
         raise ConfigError(
             f"unknown PROVIDER='{provider}'; use one of: " + ", ".join(PROVIDERS) + "."

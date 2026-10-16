@@ -702,7 +702,7 @@ class CheckLitellmTest(unittest.TestCase):
             proc.wait()
 
     def test_an_unset_or_empty_pid_is_a_no_op(self):
-        # Every provider but workersai leaves these unset.
+        # Every provider but workersai and openai leaves these unset.
         review_loop.check_litellm({})
         review_loop.check_litellm({"LITELLM_PID": "", "SHIM_PID": ""})
 
