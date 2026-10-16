@@ -35,6 +35,16 @@ RUN mkdir -p /etc/apt/keyrings \
 # --- Claude Code CLI -------------------------------------------------------
 RUN npm install -g @anthropic-ai/claude-code
 
+# --- Codex CLI -------------------------------------------------------------
+# For AGENT=codex, which runs review passes on a ChatGPT subscription login
+# (docs/superpowers/specs/2026-10-16-codex-agent-design.md). Pinned because the
+# flags codex_pass.py passes were verified against this version; bump it on
+# purpose and re-run the spec's verification. Root-owned, like every other tool
+# the reviewer runs but must not be able to modify.
+ARG CODEX_VERSION=0.162.1
+RUN npm install -g @openai/codex@${CODEX_VERSION} \
+ && codex --version
+
 # --- Anthropic -> OpenAI translator (LiteLLM) ------------------------------
 # For PROVIDER=workersai. Cloudflare's Workers AI models (@cf/...) are reachable
 # only over an OpenAI-compatible schema — Cloudflare's own docs say the
@@ -173,7 +183,10 @@ WORKDIR /home/reviewer
 # --export-sessions: it bind-mounts a single host folder at
 # ~/.claude/projects/<encoded>, and if that parent didn't already exist Docker
 # would create it root-owned, blocking Claude Code's other writes under ~/.claude.
-RUN mkdir -p /home/reviewer/.claude/projects \
+# ~/.codex has to exist in the image, owned by `reviewer`: Docker copies an image
+# directory's ownership into a new named volume mounted over it, which is what
+# makes the claudebox-codex volume writable for Codex's token refreshes.
+RUN mkdir -p /home/reviewer/.claude/projects /home/reviewer/.codex \
  && printf '{"hasCompletedOnboarding": true, "bypassPermissionsModeAccepted": true}\n' \
       > /home/reviewer/.claude.json
 
