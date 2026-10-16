@@ -1,4 +1,4 @@
-"""Running one review pass.
+"""Running one review pass through Claude Code (codex_pass.py is the Codex one).
 
 One `claude` invocation, its stream-json consumed as it arrives, its stderr
 captured to a temp file. stdout is the only pipe on purpose: reading two pipes
@@ -166,6 +166,9 @@ class PassResult:
     session_id: Optional[str]
     limited: bool
     limit_line: str
+    # Set by codex_pass only: the pass succeeded on a model Codex substituted
+    # for the one asked for, so the cycle stops after the group.
+    switched: bool = False
 
 
 def run_pass(
@@ -185,6 +188,7 @@ def run_pass(
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as errfile:
         proc = popen(
             argv,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=errfile,
             cwd=cwd,

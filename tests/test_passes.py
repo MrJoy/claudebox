@@ -234,6 +234,30 @@ class RunPassTest(unittest.TestCase):
         self.assertEqual(got.session_id, "S1")
         self.assertFalse(got.limited)
 
+    def test_stdin_is_closed(self):
+        # The Codex runner needs this (codex exec blocks on an open stdin), and
+        # both runners share it so neither inherits PID 1's stdin.
+        script = self._fake_claude(
+            """
+            import json, sys
+            if sys.stdin.read() != "":
+                sys.exit(3)
+            print(json.dumps({"type": "result", "subtype": "success", "result": "ok"}))
+            """
+        )
+        seen = {}
+
+        def popen(argv, **pk):
+            seen.update(pk)
+            return subprocess.Popen([sys.executable, script], **pk)
+
+        got = passes.run_pass(
+            pair=Pair(12, "code", "sage"), prompt="review it", session_id=None,
+            persona_prompt="p", model="m", mcp_args=[], cwd=".", popen=popen,
+        )
+        self.assertIs(seen.get("stdin"), subprocess.DEVNULL)
+        self.assertEqual(got.rc, 0)
+
     def test_last_session_id_wins(self):
         script = self._fake_claude(
             """
