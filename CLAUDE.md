@@ -420,6 +420,7 @@ Facts the code rests on (codex-cli 0.162.1, measured 2026-10-16):
 - A reviewed repo's `.codex/config.toml` starts its MCP servers in a fresh `CODEX_HOME` with no trust entry. `--ignore-user-config` stops that, so it's on every pass. It also skips `$CODEX_HOME/config.toml`, so Codex settings come from `-c` flags only.
 - `$CODEX_HOME/AGENTS.md` is read even under `--ignore-user-config`.
 - Refresh tokens are single-use ("your refresh token was already used").
+- `codex login status` reports "Logged in using ChatGPT" for any `auth.json`, even `{}`. The entrypoint also checks the file for `auth_mode: chatgpt` and a refresh token. A revoked login still passes both, so `codex_pass` logs a `codex-login` hint when a pass fails on authentication.
 - The binary carries "waiting for OAuth refresh lock", suggesting refreshes serialize across processes. Check 7 in the spec's verification list proves or disproves it for concurrent passes.
 - `exec --json` events: `thread.started` (`thread_id` is the session id), `item.completed` (`agent_message`, `command_execution`, `error`), `turn.completed`, `turn.failed` (`error.message`), and `error` (`message`; "Reconnecting... n/5" is a retry, not a failure).
 

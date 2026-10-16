@@ -24,6 +24,11 @@ _RECONNECTING = "Reconnecting..."
 
 _SWITCHED = re.compile(r"Automatically switched to (.+?) due to")
 
+# A login that no longer works. `codex login status` passes any auth.json, so
+# this is where a revoked or signed-out login first shows itself.
+_AUTH_FAILURE = re.compile(r"sign in again|refresh token|401 Unauthorized|not logged in",
+                           re.IGNORECASE)
+
 _TOML_ESCAPES = {'"': '\\"', "\\": "\\\\", "\b": "\\b", "\t": "\\t",
                  "\n": "\\n", "\f": "\\f", "\r": "\\r"}
 
@@ -215,6 +220,9 @@ def run_pass(
         # stderr cannot be assumed credential-free.
         for tail in [ln for ln in (stderr.splitlines() + errors) if ln.strip()][-5:]:
             log(f"  {tail[:400]}", pair=pair)
+        if not limited and _AUTH_FAILURE.search(evidence):
+            log("WARN: the Codex login looks invalid; run claudebox.sh codex-login "
+                "and restart the container.", pair=pair)
         return passes.PassResult(rc=rc or 1, session_id=recovered,
                                  limited=limited, limit_line=limit_line)
 

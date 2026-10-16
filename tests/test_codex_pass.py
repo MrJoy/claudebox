@@ -253,6 +253,23 @@ class RunPassTest(unittest.TestCase):
         self.assertNotEqual(got.rc, 0)
         self.assertTrue(got.limited)
 
+    def test_an_auth_failure_names_codex_login(self):
+        # codex login status passes any auth.json, so a revoked login first
+        # shows itself here. The hint is what turns a run of failed passes into
+        # something an operator can act on.
+        msg = ("Your access token could not be refreshed because your refresh token "
+               "was already used. Please log out and sign in again.")
+        got, log, _ = self._run(self._events(
+            {"type": "turn.failed", "error": {"message": msg}}, rc=1))
+        self.assertNotEqual(got.rc, 0)
+        self.assertFalse(got.limited)
+        self.assertIn("claudebox.sh codex-login", log)
+
+    def test_an_ordinary_failure_does_not_name_codex_login(self):
+        got, log, _ = self._run(self._events(
+            {"type": "turn.failed", "error": {"message": "unexpected status 400"}}, rc=1))
+        self.assertNotIn("codex-login", log)
+
     def test_a_model_switch_is_reported(self):
         got, log, _ = self._run(self._events(
             {"type": "x", "previous_model": "gpt-6.1-sol", "current_model": "gpt-6-luna"},

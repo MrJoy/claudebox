@@ -349,11 +349,19 @@ run_entrypoint() {
   local label="$1"; shift
   HOME_DIR="$WORK/home"; OUT="$WORK/out"
   rm -rf "$HOME_DIR"; mkdir -p "$HOME_DIR/work/repo/.git" "$HOME_DIR/seed"
+  # AGENT=codex needs a login in the volume: a ChatGPT-shaped auth.json, or
+  # `{}` under CODEX_AUTH=empty (which `codex login status` still calls a login).
+  case " $* " in
+    *" AGENT=codex "*)
+      mkdir -p "$HOME_DIR/.codex"
+      case " $* " in
+        *" CODEX_AUTH=empty "*) echo '{}' >"$HOME_DIR/.codex/auth.json" ;;
+        *) echo '{"auth_mode":"chatgpt","tokens":{"refresh_token":"r"}}' >"$HOME_DIR/.codex/auth.json" ;;
+      esac ;;
+  esac
   # PRESEED_CODEX=1: a login volume a hostile earlier pass wrote into.
   case " $* " in
     *" PRESEED_CODEX=1 "*)
-      mkdir -p "$HOME_DIR/.codex"
-      echo '{}' >"$HOME_DIR/.codex/auth.json"
       touch "$HOME_DIR/.codex/AGENTS.md" "$HOME_DIR/.codex/hooks.json" ;;
   esac
   # KINDEX_SRC is pinned to a path that never exists, so a host with a store
@@ -763,6 +771,9 @@ cycle "codex: CODEX_HOME is pruned to auth.json at startup" \
 
 refuses "codex: without a login, startup names codex-login" "claudebox.sh codex-login" \
   -- AGENT=codex STUB_CODEX_LOGGED_OUT=1
+
+refuses "codex: an auth.json that is not a ChatGPT login is refused" "claudebox.sh codex-login" \
+  -- AGENT=codex CODEX_AUTH=empty
 
 refuses_before_work "codex: an unknown AGENT is refused" "unknown AGENT" \
   -- AGENT=gpt

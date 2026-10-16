@@ -272,7 +272,13 @@ if [ "$AGENT" = codex ]; then
   # a planted instruction steering every later pass. Sessions need not survive:
   # the supervisor's session map is in memory.
   find "$CODEX_HOME" -mindepth 1 -maxdepth 1 ! -name auth.json -exec rm -rf {} +
+  # `codex login status` passes any auth.json at all, `{}` included, so the
+  # file's shape is checked too: a ChatGPT login with a refresh token. That also
+  # refuses an API-key login, which would bill per token. A revoked login still
+  # gets through; codex_pass names codex-login when a pass fails on auth.
   codex_status="$(codex login status 2>&1)" && case "$codex_status" in *ChatGPT*) ;; *) false ;; esac \
+    && jq -e '.auth_mode == "chatgpt" and ((.tokens.refresh_token // "") != "")' \
+         "$CODEX_HOME/auth.json" >/dev/null 2>&1 \
     || die "AGENT=codex needs a ChatGPT login in the claudebox-codex volume. Run: claudebox.sh codex-login"
   unset codex_status
   [ -z "${PROVIDER:-}" ] || log "WARN: PROVIDER=$PROVIDER is ignored under AGENT=codex."
