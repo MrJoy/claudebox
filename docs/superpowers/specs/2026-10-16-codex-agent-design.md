@@ -94,6 +94,10 @@ Measured with throwaway repos and the operator's ChatGPT login:
    already used. Please log out and sign in again."
 9. Codex can switch models on a usage limit ("Automatically switched to … due
    to usage limits"). The binary has an `allow_provider_model_fallback` key.
+   **Corrected by verification:** that key is a model-catalog field the server
+   sends, not configuration. `--strict-config` rejects it as an unknown field,
+   and without `--strict-config` it was ignored silently. There is no setting
+   to stop a switch.
 10. The binary carries "waiting for OAuth refresh lock" and "failed to lock
     OAuth refresh lock", which suggests Codex serializes token refreshes across
     processes sharing one `CODEX_HOME`. Not yet demonstrated.
@@ -165,13 +169,12 @@ and everything above `run_pass` do not branch on the agent.
 Invocation, fresh and resumed:
 
 ```
-codex exec [resume <thread_id>] --json --ignore-user-config
+codex exec [resume] --json --strict-config --ignore-user-config
   --dangerously-bypass-approvals-and-sandbox
   -m <model>
   -c developer_instructions=<persona + round stanza, TOML-quoted>
-  -c allow_provider_model_fallback=false
-  -c <update check off>
-  -- <prompt>
+  -c check_for_update_on_startup=false
+  -- [<thread_id>] <prompt>
 ```
 
 - Run with `stdin=DEVNULL` (recon 2). The Claude path gets it too; it is
@@ -201,8 +204,9 @@ limits is not misread as one; this is the Codex counterpart of the
 `_API_ERROR_PREFIX` guard. A failed turn with exit status 0 counts as a failure.
 A match behaves exactly like a Claude limit today. *(Builder's call.)*
 
-`allow_provider_model_fallback=false` is what prevents a model switch, and
-verification step 3 proves it is accepted. If a switch is still announced in
+No setting prevents a model switch (recon 9, corrected), so detection is the
+only defense, and `--strict-config` is on every pass so that a `-c` key Codex
+does not know fails loudly rather than posing as a guard. If a switch is announced in
 the event stream, the pass is not killed (nothing is killed, ever): it is
 recorded as a **success**, since its comments are already posted and re-running
 it would re-post them; it logs a WARN naming both models; and the cycle ends at
@@ -218,7 +222,7 @@ is disabled, as `DISABLE_AUTOUPDATER=1` does for Claude.
 ### Docs and tests
 
 - `test-python.sh`: unit tests for the Codex argv (fresh and resumed both carry
-  the persona, `--ignore-user-config` and the fallback-off flag; no
+  the persona, `--ignore-user-config` and `--strict-config`; no
   `--dangerously-bypass-hook-trust`), the event formatter, session-id recovery,
   and the limit classifier against recon 13's texts.
 - A bash suite case, in the style of `test-personas.sh`, with a stubbed `codex`
@@ -236,7 +240,7 @@ The plan must include, in the built image with the real login:
 2. Repeat recon 7 with a hook that provably fires when trusted, then show a repo
    hook does not fire. If no repo hook can be shown not to fire, stop and bring
    it back.
-3. Confirm `allow_provider_model_fallback=false` is accepted, and that
+3. Confirm the `-c` set is accepted under `--strict-config`, and that
    `--strict-config` does not reject the `-c` set.
 4. One real `claudebox.sh test` against a PR, reviewing it to completion and
    posting signed comments, then a second cycle that resumes.

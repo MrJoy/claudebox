@@ -18,17 +18,14 @@ try:
 except ImportError:  # Python < 3.11 on a developer's host; the image has 3.11.
     tomllib = None
 
-FIXED_TAIL = [
-    "-c", "allow_provider_model_fallback=false",
-    "-c", "check_for_update_on_startup=false",
-]
+FIXED_TAIL = ["-c", "check_for_update_on_startup=false"]
 
 
 class ArgvTest(unittest.TestCase):
     def test_fresh_pass(self):
         self.assertEqual(
             codex_pass.build_argv(None, "gpt-6.1-sol", "P", "review it"),
-            ["codex", "exec", "--json", "--ignore-user-config",
+            ["codex", "exec", "--json", "--strict-config", "--ignore-user-config",
              "--dangerously-bypass-approvals-and-sandbox",
              "-m", "gpt-6.1-sol",
              "-c", "developer_instructions=" + codex_pass.toml_string("P")]
@@ -47,6 +44,16 @@ class ArgvTest(unittest.TestCase):
         argv = codex_pass.build_argv("T1", "gpt-6.1-sol", "P", "review it")
         self.assertIn("--ignore-user-config", argv)
         self.assertIn("developer_instructions=" + codex_pass.toml_string("P"), argv)
+
+    def test_no_setting_codex_does_not_have(self):
+        # allow_provider_model_fallback is a model-catalog field, not config:
+        # without --strict-config codex ignored it silently, and with it every
+        # pass would fail. --strict-config is what turns the next such mistake
+        # into a loud failure rather than a guard that is not there.
+        for sid in (None, "T1"):
+            argv = codex_pass.build_argv(sid, "m", "P", "x")
+            self.assertIn("--strict-config", argv)
+            self.assertFalse(any("allow_provider_model_fallback" in a for a in argv))
 
     def test_never_bypasses_hook_trust(self):
         for sid in (None, "T1"):

@@ -525,7 +525,10 @@ All config is via environment variables (`.env.example` documents them). `AGENT`
 - Every Codex pass carries `--ignore-user-config`. It is the Codex counterpart
   of `--strict-mcp-config`, and dropping it lets a reviewed repo's
   `.codex/config.toml` start MCP servers in a permission-bypassed session.
-  `--dangerously-bypass-hook-trust` must never be passed.
+  `--dangerously-bypass-hook-trust` must never be passed. Every pass also
+  carries `--strict-config`: Codex ignores an unknown `-c` key without a word,
+  which is how a `-c allow_provider_model_fallback=false` once posed as a guard
+  against model switching when no such setting exists.
 - The entrypoint deletes everything in `CODEX_HOME` but `auth.json` at
   startup. The volume outlives the container, the reviewer can write it, and
   Codex reads `AGENTS.md` from it, so anything else kept there is a

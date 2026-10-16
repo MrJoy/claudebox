@@ -53,8 +53,10 @@ def build_argv(
 
     --ignore-user-config is the counterpart of Claude's --strict-mcp-config: a
     reviewed repo's .codex/config.toml starts MCP servers of its choosing
-    without it. developer_instructions carries the persona on every call, the
-    way --append-system-prompt does. `--` comes before the session id and the
+    without it. --strict-config makes an unknown -c key an error: codex
+    otherwise ignores one silently, which once left a "fallback off" setting
+    that did not exist looking like a guard. developer_instructions carries
+    the persona on every call, the way --append-system-prompt does. `--` comes before the session id and the
     prompt, so a prompt that starts with a dash is never read as a flag.
     """
     argv = ["codex", "exec"]
@@ -62,11 +64,11 @@ def build_argv(
         argv.append("resume")
     argv += [
         "--json",
+        "--strict-config",
         "--ignore-user-config",
         "--dangerously-bypass-approvals-and-sandbox",
         "-m", model,
         "-c", "developer_instructions=" + toml_string(persona_prompt),
-        "-c", "allow_provider_model_fallback=false",
         "-c", "check_for_update_on_startup=false",
         "--",
     ]
@@ -135,9 +137,10 @@ def _find_models(value: Any) -> Optional[tuple]:
 def switched_model(event: Dict[str, Any]) -> str:
     """The model Codex substituted for the one asked for, or "".
 
-    A second line of defence behind allow_provider_model_fallback=false. The
-    event shape of a switch was never observed, so this looks for the field
-    names and the message the binary carries.
+    The only defence: codex has no setting to turn the switch off
+    (allow_provider_model_fallback is a model-catalog field the server sends,
+    not config). The event shape of a switch was never observed, so this looks
+    for the field names and the message the binary carries.
     """
     found = _find_models(event)
     if found and found[0] != found[1] and found[1]:
