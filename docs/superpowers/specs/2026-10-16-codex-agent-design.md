@@ -97,7 +97,15 @@ Measured with throwaway repos and the operator's ChatGPT login:
 10. The binary carries "waiting for OAuth refresh lock" and "failed to lock
     OAuth refresh lock", which suggests Codex serializes token refreshes across
     processes sharing one `CODEX_HOME`. Not yet demonstrated.
-11. Limit errors include "You've hit your usage limit" (several variants, some
+11. `$CODEX_HOME/AGENTS.md` is read even under `--ignore-user-config`: the
+    operator's global file told a recon run to source `~/.profile`, and it did.
+12. Error events come in three shapes: `{"type":"error","message":…}` (retries
+    read "Reconnecting... n/5 (…)"), an `item.completed` whose item type is
+    `error`, and a final `{"type":"turn.failed","error":{"message":…}}`; that
+    run exited 1. A shell command is an `item.completed` with
+    `item.type == "command_execution"`, `command`, `aggregated_output` and
+    `exit_code`.
+13. Limit errors include "You've hit your usage limit" (several variants, some
     with "try again at …"), and an error kind `UsageLimitReached` with
     `resets_at`.
 
@@ -128,6 +136,15 @@ sign out whichever side refreshed second.
 - `claudebox.sh codex-login` runs `codex login --device-auth` inside the image
   with that volume attached, interactively. The operator signs in once, from any
   browser. `claudebox.sh codex-login --status` runs `codex login status`.
+- At startup, before anything runs `codex`, the entrypoint deletes everything
+  in `CODEX_HOME` except `auth.json`. The volume persists across restarts and the
+  reviewer can write to it, and Codex reads instruction files from it (recon
+  11), so without this a prompt-injected pass could plant an `AGENTS.md`, hooks
+  or rules that steer every later pass on every later container. `~/.claude` has
+  no such problem today because it does not outlive the container. Within one
+  container's life the exposure matches Claude's: a pass can write `~/.claude`
+  too. Nothing else in the volume needs to survive a restart, since the session
+  map is in memory. *(Builder's call.)*
 - `claudebox.sh run`/`test` with `AGENT=codex` attach the volume. The entrypoint
   `die`s at startup if `codex login status` does not report a ChatGPT login,
   naming `claudebox.sh codex-login` as the fix.
@@ -135,7 +152,7 @@ sign out whichever side refreshed second.
   `AGENT=codex`. `claudebox.sh run`/`test` refuse to start a second container
   with the volume attached, naming the one already running. *(Builder's call.)*
 - Concurrent passes inside the one container share `CODEX_HOME`. Recon 10
-  suggests Codex locks the refresh; verification step 6 proves it. If it fails,
+  suggests Codex locks the refresh; verification step 7 proves it. If it fails,
   `MAX_CONCURRENT_PASSES` defaults to `1` under `AGENT=codex` (an explicit
   operator value still wins), and the doc records why. *(Builder's call.)*
 
@@ -175,8 +192,9 @@ codex exec [resume <thread_id>] --json --ignore-user-config
 
 ### Limits
 
-The Codex classifier matches recon 11's texts in the JSONL **error** events
-(`error`, `turn.failed`, or whatever the error event types prove to be) and in
+The Codex classifier matches recon 13's texts in the JSONL **error** events
+(recon 12: `turn.failed`, `item.completed` items of type `error`, and
+`error` events other than "Reconnecting..." retries, which can still succeed) and in
 stderr, regardless of exit status, since whether a limit exits non-zero is not
 known. It never reads `agent_message` text, so a reviewer writing about usage
 limits is not misread as one; this is the Codex counterpart of the
@@ -202,7 +220,7 @@ is disabled, as `DISABLE_AUTOUPDATER=1` does for Claude.
 - `test-python.sh`: unit tests for the Codex argv (fresh and resumed both carry
   the persona, `--ignore-user-config` and the fallback-off flag; no
   `--dangerously-bypass-hook-trust`), the event formatter, session-id recovery,
-  and the limit classifier against recon 11's texts.
+  and the limit classifier against recon 13's texts.
 - A bash suite case, in the style of `test-personas.sh`, with a stubbed `codex`
   over two cycles. Its central assertion is that the resumed invocation still
   carries `developer_instructions` and `--ignore-user-config`.
@@ -224,7 +242,9 @@ The plan must include, in the built image with the real login:
    posting signed comments, then a second cycle that resumes.
 5. Confirm a host `codex` session still works after the container's login has
    refreshed at least once.
-6. Run a group of four concurrent passes across a token refresh (force one by
+6. Plant `AGENTS.md` and `hooks.json` in the volume, restart the container, and
+   confirm both are gone before the first pass.
+7. Run a group of four concurrent passes across a token refresh (force one by
    backdating `last_refresh`/the access token expiry in the volume's copy) and
    confirm every pass succeeds and the login survives. If not, apply the
    `MAX_CONCURRENT_PASSES` fallback under "Login".
