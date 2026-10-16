@@ -1288,6 +1288,14 @@ class ParseAgentTest(unittest.TestCase):
             review_loop.parse_agent({"AGENT": "gpt"})
         self.assertIn("claude, codex", str(ctx.exception))
 
+    def test_surrounding_whitespace_is_refused(self):
+        # --env-file keeps a trailing space or a CR. The entrypoint compares
+        # AGENT exactly, so a value it would not match must fail here, at
+        # --check, rather than crash later on a branch neither arm took.
+        for raw in ("codex ", "codex\r", " claude"):
+            with self.assertRaises(ConfigError):
+                review_loop.parse_agent({"AGENT": raw})
+
 
 class AgentCheckTest(unittest.TestCase):
     _run = CheckModeTest._run

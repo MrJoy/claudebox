@@ -145,8 +145,14 @@ def switched_model(event: Dict[str, Any]) -> str:
     The only defence: codex has no setting to turn the switch off
     (allow_provider_model_fallback is a model-catalog field the server sends,
     not config). The event shape of a switch was never observed, so this looks
-    for the field names and the message the binary carries.
+    for the field names and the message the binary carries. Never in an item
+    other than an error: command output and the review's own text can quote
+    the phrase, and reading them would end a cycle on a switch that never
+    happened.
     """
+    item = event.get("item")
+    if isinstance(item, dict) and item.get("type") != "error":
+        return ""
     found = _find_models(event)
     if found and found[0] != found[1] and found[1]:
         return str(found[1])

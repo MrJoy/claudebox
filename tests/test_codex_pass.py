@@ -165,6 +165,25 @@ class SwitchedModelTest(unittest.TestCase):
     def test_ordinary_event(self):
         self.assertEqual(codex_pass.switched_model({"type": "turn.started"}), "")
 
+    def test_the_phrase_in_command_output_is_not_a_switch(self):
+        # A pass reading a diff that contains this very phrase (this file
+        # does) must not end the cycle on a switch that never happened.
+        event = {"type": "item.completed", "item": {
+            "type": "command_execution", "command": "gh pr diff 7",
+            "aggregated_output": "+ Automatically switched to gpt-6-luna due to usage limits."}}
+        self.assertEqual(codex_pass.switched_model(event), "")
+
+    def test_the_phrase_in_review_text_is_not_a_switch(self):
+        event = {"type": "item.completed", "item": {
+            "type": "agent_message",
+            "text": "The regex matches 'Automatically switched to (.+?) due to'."}}
+        self.assertEqual(codex_pass.switched_model(event), "")
+
+    def test_an_error_item_announcing_a_switch_is_one(self):
+        event = {"type": "item.completed", "item": {
+            "type": "error", "message": "Automatically switched to gpt-6-luna due to usage limits."}}
+        self.assertEqual(codex_pass.switched_model(event), "gpt-6-luna")
+
 
 class RunPassTest(unittest.TestCase):
     """Drives run_pass against a real subprocess, as tests/test_passes.py does."""

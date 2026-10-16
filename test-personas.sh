@@ -775,6 +775,11 @@ refuses "codex: without a login, startup names codex-login" "claudebox.sh codex-
 refuses "codex: an auth.json that is not a ChatGPT login is refused" "claudebox.sh codex-login" \
   -- AGENT=codex CODEX_AUTH=empty
 
+# --env-file keeps a trailing space. Caught at --check, before any work, rather
+# than by an unbound variable after a full clone.
+refuses_before_work "codex: AGENT with a trailing space is refused before any work" "unknown AGENT" \
+  -- "AGENT=codex "
+
 refuses_before_work "codex: an unknown AGENT is refused" "unknown AGENT" \
   -- AGENT=gpt
 

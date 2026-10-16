@@ -59,8 +59,13 @@ AGENTS = ("claude", "codex")
 
 
 def parse_agent(env: Mapping[str, str]) -> str:
-    """AGENT, validated. Unset or empty is claude."""
-    agent = env.get("AGENT", "").strip() or "claude"
+    """AGENT, validated. Unset or empty is claude.
+
+    Matched exactly, not stripped: entrypoint.sh compares it exactly, and a
+    trailing space or CR that --env-file keeps would otherwise pass here and
+    match neither of its branches.
+    """
+    agent = env.get("AGENT", "") or "claude"
     if agent not in AGENTS:
         raise ConfigError(f"unknown AGENT='{agent}'; use one of: " + ", ".join(AGENTS) + ".")
     return agent
