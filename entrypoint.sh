@@ -51,7 +51,7 @@ strip_surrounding_quotes() {
 
 # Do this before anything reads these values.
 strip_surrounding_quotes \
-  PROVIDER GATEWAY_UPSTREAM REVIEW_MODEL \
+  AGENT PROVIDER GATEWAY_UPSTREAM REVIEW_MODEL \
   ANTHROPIC_BASE_URL ANTHROPIC_BEDROCK_BASE_URL ANTHROPIC_VERTEX_BASE_URL \
   ANTHROPIC_VERTEX_PROJECT_ID CLOUD_ML_REGION ANTHROPIC_CUSTOM_HEADERS \
   ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN OLLAMA_API_KEY \
@@ -247,6 +247,10 @@ case "$MAX_PASSES_PER_SESSION" in ''|*[!0-9]*) die "MAX_PASSES_PER_SESSION must 
 # reviewer/providers.py so the hosted gateway's profile loader can share them.
 # They used to be the dies in "Backend selection" below; that block now only
 # wires an environment this has already accepted.
+# Which CLI runs a review pass: claude (default) or codex. --check validates it
+# and skips the provider checks under codex, which uses no PROVIDER at all.
+AGENT="${AGENT:-claude}"
+export AGENT
 python3 "$SUPERVISOR_MAIN" --check --provider
 
 # --- GitHub auth (gh + git) ------------------------------------------------
@@ -254,6 +258,31 @@ python3 "$SUPERVISOR_MAIN" --check --provider
 # github.com over https, so PR branch fetches are authenticated.
 export GH_TOKEN="$GITHUB_TOKEN"
 gh auth setup-git
+
+# --- Codex login (AGENT=codex) -----------------------------------------------
+# The container has its own ChatGPT login in the claudebox-codex volume, set up
+# once with `claudebox.sh codex-login`. Never the host's: refresh tokens are
+# single-use, so two copies of one login sign each other out.
+if [ "$AGENT" = codex ]; then
+  export CODEX_HOME="$HOME/.codex"
+  mkdir -p "$CODEX_HOME"
+  # Everything but the credential goes. The volume outlives the container and
+  # the reviewer can write to it, and Codex reads instruction files from it
+  # (AGENTS.md even under --ignore-user-config), so anything else here could be
+  # a planted instruction steering every later pass. Sessions need not survive:
+  # the supervisor's session map is in memory.
+  find "$CODEX_HOME" -mindepth 1 -maxdepth 1 ! -name auth.json -exec rm -rf {} +
+  codex_status="$(codex login status 2>&1)" && case "$codex_status" in *ChatGPT*) ;; *) false ;; esac \
+    || die "AGENT=codex needs a ChatGPT login in the claudebox-codex volume. Run: claudebox.sh codex-login"
+  unset codex_status
+  [ -z "${PROVIDER:-}" ] || log "WARN: PROVIDER=$PROVIDER is ignored under AGENT=codex."
+  REVIEW_MODEL="${REVIEW_MODEL:-gpt-6.1-sol}"
+  PROVIDER_LABEL="codex (ChatGPT login)"
+  if [ -n "${LINEAR_API_KEY:-}" ]; then
+    log "Linear is not available under AGENT=codex yet; ignoring LINEAR_API_KEY."
+    unset LINEAR_API_KEY
+  fi
+fi
 git config --global user.name  "PR Reviewer (bot)"
 git config --global user.email "pr-reviewer@localhost"
 git config --global --add safe.directory "$WORK_REPO"
@@ -503,6 +532,10 @@ start_shim() {
 }
 
 # --- Backend selection (Claude Code -> model provider) ---------------------
+# Claude only, through the model-tier pinning below; AGENT=codex has its own
+# login and model and never reads PROVIDER. Left unindented to keep the block's
+# history readable.
+if [ "$AGENT" = claude ]; then
 # Claude Code speaks the Anthropic API. PROVIDER picks where those requests go:
 #   ollama     - Ollama Cloud's native Anthropic-compatible API (default).
 #   anthropic  - Anthropic's own API.
@@ -683,6 +716,7 @@ export ANTHROPIC_DEFAULT_SONNET_MODEL="$REVIEW_MODEL"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="$REVIEW_MODEL"
 # Deprecated alias for the small/fast model; set too for older code paths.
 export ANTHROPIC_SMALL_FAST_MODEL="$REVIEW_MODEL"
+fi  # AGENT = claude
 
 # --- Optional kindex knowledge graph ----------------------------------------
 # claudebox.sh mounts the data dir kindex resolves for the reviewed repo at
@@ -699,7 +733,9 @@ KINDEX_SRC="${KINDEX_SRC:-/kindex-src}"
 KINDEX_MCP_BIN="${KINDEX_MCP_BIN:-/opt/kindex/bin/kin-mcp}"
 KINDEX_DATA_DIR="$HOME/kindex"
 unset KINDEX_ENABLED
-if [ -f "$KINDEX_SRC/kindex.db" ]; then
+if [ "$AGENT" = codex ] && [ -f "$KINDEX_SRC/kindex.db" ]; then
+  log "kindex is not available under AGENT=codex yet; the mounted store is unused."
+elif [ -f "$KINDEX_SRC/kindex.db" ]; then
   KINDEX_ENABLED=1
   mkdir -p "$HOME/.config/kindex"
   # JSON is YAML; jq quotes the path.
@@ -718,7 +754,9 @@ fi
 # --dangerously-skip-permissions session.
 MCP_CONFIG_FILE="$HOME/mcp.json"
 rm -f "$MCP_CONFIG_FILE"
-if write_mcp_config "$MCP_CONFIG_FILE"; then
+if [ "$AGENT" = codex ]; then
+  :  # No MCP servers under Codex yet; codex_pass passes no MCP flags.
+elif write_mcp_config "$MCP_CONFIG_FILE"; then
   [ -z "${LINEAR_API_KEY:-}" ] || log "Linear MCP enabled (expects a READ-ONLY Linear API key)."
   [ "${KINDEX_ENABLED:-}" != 1 ] || log "kindex MCP enabled (a read-only snapshot of $KINDEX_SRC; read tools only)."
   if [ "${KINDEX_ENABLED:-}" = 1 ] && [ -n "$voyage_api_key" ]; then
