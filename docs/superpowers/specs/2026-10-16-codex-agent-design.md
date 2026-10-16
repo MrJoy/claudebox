@@ -253,6 +253,40 @@ The plan must include, in the built image with the real login:
    confirm every pass succeeds and the login survives. If not, apply the
    `MAX_CONCURRENT_PASSES` fallback under "Login".
 
+### Results (2026-10-16, built image, real login)
+
+- **1, 2, 3, 6** pass. The repo MCP server stays off under the pass's flags, a
+  repo hook fires only with `--dangerously-bypass-hook-trust` and without
+  `--ignore-user-config` together, the `-c` set is accepted under
+  `--strict-config`, and the entrypoint removes planted `AGENTS.md`,
+  `hooks.json` and `rules/` and keeps `auth.json`.
+- **New fact (recon 14).** A pass writes
+  `[projects."/home/reviewer/work/repo"] trust_level = "trusted"` into
+  `$CODEX_HOME/config.toml`, so for the rest of the container's life Codex
+  trusts the clone. Re-ran check 1 with that entry in place: with the pass's
+  flags the repo's MCP server stays off; with the entry and without
+  `--ignore-user-config` it starts. That makes `--ignore-user-config` the only
+  layer keeping repo config out during a container's life. Startup's prune
+  removes the entry on restart.
+- **4** passes. PR MrJoy/HordesOfOrcsNext#3120, four code personas, Sage in
+  phase 2. Cycle 1 started four threads; cycle 2 resumed all four under the same
+  thread ids, and each reported the head it had already reviewed. The PR was a
+  warning-only cleanup and no persona found anything to post, so posting a
+  signed comment under Codex is not yet observed.
+- **Launcher refusal** passes live: `claudebox.sh run --agent codex` refused
+  while another container held the volume, naming it.
+- **7 is not demonstrated.** Four concurrent passes succeeded twice, but no
+  refresh happened either time. Backdating `last_refresh` does not trigger one,
+  and neither does an expired `id_token` (15-minute lifetime). Recon 15: in
+  0.162.1 a refresh waits for the access token's own expiry, which is 10 days
+  after login, or a 401. Forcing one would mean forging a signed token.
+  Concurrency stays on: a login lasts 10 days between refreshes, and the cost of
+  losing the race is one `codex-login`. Re-running `codex-login` restarts the
+  10-day clock.
+- **5** is unaffected. The host `codex login status` still reports a ChatGPT
+  login. No container refresh happened, so the host login was never at risk in
+  this run. The two are separate device logins with separate token families.
+
 ## Left to the builder
 
 - Event-formatter detail: which item types get a log line, and how.

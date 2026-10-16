@@ -421,7 +421,8 @@ Facts the code rests on (codex-cli 0.162.1, measured 2026-10-16):
 - `$CODEX_HOME/AGENTS.md` is read even under `--ignore-user-config`.
 - Refresh tokens are single-use ("your refresh token was already used").
 - `codex login status` reports "Logged in using ChatGPT" for any `auth.json`, even `{}`. The entrypoint also checks the file for `auth_mode: chatgpt` and a refresh token. A revoked login still passes both, so `codex_pass` logs a `codex-login` hint when a pass fails on authentication.
-- The binary carries "waiting for OAuth refresh lock", suggesting refreshes serialize across processes. Check 7 in the spec's verification list proves or disproves it for concurrent passes.
+- The binary carries "waiting for OAuth refresh lock", suggesting refreshes serialize across processes. Check 7 in the spec's verification list would prove it, and it has not run: Codex refreshes only when the access token expires, 10 days after login, or on a 401, and neither backdating `last_refresh` nor an expired `id_token` forces one. Concurrency stays on until a natural refresh shows otherwise.
+- A pass writes a trust entry for the working clone into `$CODEX_HOME/config.toml`. With that entry present, only `--ignore-user-config` keeps the repo's `.codex/config.toml` out (measured: with the entry and without the flag, a repo MCP server starts).
 - `exec --json` events: `thread.started` (`thread_id` is the session id), `item.completed` (`agent_message`, `command_execution`, `error`), `turn.completed`, `turn.failed` (`error.message`), and `error` (`message`; "Reconnecting... n/5" is a retry, not a failure).
 
 `codex_pass.error_text` reads only error-typed events, never the review's prose, and a `turn.failed` is a failure even at exit 0. `PassResult.switched` marks a pass that succeeded on a model Codex substituted. `run_cycle` records it as a success and ends the cycle with `CYCLE_LIMITED`.
