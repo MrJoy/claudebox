@@ -53,6 +53,11 @@ PERSONAS=""
 # How many of a PR's personas review it at once (validated by the supervisor,
 # not here, for the same reason PERSONAS isn't).
 MAX_CONCURRENT_PASSES=""
+AGENT_FLAG=""        # --agent; empty => the env file's AGENT, else claude
+CODEX_STATUS=0       # codex-login --status
+# The Codex login's named volume. One per host: refresh tokens are single-use,
+# so two containers sharing a login sign each other out.
+CODEX_VOLUME="claudebox-codex"
 
 # kindex: on by default whenever `kin` is on PATH (--no-kindex opts out). The
 # store is resolved by kindex itself, from inside the repo, and mounted
@@ -82,6 +87,12 @@ COMMANDS
   shell     Open a bash shell inside the running container.
   stop      Stop and remove the container.
   status    Show the container's state (and live resource stats if running).
+  codex-login [--status]
+            Sign the claudebox-codex volume in to your ChatGPT account with a
+            device code (open the printed URL in any browser), for
+            --agent codex. --status shows whether it is signed in. A separate
+            login from your host's `codex`, on purpose: sharing one would sign
+            one side out the first time the other refreshed.
   config validate FILE [--org FILE] [--deploy FILE] [--repo-name NAME]
             Check a hosted-App repo config (.github/claudebox.json) offline,
             inside the image, in a network-less throwaway container. --org
@@ -101,6 +112,10 @@ OPTIONS
                     Also skips automatic kindex resolution, since there is no
                     repo to resolve a store against -- pass --kindex-profile
                     or --kindex-dir to give the reviewer one anyway.
+  --agent NAME      Which CLI reviews: claude (default) or codex. codex runs on
+                    the ChatGPT login `codex-login` stores in the
+                    claudebox-codex volume, and only one such container may run
+                    per host. Also read from AGENT= in the env file.
   --env-file PATH   Env file passed to the container. Default: auto-select from
                     the cwd, preferring .env.claudebox over .env (so a repo can
                     carry its own claudebox creds without touching its .env).
@@ -198,7 +213,7 @@ COMMAND=""
 EXTRA=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    build|run|test|logs|shell|stop|status|config)
+    build|run|test|logs|shell|stop|status|config|codex-login)
       # After `config`, every bare word is its own positional: a file may
       # be called `run` or `test`.
       if [ "$COMMAND" = config ]; then CONFIG_POS+=("$1")
@@ -213,6 +228,8 @@ while [ $# -gt 0 ]; do
     --no-repo)     MOUNT_REPO=0 ;;
     --env-file)    ENV_FILE="${2:?--env-file requires a PATH}"; ENV_FILE_EXPLICIT=1; shift ;;
     --mount-claude) MOUNT_CLAUDE=1 ;;
+    --agent)       AGENT_FLAG="${2:?--agent requires claude or codex}"; shift ;;
+    --status)      CODEX_STATUS=1 ;;
     --export-sessions) EXPORT_SESSIONS=1 ;;
     --name)        NAME="${2:?--name requires a value}"; NAME_EXPLICIT=1; shift ;;
     --image)       IMAGE="${2:?--image requires a value}"; shift ;;
@@ -245,6 +262,9 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$COMMAND" ] || { usage; exit 2; }
+
+case "$AGENT_FLAG" in ''|claude|codex) ;; *) die "--agent must be claude or codex (got '$AGENT_FLAG')." ;; esac
+[ "$CODEX_STATUS" = 0 ] || [ "$COMMAND" = codex-login ] || die "--status only applies to codex-login."
 
 if [ "$COMMAND" != config ] && { [ -n "$CONFIG_ORG" ] || [ -n "$CONFIG_DEPLOY" ] || [ -n "$CONFIG_REPO_NAME" ]; }; then
   die "--org/--deploy/--repo-name only apply to config validate."
@@ -328,7 +348,7 @@ derive_name() {
 # Run the resolution appropriate to the command. build and config need
 # nothing; test is ephemeral/unnamed so it skips name derivation.
 case "$COMMAND" in
-  build|config) : ;;
+  build|config|codex-login) : ;;
   test)  resolve_env_file; resolve_repo ;;
   *)     resolve_env_file; resolve_repo; derive_name ;;
 esac
@@ -438,6 +458,22 @@ build_run_flags() {
   resolve_kindex
   [ -z "$KINDEX_MOUNT" ] || RUN_FLAGS+=(-v "$KINDEX_MOUNT:/kindex-src:ro")
 
+  local agent="$AGENT_FLAG"
+  if [ -n "$agent" ]; then
+    RUN_FLAGS+=(-e "AGENT=$agent")
+  else
+    agent="$(sed -n -E 's/^[[:space:]]*AGENT[[:space:]]*=[[:space:]]*//p' "$ENV_FILE" | tail -1 | tr -d "\"' \r")"
+  fi
+  if [ "$agent" = codex ]; then
+    # Not under --dry-run, which must not call docker.
+    if [ "$DRY_RUN" != 1 ]; then
+      local users
+      users="$(docker ps --filter "volume=$CODEX_VOLUME" --format '{{.Names}}' | xargs)"
+      [ -z "$users" ] || die "another container is already using the $CODEX_VOLUME login ($users); two containers sharing one login sign each other out. Stop it first."
+    fi
+    RUN_FLAGS+=(-v "$CODEX_VOLUME:/home/reviewer/.codex")
+  fi
+
   if [ "$MOUNT_CLAUDE" = 1 ]; then
     [ -d "$HOME/.claude" ] || die "--mount-claude: '$HOME/.claude' does not exist (log in with 'claude' first, or use a token)."
     [ -f "$HOME/.claude/.credentials.json" ] || log "WARN: $HOME/.claude/.credentials.json not found; if you're on macOS your login lives in the Keychain (not a file) — use CLAUDE_CODE_OAUTH_TOKEN instead."
@@ -520,6 +556,13 @@ case "$COMMAND" in
   test)
     build_run_flags
     show_and_run docker run --rm -it "${RUN_FLAGS[@]}" "$IMAGE" ${EXTRA[@]+"${EXTRA[@]}"}
+    ;;
+  codex-login)
+    login_args=(login --device-auth)
+    [ "$CODEX_STATUS" = 1 ] && login_args=(login status)
+    show_and_run docker run --rm -it -v "$CODEX_VOLUME:/home/reviewer/.codex" \
+      --cap-drop ALL --security-opt no-new-privileges \
+      --entrypoint codex "$IMAGE" "${login_args[@]}"
     ;;
   logs)
     show_and_run docker logs -f ${EXTRA[@]+"${EXTRA[@]}"} "$NAME"

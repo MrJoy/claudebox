@@ -485,5 +485,51 @@ if selected "$L"; then
     "!$WORK/dash-operator/-:/config/org.json:ro"
 fi
 
+# --- AGENT=codex ---------------------------------------------------------------
+CODEX_VOL="-v claudebox-codex:/home/reviewer/.codex"
+
+L="codex: --agent codex passes AGENT and mounts the login volume"
+if selected "$L"; then
+  launch "$L" 0 -- -- "${RUN[@]}" --agent codex
+  expect "$L" 0 -- "-e AGENT=codex" "$CODEX_VOL"
+fi
+
+L="codex: AGENT=codex in the env file mounts the volume without -e"
+if selected "$L"; then
+  CODEX_ENVF="$WORK/env-codex"; printf 'AGENT=codex\n' >"$CODEX_ENVF"
+  launch "$L" 0 -- -- run --repo "$REPO" --name cb --env-file "$CODEX_ENVF" --no-restart
+  expect "$L" 0 -- "$CODEX_VOL" "!-e AGENT="
+fi
+
+L="codex: no agent anywhere means no codex volume"
+if selected "$L"; then
+  launch "$L" 0 -- -- "${RUN[@]}"
+  expect "$L" 0 -- "!claudebox-codex"
+fi
+
+L="codex: codex-login runs a device-code login in the volume"
+if selected "$L"; then
+  launch "$L" 0 -- -- codex-login
+  expect "$L" 0 -- "docker run --rm -it $CODEX_VOL --cap-drop ALL --security-opt no-new-privileges --entrypoint codex claudebox login --device-auth"
+fi
+
+L="codex: codex-login --status checks the login"
+if selected "$L"; then
+  launch "$L" 0 -- -- codex-login --status
+  expect "$L" 0 -- "--entrypoint codex claudebox login status" "!--device-auth"
+fi
+
+L="codex: an unknown --agent is refused"
+if selected "$L"; then
+  launch "$L" 0 -- -- "${RUN[@]}" --agent gpt
+  expect "$L" 1 -- "--agent must be claude or codex"
+fi
+
+L="codex: --help documents --agent and codex-login"
+if selected "$L"; then
+  launch "$L" 0 -- -- --help
+  expect "$L" 0 -- "--agent" "codex-login"
+fi
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = 0 ] || { printf 'Failed:%s\n' "$FAILED"; exit 1; }
