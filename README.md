@@ -113,6 +113,23 @@ With `PROVIDER=anthropic` you can authenticate the reviewer with the same subscr
 
 Whichever provider you pick, the entrypoint pins **every** model tier (`ANTHROPIC_MODEL` and each `..._DEFAULT_OPUS/SONNET/HAIKU/FABLE_MODEL`, plus the legacy `..._SMALL_FAST_MODEL`) to your one `REVIEW_MODEL`. On a non-Anthropic backend that's required: it has no Opus/Sonnet/Haiku models, so if a subagent or alias requested an un-overridden tier, Claude Code would error out on an unknown model. On Anthropic it's a deliberate simplification — one model does every part of the review, including any subagent work.
 
+## Running on Codex (ChatGPT subscription)
+
+`PROVIDER` picks a backend for Claude Code. `AGENT=codex` swaps Claude Code out for the [Codex CLI](https://github.com/openai/codex), which runs on your ChatGPT subscription instead of per-token billing. A different model reviewing than the one that wrote the code is the premise of this whole tool, so this suits Claude-written code well.
+
+```bash
+./claudebox.sh build
+./claudebox.sh codex-login           # once: open the printed URL in any browser, enter the code
+./claudebox.sh run --repo /path/to/repo --agent codex
+```
+
+Or put `AGENT=codex` in your env file and leave the flag off. The model defaults to `gpt-6.1-sol`; set `REVIEW_MODEL` to pick another. `PROVIDER` and its credentials are ignored, with a warning.
+
+- **Its own login.** `codex-login` signs a Docker volume, `claudebox-codex`, in to your ChatGPT account. It's deliberately separate from your Mac's `codex` login: Codex refresh tokens are single-use, so two copies of one login sign each other out. For the same reason, only one Codex container runs per host, and the launcher refuses to start a second. `./claudebox.sh codex-login --status` shows whether the volume is signed in, and a container started without a login stops at once and tells you to run `codex-login`.
+- **The volume holds a whole-account credential.** It's your ChatGPT login, not a scoped API key. At every startup the entrypoint deletes everything in the volume except `auth.json`, because Codex reads instruction files from there and the reviewer can write to it.
+- **No kindex or Linear yet.** Both are off under Codex for now. A mounted kindex store or a `LINEAR_API_KEY` is ignored, with a log line saying so.
+- **Usage limits.** When you hit your plan's limit, the loop keeps every session and backs off for `LIMIT_BACKOFF_SECONDS`. If you spend a reset, the next poll carries on where it stopped. Codex's automatic switch to a cheaper model at a limit is turned off. If it happens anyway, the loop finishes the PR it was on and then backs off rather than reviewing more on a model you didn't choose.
+
 ## How it works
 
 The reviewer runs **one Claude session per PR per mode per persona**. Each cycle the reviewer enumerates the candidate PRs (see [PR selection](#pr-selection)), works out each one's review mode, then reviews it with each persona enabled for that mode in its own session: a pair's first review starts a new session with that mode's review prompt; later cycles `--resume` that pair's session with the mode's followup prompt, so a persona remembers what it already flagged and avoids duplicate comments. The PR number is substituted into the prompt's `{{PR}}` token.
