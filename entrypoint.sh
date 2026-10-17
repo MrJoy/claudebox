@@ -180,7 +180,7 @@ write_mcp_config() {
 # is a builtin, so no value reaches an argv.
 write_codex_mcp_keys() {
   rm -rf "$1"
-  [ -n "$linear_api_key" ] || [ "${KINDEX_ENABLED:-}" = 1 ] || return 1
+  [ -n "$linear_api_key" ] || [ "${KINDEX_ENABLED:-}" = 1 ] || return 1  # nothing to write
   # Each write ends the subshell on failure: the caller tests this function on
   # the left of `&&`, where set -e is off, so the status is the last command's.
   ( umask 077
@@ -191,7 +191,7 @@ write_codex_mcp_keys() {
     if [ "${KINDEX_ENABLED:-}" = 1 ] && [ -n "$voyage_api_key" ]; then
       { printf '%s' "$voyage_api_key" >"$1/voyage.key" && chmod 600 "$1/voyage.key"; } || exit 1
     fi
-    exit 0 )
+    exit 0 ) || return 2  # a failed write
 }
 
 # Unprivileged user. Claude Code also refuses --dangerously-skip-permissions as
@@ -831,9 +831,9 @@ MCP_CONFIG_FILE="$HOME/mcp.json"
 rm -f "$MCP_CONFIG_FILE"
 CODEX_MCP_KEYS="$HOME/codex-mcp"
 if [ "$AGENT" = codex ]; then
-  mcp_ok=0
-  write_codex_mcp_keys "$CODEX_MCP_KEYS" && mcp_ok=1
-  if [ "$mcp_ok" = 1 ]; then
+  mcp_rc=0
+  write_codex_mcp_keys "$CODEX_MCP_KEYS" || mcp_rc=$?
+  if [ "$mcp_rc" = 0 ]; then
     export CODEX_MCP_DIR="$CODEX_MCP_KEYS"
     if [ -n "${linear_api_key:-}" ]; then
       export LINEAR_ENABLED=1
@@ -843,13 +843,14 @@ if [ "$AGENT" = codex ]; then
     if [ "${KINDEX_ENABLED:-}" = 1 ] && [ -n "$voyage_api_key" ]; then
       log "kindex vector search enabled (VOYAGE_API_KEY set): reviewer search queries are sent to Voyage AI to be embedded."
     fi
-  else
+  elif [ "$mcp_rc" = 2 ]; then
     # Same degrade as a failed mcp.json write: a half-written directory goes,
     # and the prompts must not promise servers that are not there.
     rm -rf "$CODEX_MCP_KEYS"
     unset KINDEX_ENABLED LINEAR_ENABLED
+    log "WARN: could not write $CODEX_MCP_KEYS; kindex and Linear are off for this run."
   fi
-  unset linear_api_key mcp_ok
+  unset linear_api_key mcp_rc
 elif write_mcp_config "$MCP_CONFIG_FILE"; then
   [ -z "${LINEAR_API_KEY:-}" ] || log "Linear MCP enabled (expects a READ-ONLY Linear API key)."
   [ "${KINDEX_ENABLED:-}" != 1 ] || log "kindex MCP enabled (a read-only snapshot of $KINDEX_SRC; read tools only)."
