@@ -182,7 +182,7 @@ write_codex_mcp_keys() {
   rm -rf "$1"
   [ -n "$linear_api_key" ] || [ "${KINDEX_ENABLED:-}" = 1 ] || return 1  # nothing to write
   # Each write ends the subshell on failure: the caller tests this function on
-  # the left of `&&`, where set -e is off, so the status is the last command's.
+  # the left of `||`, where set -e is off, so the status is the last command's.
   ( umask 077
     mkdir "$1" && chmod 700 "$1" || exit 1
     if [ -n "$linear_api_key" ]; then

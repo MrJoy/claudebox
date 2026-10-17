@@ -149,6 +149,14 @@ printf '#!/bin/sh\nexit 0\n' >"$BIN/sleep"
 printf '#!/bin/sh\nif [ -n "${STUB_MKDIR_FAIL:-}" ]; then case "$*" in *codex-mcp*) exit 1;; esac; fi\nexec %s "$@"\n' "$(command -v mkdir)" >"$BIN/mkdir"
 chmod +x "$BIN/mkdir"
 
+# A kindex-shaped store, the same fixture test-providers.sh uses, outside $HOME
+# because each run wipes $HOME. KINDEX_PYTHON stands in for the image's kindex,
+# which the supervisor runs once to open each snapshot.
+KSRC="$WORK/kindex-src"; mkdir -p "$KSRC"
+"$REAL_PYTHON3" -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)'); c.commit()" "$KSRC/kindex.db"
+printf '#!/bin/sh\nexit 0\n' >"$BIN/kindex-python"
+chmod +x "$BIN/kindex-python"
+
 # entrypoint.sh ends in `exec python3 /opt/claudebox/reviewer/review_loop.py`,
 # an image path that does not exist in a checkout. Remap it to this one; hand
 # anything else to the real interpreter, which `env -i` would otherwise hide.
@@ -781,6 +789,18 @@ cycle "codex: Linear goes through the header helper, never the environment" \
      NOARGV:1:"lin_secret_x" NOARGV:2:"lin_secret_x" \
      ARGV:1:"look that ticket up with the Linear MCP tools" \
      FILE:codex-mcp/linear.key MODE:codex-mcp:700 MODE:codex-mcp/linear.key:600
+
+cycle "codex: kindex is a required server, and the Voyage key stays in its file" \
+  AGENT=codex PERSONAS=red_team KINDEX_SRC="$KSRC" KINDEX_PYTHON="$BIN/kindex-python" \
+  VOYAGE_API_KEY=voy_secret \
+  -- CALLS:2 LOG:"kindex MCP enabled" LOG:"kindex vector search enabled" NOLOG:"voy_secret" \
+     NOLOG:"VOYAGE_API_KEY is set but kindex is not enabled" \
+     ARGV:1:"mcp_servers.kindex.required=true" ARGV:2:"mcp_servers.kindex.required=true" \
+     ARGV:1:"mcp_servers.kindex.enabled_tools" ARGV:1:"/opt/kindex/bin/kin-mcp" \
+     NOARGV:1:"mcp_servers.linear" NOARGV:1:"voy_secret" NOARGV:2:"voy_secret" \
+     ENV:1:VOYAGE_API_KEY="<unset>" ENV:2:VOYAGE_API_KEY="<unset>" ENV:1:LINEAR_ENABLED="<unset>" \
+     ARGV:1:"kindex knowledge graph" \
+     MODE:codex-mcp:700 MODE:codex-mcp/voyage.key:600 NOFILE:codex-mcp/linear.key
 
 cycle "codex: a failed key write wires no Linear server and no stanza" \
   AGENT=codex PERSONAS=red_team MAX_CYCLES=1 LINEAR_API_KEY=lin_secret_x STUB_MKDIR_FAIL=1 \
