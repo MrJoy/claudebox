@@ -33,11 +33,8 @@ that a different model should review than the one that wrote the code.
 
 ## Non-goals (first cut)
 
-- kindex and Linear access under Codex. Both are MCP servers, and proving that
-  Codex's per-tool deny list holds under its bypass flag is the slowest
-  verification in this work. With `AGENT=codex` the entrypoint logs one line
-  saying each is off for this agent, and the prompts omit their stanzas. A
-  second cut can add them.
+- kindex and Linear access under Codex. Added afterwards; see
+  `2026-10-16-codex-mcp-design.md`.
 - Mixing agents inside one container. `AGENT` is container-wide; run two
   containers to split work.
 - Reading the reset time out of a limit error to back off precisely.
@@ -186,11 +183,12 @@ codex exec [resume] --json --strict-config --ignore-user-config
   Claude: the persona followed by the round stanza, on every call. `-c` parses
   its value as TOML and falls back to a raw string if that fails, so the value is
   always emitted as a valid TOML basic string, never left to the fallback.
-- No `--mcp-config` equivalent, no MCP servers, no tool deny list (non-goal).
+- No `--mcp-config` equivalent. MCP servers arrive as `-c mcp_servers.*` flags
+  (`2026-10-16-codex-mcp-design.md`).
 - The session id comes from `thread.started.thread_id`, recovered as the stream
   arrives, before the exit code is judged, exactly as `session_id` is today.
-- The task prompts are unchanged, except that the kindex and Linear stanzas are
-  absent because neither is wired. `GH_STANZA`, `TEST_STANZA`, `PLAN_STANZA` and
+- The task prompts are unchanged, except that the kindex and Linear stanzas appear
+  only when the matching server is wired (`2026-10-16-codex-mcp-design.md`). `GH_STANZA`, `TEST_STANZA`, `PLAN_STANZA` and
   `WORKTREE_STANZA` apply as they do under Claude.
 
 ### Limits
@@ -297,5 +295,6 @@ The plan must include, in the built image with the real login:
 ## Decided by the operator
 
 - Default model under `AGENT=codex`: `gpt-6.1-sol`.
-- The first cut ships without kindex and Linear.
+- The first cut shipped without kindex and Linear. They came later; see
+  `2026-10-16-codex-mcp-design.md`.
 - Built on its own branch off `main`, independent of `PROVIDER=openai`.
