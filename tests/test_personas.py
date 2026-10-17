@@ -43,13 +43,26 @@ class TreeBuilder:
 
 
 class ShippedPersonasTest(unittest.TestCase):
-    def test_code_default_resolves_to_four(self):
+    def test_code_default_resolves_to_five(self):
         got = personas.resolve("code", SHIPPED, {})
-        self.assertEqual([p.id for p in got], ["red_team", "adversarial", "sme", "sage"])
+        self.assertEqual(
+            [p.id for p in got], ["red_team", "adversarial", "sme", "minimalist", "sage"]
+        )
 
-    def test_plan_default_resolves_to_seven(self):
+    def test_plan_default_resolves_to_eight(self):
         got = personas.resolve("plan", SHIPPED, {})
-        self.assertEqual(len(got), 7)
+        self.assertEqual(len(got), 8)
+        self.assertIn("minimalist", [p.id for p in got])
+
+    def test_minimalist_ships_in_both_trees_at_phase_one(self):
+        # claudebox's own persona, not advocate's, so the importer never writes
+        # it. It reviews the author's code rather than its siblings' comments,
+        # which is why it runs beside them and not after them with Sage.
+        for mode, var in (("code", "PERSONAS"), ("plan", "PLAN_PERSONAS")):
+            got = personas.resolve(mode, SHIPPED, {var: "minimalist"})
+            self.assertEqual([(p.id, p.label, p.phase) for p in got],
+                             [("minimalist", "Minimalist", 1)])
+            self.assertIn("requirement", got[0].prompt)
 
     def test_prompt_is_body_then_shared_contract(self):
         got = personas.resolve("code", SHIPPED, {"PERSONAS": "red_team"})
@@ -116,6 +129,23 @@ class ShippedPersonasTest(unittest.TestCase):
         plan_sage = personas.resolve("plan", SHIPPED, {"PLAN_PERSONAS": "sage"})[0].prompt
         self.assertNotIn("## Your second job", plan_sage)
 
+    def test_minimalist_code_body_reconciles_itself_with_the_contract(self):
+        # _shared.md is appended after the body, so it has the last word, and
+        # its non-findings list names defences and extension points while its
+        # tag rule makes "nothing breaks without these lines" a nit. Without
+        # the carve-out, read literally, the contract tells this persona to
+        # post nothing at all. The plan contract carries neither rule.
+        body = personas.resolve("code", SHIPPED, {"PERSONAS": "minimalist"})[0].prompt
+        carve_out = "## How the contract below applies to you"
+        self.assertIn(carve_out, body)
+        # The two halves of the reconciliation, not just its heading: the
+        # non-findings list is about requests, and a deletion has a tag.
+        self.assertIn("asking the author to add them.", body)
+        self.assertIn("is the opposite case, and it is your finding.", body)
+        self.assertIn("A deletion that passes both is `should-fix`.", body)
+        plan = personas.resolve("plan", SHIPPED, {"PLAN_PERSONAS": "minimalist"})[0].prompt
+        self.assertNotIn(carve_out, plan)
+
     def test_unterminated_frontmatter_yields_no_body(self):
         # What the awk it replaced did: it never set body without a closing
         # ---. Returning the rest of the file instead would ship the frontmatter
@@ -127,11 +157,11 @@ class ShippedPersonasTest(unittest.TestCase):
 
     def test_all_selects_every_persona_in_the_tree(self):
         got = personas.resolve("code", SHIPPED, {"PERSONAS": "all"})
-        self.assertEqual(len(got), 7)
+        self.assertEqual(len(got), 8)
 
     def test_all_is_case_insensitive(self):
         self.assertEqual(
-            len(personas.resolve("code", SHIPPED, {"PERSONAS": "ALL"})), 7
+            len(personas.resolve("code", SHIPPED, {"PERSONAS": "ALL"})), 8
         )
 
     def test_selector_order_is_preserved(self):
@@ -144,7 +174,7 @@ class ShippedPersonasTest(unittest.TestCase):
 
     def test_plan_selector_var_is_separate(self):
         got = personas.resolve("plan", SHIPPED, {"PERSONAS": "sage"})
-        self.assertEqual(len(got), 7)
+        self.assertEqual(len(got), 8)
 
 
 class RefusalTest(unittest.TestCase):
