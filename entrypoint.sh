@@ -850,12 +850,13 @@ git -C "$WORK_REPO" remote set-url origin "https://github.com/${GITHUB_REPOSITOR
 # thing that crosses this line: no JSON handoff file, no serialized arrays.
 #
 # exec, not a child process: any LiteLLM/shim children started above are
-# inherited by the supervisor rather than orphaned, and it reaps them (see
-# check_litellm) because PID 1 gets no automatic reaping. Being PID 1 does not
-# make `docker stop` graceful -- the kernel drops a default-disposition signal
-# sent to PID 1, and the supervisor installs no SIGTERM handler, so a stop is a
-# no-op followed by the SIGKILL ten seconds later. Bash behaved identically
-# here; a handler that ends the in-flight pass is deferred.
+# inherited by the supervisor rather than orphaned, and it reaps them itself
+# (see check_litellm). Everything else a pass orphans is reaped by the init
+# claudebox.sh's --init puts at PID 1. Without --init the supervisor is PID 1,
+# those orphans stay zombies holding --pids-limit slots, and `docker stop` is a
+# no-op followed by the SIGKILL ten seconds later, since the kernel drops a
+# default-disposition signal sent to PID 1 and the supervisor installs no
+# SIGTERM handler. A handler that ends the in-flight pass is deferred.
 export WORK_REPO
 export REVIEW_MODEL
 export MCP_CONFIG_FILE

@@ -323,7 +323,7 @@ It stubs `gh`/`git`/`claude`, plus `curl`, `sleep`, and a `python3` that dispatc
     which is exactly this `docker run`:
 
     ```bash
-    docker run -d --name claudebox --restart unless-stopped \
+    docker run -d --name claudebox --restart unless-stopped --init \
       --env-file .env \
       -v /path/to/your/repo/.git:/repo/.git:ro \
       --cap-drop ALL \
@@ -340,7 +340,7 @@ It stubs `gh`/`git`/`claude`, plus `curl`, `sleep`, and a `python3` that dispatc
     ```bash
     ./claudebox.sh test --repo /path/to/your/repo
     # equivalently:
-    docker run --rm -it --env-file .env -v /path/to/your/repo/.git:/repo/.git:ro --cap-drop ALL --security-opt no-new-privileges --pids-limit 512 --memory 4g claudebox
+    docker run --rm -it --init --env-file .env -v /path/to/your/repo/.git:/repo/.git:ro --cap-drop ALL --security-opt no-new-privileges --pids-limit 512 --memory 4g claudebox
     ```
 
 On startup the reviewer makes a cheap **local clone** of `/repo/.git` into its own writable working dir — it reuses the local git object store, so no objects are downloaded over the network, and your repo is never written to. It then repoints `origin` at GitHub and fetches only the new PR refs each cycle.
@@ -357,7 +357,8 @@ Because the loop runs unattended in YOLO mode, the command above locks the conta
 
 - `--cap-drop ALL` — drop all Linux capabilities; the reviewer needs none.
 - `--security-opt no-new-privileges` — block privilege escalation via setuid.
-- `--pids-limit 512` — cap runaway process spawning.
+- `--pids-limit 512` — cap runaway process spawning. The limit counts threads, and a Codex pass runs about 50, so the launcher raises its default to 2048 under `AGENT=codex`.
+- `--init` — not a security boundary, and the entrypoint doesn't check for it. It runs an init process as PID 1 that reaps processes a review pass orphans. Without it each one stays a zombie and holds a PID slot until the container restarts.
 - `--memory 4g` — bound memory use.
 
 The entrypoint **verifies these on startup** and refuses to run if a security boundary is missing: it aborts when running as root, or without `no-new-privileges`, or without `--cap-drop ALL`. The two resource bounds (`--pids-limit`, `--memory`) only print a `WARN` if absent, since they cap runaway use rather than form a safety boundary. To run somewhere these checks don't apply (e.g. a non-Docker runtime, or a deliberate test), set `ALLOW_UNHARDENED=1` to downgrade the hard failures to warnings.

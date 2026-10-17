@@ -350,8 +350,9 @@ def check_litellm(env: Mapping[str, str]) -> None:
     Called each cycle so a dead one is a loud, fatal error rather than every
     review pass failing on connection refused. No-op for every other provider.
 
-    We are PID 1 after the exec, so a dead child becomes a zombie that os.kill
-    would still find. Reap first, non-blockingly, or the check never fires.
+    Both are our own children after the exec, so a dead one is a zombie that
+    os.kill would still find, with or without an init above us. Reap first,
+    non-blockingly, or the check never fires.
 
     Reaping only these two pids, never waitpid(-1): a wildcard reap would also
     collect a review pass's own claude, stealing the exit status its Popen is

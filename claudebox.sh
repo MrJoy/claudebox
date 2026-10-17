@@ -26,7 +26,7 @@ MOUNT_CLAUDE=0
 EXPORT_SESSIONS=0
 RESTART=1
 MEMORY="4g"
-PIDS="512"
+PIDS=""            # --pids; empty => 512, or 2048 under AGENT=codex
 TAIL=0
 DRY_RUN=0
 
@@ -138,7 +138,8 @@ OPTIONS
                     run at once.
   --image NAME      Image tag to build/run (default: claudebox).
   --memory SIZE     Memory limit (default: 4g).
-  --pids N          PID limit (default: 512).
+  --pids N          PID limit (default: 512, or 2048 under --agent codex / AGENT=codex,
+                    whose passes run ~50 threads each and the limit counts threads).
   --no-restart      Don't pass --restart unless-stopped to `run`.
   --tail            After `run` starts the container, follow its logs (like the
                     `logs` command). Ctrl-C stops following; the container runs on.
@@ -188,7 +189,8 @@ OPTIONS
 
 HARDENING (always applied to run/test; the entrypoint refuses to start without it)
   --cap-drop ALL  --security-opt no-new-privileges  --pids-limit N  --memory SIZE
-  and the image's own non-root `reviewer` user.
+  and the image's own non-root `reviewer` user. `run`/`test` also pass --init, so
+  an init process reaps the orphans a pass leaves behind.
 
 EXAMPLES
   ./claudebox.sh build
@@ -472,6 +474,11 @@ build_run_flags() {
       [ -z "$users" ] || die "another container is already using the $CODEX_VOLUME login ($users); two containers sharing one login sign each other out. Stop it first."
     fi
     RUN_FLAGS+=(-v "$CODEX_VOLUME:/home/reviewer/.codex")
+    # One Codex pass is ~50 threads (node, codex, its code-mode host) before
+    # any gh, and --pids-limit counts threads: eight plan personas at once ran
+    # a 512 limit dry, gh died with EAGAIN, and one pass hung on a tool call
+    # that never returned.
+    [ -n "$PIDS" ] || PIDS=2048
   fi
 
   if [ "$MOUNT_CLAUDE" = 1 ]; then
@@ -503,7 +510,11 @@ build_run_flags() {
   fi
 
   # Hardening: the entrypoint's startup checks refuse to run without these.
-  RUN_FLAGS+=(--cap-drop ALL --security-opt no-new-privileges --pids-limit "$PIDS" --memory "$MEMORY")
+  # --init is not one of them: it puts an init at PID 1 to reap processes
+  # orphaned by a pass (codex's code-mode host, a gh), which the supervisor
+  # cannot reap without stealing a live pass's exit status. Each zombie it
+  # leaves holds a slot under --pids-limit for the container's whole life.
+  RUN_FLAGS+=(--init --cap-drop ALL --security-opt no-new-privileges --pids-limit "${PIDS:-512}" --memory "$MEMORY")
 
   # Pass any given PR selector through to the container. (An env-file value of
   # the same var is overridden by this -e; two selectors reaching the container
@@ -604,7 +615,7 @@ case "$COMMAND" in
     fi
     [ -z "$CONFIG_REPO_NAME" ] || cli_args+=(--repo-name "$CONFIG_REPO_NAME")
     show_and_run docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges \
-      --pids-limit "$PIDS" --memory "$MEMORY" "${mounts[@]}" \
+      --pids-limit "${PIDS:-512}" --memory "$MEMORY" "${mounts[@]}" \
       --entrypoint python3 "$IMAGE" /opt/claudebox/reviewer/config_cli.py "${cli_args[@]}"
     ;;
 esac
