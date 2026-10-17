@@ -189,6 +189,13 @@ cat >"$BIN/claude" <<'STUB'
 # holding the lock would spin a core until somebody noticed. Thirty seconds is
 # far longer than any real holder, which does four file operations, so reaching
 # the cap means the holder is gone; steal the lock and carry on.
+# Installed as both `claude` and `codex`; $0 says which. A codex login check
+# runs before the counter, so it never counts as a review pass.
+agent="$(basename "$0")"
+if [ "$agent" = codex ] && [ "${1:-}" = login ]; then
+  if [ -n "${STUB_CODEX_LOGGED_OUT:-}" ]; then echo "Not logged in"; exit 1; fi
+  echo "Logged in using ChatGPT"; exit 0
+fi
 hold_lock() {
   local waited=0
   while ! mkdir "$HOME/calls.lock" 2>/dev/null; do
@@ -228,7 +235,7 @@ rmdir "$HOME/calls.lock"
   echo "ARGV $*"
   for v in ANTHROPIC_MODEL ANTHROPIC_DEFAULT_FABLE_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL \
            ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL \
-           ANTHROPIC_SMALL_FAST_MODEL; do
+           ANTHROPIC_SMALL_FAST_MODEL CODEX_HOME; do
     if [ -n "${!v+set}" ]; then echo "ENV $v=${!v}"; else echo "ENV $v=<unset>"; fi
   done
 } >"$HOME/dump.$n"
@@ -242,6 +249,21 @@ esac
 # use; this is for the parallel block, where "invocation 3" names nothing.
 if [ -n "${STUB_FAIL_PERSONA:-}" ] && printf '%s' "$*" | grep -qF -- "$STUB_FAIL_PERSONA"; then
   should_fail=1
+fi
+if [ "$agent" = codex ]; then
+  [ -n "$should_fail" ] && [ -n "${STUB_NO_SESSION:-}" ] \
+    || printf '{"type":"thread.started","thread_id":"S%s"}\n' "$n"
+  if [ -n "$should_fail" ]; then
+    case "${STUB_FAIL_MODE:-limit}" in
+      # The wording the codex-cli 0.162.1 binary carries for an exhausted plan.
+      limit) msg="You've hit your usage limit. Upgrade to Plus to continue using Codex (https://chatgpt.com/explore/plus), or try again at 3:00 PM." ;;
+      *)     msg="unexpected status 400 Bad Request" ;;
+    esac
+    printf '{"type":"turn.failed","error":{"message":"%s"}}\n' "$msg"
+    exit 1
+  fi
+  printf '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}\n'
+  exit 0
 fi
 if [ -n "$should_fail" ]; then
   # STUB_NO_SESSION suppresses the init event, which is the one case where the
@@ -273,6 +295,7 @@ printf '{"type":"system","subtype":"init","session_id":"S%s"}\n' "$n"
 printf '{"type":"result","subtype":"success","session_id":"S%s","result":"ok"}\n' "$n"
 exit 0
 STUB
+cp "$BIN/claude" "$BIN/codex"
 chmod +x "$BIN"/*
 
 # Persona directories built to be broken, for the startup checks that only a
@@ -326,6 +349,21 @@ run_entrypoint() {
   local label="$1"; shift
   HOME_DIR="$WORK/home"; OUT="$WORK/out"
   rm -rf "$HOME_DIR"; mkdir -p "$HOME_DIR/work/repo/.git" "$HOME_DIR/seed"
+  # AGENT=codex needs a login in the volume: a ChatGPT-shaped auth.json, or
+  # `{}` under CODEX_AUTH=empty (which `codex login status` still calls a login).
+  case " $* " in
+    *" AGENT=codex "*)
+      mkdir -p "$HOME_DIR/.codex"
+      case " $* " in
+        *" CODEX_AUTH=empty "*) echo '{}' >"$HOME_DIR/.codex/auth.json" ;;
+        *) echo '{"auth_mode":"chatgpt","tokens":{"refresh_token":"r"}}' >"$HOME_DIR/.codex/auth.json" ;;
+      esac ;;
+  esac
+  # PRESEED_CODEX=1: a login volume a hostile earlier pass wrote into.
+  case " $* " in
+    *" PRESEED_CODEX=1 "*)
+      touch "$HOME_DIR/.codex/AGENTS.md" "$HOME_DIR/.codex/hooks.json" ;;
+  esac
   # KINDEX_SRC is pinned to a path that never exists, so a host with a store
   # at the entrypoint's default /kindex-src still runs these cases without
   # kindex's MCP server.
@@ -441,6 +479,7 @@ refuses_before_work() {
 #   ENV:N:VAR=value      -- invocation N saw exactly that value
 #   LOG:substring        -- the run's log contains substring
 #   NOLOG:substring      -- the run's log does not contain substring
+#   FILE:path / NOFILE:path -- a path under the run's $HOME exists / does not
 #   MAXINFLIGHT:N        -- exactly N claude processes were alive at once at the
 #                           peak: the one assertion here that can tell overlap
 #                           from a fast sequence
@@ -482,6 +521,9 @@ cycle() {
         [ "$(count_matching "$rest")" = "$n" ] \
           || missing="$missing [expected $n dumps matching $rest, got $(count_matching "$rest")]" ;;
       LOG:*)   grep -qF "${expect#LOG:}" "$OUT" || missing="$missing [log missing: ${expect#LOG:}]" ;;
+      # FILE:/NOFILE: a path under the run's $HOME exists, or does not.
+      FILE:*)   [ -e "$HOME_DIR/${expect#FILE:}" ] || missing="$missing [file missing: ${expect#FILE:}]" ;;
+      NOFILE:*) [ -e "$HOME_DIR/${expect#NOFILE:}" ] && missing="$missing [file should be gone: ${expect#NOFILE:}]" ;;
       NOLOG:*) grep -qF "${expect#NOLOG:}" "$OUT" && missing="$missing [log should not have: ${expect#NOLOG:}]" ;;
       *) missing="$missing [unknown expectation: $expect]" ;;
     esac
@@ -682,6 +724,64 @@ cycle "limits: a rate-limited pass keeps its session and resumes next cycle" \
      ARGV:2:"--resume S1" \
      LOG:"hit a usage or rate limit" \
      LOG:"Backing off"
+
+# --- AGENT=codex -------------------------------------------------------------
+# The same stub answers as `codex`. The baseline's PROVIDER=ollama stays, which is
+# exactly the shape of a shared env file that names a provider beside AGENT=codex.
+cycle "codex: passes go to codex, never claude" \
+  AGENT=codex \
+  -- CALLS:8 ARGV:1:"exec --json" ARGV:5:"exec resume --json" \
+     LOG:"Review agent: codex"
+
+cycle "codex: a resumed pass still carries its persona and the lockdown" \
+  AGENT=codex PR_IDS=12 MAX_CONCURRENT_PASSES= \
+  -- CALLS:8 \
+     MATCHCOUNT:"exec resume":4 \
+     MATCHCOUNT:"exec resume&&--ignore-user-config&&developer_instructions=&&You are a Red Team security reviewer":1 \
+     MATCHCOUNT:"exec resume&&--ignore-user-config&&developer_instructions=&&You are an Adversarial reviewer":1 \
+     MATCHCOUNT:"exec resume&&--ignore-user-config&&developer_instructions=&&You are a Subject Matter Expert":1 \
+     MATCHCOUNT:"exec resume&&--ignore-user-config&&developer_instructions=&&You are a Sage":1 \
+     MATCHCOUNT:"--dangerously-bypass-hook-trust":0
+
+cycle "codex: model defaults to gpt-6.1-sol" \
+  AGENT=codex PERSONAS=red_team MAX_CYCLES=1 \
+  -- CALLS:1 ARGV:1:"-m gpt-6.1-sol"
+
+cycle "codex: REVIEW_MODEL picks the model" \
+  AGENT=codex PERSONAS=red_team MAX_CYCLES=1 REVIEW_MODEL=gpt-6-astra \
+  -- CALLS:1 ARGV:1:"-m gpt-6-astra"
+
+cycle "codex: PROVIDER is ignored with a warning" \
+  AGENT=codex PERSONAS=red_team MAX_CYCLES=1 \
+  -- CALLS:1 LOG:"PROVIDER=ollama is ignored under AGENT=codex" \
+     ENV:1:ANTHROPIC_MODEL="<unset>" ENV:1:CODEX_HOME="$WORK/home/.codex"
+
+cycle "codex: Linear is off" \
+  AGENT=codex PERSONAS=red_team MAX_CYCLES=1 LINEAR_API_KEY=lin \
+  -- CALLS:1 LOG:"Linear is not available under AGENT=codex" NOARGV:1:"Linear"
+
+cycle "codex: a usage limit keeps the session and backs off" \
+  AGENT=codex PERSONAS=red_team STUB_FAIL_ON=1 STUB_FAIL_MODE=limit \
+  -- CALLS:2 ARGV:2:"exec resume" ARGV:2:"-- S1 " \
+     LOG:"hit a usage or rate limit" LOG:"Backing off"
+
+cycle "codex: CODEX_HOME is pruned to auth.json at startup" \
+  AGENT=codex PERSONAS=red_team MAX_CYCLES=1 PRESEED_CODEX=1 \
+  -- CALLS:1 FILE:.codex/auth.json NOFILE:.codex/AGENTS.md NOFILE:.codex/hooks.json
+
+refuses "codex: without a login, startup names codex-login" "claudebox.sh codex-login" \
+  -- AGENT=codex STUB_CODEX_LOGGED_OUT=1
+
+refuses "codex: an auth.json that is not a ChatGPT login is refused" "claudebox.sh codex-login" \
+  -- AGENT=codex CODEX_AUTH=empty
+
+# --env-file keeps a trailing space. Caught at --check, before any work, rather
+# than by an unbound variable after a full clone.
+refuses_before_work "codex: AGENT with a trailing space is refused before any work" "unknown AGENT" \
+  -- "AGENT=codex "
+
+refuses_before_work "codex: an unknown AGENT is refused" "unknown AGENT" \
+  -- AGENT=gpt
 
 cycle "limits: an ordinary failure still drops the session" \
   PERSONAS=red_team STUB_FAIL_ON=1 STUB_FAIL_MODE=other \

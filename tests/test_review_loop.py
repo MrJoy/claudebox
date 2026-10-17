@@ -1276,6 +1276,120 @@ class CheckModeTest(unittest.TestCase):
         self.assertIn("--dry-run", err)
 
 
+class ParseAgentTest(unittest.TestCase):
+    def test_unset_is_claude(self):
+        self.assertEqual(review_loop.parse_agent({}), "claude")
+
+    def test_empty_is_claude(self):
+        self.assertEqual(review_loop.parse_agent({"AGENT": ""}), "claude")
+
+    def test_codex(self):
+        self.assertEqual(review_loop.parse_agent({"AGENT": "codex"}), "codex")
+
+    def test_unknown_is_refused(self):
+        with self.assertRaises(ConfigError) as ctx:
+            review_loop.parse_agent({"AGENT": "gpt"})
+        self.assertIn("claude, codex", str(ctx.exception))
+
+    def test_surrounding_whitespace_is_refused(self):
+        # --env-file keeps a trailing space or a CR. The entrypoint compares
+        # AGENT exactly, so a value it would not match must fail here, at
+        # --check, rather than crash later on a branch neither arm took.
+        for raw in ("codex ", "codex\r", " claude"):
+            with self.assertRaises(ConfigError):
+                review_loop.parse_agent({"AGENT": raw})
+
+
+class AgentCheckTest(unittest.TestCase):
+    _run = CheckModeTest._run
+
+    def test_check_rejects_an_unknown_agent(self):
+        rc, out, err = self._run(["--check"], preflight_env(AGENT="gpt"))
+        self.assertEqual(rc, 1)
+        self.assertIn("unknown AGENT", err)
+
+    def test_check_provider_skips_provider_validation_under_codex(self):
+        env = preflight_env(AGENT="codex")
+        env.pop("OLLAMA_API_KEY", None)
+        rc, out, err = self._run(["--check", "--provider"], env)
+        self.assertEqual(rc, 0, err)
+
+    def test_check_provider_still_validates_under_claude(self):
+        env = preflight_env()
+        env.pop("OLLAMA_API_KEY", None)
+        env.pop("AGENT", None)
+        rc, out, err = self._run(["--check", "--provider"], env)
+        self.assertEqual(rc, 1)
+        self.assertIn("OLLAMA_API_KEY", err)
+
+
+class CodexDispatchTest(unittest.TestCase):
+    def _supervisor(self):
+        return review_loop.Supervisor(
+            personas={"code": ["red_team"], "plan": []},
+            persona_prompts={("code", "red_team"): "rt"},
+            review_prompts={"code": "review #{{PR}}"},
+            followup_prompts={"code": "recheck #{{PR}}"},
+            model="gpt-6.1-sol",
+            mcp_args=["--strict-mcp-config"],
+            cwd=".",
+            max_passes_per_session=0,
+            agent="codex",
+        )
+
+    def _patch(self, module, fn):
+        original = module.run_pass
+        module.run_pass = fn
+        self.addCleanup(setattr, module, "run_pass", original)
+
+    def test_codex_agent_dispatches_to_codex_pass(self):
+        s = self._supervisor()
+        codex_calls, claude_calls = [], []
+
+        def codex(**kwargs):
+            codex_calls.append(kwargs)
+            return ok("T1")
+
+        self._patch(review_loop.codex_pass, codex)
+        self._patch(review_loop.passes, lambda **kw: claude_calls.append(kw) or ok())
+        pair = Pair(12, "code", "red_team")
+        # Read before the run: a completed pass advances the round counter.
+        expected_system = s.system_prompt_for(pair)
+        with contextlib.redirect_stdout(io.StringIO()):
+            s.run_cycle(grouped(pair))
+        self.assertEqual(claude_calls, [])
+        self.assertEqual(len(codex_calls), 1)
+        self.assertEqual(codex_calls[0]["persona_prompt"], expected_system)
+        self.assertEqual(codex_calls[0]["model"], "gpt-6.1-sol")
+        self.assertNotIn("mcp_args", codex_calls[0])
+
+    def test_spawn_failure_names_the_agent(self):
+        s = self._supervisor()
+
+        def boom(**kwargs):
+            raise OSError(2, "No such file or directory")
+
+        self._patch(review_loop.codex_pass, boom)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            s.run_cycle(grouped(Pair(12, "code", "red_team")))
+        self.assertIn("could not run codex", buf.getvalue())
+
+
+class ModelSwitchTest(unittest.TestCase):
+    def test_a_switched_pass_counts_as_success_and_ends_the_cycle(self):
+        switched = PassResult(rc=0, session_id="T1", limited=False, limit_line="",
+                              switched=True)
+        s = supervisor([switched], personas={"code": ["red_team"], "plan": []})
+        first, second = Pair(12, "code", "red_team"), Pair(13, "code", "red_team")
+        with contextlib.redirect_stdout(io.StringIO()):
+            outcome = s.run_cycle(grouped(first, second))
+        self.assertEqual(outcome, review_loop.CYCLE_LIMITED)
+        self.assertEqual(s.sessions.get(first), "T1")
+        self.assertNotIn(first, s.owed)
+        self.assertEqual(s.attempted, [first])
+
+
 class CutoffLogTest(unittest.TestCase):
     """main() names the startup cutoff whenever one narrows the candidates."""
 

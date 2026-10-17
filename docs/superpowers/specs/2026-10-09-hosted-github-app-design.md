@@ -1180,8 +1180,10 @@ workers to the gateway, the hardening answer from spike S7.
 
 The no-Docker, no-network suites stay the main line of defense.
 
-- **Phase 0** adds no tests and changes none; every existing suite passing
-  untouched is the proof.
+- **Phase 0** changes no test; every existing suite passing untouched is the
+  proof for the code it moves. Shell logic it rewrites in Python rather than
+  moves (the provider validation) gets a case for each branch no suite
+  reached, as added cases, never edits.
 - **Phases 1 to 3** add `unittest` suites that stub at the seams, as
   `test-python.sh` does: every decision this plan states (config strictness,
   triggers and asks, each outcome row with the outcome taken from a fake

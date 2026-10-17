@@ -113,6 +113,23 @@ With `PROVIDER=anthropic` you can authenticate the reviewer with the same subscr
 
 Whichever provider you pick, the entrypoint pins **every** model tier (`ANTHROPIC_MODEL` and each `..._DEFAULT_OPUS/SONNET/HAIKU/FABLE_MODEL`, plus the legacy `..._SMALL_FAST_MODEL`) to your one `REVIEW_MODEL`. On a non-Anthropic backend that's required: it has no Opus/Sonnet/Haiku models, so if a subagent or alias requested an un-overridden tier, Claude Code would error out on an unknown model. On Anthropic it's a deliberate simplification — one model does every part of the review, including any subagent work.
 
+## Running on Codex (ChatGPT subscription)
+
+`PROVIDER` picks a backend for Claude Code. `AGENT=codex` swaps Claude Code out for the [Codex CLI](https://github.com/openai/codex), which runs on your ChatGPT subscription instead of per-token billing. A different model reviewing than the one that wrote the code is the premise of this whole tool, so this suits Claude-written code well.
+
+```bash
+./claudebox.sh build
+./claudebox.sh codex-login           # once: open the printed URL in any browser, enter the code
+./claudebox.sh run --repo /path/to/repo --agent codex
+```
+
+Or put `AGENT=codex` in your env file and leave the flag off. The model defaults to `gpt-6.1-sol`; set `REVIEW_MODEL` to pick another. `PROVIDER` and its credentials are ignored, with a warning.
+
+- **Its own login.** `codex-login` signs a Docker volume, `claudebox-codex`, in to your ChatGPT account. It's deliberately separate from your Mac's `codex` login: Codex refresh tokens are single-use, so two copies of one login sign each other out. For the same reason, only one Codex container runs per host, and the launcher refuses to start a second. `./claudebox.sh codex-login --status` shows whether the volume is signed in, and a container started without a login stops at once and tells you to run `codex-login`.
+- **The volume holds a whole-account credential.** It's your ChatGPT login, not a scoped API key. At every startup the entrypoint deletes everything in the volume except `auth.json`, because Codex reads instruction files from there and the reviewer can write to it.
+- **No kindex or Linear yet.** Both are off under Codex for now. A mounted kindex store or a `LINEAR_API_KEY` is ignored, with a log line saying so.
+- **Usage limits.** When you hit your plan's limit, the loop keeps every session and backs off for `LIMIT_BACKOFF_SECONDS`. If you spend a reset, the next poll carries on where it stopped. Codex can also switch to a cheaper model by itself at a limit, and there's no setting to stop that. If the loop sees a switch, it logs a warning, finishes the PR it was on, and then backs off rather than reviewing more on a model you didn't choose.
+
 ## How it works
 
 The reviewer runs **one Claude session per PR per mode per persona**. Each cycle the reviewer enumerates the candidate PRs (see [PR selection](#pr-selection)), works out each one's review mode, then reviews it with each persona enabled for that mode in its own session: a pair's first review starts a new session with that mode's review prompt; later cycles `--resume` that pair's session with the mode's followup prompt, so a persona remembers what it already flagged and avoids duplicate comments. The PR number is substituted into the prompt's `{{PR}}` token.
@@ -200,6 +217,7 @@ Three failures in a row that are **not** limits — connection refused, a dead t
 ./claudebox.sh logs                            # follow the play-by-play
 ./claudebox.sh test --repo /path/to/your/repo  # one-off, foreground, --rm
 ./claudebox.sh stop
+./claudebox.sh config validate .github/claudebox.json   # check a hosted-App config offline
 ```
 
 **Per-repo config & naming.** Run the launcher from inside a repo's working copy and it
@@ -488,6 +506,39 @@ Both overrides work under `--no-repo` too. `--kindex-profile` then resolves from
 The container never opens your live store: it's mounted read-only as a source, and the loop copies it into the container before anything queries it, verifying the copy before use. Nothing the reviewer does can write back to your host graph.
 
 Rebuild after upgrading kindex on the host. `claudebox.sh build` pins the image's kindex to your host's `kin --version`, so an image older than the schema your store was written with fails the first snapshot at startup with a message telling you to rebuild; an older host schema is migrated into the copy instead of refused. Upgrading kindex on the host while a container is already running shows up later instead, at the next cycle's refresh, as a WARN that keeps the last good snapshot until you rebuild.
+
+## Hosted config (preview)
+
+`.github/claudebox.json` configures the hosted GitHub App, which is still being built. When the App reviews a repo, it will read this file from the repo's default branch, and org-wide defaults from the same path in the org's `.github` repository. Local mode doesn't read it. A container started with `run` or `test` logs one line at startup when the reviewed repo carries the file, and keeps taking its configuration from the env file (`.env.claudebox`).
+
+The design names YAML for this file. It's JSON for now, by a founder ruling, with the design's keys, nesting and meaning:
+
+```json
+{
+  "$schema": "https://raw.githubusercontent.com/MrJoy/claudebox/main/schema/claudebox.schema.json",
+  "version": 1,
+  "trigger": "auto",
+  "profile": "main",
+  "plan": { "label": "plan", "personas": "all" },
+  "code": { "personas": "red_team,adversarial,sme,sage" },
+  "max_concurrent_personas": 0,
+  "rounds": { "cap": 4 },
+  "kindex": { "store": "none" }
+}
+```
+
+The `$schema` line points an editor at `schema/claudebox.schema.json` for completion and squiggles. The loader is stricter than the schema, and the loader decides. An unknown key is an error rather than a silent fall back to the org default, and so is an unknown `version` (a missing one means 1). A repo file overrides the org file key by key. An invalid repo file falls back to the org defaults; when the org file is invalid too, the repo isn't reviewed. The persona fields take the same selector syntax as `PERSONAS` and `PLAN_PERSONAS`.
+
+Check a file before you commit it:
+
+```bash
+./claudebox.sh build                                    # once: validation runs inside the image
+./claudebox.sh config validate .github/claudebox.json
+./claudebox.sh config validate .github/claudebox.json --org path/to/org-defaults.json
+./claudebox.sh config validate .github/claudebox.json --deploy claudebox.deploy.json --repo-name OWNER/NAME
+```
+
+It runs in a throwaway container with no network, the files mounted read-only, so it needs a built image. Without `--deploy` it checks the file's shape alone and says plainly that `profile`, `model`, `team` and `kindex.store` went unchecked, since only a deployment can judge those. With `--deploy`, it also checks the merged config against the operator's deployment file (`claudebox.deploy.json`): the profile exists, the model is one the profile allows, and the org kindex store is there and shared with this repo (that last check needs `--repo-name`). Whatever only the running App can know, such as whether a team exists or the repo is private, is printed as `NOT CHECKED HERE` and never counted as a pass. The repo file is judged strictly. A problem in it fails the run even though the App would fall back to the org defaults, and the output says which fallback would apply.
 
 ## Notes & caveats
 

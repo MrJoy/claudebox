@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "claudebox repo config",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "This schema's URL, for editors. Ignored."
+    },
+    "version": {
+      "const": 1,
+      "description": "Config format version. Omitted means 1."
+    },
+    "trigger": {
+      "enum": [
+        "auto",
+        "requested"
+      ],
+      "description": "auto reviews every PR; requested only PRs that ask."
+    },
+    "team": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]+$",
+      "description": "Team slug whose review request counts as an ask."
+    },
+    "profile": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]+$",
+      "description": "A provider profile the deployment defines."
+    },
+    "model": {
+      "type": "string",
+      "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$",
+      "description": "A model the profile allows; omit for its default."
+    },
+    "plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "label": {
+          "type": "string",
+          "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f](?:[^\\x00-\\x1f\\x7f-\\x9f]*[^\\s\\x00-\\x1f\\x7f-\\x9f])?$",
+          "description": "The label that makes a PR a plan review."
+        },
+        "personas": {
+          "type": "string",
+          "description": "Plan-mode personas: a comma or space separated list, or all. Shipped: adversarial, good_friend, helland, red_team, sage, sme, user."
+        }
+      }
+    },
+    "code": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "personas": {
+          "type": "string",
+          "description": "Code-mode personas: a comma or space separated list, or all. Shipped: adversarial, good_friend, helland, red_team, sage, sme, user."
+        }
+      }
+    },
+    "max_concurrent_personas": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "A PR's personas at once; 0 is all."
+    },
+    "rounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cap": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Automatic rounds before an explicit ask is needed."
+        }
+      }
+    },
+    "kindex": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "store": {
+          "enum": [
+            "none",
+            "org"
+          ],
+          "description": "Which kindex store reviewers read."
+        }
+      }
+    }
+  }
+}

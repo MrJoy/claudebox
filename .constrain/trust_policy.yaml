@@ -32,6 +32,12 @@ classifications:
     canary_eligible: false
     canary_pattern: null
     rationale: "Never logged. For workersai the real Cloudflare token is withheld from the review session and replaced by a per-container LiteLLM master key, precisely so a prompt-injected review cannot read it."
+  - field_pattern: "claudebox-codex volume auth.json (AGENT=codex)"
+    tier: AUTH
+    authoritative_component: "codex-login"
+    canary_eligible: false
+    canary_pattern: null
+    rationale: "A whole ChatGPT account credential, not a scoped key, held in a named volume the reviewer can write (Codex rewrites it on refresh). Never shared with the host's login, since refresh tokens are single-use. The entrypoint prunes everything else in the volume at startup so it cannot carry planted instructions across restarts."
   - field_pattern: "LINEAR_API_KEY"
     tier: AUTH
     authoritative_component: "supervisor"

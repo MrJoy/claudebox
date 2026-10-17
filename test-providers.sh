@@ -358,6 +358,15 @@ wires "anthropic: OAuth token path unsets the key vars" \
   PROVIDER=anthropic CLAUDE_CODE_OAUTH_TOKEN=tok \
   -- ANTHROPIC_API_KEY='<unset>' ANTHROPIC_AUTH_TOKEN='<unset>' ANTHROPIC_MODEL=claude-opus-4-8
 refuses "anthropic: no credential at all" "needs a credential" -- PROVIDER=anthropic
+# The third credential path: a mounted ~/.claude, as --mount-claude provides.
+# providers.py re-implements the shell's `[ -r "$creds_file" ]`, which no case
+# reached until review on PR #14 found it unpinned. CLAUDE_CONFIG_DIR points
+# outside $HOME because run_entrypoint wipes $HOME per case.
+mkdir -p "$WORK/claude-creds"; : >"$WORK/claude-creds/.credentials.json"
+wires "anthropic: a mounted credentials file is a credential" \
+  PROVIDER=anthropic CLAUDE_CONFIG_DIR="$WORK/claude-creds" \
+  -- ANTHROPIC_API_KEY='<unset>' ANTHROPIC_AUTH_TOKEN='<unset>' ANTHROPIC_MODEL=claude-opus-4-8 \
+     "LOG:authenticating with mounted credentials at $WORK/claude-creds/.credentials.json"
 
 # --- custom -----------------------------------------------------------------
 wires "custom: Bearer auth" \
@@ -500,6 +509,14 @@ wires "several headers: numbered vars satisfy the bedrock credential check" \
   ANTHROPIC_BEDROCK_BASE_URL=https://gw.example/bedrock \
   ANTHROPIC_CUSTOM_HEADERS_1='cf-aig-authorization: Bearer t' \
   -- 'ANTHROPIC_CUSTOM_HEADERS=cf-aig-authorization: Bearer t' CLAUDE_CODE_USE_BEDROCK=1
+# A numbered value that is only a pair of quotes joins as nothing, so bedrock
+# still has no credential and must refuse at startup, as the shell's `:?` on the
+# joined value did. The quotes are still there when the --check --provider
+# pre-flight runs: build_custom_headers strips the numbered vars after it.
+refuses "several headers: a quoted-empty numbered value is not a credential" \
+  "ANTHROPIC_CUSTOM_HEADERS" \
+  -- PROVIDER=cloudflare GATEWAY_UPSTREAM=bedrock REVIEW_MODEL=m \
+     ANTHROPIC_BEDROCK_BASE_URL=https://gw.example/bedrock ANTHROPIC_CUSTOM_HEADERS_1="''"
 
 # --- workersai (Cloudflare Workers AI via the bundled translator) ------------
 # Only the wiring is tested; the stubbed litellm never translates anything.

@@ -234,6 +234,30 @@ class RunPassTest(unittest.TestCase):
         self.assertEqual(got.session_id, "S1")
         self.assertFalse(got.limited)
 
+    def test_stdin_is_closed(self):
+        # The Codex runner needs this (codex exec blocks on an open stdin), and
+        # both runners share it so neither inherits PID 1's stdin.
+        script = self._fake_claude(
+            """
+            import json, sys
+            if sys.stdin.read() != "":
+                sys.exit(3)
+            print(json.dumps({"type": "result", "subtype": "success", "result": "ok"}))
+            """
+        )
+        seen = {}
+
+        def popen(argv, **pk):
+            seen.update(pk)
+            return subprocess.Popen([sys.executable, script], **pk)
+
+        got = passes.run_pass(
+            pair=Pair(12, "code", "sage"), prompt="review it", session_id=None,
+            persona_prompt="p", model="m", mcp_args=[], cwd=".", popen=popen,
+        )
+        self.assertIs(seen.get("stdin"), subprocess.DEVNULL)
+        self.assertEqual(got.rc, 0)
+
     def test_last_session_id_wins(self):
         script = self._fake_claude(
             """
@@ -317,6 +341,46 @@ class RunPassTest(unittest.TestCase):
         )
         got = self._run(script)
         self.assertEqual(got.rc, 1)
+        self.assertFalse(got.limited)
+        self.assertEqual(got.limit_line, "")
+
+    def test_a_limit_reported_only_in_the_result_event_is_a_limit(self):
+        # Ollama Cloud's 429, as claude 2.1 reported it on 2026-10-11: the
+        # limit is the result event's text on stdout, subtype "success", rc 1,
+        # and stderr carries an unrelated line. Classifying stderr alone
+        # dropped every session and abandoned the cycle as unhealthy.
+        script = self._fake_claude(
+            """
+            import json, sys
+            msg = ("API Error: Request rejected (429) \u00b7 you have reached "
+                   "your session usage limit, add usage credits")
+            print(json.dumps({"type": "system", "subtype": "init", "session_id": "S1"}))
+            print(json.dumps({"type": "result", "subtype": "success",
+                              "session_id": "S1", "result": msg}))
+            sys.stderr.write("[claude-code:unrecognized_model] {}\\n")
+            sys.exit(1)
+            """
+        )
+        got = self._run(script)
+        self.assertEqual(got.rc, 1)
+        self.assertEqual(got.session_id, "S1")
+        self.assertTrue(got.limited)
+        self.assertIn("usage limit", got.limit_line)
+
+    def test_a_failed_passs_own_prose_about_limits_is_not_a_limit(self):
+        # Only Claude Code's "API Error:" result is evidence. A review whose
+        # final text discusses rate limiting, from a pass that then failed for
+        # some other reason, must keep the ordinary failure path.
+        script = self._fake_claude(
+            """
+            import json, sys
+            print(json.dumps({"type": "result", "subtype": "success",
+                              "result": "The retry loop ignores 429 and the rate limit."}))
+            sys.stderr.write("connection reset\\n")
+            sys.exit(1)
+            """
+        )
+        got = self._run(script)
         self.assertFalse(got.limited)
         self.assertEqual(got.limit_line, "")
 
