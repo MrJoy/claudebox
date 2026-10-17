@@ -24,6 +24,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
 
+import codex_mcp
 import codex_pass
 import gh
 import graph_snapshot
@@ -576,13 +577,13 @@ class Supervisor:
     def _run_one(self, pair: Pair, prompt: str, session_id: Optional[str]):
         try:
             if self.agent == "codex":
-                # No MCP flags: kindex and Linear are not wired under Codex yet.
                 return codex_pass.run_pass(
                     pair=pair,
                     prompt=prompt,
                     session_id=session_id,
                     persona_prompt=self.system_prompt_for(pair),
                     model=self.model,
+                    mcp_args=self.mcp_args,
                     cwd=self.cwd,
                 )
             return passes.run_pass(
@@ -914,20 +915,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "than the image's, rebuild with `claudebox.sh build`, which pins "
                     "the image to the host's version; or run with --no-kindex."
                 )
-            kindex_deny = kindex_tools.deny_args(
-                env.get("KINDEX_TOOLS_FILE") or "/opt/kindex/tools.txt")
+            if agent != "codex":
+                kindex_deny = kindex_tools.deny_args(
+                    env.get("KINDEX_TOOLS_FILE") or "/opt/kindex/tools.txt")
             log("kindex: read-only snapshot of the host store ready; "
                 f"{len(kindex_tools.READ_TOOLS)} read tools allowed.")
+
+        mcp_args: List[str] = []
+        if agent == "codex":
+            use_kindex = env.get("KINDEX_ENABLED") == "1"
+            use_linear = env.get("LINEAR_ENABLED") == "1"
+            if use_kindex or use_linear:
+                mcp_args = codex_mcp.build_args(
+                    _required(env, "CODEX_MCP_DIR"), use_kindex, use_linear,
+                    env.get("KINDEX_MCP_BIN") or "/opt/kindex/bin/kin-mcp")
     except ConfigError as exc:
         die(str(exc))
 
-    mcp_args = ["--strict-mcp-config"]
-    mcp_config = env.get("MCP_CONFIG_FILE", "")
-    if mcp_config and os.path.isfile(mcp_config):
-        mcp_args += ["--mcp-config", mcp_config]
-        # Only behind a config that exists: the deny list names kindex's tools,
-        # and there is no kindex server without the file.
-        mcp_args += kindex_deny
+    if agent != "codex":
+        mcp_args = ["--strict-mcp-config"]
+        mcp_config = env.get("MCP_CONFIG_FILE", "")
+        if mcp_config and os.path.isfile(mcp_config):
+            mcp_args += ["--mcp-config", mcp_config]
+            # Only behind a config that exists: the deny list names kindex's
+            # tools, and there is no kindex server without the file.
+            mcp_args += kindex_deny
 
     supervisor = Supervisor(
         personas=persona_ids,

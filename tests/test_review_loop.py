@@ -1361,7 +1361,7 @@ class CodexDispatchTest(unittest.TestCase):
         self.assertEqual(len(codex_calls), 1)
         self.assertEqual(codex_calls[0]["persona_prompt"], expected_system)
         self.assertEqual(codex_calls[0]["model"], "gpt-6.1-sol")
-        self.assertNotIn("mcp_args", codex_calls[0])
+        self.assertEqual(codex_calls[0]["mcp_args"], ["--strict-mcp-config"])
 
     def test_spawn_failure_names_the_agent(self):
         s = self._supervisor()
@@ -1854,6 +1854,31 @@ class KindexWiringTest(unittest.TestCase):
         self.assertIn("WARN: kindex snapshot refresh failed (kindex refused the copy: newer); "
                       "keeping the previous one.", out)
         self.assertEqual(len(captured["prompts"]), 2)
+
+    def test_main_builds_codex_mcp_args_with_kindex_and_linear(self):
+        mcp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, mcp_dir, ignore_errors=True)
+        _, _, _, captured = self._main(self._env(
+            AGENT="codex", LINEAR_ENABLED="1", CODEX_MCP_DIR=mcp_dir))
+        expected = review_loop.codex_mcp.build_args(
+            mcp_dir, True, True, "/opt/kindex/bin/kin-mcp")
+        self.assertEqual(captured["mcp_args"], expected)
+        self.assertNotIn("--strict-mcp-config", captured["mcp_args"])
+        self.assertTrue(os.path.isfile(os.path.join(self.data_dir, "kindex.db")))
+
+    def test_main_codex_without_servers_has_no_mcp_args(self):
+        env = self._env(AGENT="codex")
+        env.pop("KINDEX_ENABLED")
+        _, _, _, captured = self._main(env)
+        self.assertEqual(captured["mcp_args"], [])
+
+    def test_main_codex_server_without_dir_is_a_config_error(self):
+        env = self._env(AGENT="codex", LINEAR_ENABLED="1")
+        env.pop("KINDEX_ENABLED")
+        rc, _, err, captured = self._main(env)
+        self.assertEqual(rc, 1)
+        self.assertIn("CODEX_MCP_DIR", err)
+        self.assertIsNone(captured["mcp_args"])
 
     def test_disabled_means_no_snapshot_and_no_flag(self):
         env = self._env()
