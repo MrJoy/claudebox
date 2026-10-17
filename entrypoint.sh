@@ -181,17 +181,17 @@ write_mcp_config() {
 write_codex_mcp_keys() {
   rm -rf "$1"
   [ -n "$linear_api_key" ] || [ "${KINDEX_ENABLED:-}" = 1 ] || return 1
+  # Each write ends the subshell on failure: the caller tests this function on
+  # the left of `&&`, where set -e is off, so the status is the last command's.
   ( umask 077
-    mkdir "$1"
-    chmod 700 "$1"
+    mkdir "$1" && chmod 700 "$1" || exit 1
     if [ -n "$linear_api_key" ]; then
-      printf '%s' "$linear_api_key" >"$1/linear.key"
-      chmod 600 "$1/linear.key"
+      { printf '%s' "$linear_api_key" >"$1/linear.key" && chmod 600 "$1/linear.key"; } || exit 1
     fi
     if [ "${KINDEX_ENABLED:-}" = 1 ] && [ -n "$voyage_api_key" ]; then
-      printf '%s' "$voyage_api_key" >"$1/voyage.key"
-      chmod 600 "$1/voyage.key"
-    fi )
+      { printf '%s' "$voyage_api_key" >"$1/voyage.key" && chmod 600 "$1/voyage.key"; } || exit 1
+    fi
+    exit 0 )
 }
 
 # Unprivileged user. Claude Code also refuses --dangerously-skip-permissions as
