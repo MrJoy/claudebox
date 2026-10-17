@@ -92,7 +92,17 @@ accepted every key below.
    that exits at once, and a header helper that exits 1, each left the pass
    running to completion with rc 0, the tools absent, and only an `ERROR`
    line on stderr. With `required=true` on that server, the pass itself
-   failed (rc 1, "required MCP servers failed to initialize").
+   failed (rc 1, "required MCP servers failed to initialize"). A failed
+   stdio server writes nothing to stderr at Codex's default log level; a
+   failed header helper writes an `ERROR ... MCP HTTP headers helper exited`
+   line.
+10. **Non-required servers lose a race on the first request.** Codex waits for
+    a server's initialize handshake but not its `tools/list`, so the first
+    model request of every pass carried no tools from it (kin-mcp started
+    directly, 18 tools allowed: `[0, 18, 18]` across three requests). A
+    server slower than the turn never appeared. `startup_readiness`
+    (`"connection"` or `"catalog"`) and `startup_timeout_sec` changed
+    nothing. With `required = true` the first request carried all 18.
 6. **MCP resources go around `enabled_tools`.** `list_mcp_resources` and
    `read_mcp_resource` reach every server's resources. Claude's resource tools
    do the same. kin-mcp's four resources (`kindex://status`,
@@ -143,7 +153,8 @@ Claude, and hands them to `Supervisor`. `codex_pass.build_argv` splices them
 into every pass, fresh and resumed, before the `--`. Per server:
 
 - kindex, only when `KINDEX_ENABLED=1`: `command` set to `python3`, `args`
-  naming the helper, and `enabled_tools` set to `sorted(READ_TOOLS)`. The
+  naming the helper, `enabled_tools` set to `sorted(READ_TOOLS)`, and
+  `required = true`. The
   allowlist is native here, so `tools.txt` is not consulted on this arm.
   The Dockerfile's existing check that every `READ_TOOLS` name still exists
   keeps covering a renamed tool.
@@ -157,16 +168,24 @@ falls back to raw text on invalid TOML.
 The comment at `review_loop.py:579` that says no MCP flags are passed under
 Codex goes.
 
-### A server that fails to start
+### A server that fails to start, and the first-request race
 
-Operator's decision: the pass carries on without it, as Claude's does and as
-Codex does by default (measurement 9). No server is marked `required`.
-Unlike Claude, the failure is made visible: `codex_pass` echoes the MCP
-startup `ERROR` line from Codex's stderr into the pass log, in the way
-`passes.usage_limit_line` echoes the line a limit matched, truncated and
-only that line. The builder may raise `startup_timeout_sec` on the kindex
-server if kin-mcp startup under a full plan-mode fan-out turns out to be
-slow; that is a tuning call, not a design one.
+Measurement 10 changed the operator's first answer ("carry on without")
+into a split, decided by the operator 2026-10-17:
+
+- **kindex is `required = true`.** Codex then waits for kin-mcp's tool list,
+  so the persona has the graph from its first request. kin-mcp is local and
+  the supervisor has already opened and checked the snapshot before cycle 1,
+  so a failure to start is a fault in the image, and failing the pass makes
+  it loud: the existing WARN tail carries "required MCP servers failed to
+  initialize: kindex", and three in a row back the cycle off like any other
+  dead dependency.
+- **Linear is not required.** It is remote, and an outage there must not
+  fail reviews. Its tools are missing from each pass's first request and
+  present after. When its header helper fails, Codex prints an `ERROR` line
+  on stderr at its default log level; `codex_pass` echoes the first line
+  naming an MCP failure into the pass log on a pass that otherwise
+  succeeded, truncated to 400 characters as `passes.usage_limit_line` does.
 
 ### Prompts
 
@@ -223,5 +242,5 @@ entrypoint stops skipping `KINDEX_ENABLED=1` under Codex.
 - `enabled_tools` alone, without a `disabled_tools` belt. It failed closed in
   every measurement, and `disabled_tools` would need `tools.txt` for no gain.
 - No Linear tool filter, for parity with Claude.
-- Echoing the MCP startup error into the pass log (the operator chose to
-  carry on without a failed server; making it visible was my addition).
+- Echoing Linear's MCP startup error into the pass log (making a skipped
+  server visible was my addition to the operator's split).
