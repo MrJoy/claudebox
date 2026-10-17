@@ -745,13 +745,13 @@ cycle "limits: a rate-limited pass keeps its session and resumes next cycle" \
 # exactly the shape of a shared env file that names a provider beside AGENT=codex.
 cycle "codex: passes go to codex, never claude" \
   AGENT=codex \
-  -- CALLS:8 ARGV:1:"exec --json" ARGV:5:"exec resume --json" \
+  -- CALLS:10 ARGV:1:"exec --json" ARGV:6:"exec resume --json" \
      LOG:"Review agent: codex"
 
 cycle "codex: a resumed pass still carries its persona and the lockdown" \
   AGENT=codex PR_IDS=12 MAX_CONCURRENT_PASSES= \
-  -- CALLS:8 \
-     MATCHCOUNT:"exec resume":4 \
+  -- CALLS:10 \
+     MATCHCOUNT:"exec resume":5 \
      MATCHCOUNT:"exec resume&&--ignore-user-config&&developer_instructions=&&You are a Red Team security reviewer":1 \
      MATCHCOUNT:"exec resume&&--ignore-user-config&&developer_instructions=&&You are an Adversarial reviewer":1 \
      MATCHCOUNT:"exec resume&&--ignore-user-config&&developer_instructions=&&You are a Subject Matter Expert":1 \
@@ -1218,7 +1218,7 @@ cycle "mcp: a Linear key adds the generated config to every invocation" \
 # The floor: a group's personas each get their own pass, on both cycles.
 cycle "parallel: every code persona of a group gets its own pass, both cycles" \
   PR_IDS=12 MAX_CONCURRENT_PASSES= \
-  -- CALLS:8 \
+  -- CALLS:10 \
      MATCHCOUNT:"You are a Red Team security reviewer":2 \
      MATCHCOUNT:"You are an Adversarial reviewer":2 \
      MATCHCOUNT:"You are a Subject Matter Expert":2 \
@@ -1259,7 +1259,7 @@ cycle "parallel: MAX_CONCURRENT_PASSES caps the peak without dropping a pass" \
 # MATCHCOUNT:--resume:5 on its own would not notice.
 cycle "parallel: a resumed pass still carries its own persona" \
   PR_IDS=12 MAX_CONCURRENT_PASSES= \
-  -- CALLS:8 \
+  -- CALLS:10 \
      MATCHCOUNT:"--resume":5 \
      MATCHCOUNT:"--resume&&--append-system-prompt&&You are a Red Team security reviewer":1 \
      MATCHCOUNT:"--resume&&--append-system-prompt&&You are an Adversarial reviewer":1 \
@@ -1273,7 +1273,7 @@ cycle "parallel: a resumed pass still carries its own persona" \
 # siblings are reading, and a resumed pass is as able to do that as a new one.
 cycle "worktree: the shared-copy stanza reaches every pass, resumed ones included" \
   PR_IDS=12 MAX_CONCURRENT_PASSES= \
-  -- CALLS:8 \
+  -- CALLS:10 \
      MATCHCOUNT:"One more constraint":10 \
      LOG:"Shared-worktree constraint active for: code plan"
 
@@ -1283,7 +1283,7 @@ cycle "worktree: the shared-copy stanza reaches every pass, resumed ones include
 # each mode's effective concurrency one.
 cycle "worktree: no shared-copy stanza when nothing runs beside the pass" \
   PR_IDS=12 \
-  -- CALLS:8 \
+  -- CALLS:10 \
      MATCHCOUNT:"One more constraint":0 \
      NOLOG:"Shared-worktree constraint active"
 
@@ -1347,7 +1347,7 @@ cycle "parallel: the cut abandons the groups after it and the next cycle starts 
 # count is zero rather than one.
 cycle "parallel: a non-limit failure neither cuts the cycle nor costs its siblings their sessions" \
   PR_IDS=12 MAX_CONCURRENT_PASSES= STUB_FAIL_PERSONA="Red Team" STUB_FAIL_MODE=other \
-  -- CALLS:8 \
+  -- CALLS:10 \
      MATCHCOUNT:"--resume":4 \
      MATCHCOUNT:"--resume&&You are a Red Team security reviewer":0 \
      MATCHCOUNT:"You are a Red Team security reviewer":2 \
