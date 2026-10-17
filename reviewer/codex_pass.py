@@ -257,7 +257,7 @@ def run_pass(
 
     skipped = mcp_failure_line(stderr)
     if skipped:
-        log(f"WARN: an MCP server did not start; this pass ran without it: {skipped}",
+        log(f"WARN: an MCP server failed; this pass may have run without it: {skipped}",
             pair=pair)
     if switched:
         log(f"WARN: codex switched from {model} to {switched}; "

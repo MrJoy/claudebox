@@ -364,7 +364,7 @@ class RunPassTest(unittest.TestCase):
         got, log, _ = self._run(self._events(
             {"type": "turn.completed", "usage": {}}, stderr=McpFailureLineTest.HELPER + "\n"))
         self.assertEqual(got.rc, 0)
-        self.assertIn("an MCP server did not start", log)
+        self.assertIn("an MCP server failed", log)
         self.assertIn("MCP HTTP headers helper exited", log)
 
     def test_mcp_args_reach_popen(self):
