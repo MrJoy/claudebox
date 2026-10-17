@@ -107,8 +107,10 @@ printf '#!/bin/sh\nexit 0\n' >"$BIN/sleep"
 # stub above returns at once and would leave nothing running), and `curl`
 # reports it ready on the first poll so the readiness wait returns immediately.
 # It also records whether it inherited VOYAGE_API_KEY, which belongs to kin-mcp
-# alone and must be gone from the environment before either helper starts.
-printf '#!/bin/sh\nprintf "%%s voyage=%%s" "$*" "${VOYAGE_API_KEY-<unset>}" >"$HOME/litellm-argv"\nexec tail -f /dev/null\n' >"$BIN/litellm"
+# alone and must be gone from the environment before either helper starts, and
+# which upstream credentials it was handed: the translator is the one process
+# that is supposed to hold them.
+printf '#!/bin/sh\nprintf "%%s voyage=%%s cf=%%s openai=%%s" "$*" "${VOYAGE_API_KEY-<unset>}" "${CLOUDFLARE_API_TOKEN-<unset>}" "${OPENAI_API_KEY-<unset>}" >"$HOME/litellm-argv"\nexec tail -f /dev/null\n' >"$BIN/litellm"
 printf '#!/bin/sh\nexit 0\n' >"$BIN/curl"
 
 # python3 has two callers now, and only one of them may be stubbed. The
@@ -127,7 +129,7 @@ cat >"$BIN/python3" <<'STUB'
 #!/bin/sh
 case "$1" in
   *workersai-shim.py)
-    printf '%s upstream=%s port=%s voyage=%s' "$*" "$SHIM_UPSTREAM_URL" "$SHIM_PORT" "${VOYAGE_API_KEY-<unset>}" >"$HOME/shim-argv"
+    printf '%s upstream=%s port=%s voyage=%s cf=%s' "$*" "$SHIM_UPSTREAM_URL" "$SHIM_PORT" "${VOYAGE_API_KEY-<unset>}" "${CLOUDFLARE_API_TOKEN-<unset>}" >"$HOME/shim-argv"
     exec tail -f /dev/null ;;
   */reviewer/review_loop.py)
     shift; exec "$REAL_PYTHON3" "$REVIEWER_MAIN" "$@" ;;
@@ -151,7 +153,7 @@ cat >"$BIN/claude" <<'STUB'
            ANTHROPIC_MODEL ANTHROPIC_DEFAULT_FABLE_MODEL \
            ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL \
            ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_SMALL_FAST_MODEL \
-           VOYAGE_API_KEY; do
+           VOYAGE_API_KEY CLOUDFLARE_API_TOKEN OPENAI_API_KEY; do
     # Escape newlines back to a literal \n: ANTHROPIC_CUSTOM_HEADERS is genuinely
     # multi-line, and one dump line per variable keeps the assertions greppable.
     # Backslashes are escaped FIRST, so a real newline (dumped as \n) can't be
@@ -301,6 +303,8 @@ wires() {
       NOLOG:*) grep -qF -- "${expect#NOLOG:}" "$OUT" && missing="$missing [log should not have: ${expect#NOLOG:}]"; continue ;;
       # A CFG:<line> expectation checks a line of the generated litellm.yaml.
       CFG:*) grep -qxF "CFG ${expect#CFG:}" "$DUMP" || missing="$missing [config missing: ${expect#CFG:}]"; continue ;;
+      # NOCFG:<substring> -- the generated translator config must NOT contain it.
+      NOCFG:*) grep '^CFG ' "$DUMP" | grep -qF -- "${expect#NOCFG:}" && missing="$missing [config should not have: ${expect#NOCFG:}]"; continue ;;
       # A NOT:VAR=value expectation asserts claude did NOT get that exact value —
       # for a credential that must stay behind the translator, where the value it
       # legitimately holds instead is random and can't be matched positively.
@@ -530,7 +534,12 @@ wires "workersai: defaults to glm-5.2 behind the local translator" \
 wires "workersai: the Cloudflare token is not handed to claude" \
   PROVIDER=workersai CLOUDFLARE_ACCOUNT_ID=acct CLOUDFLARE_API_TOKEN=cftok \
   -- NOT:ANTHROPIC_AUTH_TOKEN=cftok NOT:ANTHROPIC_API_KEY=cftok \
+     CLOUDFLARE_API_TOKEN='<unset>' \
      CFG:'      api_key: os.environ/CLOUDFLARE_API_TOKEN'
+# Nor to the normalizer: only the translator, which sends it upstream, holds it.
+wires "workersai: only the translator holds the Cloudflare token" \
+  PROVIDER=workersai CLOUDFLARE_ACCOUNT_ID=acct CLOUDFLARE_API_TOKEN=cftok \
+  -- PROXY:'cf=cftok' SHIM:'cf=<unset>'
 # Load-bearing, not a tuning knob: without it LiteLLM translates /v1/messages into
 # the OpenAI *Responses* API, which Cloudflare does not serve for these models, and
 # every request fails its schema union.
@@ -560,6 +569,43 @@ wires "workersai: the model id is emitted as a quoted YAML scalar" \
   REVIEW_MODEL=@cf/moonshotai/kimi-k2.7-code \
   -- CFG:'  - model_name: "@cf/moonshotai/kimi-k2.7-code"' \
      CFG:'      model: "openai/@cf/moonshotai/kimi-k2.7-code"'
+
+# --- openai (OpenAI's API via the bundled translator) ------------------------
+# Only the wiring is tested here too. What the translator puts on the wire for
+# gpt-6.1-sol was captured against an echo server (see CLAUDE.md).
+wires "openai: defaults to gpt-6.1-sol behind the local translator" \
+  PROVIDER=openai OPENAI_API_KEY=sk-oai \
+  -- ANTHROPIC_BASE_URL=http://127.0.0.1:4000 ANTHROPIC_API_KEY= \
+     ANTHROPIC_MODEL=gpt-6.1-sol ANTHROPIC_SMALL_FAST_MODEL=gpt-6.1-sol \
+     CFG:'      model: "openai/gpt-6.1-sol"' \
+     CFG:'      api_base: "https://api.openai.com/v1"' \
+     LOG:'Translator ready.'
+wires "openai: REVIEW_MODEL picks the model" \
+  PROVIDER=openai OPENAI_API_KEY=sk-oai REVIEW_MODEL=gpt-6-astra \
+  -- ANTHROPIC_MODEL=gpt-6-astra CFG:'  - model_name: "gpt-6-astra"'
+# The OpenAI key reaches the translator and nothing else: not claude, whose
+# shell a prompt-injected review controls.
+wires "openai: only the translator holds the OpenAI key" \
+  PROVIDER=openai OPENAI_API_KEY=sk-oai \
+  -- OPENAI_API_KEY='<unset>' NOT:ANTHROPIC_AUTH_TOKEN=sk-oai \
+     PROXY:'openai=sk-oai' CFG:'      api_key: os.environ/OPENAI_API_KEY'
+wires "openai: a quoted OPENAI_API_KEY is unquoted before it is handed over" \
+  PROVIDER=openai OPENAI_API_KEY='"sk-oai"' \
+  -- PROXY:'openai=sk-oai$' OPENAI_API_KEY='<unset>'
+# The opposite of workersai: gpt-6.1-sol calls tools only over the Responses
+# API, and the chat/completions switch is global.
+wires "openai: the translator stays on the Responses API" \
+  PROVIDER=openai OPENAI_API_KEY=sk-oai \
+  -- 'NOCFG:use_chat_completions_url_for_anthropic_messages'
+wires "openai: no normalizer" \
+  PROVIDER=openai OPENAI_API_KEY=sk-oai \
+  -- NOSHIM:'upstream='
+wires "openai: the translator is bound to loopback only" \
+  PROVIDER=openai OPENAI_API_KEY=sk-oai \
+  -- PROXY:'--host 127.0.0.1' PROXY:'--num_workers 1'
+refuses "openai: no API key" "OPENAI_API_KEY" -- PROVIDER=openai
+refuses "openai: translator missing from the image" "PROVIDER=openai needs the bundled LiteLLM translator" \
+  -- PROVIDER=openai OPENAI_API_KEY=sk-oai LITELLM_BIN=/nonexistent
 
 # --- workersai: the normalizer between the translator and Cloudflare ----------
 # The chain is Claude Code -> LiteLLM -> normalizer -> Cloudflare. LiteLLM omits

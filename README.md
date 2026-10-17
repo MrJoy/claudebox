@@ -25,12 +25,14 @@ Set `PROVIDER` (default `ollama`) to pick the backend. The entrypoint validates 
 | `custom` | `ANTHROPIC_AUTH_TOKEN` *or* `ANTHROPIC_API_KEY` | your `ANTHROPIC_BASE_URL` | *(none — you must set `REVIEW_MODEL`)* |
 | `cloudflare` | depends on `GATEWAY_UPSTREAM` — see [below](#cloudflare-ai-gateway) | your Cloudflare AI Gateway | *(none — you must set `REVIEW_MODEL`)* |
 | `workersai` | `CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_API_TOKEN` | Cloudflare Workers AI, via a bundled translator | `@cf/zai-org/glm-5.2` |
+| `openai` | `OPENAI_API_KEY` | OpenAI's API, via the same translator | `gpt-6.1-sol` |
 
 - **`ollama`** — Ollama Cloud's native Anthropic-compatible API. Auth goes through `ANTHROPIC_AUTH_TOKEN` (a Bearer token), so `ANTHROPIC_API_KEY` is blanked.
 - **`anthropic`** — Anthropic's own API, at its default endpoint. You don't have to paste an API key: the entrypoint takes the first credential it finds, in this order — `ANTHROPIC_API_KEY` (console key), else `CLAUDE_CODE_OAUTH_TOKEN`, else a mounted credentials file — and only errors if none exists. See [Reusing your existing `claude` login](#reusing-your-existing-claude-login).
 - **`custom`** — any other Anthropic-compatible endpoint. Set `ANTHROPIC_BASE_URL`, a `REVIEW_MODEL` the endpoint serves, and whichever auth the endpoint expects: `ANTHROPIC_AUTH_TOKEN` for a Bearer header (most gateways/compatible services) or `ANTHROPIC_API_KEY` for `x-api-key`.
 - **`cloudflare`** — a [Cloudflare AI Gateway](https://developers.cloudflare.com/ai-gateway/integrations/coding-agents/claude-code/) fronting Anthropic, Amazon Bedrock, or Google Vertex AI. See [Cloudflare AI Gateway](#cloudflare-ai-gateway).
 - **`workersai`** — a model Cloudflare itself hosts, from the [Workers AI catalog](https://developers.cloudflare.com/workers-ai/models/). Needs no URL and no gateway; see [Cloudflare Workers AI](#cloudflare-workers-ai).
+- **`openai`** — an OpenAI model, through the translator `workersai` uses. See [OpenAI](#openai).
 
 > **Don't quote values in your env file.** `docker run --env-file` isn't a shell — it keeps everything after the `=` literally, so `ANTHROPIC_BASE_URL="https://…"` yields a value that really begins and ends with a quote, and Claude Code then fails on an unparseable URL at *request* time. Values with spaces or colons (`ANTHROPIC_CUSTOM_HEADERS`, `PR_SEARCH`) need no quoting. The entrypoint strips a matched surrounding pair and warns, and rejects a base URL that isn't `http(s)://` at startup, but the habit is the thing to fix. Shell quoting *is* required for launcher flags like `--search "is:open label:x"`, which is a different context.
 
@@ -65,15 +67,29 @@ Create the token at [dash.cloudflare.com/profile/api-tokens](https://dash.cloudf
 
 Pick a model that lists **function calling** in the catalog. A reviewer that can't call tools can't read the diff, so a model without it fails in a confusing rather than obvious way. `@cf/zai-org/glm-5.2` (the default) and `@cf/moonshotai/kimi-k2.7-code` both do.
 
-> **Why this needs a translator, and `cloudflare` doesn't.** Workers AI models are served only over an OpenAI-compatible schema — [Cloudflare's REST API docs](https://developers.cloudflare.com/ai-gateway/usage/rest-api/) state that the Anthropic-shaped `/ai/v1/messages` endpoint does *not* serve `@cf/` models — and Claude Code speaks nothing but the Anthropic Messages API. So this provider starts a [LiteLLM](https://docs.litellm.ai/docs/anthropic_unified/) proxy inside the container as an Anthropic→OpenAI translator, and points Claude Code at it. It's baked into the image (pinned; override with `--build-arg LITELLM_VERSION=…`), listens on **loopback only**, and runs only for this provider — every other provider still talks straight to its endpoint with no extra process. Your Cloudflare token stays behind the translator: Claude Code is given a random per-container key instead, so a PR that tries to prompt-inject its way to your credentials doesn't find them. Set `LITELLM_PORT` if 4000 is taken.
+> **Why this needs a translator, and `cloudflare` doesn't.** Workers AI models are served only over an OpenAI-compatible schema — [Cloudflare's REST API docs](https://developers.cloudflare.com/ai-gateway/usage/rest-api/) state that the Anthropic-shaped `/ai/v1/messages` endpoint does *not* serve `@cf/` models — and Claude Code speaks nothing but the Anthropic Messages API. So this provider starts a [LiteLLM](https://docs.litellm.ai/docs/anthropic_unified/) proxy inside the container as an Anthropic→OpenAI translator, and points Claude Code at it. It's baked into the image (pinned; override with `--build-arg LITELLM_VERSION=…`), listens on **loopback only**, and runs only for this provider and `openai`. Every other provider still talks straight to its endpoint with no extra process. Your Cloudflare token stays behind the translator: it's taken out of the environment at startup and handed to the translator process alone, and Claude Code is given a random per-container key instead, so a PR that tries to prompt-inject its way to your credentials won't find them in the environment. (The translator runs as the same user as the reviewer, so a determined attempt could still read it out of `/proc`.) Set `LITELLM_PORT` if 4000 is taken.
 >
-> Bundling it roughly doubles the image (~1.1GB to ~1.9GB) — it drags in Python and LiteLLM's dependency tree. That only affects `PROVIDER=workersai`; the other providers ignore it entirely, but they do carry the bytes.
+> Bundling it roughly doubles the image (~1.1GB to ~1.9GB) — it drags in Python and LiteLLM's dependency tree. That only affects `PROVIDER=workersai` and `PROVIDER=openai`; the other providers ignore it entirely, but they do carry the bytes.
 >
 > If a model rejects the translated requests, set `LITELLM_DEBUG=1` to log the actual request bodies to `litellm.log`. They include your token, so turn it back off for unattended runs.
 >
 > The translator is started before the first review pass and waited on, and re-checked every cycle — if it dies, the container fails loudly instead of grinding through passes that can't reach a model. `docker exec <container> cat litellm.log` has its output.
 >
 > **And one more hop, for the Kimi models.** LiteLLM leaves the `content` field out entirely on an assistant message that carries only a tool call. That's legal OpenAI and glm-5.2 accepts it, but the Kimi models reject it outright — `Invalid value at messages[N].content` — and Claude Code produces such a message on *every* tool call, so those models would fail on essentially every review. So a small normalizer (`workersai-shim.py`, ~150 lines of Python standard library) runs between the translator and Cloudflare and fills in `content: ""`. It has to be a separate process because the omission happens in LiteLLM's output, after the translation its own plugin hooks can reach. Like the translator, it's loopback-only and this provider only; `SHIM_PORT` moves it off 4001 and `SHIM_NORMALIZE=0` removes it, though there's little reason to — an empty string is valid for every model, so it's one path that always gets exercised rather than a special case for one family. Its output is in `shim.log`.
+
+### OpenAI
+
+```bash
+PROVIDER=openai
+OPENAI_API_KEY=<key from platform.openai.com/api-keys>
+# REVIEW_MODEL=gpt-6.1-sol   # the default
+```
+
+Claude Code only speaks Anthropic's API, so this provider runs the same bundled LiteLLM translator as [`workersai`](#cloudflare-workers-ai), with the same loopback bind, startup wait, per-cycle check and `LITELLM_DEBUG`/`LITELLM_PORT` settings. The OpenAI key gets the same treatment as the Cloudflare token: only the translator process holds it, and Claude Code gets the per-container key.
+
+The translator talks to OpenAI over the **Responses API**, the opposite of `workersai`. `gpt-6.1-sol` only calls tools over Responses, and Chat Completions serves it only for requests without tools. There's no normalizer either, because OpenAI accepts the message shape the Kimi models reject.
+
+Any `REVIEW_MODEL` that calls tools over the Responses API should work. LiteLLM 1.95.0 has no entry for the gpt-6 family, so a reasoning effort the model doesn't list gets rounded to one it does (`max` and `xhigh` to `high`, `minimal` to `low`). Run `claudebox.sh test` against a model before you leave it unattended.
 
 ### Cloudflare AI Gateway
 

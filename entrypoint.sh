@@ -55,7 +55,7 @@ strip_surrounding_quotes \
   ANTHROPIC_BASE_URL ANTHROPIC_BEDROCK_BASE_URL ANTHROPIC_VERTEX_BASE_URL \
   ANTHROPIC_VERTEX_PROJECT_ID CLOUD_ML_REGION ANTHROPIC_CUSTOM_HEADERS \
   ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN OLLAMA_API_KEY \
-  CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN \
+  CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN OPENAI_API_KEY \
   GITHUB_TOKEN GITHUB_REPOSITORY LINEAR_API_KEY VOYAGE_API_KEY \
   PR_ASSIGNEE PR_AUTHOR PR_IDS PR_SEARCH \
   PERSONAS PLAN_PERSONAS PERSONA_DIR PLAN_LABEL LIMIT_BACKOFF_SECONDS MAX_CYCLES \
@@ -352,21 +352,25 @@ if [ -n "$_custom_headers" ]; then
 fi
 unset _custom_headers _h
 
-# --- Workers AI translator (LiteLLM) ---------------------------------------
-# Cloudflare's Workers AI catalog (glm-5.2, the Kimi models, ...) is reachable
-# ONLY over an OpenAI-compatible schema: Cloudflare's REST API docs state plainly
-# that its Anthropic-shaped /ai/v1/messages endpoint does not serve @cf/ models,
-# and Claude Code speaks nothing but the Anthropic Messages API. So for
-# PROVIDER=workersai we run LiteLLM's proxy in-container as a translator —
-# Anthropic /v1/messages in, OpenAI /chat/completions out, streaming and tool
-# calls included. Tool calling is the whole job of a reviewer, which is why an
-# off-the-shelf translator that already gets it right beats one of our own.
+# --- Anthropic -> OpenAI translator (LiteLLM) -------------------------------
+# Two providers serve models only over OpenAI's schemas, and Claude Code speaks
+# nothing but the Anthropic Messages API. For those we run LiteLLM's proxy
+# in-container as a translator, streaming and tool calls included. Tool calling
+# is the whole job of a reviewer, which is why an off-the-shelf translator that
+# already gets it right beats one of our own.
 #
-# The proxy is a local implementation detail: it listens on loopback, holds the
-# Cloudflare token only via the environment, and exists only for this provider.
+#   workersai  Cloudflare's Workers AI catalog (glm-5.2, the Kimi models, ...).
+#              Cloudflare's REST API docs state plainly that its Anthropic-shaped
+#              /ai/v1/messages endpoint does not serve @cf/ models, so it goes
+#              out over /chat/completions. The full chain is Claude Code ->
+#              LiteLLM -> shim -> Cloudflare; the shim is workersai-shim.py, and
+#              start_shim below says why the extra hop exists.
+#   openai     OpenAI's own API. Current models (gpt-6.1-sol) call tools only
+#              over the Responses API, which is LiteLLM's default for the
+#              `openai` provider, so it goes out over /responses.
 #
-# The full chain is: Claude Code -> LiteLLM -> shim -> Cloudflare. The shim is
-# workersai-shim.py; see start_shim below for why the extra hop exists.
+# The proxy is a local implementation detail: it listens on loopback, and it is
+# the only process that holds the upstream credential (see start_litellm).
 LITELLM_PORT="${LITELLM_PORT:-4000}"
 LITELLM_CONFIG="$HOME/litellm.yaml"
 LITELLM_PID=""
@@ -397,23 +401,24 @@ stop_shim() {
 # two processes are left holding their ports.
 trap 'stop_litellm; stop_shim' EXIT
 
-# Write the proxy config. The Cloudflare token is referenced as os.environ/... so
-# it is never written to disk; the file still gets mode 600, since the account id
-# and model choice are nobody else's business either. Values are emitted through
-# jq so a model id full of '@' and '/' (or an account id with something odd in it)
-# can't break the YAML — a JSON scalar is a valid YAML scalar.
+# Write the proxy config. The upstream credential is referenced as
+# os.environ/<key_var> so it is never written to disk; the file still gets mode
+# 600, since the account id and model choice are nobody else's business either.
+# Values are emitted through jq so a model id full of '@' and '/' (or an account
+# id with something odd in it) can't break the YAML -- a JSON scalar is a valid
+# YAML scalar.
 write_litellm_config() {
-  local path=$1 model=$2 api_base=$3
+  local path=$1 model=$2 api_base=$3 key_var=$4 api=$5
   ( umask 077; : >"$path" )
   {
     printf 'model_list:\n'
     printf '  - model_name: %s\n' "$(jq -rn --arg v "$model" '$v|@json')"
     printf '    litellm_params:\n'
     # openai/ prefix = "talk to an OpenAI-compatible endpoint at api_base",
-    # which is what Cloudflare's /ai/v1 surface is.
+    # which both OpenAI and Cloudflare's /ai/v1 surface are.
     printf '      model: %s\n' "$(jq -rn --arg v "openai/$model" '$v|@json')"
     printf '      api_base: %s\n' "$(jq -rn --arg v "$api_base" '$v|@json')"
-    printf '      api_key: os.environ/CLOUDFLARE_API_TOKEN\n'
+    printf '      api_key: os.environ/%s\n' "$key_var"
     printf 'general_settings:\n'
     # Without a master key the proxy would accept unauthenticated requests from
     # anything that can reach the port. Loopback-only makes that a small window,
@@ -423,46 +428,61 @@ write_litellm_config() {
     # Claude Code sends Anthropic-specific parameters that have no OpenAI
     # equivalent. Dropping them beats failing the request outright.
     printf '  drop_params: true\n'
-    # REQUIRED, not a tuning knob. For the "openai" provider LiteLLM translates an
-    # incoming /v1/messages request into the OpenAI *Responses* API by default
-    # (`input`/`instructions`/`max_output_tokens`, and flat `{type,name,parameters}`
-    # tools). Cloudflare's /ai/v1 surface serves Responses only for a couple of
-    # models -- not glm-5.2 -- so every request failed its schema union with a wall
-    # of "required properties at '/' are 'messages'" and, once per tool,
-    # "required properties at '/tools/N/function' are 'name'". This flag routes
-    # through /chat/completions instead, which emits `messages` and nested
-    # `{type: function, function: {name, ...}}` tools -- the shape Cloudflare wants.
-    printf '  use_chat_completions_url_for_anthropic_messages: true\n'
+    if [ "$api" = chat ]; then
+      # REQUIRED for workersai, not a tuning knob. For the "openai" provider
+      # LiteLLM translates an incoming /v1/messages request into the OpenAI
+      # *Responses* API by default (`input`/`instructions`/`max_output_tokens`,
+      # and flat `{type,name,parameters}` tools). Cloudflare's /ai/v1 surface
+      # serves Responses only for a couple of models -- not glm-5.2 -- so every
+      # request failed its schema union with a wall of "required properties at
+      # '/' are 'messages'" and, once per tool, "required properties at
+      # '/tools/N/function' are 'name'". This flag routes through
+      # /chat/completions instead, which emits `messages` and nested
+      # `{type: function, function: {name, ...}}` tools -- the shape Cloudflare
+      # wants. PROVIDER=openai must NOT get it: gpt-6.1-sol accepts tools only
+      # over Responses, and the flag is global, not per model.
+      printf '  use_chat_completions_url_for_anthropic_messages: true\n'
+    fi
   } >>"$path"
 }
 
 # Start the translator and block until it answers, or die. Starting it lazily on
 # the first request is not an option: the first review pass would fail while it
 # was still booting, and a review pass that fails is a session thrown away.
+#
+# The upstream credential reaches LiteLLM and nothing else. The caller takes it
+# out of the environment before calling this (and before start_shim), and it is
+# exported here only inside the subshell that execs the proxy. Left exported, it
+# would be inherited by the supervisor this script execs into, and from there by
+# every claude pass and every shell a pass spawns, so a prompt-injected review
+# could print it. A determined one still can: the proxy runs as `reviewer`, which
+# can read /proc/<pid>/environ. Closing that takes a second uid.
 start_litellm() {
-  local model=$1 api_base=$2 waited=0
-  [ -x "${LITELLM_BIN:-}" ] || die "PROVIDER=workersai needs the bundled LiteLLM translator at ${LITELLM_BIN:-<LITELLM_BIN unset>}, which is missing. Rebuild the image (the Dockerfile installs it)."
+  local model=$1 api_base=$2 key_var=$3 key=$4 api=$5 waited=0
+  [ -x "${LITELLM_BIN:-}" ] || die "PROVIDER=$PROVIDER needs the bundled LiteLLM translator at ${LITELLM_BIN:-<LITELLM_BIN unset>}, which is missing. Rebuild the image (the Dockerfile installs it)."
   # A per-container random key, so it can't be anything an operator has reused.
   export LITELLM_MASTER_KEY="sk-$(head -c 24 /dev/urandom | base64 | tr -d '/+=')"
-  write_litellm_config "$LITELLM_CONFIG" "$model" "$api_base"
+  write_litellm_config "$LITELLM_CONFIG" "$model" "$api_base" "$key_var" "$api"
   # --host 127.0.0.1 is load-bearing: the proxy defaults to 0.0.0.0, and it is an
-  # unauthenticated-by-default gateway holding a Cloudflare token. Nothing outside
+  # unauthenticated-by-default gateway holding an upstream token. Nothing outside
   # this container has any business reaching it.
   # --num_workers 1 because the loop reviews one PR at a time; the default is one
   # worker per CPU, which would waste memory and eat into --pids-limit.
   # LITELLM_DEBUG=1 logs the translated request/response bodies, which is the only
   # practical way to see what the translator actually put on the wire when a
   # provider rejects a request. It is off by default because those bodies include
-  # the Authorization header, i.e. the Cloudflare token.
+  # the Authorization header, i.e. the upstream token.
   local debug_args=()
   if pr_truthy "${LITELLM_DEBUG:-}"; then
     debug_args=(--detailed_debug)
     log "WARN: LITELLM_DEBUG is on; $HOME/litellm.log will contain full request bodies INCLUDING CREDENTIALS. Turn it off for unattended runs."
   fi
-  "$LITELLM_BIN" --config "$LITELLM_CONFIG" \
-    --host 127.0.0.1 --port "$LITELLM_PORT" --num_workers 1 \
-    ${debug_args[@]+"${debug_args[@]}"} \
-    >"$HOME/litellm.log" 2>&1 &
+  (
+    export "$key_var=$key"
+    exec "$LITELLM_BIN" --config "$LITELLM_CONFIG" \
+      --host 127.0.0.1 --port "$LITELLM_PORT" --num_workers 1 \
+      ${debug_args[@]+"${debug_args[@]}"}
+  ) >"$HOME/litellm.log" 2>&1 &
   LITELLM_PID=$!
   log "Starting the LiteLLM translator on 127.0.0.1:$LITELLM_PORT (pid $LITELLM_PID)..."
   # /health/liveliness is the proxy's own unauthenticated liveness probe.
@@ -549,6 +569,7 @@ if [ "$AGENT" = claude ]; then
 #   cloudflare - a Cloudflare AI Gateway fronting Anthropic, Bedrock, or Vertex
 #                (GATEWAY_UPSTREAM picks which).
 #   workersai  - a Cloudflare Workers AI model, through the bundled translator.
+#   openai     - an OpenAI model, through the same translator.
 # Whichever backend is chosen, we pin EVERY model tier to the single
 # $REVIEW_MODEL. A non-Anthropic backend has no Opus/Sonnet/Haiku models, so if
 # a subagent or alias requests an un-overridden tier, Claude Code errors out on
@@ -684,7 +705,11 @@ case "$PROVIDER" in
     # LiteLLM translator (see "Workers AI translator" above for why one is needed).
     # Only two things to configure, because the endpoint is derivable: the account
     # the models are billed to, and a token that can invoke them.
-    export CLOUDFLARE_API_TOKEN
+    # The token goes to the translator alone (see start_litellm). Out of the
+    # environment before start_shim too: the normalizer forwards the
+    # Authorization header LiteLLM sends and has no use for the token itself.
+    workersai_token="$CLOUDFLARE_API_TOKEN"
+    unset CLOUDFLARE_API_TOKEN
     # glm-5.2 is the same model the default ollama provider uses, so the reviewer
     # behaves the same way on either backend. Other options in the catalog:
     # @cf/moonshotai/kimi-k2.7-code, @cf/moonshotai/kimi-k2.6, @cf/zai-org/glm-4.7-flash.
@@ -702,8 +727,9 @@ case "$PROVIDER" in
       log "WARN: SHIM_NORMALIZE is off; models that require an explicit assistant content field (the Kimi models) will fail."
       workersai_upstream="$workersai_base"
     fi
-    start_litellm "$REVIEW_MODEL" "$workersai_upstream"
-    unset workersai_base workersai_upstream
+    start_litellm "$REVIEW_MODEL" "$workersai_upstream" \
+      CLOUDFLARE_API_TOKEN "$workersai_token" chat
+    unset workersai_base workersai_upstream workersai_token
     # Point Claude Code at the translator, not at Cloudflare. Auth is the
     # translator's own per-container key; the Cloudflare token stays behind it, so
     # a prompt-injected review can't read a credential out of Claude Code's env.
@@ -711,6 +737,25 @@ case "$PROVIDER" in
     export ANTHROPIC_AUTH_TOKEN="$LITELLM_MASTER_KEY"
     export ANTHROPIC_API_KEY=""
     PROVIDER_LABEL="workersai (via the bundled LiteLLM translator)"
+    ;;
+  openai)
+    # An OpenAI model, through the same translator as workersai, with no
+    # normalizer behind it: OpenAI accepts the content-less assistant message
+    # that the Kimi models reject. The translator talks to OpenAI over the
+    # Responses API (see write_litellm_config for why that is the default here
+    # and switched off for workersai).
+    REVIEW_MODEL="${REVIEW_MODEL:-gpt-6.1-sol}"
+    openai_key="$OPENAI_API_KEY"
+    unset OPENAI_API_KEY
+    start_litellm "$REVIEW_MODEL" "https://api.openai.com/v1" \
+      OPENAI_API_KEY "$openai_key" responses
+    unset openai_key
+    # As for workersai: Claude Code authenticates to the translator with its
+    # per-container key, and the OpenAI key stays behind it.
+    export ANTHROPIC_BASE_URL="http://127.0.0.1:$LITELLM_PORT"
+    export ANTHROPIC_AUTH_TOKEN="$LITELLM_MASTER_KEY"
+    export ANTHROPIC_API_KEY=""
+    PROVIDER_LABEL="openai (via the bundled LiteLLM translator)"
     ;;
 esac
 

@@ -46,14 +46,16 @@ RUN npm install -g @openai/codex@${CODEX_VERSION} \
  && codex --version
 
 # --- Anthropic -> OpenAI translator (LiteLLM) ------------------------------
-# For PROVIDER=workersai. Cloudflare's Workers AI models (@cf/...) are reachable
-# only over an OpenAI-compatible schema — Cloudflare's own docs say the
-# Anthropic-shaped /ai/v1/messages endpoint explicitly does NOT serve them — and
-# Claude Code speaks nothing but the Anthropic Messages API. LiteLLM's proxy
-# bridges the two: it exposes /v1/messages and translates to /chat/completions,
-# streaming and tool calls included, which is the part that has to be right for a
-# reviewer to work at all. entrypoint.sh starts it on 127.0.0.1 only, and only
-# for that provider; every other provider runs with no extra process.
+# For PROVIDER=workersai and PROVIDER=openai. Cloudflare's Workers AI models
+# (@cf/...) and OpenAI's own models are reachable only over OpenAI's schemas
+# (Cloudflare's own docs say its Anthropic-shaped /ai/v1/messages endpoint
+# explicitly does NOT serve @cf/ models), and Claude Code speaks nothing but the
+# Anthropic Messages API. LiteLLM's proxy bridges the two: it exposes
+# /v1/messages and translates to /chat/completions for Cloudflare and to
+# /responses for OpenAI, streaming and tool calls included, which is the part
+# that has to be right for a reviewer to work at all. entrypoint.sh starts it on
+# 127.0.0.1 only, and only for those two providers; every other provider runs
+# with no extra process.
 #
 # Pinned deliberately: this pulls a large dependency tree into the image at build
 # time, so the version that gets audited is the version that ships. Bump it on
@@ -81,7 +83,8 @@ RUN apt-get update \
  && /opt/litellm/bin/python -c "import litellm.proxy.proxy_server" \
  && find /opt/litellm -name '__pycache__' -type d -prune -exec rm -rf {} +
 # Root-owned and world-executable: the unprivileged reviewer runs it but cannot
-# modify it. entrypoint.sh refuses PROVIDER=workersai if this is missing.
+# modify it. entrypoint.sh refuses PROVIDER=workersai and PROVIDER=openai if
+# this is missing.
 ENV LITELLM_BIN=/opt/litellm/bin/litellm \
     LITELLM_LOCAL_MODEL_COST_MAP=True
 
