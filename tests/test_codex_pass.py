@@ -32,6 +32,18 @@ class ArgvTest(unittest.TestCase):
             + FIXED_TAIL + ["--", "review it"],
         )
 
+    def test_mcp_args_come_before_the_separator_on_both_shapes(self):
+        mcp = ["-c", "mcp_servers.k.required=true"]
+        for sid in (None, "T1"):
+            argv = codex_pass.build_argv(sid, "m", "P", "x", mcp_args=mcp)
+            i = argv.index("mcp_servers.k.required=true")
+            self.assertLess(i, argv.index("--"))
+            self.assertEqual(argv[i - 1], "-c")
+
+    def test_no_mcp_args_is_todays_argv(self):
+        self.assertEqual(codex_pass.build_argv(None, "m", "P", "x"),
+                         codex_pass.build_argv(None, "m", "P", "x", mcp_args=()))
+
     def test_resumed_pass(self):
         argv = codex_pass.build_argv("T1", "gpt-6.1-sol", "P", "review it")
         self.assertEqual(argv[:4], ["codex", "exec", "resume", "--json"])
@@ -79,6 +91,39 @@ class TomlStringTest(unittest.TestCase):
     def test_control_characters_are_escaped(self):
         self.assertEqual(codex_pass.toml_string("\x01"), '"\\u0001"')
         self.assertEqual(codex_pass.toml_string("\x7f"), '"\\u007F"')
+
+
+class TomlArrayTest(unittest.TestCase):
+    def test_empty(self):
+        self.assertEqual(codex_pass.toml_array([]), "[]")
+
+    def test_round_trips(self):
+        if tomllib is None:
+            self.skipTest("tomllib needs Python 3.11")
+        items = ['a"b', "c\\d", "e f"]
+        self.assertEqual(tomllib.loads("x = " + codex_pass.toml_array(items))["x"], items)
+
+
+class McpFailureLineTest(unittest.TestCase):
+    HELPER = ('2026-10-17T06:23:16.357451Z ERROR rmcp::transport::worker: worker quit with fatal: '
+              'Transport channel closed, when Client(HttpRequest(HttpRequest("MCP HTTP headers '
+              'helper exited with status exit status: 1")))')
+    AUTH = ('2026-10-17T06:23:15.376237Z ERROR rmcp::transport::worker: worker quit with fatal: '
+            'Transport channel closed, when AuthRequired(AuthRequiredError { www_authenticate_header: '
+            '"Bearer realm=\\"OAuth\\"" })')
+
+    def test_captured_helper_failure(self):
+        self.assertEqual(codex_pass.mcp_failure_line("Reading additional input from stdin...\n" + self.HELPER),
+                         self.HELPER)
+
+    def test_captured_auth_failure(self):
+        self.assertEqual(codex_pass.mcp_failure_line(self.AUTH), self.AUTH)
+
+    def test_truncated(self):
+        self.assertEqual(len(codex_pass.mcp_failure_line(self.HELPER + "x" * 500)), 400)
+
+    def test_ordinary_stderr(self):
+        self.assertEqual(codex_pass.mcp_failure_line("Reading additional input from stdin...\n"), "")
 
 
 class FormatEventTest(unittest.TestCase):
@@ -195,11 +240,12 @@ class RunPassTest(unittest.TestCase):
         self.addCleanup(os.unlink, path)
         return path
 
-    def _run(self, script, session_id=None):
+    def _run(self, script, session_id=None, mcp_args=()):
         seen = {}
 
         def popen(argv, **pk):
             seen.update(pk)
+            seen["argv"] = argv
             return subprocess.Popen([sys.executable, script], **pk)
 
         out = io.StringIO()
@@ -211,6 +257,7 @@ class RunPassTest(unittest.TestCase):
                 persona_prompt="you are red team",
                 model="gpt-6.1-sol",
                 cwd=".",
+                mcp_args=mcp_args,
                 popen=popen,
             )
         return result, out.getvalue(), seen
@@ -316,3 +363,16 @@ class RunPassTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_a_skipped_mcp_server_is_logged_on_success(self):
+        got, log, _ = self._run(self._events(
+            {"type": "turn.completed", "usage": {}}, stderr=McpFailureLineTest.HELPER + "\n"))
+        self.assertEqual(got.rc, 0)
+        self.assertIn("an MCP server did not start", log)
+        self.assertIn("MCP HTTP headers helper exited", log)
+
+    def test_mcp_args_reach_popen(self):
+        mcp = ["-c", "mcp_servers.k.required=true"]
+        _, _, seen = self._run(self._events({"type": "turn.completed", "usage": {}}),
+                               mcp_args=mcp)
+        self.assertIn("mcp_servers.k.required=true", seen["argv"])

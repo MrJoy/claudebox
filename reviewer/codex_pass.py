@@ -11,7 +11,7 @@ import json
 import re
 import subprocess
 import tempfile
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import passes
 from common import Pair, log
@@ -28,6 +28,11 @@ _SWITCHED = re.compile(r"Automatically switched to (.+?) due to")
 # this is where a revoked or signed-out login first shows itself.
 _AUTH_FAILURE = re.compile(r"sign in again|refresh token|401 Unauthorized|not logged in",
                            re.IGNORECASE)
+
+# An MCP server that failed to start. Codex logs it to stderr and carries on
+# without the server, so a pass can succeed having never seen the tools the
+# prompt promised.
+MCP_FAILURE_RE = re.compile(r"\bERROR\b.*\brmcp\b")
 
 _TOML_ESCAPES = {'"': '\\"', "\\": "\\\\", "\b": "\\b", "\t": "\\t",
                  "\n": "\\n", "\f": "\\f", "\r": "\\r"}
@@ -51,8 +56,22 @@ def toml_string(text: str) -> str:
     return '"' + "".join(out) + '"'
 
 
+def toml_array(items: Sequence[str]) -> str:
+    """A TOML array of basic strings, `[]` when empty."""
+    return "[" + ", ".join(toml_string(i) for i in items) + "]"
+
+
+def mcp_failure_line(text: str) -> str:
+    """The first stderr line reporting a failed MCP server, truncated, or ""."""
+    for line in text.splitlines():
+        if MCP_FAILURE_RE.search(line):
+            return line[:400]
+    return ""
+
+
 def build_argv(
-    session_id: Optional[str], model: str, persona_prompt: str, prompt: str
+    session_id: Optional[str], model: str, persona_prompt: str, prompt: str,
+    mcp_args: Sequence[str] = (),
 ) -> List[str]:
     """The codex invocation, fresh or resumed.
 
@@ -61,7 +80,9 @@ def build_argv(
     without it. --strict-config makes an unknown -c key an error: codex
     otherwise ignores one silently, which once left a "fallback off" setting
     that did not exist looking like a guard. developer_instructions carries
-    the persona on every call, the way --append-system-prompt does. `--` comes before the session id and the
+    the persona on every call, the way --append-system-prompt does. MCP servers
+    arrive here as `-c` flags because --ignore-user-config skips every config
+    file. `--` comes before the session id and the
     prompt, so a prompt that starts with a dash is never read as a flag.
     """
     argv = ["codex", "exec"]
@@ -75,6 +96,7 @@ def build_argv(
         "-m", model,
         "-c", "developer_instructions=" + toml_string(persona_prompt),
         "-c", "check_for_update_on_startup=false",
+        *mcp_args,
         "--",
     ]
     if session_id:
@@ -167,9 +189,10 @@ def run_pass(
     persona_prompt: str,
     model: str,
     cwd: str,
+    mcp_args: Sequence[str] = (),
     popen: Callable[..., Any] = subprocess.Popen,
 ) -> passes.PassResult:
-    argv = build_argv(session_id, model, persona_prompt, prompt)
+    argv = build_argv(session_id, model, persona_prompt, prompt, mcp_args)
     recovered = session_id
     errors: List[str] = []
     turn_failed = False
@@ -232,6 +255,10 @@ def run_pass(
         return passes.PassResult(rc=rc or 1, session_id=recovered,
                                  limited=limited, limit_line=limit_line)
 
+    skipped = mcp_failure_line(stderr)
+    if skipped:
+        log(f"WARN: an MCP server did not start; this pass ran without it: {skipped}",
+            pair=pair)
     if switched:
         log(f"WARN: codex switched from {model} to {switched}; "
             "ending this cycle after the group.", pair=pair)
