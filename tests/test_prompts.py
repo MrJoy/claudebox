@@ -81,6 +81,18 @@ class StanzaScopeTest(unittest.TestCase):
         self.assertEqual(prompts.linear_stanza({}), "")
         self.assertEqual(prompts.linear_stanza({"LINEAR_API_KEY": ""}), "")
 
+    def test_linear_enabled_lands_the_stanza_without_a_key(self):
+        self.assertEqual(prompts.linear_stanza({"LINEAR_ENABLED": "1"}),
+                         prompts.linear_stanza({"LINEAR_API_KEY": "x"}))
+
+    def test_linear_enabled_other_values_do_not(self):
+        for v in ("", "0", "true"):
+            self.assertEqual(prompts.linear_stanza({"LINEAR_ENABLED": v}), "")
+
+    def test_linear_enabled_reaches_the_built_default_byte_for_byte(self):
+        built = prompts.build({"LINEAR_ENABLED": "1"}).review["code"]
+        self.assertEqual(built, prompts.build({"LINEAR_API_KEY": "lin_test"}).review["code"])
+
 
 class KindexStanzaTest(unittest.TestCase):
     ON = {"KINDEX_ENABLED": "1"}

@@ -182,9 +182,14 @@ class Prompts:
 def linear_stanza(env: Mapping[str, str]) -> str:
     """The Linear instruction, or empty when Linear is not configured.
 
+    Configured means a non-empty LINEAR_API_KEY, or LINEAR_ENABLED=1. The second
+    signal exists for the Codex arm: entrypoint.sh unsets the key before the
+    supervisor starts, so it never reaches Codex's environment, and exports
+    LINEAR_ENABLED=1 in its place.
+
     Leading space included: it is appended to a prompt.
     """
-    if not env.get("LINEAR_API_KEY"):
+    if not (env.get("LINEAR_API_KEY") or env.get("LINEAR_ENABLED") == "1"):
         return ""
     return _LINEAR_STANZA
 
