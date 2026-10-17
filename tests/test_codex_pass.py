@@ -360,10 +360,6 @@ class RunPassTest(unittest.TestCase):
         self.assertIs(seen.get("stdin"), subprocess.DEVNULL)
         self.assertEqual(got.rc, 0)
 
-
-if __name__ == "__main__":
-    unittest.main()
-
     def test_a_skipped_mcp_server_is_logged_on_success(self):
         got, log, _ = self._run(self._events(
             {"type": "turn.completed", "usage": {}}, stderr=McpFailureLineTest.HELPER + "\n"))
@@ -376,3 +372,7 @@ if __name__ == "__main__":
         _, _, seen = self._run(self._events({"type": "turn.completed", "usage": {}}),
                                mcp_args=mcp)
         self.assertIn("mcp_servers.k.required=true", seen["argv"])
+
+
+if __name__ == "__main__":
+    unittest.main()

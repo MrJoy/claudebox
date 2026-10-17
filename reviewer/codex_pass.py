@@ -82,8 +82,8 @@ def build_argv(
     that did not exist looking like a guard. developer_instructions carries
     the persona on every call, the way --append-system-prompt does. MCP servers
     arrive here as `-c` flags because --ignore-user-config skips every config
-    file. `--` comes before the session id and the
-    prompt, so a prompt that starts with a dash is never read as a flag.
+    file. `--` comes before the session id and the prompt, so a prompt that
+    starts with a dash is never read as a flag.
     """
     argv = ["codex", "exec"]
     if session_id:
