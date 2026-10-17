@@ -76,7 +76,9 @@ def _read_key(mcp_dir: str, name: str) -> str:
     try:
         with open(os.path.join(mcp_dir, name)) as f:
             text = f.read()
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError covers UnicodeDecodeError; its message names the byte, so
+        # it is dropped rather than echoed.
         return ""
     return text[:-1] if text.endswith("\n") else text
 

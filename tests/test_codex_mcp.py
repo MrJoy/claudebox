@@ -108,6 +108,15 @@ class LinearHeadersTest(KeyDirTest):
         self.assertEqual(out, "")
         self.assertIn("linear.key", err)
 
+    def test_non_utf8_file_is_unreadable_not_a_traceback(self):
+        with open(os.path.join(self.dir.name, "linear.key"), "wb") as f:
+            f.write(b"\xff")
+        rc, out, err = self.run_main(["linear-headers", self.dir.name])
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(out, "")
+        self.assertIn("linear.key", err)
+        self.assertNotIn("xff", err.lower())
+
     def test_empty_file_exits_nonzero(self):
         self.write("linear.key", "")
         rc, out, err = self.run_main(["linear-headers", self.dir.name])
