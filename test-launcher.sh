@@ -507,6 +507,32 @@ if selected "$L"; then
   expect "$L" 0 -- "!claudebox-codex"
 fi
 
+# Mutation: drop the codex PID default, or apply it to claude too.
+L="codex: the PID limit defaults to 2048 under codex and 512 otherwise"
+if selected "$L"; then
+  launch "$L" 0 -- -- "${RUN[@]}" --agent codex
+  expect "$L (flag)" 0 -- "--pids-limit 2048"
+  PIDS_ENVF="$WORK/env-codex-pids"; printf 'AGENT=codex\n' >"$PIDS_ENVF"
+  launch "$L" 0 -- -- run --repo "$REPO" --name cb --env-file "$PIDS_ENVF" --no-restart
+  expect "$L (env file)" 0 -- "--pids-limit 2048"
+  launch "$L" 0 -- -- "${RUN[@]}"
+  expect "$L (claude)" 0 -- "--pids-limit 512"
+fi
+
+# Mutation: let the codex default overwrite an explicit --pids.
+L="codex: an explicit --pids wins over the codex default"
+if selected "$L"; then
+  launch "$L" 0 -- -- "${RUN[@]}" --agent codex --pids 700
+  expect "$L" 0 -- "--pids-limit 700" "!--pids-limit 2048"
+fi
+
+# Mutation: drop --init from the hardening flags.
+L="run: an init process reaps orphaned pass children"
+if selected "$L"; then
+  launch "$L" 0 -- -- "${RUN[@]}"
+  expect "$L" 0 -- "--init --cap-drop ALL"
+fi
+
 L="codex: codex-login runs a device-code login in the volume"
 if selected "$L"; then
   launch "$L" 0 -- -- codex-login

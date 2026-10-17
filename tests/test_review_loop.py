@@ -612,9 +612,9 @@ class MaxCyclesTest(unittest.TestCase):
 
 
 class CheckLitellmTest(unittest.TestCase):
-    """The PID-1 zombie hazard. Python is PID 1 after entrypoint.sh execs into
-    it, so a dead translator stays a zombie and os.kill(pid, 0) still succeeds
-    against it. Without the non-blocking reap the liveness check would pass
+    """The zombie hazard. The translator is the supervisor's own child after
+    entrypoint.sh execs into it, so no init above reaps it: a dead translator
+    stays a zombie and os.kill(pid, 0) still succeeds against it. Without the non-blocking reap the liveness check would pass
     against a dead translator forever, and every pass would fail on connection
     refused instead of one loud error."""
 
