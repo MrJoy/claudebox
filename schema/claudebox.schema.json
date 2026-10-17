@@ -45,7 +45,7 @@
         },
         "personas": {
           "type": "string",
-          "description": "Plan-mode personas: a comma or space separated list, or all. Shipped: adversarial, good_friend, helland, red_team, sage, sme, user."
+          "description": "Plan-mode personas: a comma or space separated list, or all. Shipped: adversarial, good_friend, helland, minimalist, red_team, sage, sme, user."
         }
       }
     },
@@ -55,7 +55,7 @@
       "properties": {
         "personas": {
           "type": "string",
-          "description": "Code-mode personas: a comma or space separated list, or all. Shipped: adversarial, good_friend, helland, red_team, sage, sme, user."
+          "description": "Code-mode personas: a comma or space separated list, or all. Shipped: adversarial, good_friend, helland, minimalist, red_team, sage, sme, user."
         }
       }
     },
