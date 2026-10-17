@@ -235,7 +235,8 @@ rmdir "$HOME/calls.lock"
   echo "ARGV $*"
   for v in ANTHROPIC_MODEL ANTHROPIC_DEFAULT_FABLE_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL \
            ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL \
-           ANTHROPIC_SMALL_FAST_MODEL CODEX_HOME; do
+           ANTHROPIC_SMALL_FAST_MODEL CODEX_HOME \
+           LINEAR_API_KEY VOYAGE_API_KEY LINEAR_ENABLED; do
     if [ -n "${!v+set}" ]; then echo "ENV $v=${!v}"; else echo "ENV $v=<unset>"; fi
   done
 } >"$HOME/dump.$n"
@@ -363,6 +364,11 @@ run_entrypoint() {
   case " $* " in
     *" PRESEED_CODEX=1 "*)
       touch "$HOME_DIR/.codex/AGENTS.md" "$HOME_DIR/.codex/hooks.json" ;;
+  esac
+  # PRESEED_LINEAR_KEY=1: a key file left by an earlier run.
+  case " $* " in
+    *" PRESEED_LINEAR_KEY=1 "*)
+      mkdir -p "$HOME_DIR/codex-mcp"; echo stale >"$HOME_DIR/codex-mcp/linear.key" ;;
   esac
   # KINDEX_SRC is pinned to a path that never exists, so a host with a store
   # at the entrypoint's default /kindex-src still runs these cases without
@@ -493,7 +499,7 @@ cycle() {
   [ "${1:-}" = "--" ] && shift
   selected "$label" || return 0
   run_entrypoint "$label" ${env_in[@]+"${env_in[@]}"}
-  local expect missing="" n rest dump
+  local expect missing="" n rest dump got
   for expect in "$@"; do
     case "$expect" in
       CALLS:*)
@@ -524,6 +530,11 @@ cycle() {
       # FILE:/NOFILE: a path under the run's $HOME exists, or does not.
       FILE:*)   [ -e "$HOME_DIR/${expect#FILE:}" ] || missing="$missing [file missing: ${expect#FILE:}]" ;;
       NOFILE:*) [ -e "$HOME_DIR/${expect#NOFILE:}" ] && missing="$missing [file should be gone: ${expect#NOFILE:}]" ;;
+      # MODE:path:octal -- a path under $HOME has that permission mode.
+      MODE:*)
+        rest="${expect#MODE:}"; n="${rest##*:}"; rest="${rest%:*}"
+        got="$(stat -c %a "$HOME_DIR/$rest" 2>/dev/null || stat -f %Lp "$HOME_DIR/$rest" 2>/dev/null)"
+        [ "$got" = "$n" ] || missing="$missing [mode of $rest: expected $n, got ${got:-none}]" ;;
       NOLOG:*) grep -qF "${expect#NOLOG:}" "$OUT" && missing="$missing [log should not have: ${expect#NOLOG:}]" ;;
       *) missing="$missing [unknown expectation: $expect]" ;;
     esac
@@ -756,9 +767,23 @@ cycle "codex: PROVIDER is ignored with a warning" \
   -- CALLS:1 LOG:"PROVIDER=ollama is ignored under AGENT=codex" \
      ENV:1:ANTHROPIC_MODEL="<unset>" ENV:1:CODEX_HOME="$WORK/home/.codex"
 
-cycle "codex: Linear is off" \
-  AGENT=codex PERSONAS=red_team MAX_CYCLES=1 LINEAR_API_KEY=lin \
-  -- CALLS:1 LOG:"Linear is not available under AGENT=codex" NOARGV:1:"Linear"
+cycle "codex: Linear goes through the header helper, never the environment" \
+  AGENT=codex PERSONAS=red_team LINEAR_API_KEY=lin_secret_x \
+  -- CALLS:2 LOG:"Linear MCP enabled" \
+     ENV:1:LINEAR_API_KEY="<unset>" ENV:2:LINEAR_API_KEY="<unset>" \
+     ARGV:1:"mcp_servers.linear.http_headers_helper" ARGV:2:"mcp_servers.linear.http_headers_helper" \
+     NOARGV:1:"lin_secret_x" NOARGV:2:"lin_secret_x" \
+     ARGV:1:"look that ticket up with the Linear MCP tools" \
+     FILE:codex-mcp/linear.key MODE:codex-mcp:700 MODE:codex-mcp/linear.key:600
+
+cycle "codex: no Linear key, no server, and a stale key file is gone" \
+  AGENT=codex PERSONAS=red_team MAX_CYCLES=1 PRESEED_LINEAR_KEY=1 \
+  -- CALLS:1 NOARGV:1:"mcp_servers.linear" NOFILE:codex-mcp/linear.key \
+     NOARGV:1:"look that ticket up with the Linear MCP tools"
+
+cycle "codex: an empty Linear key wires nothing" \
+  AGENT=codex PERSONAS=red_team MAX_CYCLES=1 LINEAR_API_KEY= \
+  -- CALLS:1 NOARGV:1:"mcp_servers.linear" NOFILE:codex-mcp/linear.key
 
 cycle "codex: a usage limit keeps the session and backs off" \
   AGENT=codex PERSONAS=red_team STUB_FAIL_ON=1 STUB_FAIL_MODE=limit \

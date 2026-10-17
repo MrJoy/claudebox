@@ -75,6 +75,9 @@ strip_surrounding_quotes \
 # in an unexported variable and handed only to the jq that writes mcp.json.
 voyage_api_key="${VOYAGE_API_KEY:-}"
 unset VOYAGE_API_KEY
+# LINEAR_ENABLED is ours alone, like KINDEX_ENABLED: an env-file value must not
+# make the prompts promise a Linear server nobody wired.
+unset LINEAR_ENABLED
 
 # --- Required configuration ------------------------------------------------
 # Provider-specific credentials are validated in "Backend selection" below.
@@ -165,6 +168,30 @@ write_mcp_config() {
         } else {} end)
       )
     }' >"$1" )
+}
+
+# AGENT=codex counterpart of write_mcp_config. Codex has no mcp.json that
+# carries a secret, and a key in its environment or argv would be readable by
+# the pass, so the keys go to files in $CODEX_MCP_DIR instead and the
+# supervisor's flags point helpers at them (reviewer/codex_mcp.py). Returns 1
+# when there is nothing to write: no Linear key and no kindex store. A voyage
+# key is written only with a store, a Linear key only when non-empty. The
+# subshell umask makes the directory 700 and the files 600 at creation; printf
+# is a builtin, so no value reaches an argv.
+write_codex_mcp_keys() {
+  rm -rf "$1"
+  [ -n "$linear_api_key" ] || [ "${KINDEX_ENABLED:-}" = 1 ] || return 1
+  ( umask 077
+    mkdir "$1"
+    chmod 700 "$1"
+    if [ -n "$linear_api_key" ]; then
+      printf '%s' "$linear_api_key" >"$1/linear.key"
+      chmod 600 "$1/linear.key"
+    fi
+    if [ "${KINDEX_ENABLED:-}" = 1 ] && [ -n "$voyage_api_key" ]; then
+      printf '%s' "$voyage_api_key" >"$1/voyage.key"
+      chmod 600 "$1/voyage.key"
+    fi )
 }
 
 # Unprivileged user. Claude Code also refuses --dangerously-skip-permissions as
@@ -284,10 +311,9 @@ if [ "$AGENT" = codex ]; then
   [ -z "${PROVIDER:-}" ] || log "WARN: PROVIDER=$PROVIDER is ignored under AGENT=codex."
   REVIEW_MODEL="${REVIEW_MODEL:-gpt-6.1-sol}"
   PROVIDER_LABEL="codex (ChatGPT login)"
-  if [ -n "${LINEAR_API_KEY:-}" ]; then
-    log "Linear is not available under AGENT=codex yet; ignoring LINEAR_API_KEY."
-    unset LINEAR_API_KEY
-  fi
+  # Held unexported, like voyage_api_key: Codex gets it through a key file.
+  linear_api_key="${LINEAR_API_KEY:-}"
+  unset LINEAR_API_KEY
 fi
 git config --global user.name  "PR Reviewer (bot)"
 git config --global user.email "pr-reviewer@localhost"
@@ -784,9 +810,7 @@ KINDEX_SRC="${KINDEX_SRC:-/kindex-src}"
 KINDEX_MCP_BIN="${KINDEX_MCP_BIN:-/opt/kindex/bin/kin-mcp}"
 KINDEX_DATA_DIR="$HOME/kindex"
 unset KINDEX_ENABLED
-if [ "$AGENT" = codex ] && [ -f "$KINDEX_SRC/kindex.db" ]; then
-  log "kindex is not available under AGENT=codex yet; the mounted store is unused."
-elif [ -f "$KINDEX_SRC/kindex.db" ]; then
+if [ -f "$KINDEX_SRC/kindex.db" ]; then
   KINDEX_ENABLED=1
   mkdir -p "$HOME/.config/kindex"
   # JSON is YAML; jq quotes the path.
@@ -805,8 +829,27 @@ fi
 # --dangerously-skip-permissions session.
 MCP_CONFIG_FILE="$HOME/mcp.json"
 rm -f "$MCP_CONFIG_FILE"
+CODEX_MCP_KEYS="$HOME/codex-mcp"
 if [ "$AGENT" = codex ]; then
-  :  # No MCP servers under Codex yet; codex_pass passes no MCP flags.
+  mcp_ok=0
+  write_codex_mcp_keys "$CODEX_MCP_KEYS" && mcp_ok=1
+  if [ "$mcp_ok" = 1 ]; then
+    export CODEX_MCP_DIR="$CODEX_MCP_KEYS"
+    if [ -n "${linear_api_key:-}" ]; then
+      export LINEAR_ENABLED=1
+      log "Linear MCP enabled (expects a READ-ONLY Linear API key)."
+    fi
+    [ "${KINDEX_ENABLED:-}" != 1 ] || log "kindex MCP enabled (a read-only snapshot of $KINDEX_SRC; read tools only)."
+    if [ "${KINDEX_ENABLED:-}" = 1 ] && [ -n "$voyage_api_key" ]; then
+      log "kindex vector search enabled (VOYAGE_API_KEY set): reviewer search queries are sent to Voyage AI to be embedded."
+    fi
+  else
+    # Same degrade as a failed mcp.json write: a half-written directory goes,
+    # and the prompts must not promise servers that are not there.
+    rm -rf "$CODEX_MCP_KEYS"
+    unset KINDEX_ENABLED LINEAR_ENABLED
+  fi
+  unset linear_api_key mcp_ok
 elif write_mcp_config "$MCP_CONFIG_FILE"; then
   [ -z "${LINEAR_API_KEY:-}" ] || log "Linear MCP enabled (expects a READ-ONLY Linear API key)."
   [ "${KINDEX_ENABLED:-}" != 1 ] || log "kindex MCP enabled (a read-only snapshot of $KINDEX_SRC; read tools only)."
@@ -906,7 +949,7 @@ export WORK_REPO
 export REVIEW_MODEL
 export MCP_CONFIG_FILE
 if [ "${KINDEX_ENABLED:-}" = 1 ]; then
-  export KINDEX_ENABLED KINDEX_SRC KINDEX_DATA_DIR
+  export KINDEX_ENABLED KINDEX_SRC KINDEX_DATA_DIR KINDEX_MCP_BIN
 fi
 export LITELLM_PID="${LITELLM_PID:-}"
 export SHIM_PID="${SHIM_PID:-}"
