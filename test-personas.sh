@@ -772,8 +772,10 @@ cycle "codex: PROVIDER is ignored with a warning" \
      ENV:1:ANTHROPIC_MODEL="<unset>" ENV:1:CODEX_HOME="$WORK/home/.codex"
 
 cycle "codex: Linear goes through the header helper, never the environment" \
-  AGENT=codex PERSONAS=red_team LINEAR_API_KEY=lin_secret_x \
-  -- CALLS:2 LOG:"Linear MCP enabled" \
+  AGENT=codex PERSONAS=red_team LINEAR_API_KEY=lin_secret_x VOYAGE_API_KEY=voy_secret \
+  -- CALLS:2 LOG:"Linear MCP enabled" LOG:"VOYAGE_API_KEY is set but kindex is not enabled" \
+     ENV:1:LINEAR_ENABLED=1 ENV:1:VOYAGE_API_KEY="<unset>" ENV:2:VOYAGE_API_KEY="<unset>" \
+     NOARGV:1:"voy_secret" NOARGV:2:"voy_secret" NOFILE:codex-mcp/voyage.key \
      ENV:1:LINEAR_API_KEY="<unset>" ENV:2:LINEAR_API_KEY="<unset>" \
      ARGV:1:"mcp_servers.linear.http_headers_helper" ARGV:2:"mcp_servers.linear.http_headers_helper" \
      NOARGV:1:"lin_secret_x" NOARGV:2:"lin_secret_x" \
@@ -782,12 +784,13 @@ cycle "codex: Linear goes through the header helper, never the environment" \
 
 cycle "codex: a failed key write wires no Linear server and no stanza" \
   AGENT=codex PERSONAS=red_team MAX_CYCLES=1 LINEAR_API_KEY=lin_secret_x STUB_MKDIR_FAIL=1 \
-  -- CALLS:1 NOLOG:"Linear MCP enabled" NOARGV:1:"mcp_servers.linear" \
+  -- CALLS:1 NOLOG:"Linear MCP enabled" LOG:"WARN: could not write" NOARGV:1:"mcp_servers.linear" \
      NOARGV:1:"look that ticket up with the Linear MCP tools" NOFILE:codex-mcp
 
 cycle "codex: no Linear key, no server, and a stale key file is gone" \
   AGENT=codex PERSONAS=red_team MAX_CYCLES=1 PRESEED_LINEAR_KEY=1 \
   -- CALLS:1 NOARGV:1:"mcp_servers.linear" NOFILE:codex-mcp/linear.key \
+     ENV:1:LINEAR_ENABLED="<unset>" NOLOG:"WARN: could not write" \
      NOARGV:1:"look that ticket up with the Linear MCP tools"
 
 cycle "codex: an empty Linear key wires nothing" \
