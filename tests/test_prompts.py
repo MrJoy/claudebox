@@ -16,12 +16,12 @@ def fixture(name):
 BASE = {}
 
 
-class DefaultsMatchTheShellTest(unittest.TestCase):
-    """The fixtures were captured from the pre-port entrypoint (Task 2).
+class DefaultsMatchTheFixturesTest(unittest.TestCase):
+    """The fixtures were captured from the pre-port entrypoint (Task 2), and
+    regenerated when the defaults stopped naming review topics (2026-10-20).
 
-    These are the port's real acceptance criteria: a stanza that lost a space,
-    a period, or a backtick during transcription changes what every review is
-    asked to do, and nothing else in the suite would notice.
+    A stanza that loses a space, a period, or a backtick changes what every
+    review is asked to do, and nothing else in the suite would notice.
     """
 
     def test_code_review_prompt(self):
@@ -54,10 +54,28 @@ class DefaultsMatchTheShellTest(unittest.TestCase):
 
 
 class StanzaScopeTest(unittest.TestCase):
-    def test_plan_prompts_carry_no_test_stanza(self):
+    def test_no_default_carries_the_test_procedure(self):
+        # It reached every persona from here, so every persona ran it. It is
+        # Adversarial's now, in personas/code/adversarial.md.
         p = prompts.build(BASE)
-        self.assertNotIn(prompts.TEST_STANZA, p.review["plan"])
-        self.assertNotIn(prompts.TEST_STANZA, p.followup["plan"])
+        for table in (p.review, p.followup):
+            for mode in ("code", "plan"):
+                self.assertNotIn("mentally revert", table[mode], mode)
+
+    def test_every_default_confines_the_persona_to_its_angle(self):
+        p = prompts.build(BASE)
+        for table in (p.review, p.followup):
+            for mode in ("code", "plan"):
+                self.assertIn("and only from that angle", table[mode], mode)
+
+    def test_no_default_names_review_topics(self):
+        # A topic list in the user turn outweighs the persona's angle in the
+        # system prompt. One PR drew eleven comments carrying three findings.
+        p = prompts.build(BASE)
+        for table in (p.review, p.followup):
+            for mode in ("code", "plan"):
+                for topic in ("security", "correctness", "test quality", "architectur"):
+                    self.assertNotIn(topic, table[mode].lower(), (mode, topic))
 
     def test_plan_prompts_carry_the_gh_stanza(self):
         p = prompts.build(BASE)
@@ -140,12 +158,12 @@ class OverrideTest(unittest.TestCase):
     def test_plan_override_does_not_change_code_mode(self):
         p = prompts.build({"PLAN_REVIEW_PROMPT": "read the plan in #{{PR}}"})
         self.assertEqual(p.review["plan"], "read the plan in #{{PR}}")
-        self.assertIn(prompts.TEST_STANZA, p.review["code"])
+        self.assertIn(prompts.GH_STANZA, p.review["code"])
 
     def test_suffix_appends_to_a_default(self):
         p = prompts.build({"REVIEW_PROMPT_SUFFIX": "Be terse."})
         self.assertTrue(p.review["code"].endswith(" Be terse."))
-        self.assertIn(prompts.TEST_STANZA, p.review["code"])
+        self.assertIn(prompts.GH_STANZA, p.review["code"])
 
     def test_suffix_appends_to_an_override(self):
         p = prompts.build(
@@ -171,7 +189,7 @@ class OverrideTest(unittest.TestCase):
         # ${REVIEW_PROMPT:-$DEFAULT_PROMPT} in the shell: an empty value falls
         # back to the default rather than sending Claude an empty prompt.
         p = prompts.build({"REVIEW_PROMPT": ""})
-        self.assertIn(prompts.TEST_STANZA, p.review["code"])
+        self.assertIn(prompts.GH_STANZA, p.review["code"])
 
 
 

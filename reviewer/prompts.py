@@ -18,33 +18,42 @@ from typing import Dict, FrozenSet, Mapping
 # Extracted from entrypoint.sh by tools/extract-stanzas.py. See the long
 # comments there for why each exists; the short version:
 #   GH     - what the privilege-minimized token can actually do.
-#   TEST   - "review the tests" as a runnable procedure rather than a quality.
-#   PLAN   - what to review in a proposal, and what NOT to flag in one.
+#   PLAN   - a proposal is reviewed as a proposal, and what NOT to flag in one.
 #   LINEAR - read the ticket the PR claims to implement. Leading space included.
-from _stanzas import GH_STANZA, LINEAR_STANZA as _LINEAR_STANZA, PLAN_STANZA, TEST_STANZA
+from _stanzas import GH_STANZA, LINEAR_STANZA as _LINEAR_STANZA, PLAN_STANZA
+
+# The task prompt names no review topics. It reaches every persona in the user
+# turn, where a checklist outweighs the angle the persona was given in its
+# system prompt: when the default listed tests, security, correctness and
+# architecture and carried the test-mutation procedure, every persona reviewed
+# all four, and one PR drew eleven comments carrying three findings. The angle
+# lives in the persona, the rule that confines a persona to it lives in each
+# tree's _shared.md, and the test procedure is Adversarial's own.
+_ANGLE = (
+    "from the angle of attack your system instructions set out, and only from that "
+    "angle"
+)
 
 _DEFAULT_REVIEW_CODE = (
-    "Perform a thorough review of pull request #{{PR}} in this repository. Inspect it "
+    "Review pull request #{{PR}} in this repository " + _ANGLE + ". Inspect it "
     "with `gh pr diff {{PR}}` and `gh pr view {{PR}} --json number,title,body,author,"
     "url,state,isDraft,headRefName,headRefOid,baseRefName,labels,files,commits,"
     "comments,reviews`, and be sure you're looking at the most recent commit on its "
-    "branch. " + GH_STANZA + " Pay particular attention to test quality/robustness, "
-    "security, correctness, and architectural coherence/consistency, and whether the "
-    "approach the PR takes is prudent and robust in light of the issue it addresses. "
-    + TEST_STANZA + " Post findings as comments on the PR, one comment per finding."
+    "branch. " + GH_STANZA + " Post findings as comments on the PR, one comment per "
+    "finding."
 )
 
 _DEFAULT_FOLLOWUP_CODE = (
     "I've fetched the latest refs. Re-check pull request #{{PR}} for new commits or "
-    "changes since your last review of it. Apply the same review standard, and only "
-    "post findings you haven't already raised on this PR. Be sure you're looking at "
-    "the most recent commit on its branch. " + GH_STANZA + " " + TEST_STANZA
+    "changes since your last review of it. Apply the same review standard, " + _ANGLE
+    + ", and only post findings you haven't already raised on this PR. Be sure you're "
+    "looking at the most recent commit on its branch. " + GH_STANZA
 )
 
 _DEFAULT_REVIEW_PLAN = (
-    "Review the plan or design proposed in pull request #{{PR}} in this repository. "
-    "Read it with `gh pr diff {{PR}}` and `gh pr view {{PR}} --json number,title,body,"
-    "author,url,state,isDraft,headRefName,headRefOid,baseRefName,labels,files,commits,"
+    "Review the plan or design proposed in pull request #{{PR}} in this repository "
+    + _ANGLE + ". Read it with `gh pr diff {{PR}}` and `gh pr view {{PR}} --json "
+    "number,title,body,author,url,state,isDraft,headRefName,headRefOid,baseRefName,labels,files,commits,"
     "comments,reviews`, and be sure you're looking at the most recent commit on its "
     "branch. " + GH_STANZA + " " + PLAN_STANZA + " Post findings as comments on the "
     "PR, one comment per finding."
@@ -52,9 +61,9 @@ _DEFAULT_REVIEW_PLAN = (
 
 _DEFAULT_FOLLOWUP_PLAN = (
     "I've fetched the latest refs. Re-read the plan in pull request #{{PR}} for "
-    "revisions since your last review of it. Apply the same review standard, and only "
-    "post findings you haven't already raised on this PR. A point you raised that the "
-    "revision addresses is settled; say nothing further about it. Be sure you're "
+    "revisions since your last review of it. Apply the same review standard, "
+    + _ANGLE + ", and only post findings you haven't already raised on this PR. A "
+    "point you raised that the revision addresses is settled; say nothing further about it. Be sure you're "
     "looking at the most recent commit on its branch. " + GH_STANZA + " " + PLAN_STANZA
 )
 

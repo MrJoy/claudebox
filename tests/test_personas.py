@@ -122,6 +122,25 @@ class ShippedPersonasTest(unittest.TestCase):
                          {k: 1 for k in code if k != "sage"})
         self.assertEqual(plan, {k: 1 for k in plan})
 
+    def test_only_code_adversarial_carries_the_test_procedure(self):
+        # It moved here from the task prompt, where every persona ran it. Like
+        # Sage's phase key, the importer writes advocate's body alone, so a
+        # re-run drops this section; this is the check that notices.
+        code = {p.id: p.prompt for p in personas.resolve("code", SHIPPED, {"PERSONAS": "all"})}
+        plan = {p.id: p.prompt for p in personas.resolve("plan", SHIPPED, {"PLAN_PERSONAS": "all"})}
+        self.assertIn("## The tests are yours", code["adversarial"])
+        self.assertIn("decide whether the test would still pass", code["adversarial"])
+        for pid, prompt in list(code.items()) + list(plan.items()):
+            if prompt is code["adversarial"]:
+                continue
+            self.assertNotIn("mutation thinking", prompt, pid)
+
+    def test_both_contracts_confine_a_persona_to_its_angle(self):
+        for mode, var in (("code", "PERSONAS"), ("plan", "PLAN_PERSONAS")):
+            prompt = personas.resolve(mode, SHIPPED, {var: "red_team"})[0].prompt
+            self.assertIn("would have sent you looking", prompt, mode)
+            self.assertIn("you do not\npost it", prompt, mode)
+
     def test_sage_code_body_carries_the_rebuttal_mandate(self):
         sage = personas.resolve("code", SHIPPED, {"PERSONAS": "sage"})[0].prompt
         self.assertIn("## Your second job", sage)

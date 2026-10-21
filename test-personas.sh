@@ -690,7 +690,7 @@ cycle "rounds: the resumed pass carries round 2 beside its persona" \
 cycle "passes: the persona travels in the system prompt, not the task prompt" \
   PERSONAS=red_team \
   -- ARGV:1:"--append-system-prompt You are a Red Team security reviewer" \
-     ARGV:1:"-- Perform a thorough review of pull request #1"
+     ARGV:1:"-- Review pull request #1 in this repository"
 
 # The persona-specific signature lives in the system prompt (see the case above),
 # so a default prompt carrying its own signature sentence would contradict it and
@@ -1103,14 +1103,16 @@ cycle "failures: one success in a group forgives its failing siblings" \
      NOLOG:"Abandoning this cycle"
 
 # --- per-mode prompts --------------------------------------------------------
-# The test stanza asks the reviewer to mentally revert production lines a test
-# depends on. There are none in a plan, and a reviewer handed a design document
-# will otherwise report missing tests in code nobody has written.
-cycle "prompts: plan mode drops the test stanza and code mode keeps it" \
-  PR_IDS=1,2 PERSONAS=red_team PLAN_PERSONAS=red_team STUB_PLAN_PRS=2 MAX_CYCLES=1 \
-  -- CALLS:2 \
-     ARGV:1:"Treat the tests in this PR as code under review" \
-     NOARGV:2:"Treat the tests in this PR as code under review"
+# The test procedure asks the reviewer to mentally revert production lines a
+# test depends on. It is code-mode Adversarial's alone: in the task prompt it
+# reached every persona and every persona ran it. There are no production lines
+# in a plan, so plan-mode Adversarial does not carry it either.
+cycle "prompts: only code-mode Adversarial carries the test procedure" \
+  PR_IDS=1,2 PERSONAS=red_team,adversarial PLAN_PERSONAS=adversarial STUB_PLAN_PRS=2 \
+  MAX_CONCURRENT_PASSES=1 MAX_CYCLES=1 \
+  -- CALLS:3 \
+     MATCHCOUNT:"The tests are yours":1 \
+     MATCHCOUNT:"You are an Adversarial reviewer&&The tests are yours&&Review pull request #1 ":1
 
 cycle "prompts: the plan default says what a plan review is and is not" \
   PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 MAX_CYCLES=1 \
@@ -1125,14 +1127,16 @@ cycle "prompts: the plan default keeps the gh stanza" \
 
 # The code followup's own coverage: it lived as a bare scalar before this branch
 # moved both prompts into MODE_FOLLOWUP_PROMPT[code], the refactor that could
-# silently drop a stanza, and the gh/test text is now hand-maintained in four
-# copies rather than two.
-cycle "prompts: the code followup repeats the gh and test stanzas" \
-  PERSONAS=red_team \
+# silently drop a stanza. The test procedure reaches a resumed pass through
+# Adversarial's system prompt, which is re-passed on --resume, so it is asserted
+# here against the followup rather than being a part of it.
+cycle "prompts: the code followup repeats the gh stanza, and Adversarial keeps the tests" \
+  PERSONAS=adversarial \
   -- CALLS:2 \
+     ARGV:2:"--resume S1" \
      ARGV:2:"Re-check pull request #1" \
      ARGV:2:'do not use `gh pr checks`' \
-     ARGV:2:"Treat the tests in this PR as code under review"
+     ARGV:2:"The tests are yours"
 
 # Repeated on resumed passes for the same reason the gh stanza is: a long-resumed
 # session's earliest turns are the first thing a context summary drops.
@@ -1164,7 +1168,7 @@ cycle "prompts: FOLLOWUP_PROMPT reaches Claude verbatim, with no stanzas" \
      ARGV:2:"just re-check 1" \
      NOARGV:1:"just re-check 1" \
      NOARGV:2:'do not use `gh pr checks`' \
-     NOARGV:2:"Treat the tests in this PR as code under review"
+     NOARGV:2:"and only from that angle"
 
 cycle "prompts: PLAN_FOLLOWUP_PROMPT reaches Claude verbatim, with no stanzas" \
   PLAN_PERSONAS=red_team STUB_PLAN_PRS=1 PLAN_FOLLOWUP_PROMPT='just re-read the plan in 1' \
@@ -1320,8 +1324,8 @@ cycle "worktree: the stanza is appended even to an operator prompt override" \
   -- CALLS:5 \
      MATCHCOUNT:"look at #12":5 \
      MATCHCOUNT:"You are a Red Team security reviewer&&look at #12&&One more constraint":1 \
-     MATCHCOUNT:"Perform a thorough review of pull request":0 \
-     MATCHCOUNT:"Treat the tests in this PR as code under review":0
+     MATCHCOUNT:"Review pull request #12 in this repository":0 \
+     MATCHCOUNT:'do not use `gh pr checks`':0
 
 # --- limits and failures inside a group --------------------------------------
 # A limit cannot recall the siblings already in flight, and killing them would

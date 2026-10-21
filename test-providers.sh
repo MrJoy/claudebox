@@ -728,15 +728,17 @@ wires "prompt: {{PR}} is substituted throughout" \
 wires "prompt: an override is verbatim, with no gh stanza appended" \
   PROVIDER=ollama OLLAMA_API_KEY=k REVIEW_PROMPT='just review {{PR}} please' \
   -- ARGV:'just review 1 please' NOARGV:'gh pr checks'
-# The test-quality stanza: the reviewer is told to mutation-check the tests a PR
-# adds, because a test that passes with the change reverted is the failure this
-# stanza exists to catch. Only the new-session prompt is asserted here -- the
-# harness runs a single cycle and the claude stub fails it, so FOLLOWUP_PROMPT
-# is never put on an argv this suite can see. Its copy of the stanza is
-# unverified by this file; keep them in step by hand.
-wires "prompt: the default tells the reviewer to mutation-check the tests" \
+# The test-mutation procedure: a test that passes with the change reverted is
+# the failure it exists to catch. It is Adversarial's own, in its system prompt,
+# so it reaches a resumed pass and an operator override alike. It used to sit in
+# the default task prompt, where every persona ran it; test-personas.sh asserts
+# that the others no longer do.
+wires "prompt: Adversarial is told to mutation-check the tests" \
+  PROVIDER=ollama OLLAMA_API_KEY=k PERSONAS=adversarial \
+  -- ARGV:'The tests are yours' ARGV:'lock in as-implemented behavior'
+wires "prompt: the default task prompt carries no test procedure" \
   PROVIDER=ollama OLLAMA_API_KEY=k \
-  -- ARGV:'mentally revert just those lines' ARGV:'lock in as-implemented behavior'
+  -- NOARGV:'The tests are yours' NOARGV:'lock in as-implemented behavior'
 wires "prompt: a suffix appends to an override" \
   PROVIDER=ollama OLLAMA_API_KEY=k REVIEW_PROMPT='review {{PR}}' \
   REVIEW_PROMPT_SUFFIX='and skip the tests' \
