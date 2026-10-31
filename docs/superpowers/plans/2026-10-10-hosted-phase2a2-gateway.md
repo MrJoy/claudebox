@@ -2467,6 +2467,10 @@ class BoundedServer(http.server.ThreadingHTTPServer):
     """
 
     daemon_threads = True
+    # listen()'s backlog. The default of 5 resets a burst of connects on some
+    # kernels before process_request can count them: macOS answers a full
+    # queue with RST where Linux drops the SYN for the client to retry.
+    request_queue_size = MAX_CONNECTIONS
     max_connections = MAX_CONNECTIONS
     max_per_peer = MAX_CONNECTIONS_PER_PEER
 
