@@ -3715,6 +3715,7 @@ class _BoundedServer(http.server.ThreadingHTTPServer):
     """A threading server that refuses a connection past MAX_CONNECTIONS."""
 
     daemon_threads = True
+    request_queue_size = MAX_CONNECTIONS   # listen()'s backlog; the default is 5
 
     def __init__(self, *a, **k):
         self.slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
