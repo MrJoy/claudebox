@@ -12,7 +12,9 @@ passed to --disallowedTools, including a tool a kindex bump adds. The build
 also checks that everything below still exists, so a renamed read tool fails
 the image rather than silently vanishing.
 
-Classified by reading each tool body in kindex 0.44's mcp_server.py. Four that
+Classified by reading each tool body in kindex 0.44's mcp_server.py, and
+re-read at 0.53, whose eighteen new tools are all left out. 0.54 adds no
+tools; its changes to ask, context and search only add warning text. Four that
 look like reads are out: coord_read advances a read cursor, remind_check fires
 reminder notifications, stale_check re-hashes files against the container's cwd
 and writes demotion markers, and graph_heal works on the raw connection.

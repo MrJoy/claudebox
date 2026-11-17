@@ -113,7 +113,7 @@ ENV LITELLM_BIN=/opt/litellm/bin/litellm \
 # like the venv. The check after the install runs a real LIMIT KNN query, so
 # an interpreter whose SQLite is too old fails the build rather than quietly
 # serving FTS only.
-ARG KINDEX_VERSION=0.44.0
+ARG KINDEX_VERSION=0.54.2
 ARG KINDEX_PYTHON_VERSION=3.12
 COPY --from=ghcr.io/astral-sh/uv:0.9.30 /uv /usr/local/bin/uv
 RUN UV_PYTHON_INSTALL_DIR=/opt/kindex-python \
