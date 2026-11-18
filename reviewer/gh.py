@@ -105,6 +105,20 @@ def wants_new(selector: str, env: Mapping[str, str]) -> bool:
     )
 
 
+def order_snapshots(snapshots: List[PRSnapshot], env: Mapping[str, str]) -> List[PRSnapshot]:
+    """The candidates in the order this run walks them.
+
+    Left alone by default: gh lists newest-created first, and PR_IDS keeps the
+    operator's own order. OLDEST_FIRST sorts by PR number ascending. GitHub
+    hands out a repo's numbers in creation order, so that is creation order,
+    and it needs no extra field that a PR object could arrive without. It is
+    never updatedAt, which every claudebox comment moves.
+    """
+    if pr_truthy(env.get("OLDEST_FIRST")):
+        return sorted(snapshots, key=lambda s: s.number)
+    return snapshots
+
+
 def pr_modes(payload: Any, plan_label: str) -> List[PRSnapshot]:
     """Turn gh --json number,labels,headRefOid,updatedAt output into snapshots.
 
@@ -227,7 +241,7 @@ def enumerate_candidate_prs(
                 log(f"WARN: could not read labels for PR #{number}; skipping it this cycle.")
                 for line in _stderr_tail(result):
                     log(line)
-        return out
+        return order_snapshots(out, env)
 
     base = ["gh", "pr", "list", "-R", repo]
     if selector == "all":
@@ -289,7 +303,7 @@ def enumerate_candidate_prs(
         for line in _stderr_tail(result):
             log(line)
         return []
-    return pr_modes(payload, plan_label)
+    return order_snapshots(pr_modes(payload, plan_label), env)
 
 
 def pr_signal(snapshot: PRSnapshot, env: Mapping[str, str],

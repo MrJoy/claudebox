@@ -270,6 +270,35 @@ class EnumerateTest(unittest.TestCase):
         self.assertIn("--json", run.calls[0])
         self.assertIn("number,labels,headRefOid,updatedAt", run.calls[0])
 
+    def test_list_order_is_kept_by_default(self):
+        run = runner(Result(0, json.dumps([{"number": n, "labels": []} for n in (30, 12, 21)])))
+        got = gh.enumerate_candidate_prs("all", dict(self.ENV, PR_ALL="1"), run=run)
+        self.assertEqual([s.number for s in got], [30, 12, 21])
+
+    def test_oldest_first_sorts_a_list_by_number(self):
+        run = runner(Result(0, json.dumps([{"number": n, "labels": []} for n in (30, 12, 21)])))
+        got = gh.enumerate_candidate_prs(
+            "all", dict(self.ENV, PR_ALL="1", OLDEST_FIRST="1"), run=run)
+        self.assertEqual([s.number for s in got], [12, 21, 30])
+
+    def test_oldest_first_sorts_ids_too(self):
+        run = runner(
+            Result(0, json.dumps({"number": 13, "labels": []})),
+            Result(0, json.dumps({"number": 12, "labels": []})),
+        )
+        got = gh.enumerate_candidate_prs(
+            "ids", dict(self.ENV, PR_IDS="13,12", OLDEST_FIRST="1"), run=run)
+        self.assertEqual([s.number for s in got], [12, 13])
+
+    def test_oldest_first_off_keeps_ids_as_written(self):
+        run = runner(
+            Result(0, json.dumps({"number": 13, "labels": []})),
+            Result(0, json.dumps({"number": 12, "labels": []})),
+        )
+        got = gh.enumerate_candidate_prs(
+            "ids", dict(self.ENV, PR_IDS="13,12", OLDEST_FIRST="0"), run=run)
+        self.assertEqual([s.number for s in got], [13, 12])
+
     def test_failed_list_yields_nothing(self):
         run = runner(Result(1, ""))
         self.assertEqual(

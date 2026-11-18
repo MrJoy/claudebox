@@ -254,6 +254,18 @@ if selected "$L"; then
   expect "$L" 0 -- "PR_NEW=1" "!ERROR:"
 fi
 
+L="selectors: --oldest-first passes OLDEST_FIRST"
+if selected "$L"; then
+  launch "$L" 0 -- -- "${RUN[@]}" --all --oldest-first
+  expect "$L" 0 -- "PR_ALL=1" "OLDEST_FIRST=1" "!ERROR:"
+fi
+
+L="selectors: OLDEST_FIRST is absent without --oldest-first"
+if selected "$L"; then
+  launch "$L" 0 -- -- "${RUN[@]}" --all
+  expect "$L" 0 -- "PR_ALL=1" "!OLDEST_FIRST" "!ERROR:"
+fi
+
 L="selectors: --new combines with --assignee"
 if selected "$L"; then
   launch "$L" 0 -- -- "${RUN[@]}" --new --assignee alice

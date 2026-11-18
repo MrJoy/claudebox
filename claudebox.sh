@@ -43,6 +43,7 @@ PR_AUTHOR=""
 PR_IDS=""
 PR_SEARCH=""
 PR_NEW=0
+OLDEST_FIRST=0
 PR_SEL_COUNT=0
 PR_SEL_NAMES=""
 
@@ -158,6 +159,8 @@ OPTIONS
                     user's new PRs. Otherwise provide exactly ONE of
                     --all/--assignee/--author/--prs/--search/--new (here or via
                     PR_* in the env file).
+  --oldest-first    Review PRs oldest-created first instead of newest first
+                    (sorted by PR number, which GitHub assigns at creation).
   --persona LIST    Review with these adversarial personas only (comma list, or
                     'all'). Default: red_team,adversarial,sme,minimalist,sage.
                     Also available: user, good_friend, helland. One session per PR per persona,
@@ -204,6 +207,7 @@ EXAMPLES
   claudebox run --new                                        # only PRs opened after startup
   claudebox run --assignee alice --new                       # alice's PRs opened after startup
   claudebox run --author alice --new                         # PRs alice opened after startup
+  claudebox run --all --oldest-first                         # every open PR, oldest first
   ./claudebox.sh test --repo ~/src/myrepo                    # one-off foreground run
   ./claudebox.sh logs
   ./claudebox.sh stop
@@ -245,6 +249,7 @@ while [ $# -gt 0 ]; do
     --prs)         PR_IDS="${2:?--prs requires a comma/space list of PR numbers}"; PR_SEL_COUNT=$((PR_SEL_COUNT + 1)); PR_SEL_NAMES="$PR_SEL_NAMES --prs"; shift ;;
     --search)      PR_SEARCH="${2:?--search requires a gh search query}"; PR_SEL_COUNT=$((PR_SEL_COUNT + 1)); PR_SEL_NAMES="$PR_SEL_NAMES --search"; shift ;;
     --new)         PR_NEW=1 ;;
+    --oldest-first) OLDEST_FIRST=1 ;;
     --persona)     PERSONAS="${2:?--persona requires a comma-separated list of persona names}"; shift ;;
     --max-concurrent-passes)
                    MAX_CONCURRENT_PASSES="${2:?--max-concurrent-passes requires a non-negative integer}"; shift ;;
@@ -525,6 +530,7 @@ build_run_flags() {
   [ -n "$PR_IDS" ]      && RUN_FLAGS+=(-e "PR_IDS=$PR_IDS")
   [ -n "$PR_SEARCH" ]   && RUN_FLAGS+=(-e "PR_SEARCH=$PR_SEARCH")
   [ "$PR_NEW" = 1 ]     && RUN_FLAGS+=(-e "PR_NEW=1")
+  [ "$OLDEST_FIRST" = 1 ] && RUN_FLAGS+=(-e "OLDEST_FIRST=1")
   [ -n "$PERSONAS" ]    && RUN_FLAGS+=(-e "PERSONAS=$PERSONAS")
   [ -n "$MAX_CONCURRENT_PASSES" ] && RUN_FLAGS+=(-e "MAX_CONCURRENT_PASSES=$MAX_CONCURRENT_PASSES")
   true  # keep the function's exit status 0: the last `[ ... ] && ...` above

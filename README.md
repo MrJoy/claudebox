@@ -469,6 +469,8 @@ Set **exactly one** of these (or pass the matching launcher flag), except that `
 | `PR_SEARCH=is:open label:x` | `--search "…"` | PRs matching a gh search query (you control state) |
 | `PR_NEW=1` | `--new` | open PRs created after this container started (cutoff captured once at startup, reset on restart) |
 
+`OLDEST_FIRST=1` (`--oldest-first`) walks the candidates oldest-created first. Without it the list selectors go newest first, which is the order `gh pr list` returns, and `PR_IDS` keeps the order you wrote. The sort is by PR number, since GitHub numbers a repo's PRs in the order they were opened; it never uses `updatedAt`. It combines with any selector. The list selectors fetch at most 100 open PRs, the newest 100, so in a repo with more than that the oldest few are never candidates in either order.
+
 `PR_NEW` is the one selector that combines with another: set it alongside `PR_ASSIGNEE` or `PR_AUTHOR` (`--assignee login --new`, `--author login --new`) to review only that user's PRs opened after startup. Those combinations stay off the search API, filtering the listing by `createdAt` itself, so they work on a privilege-minimized token even though `PR_NEW` alone does not. `PR_ASSIGNEE` and `PR_AUTHOR` cannot be combined with each other.
 
 > **`PR_SEARCH` and `PR_NEW` need a token that can search.** Both are backed by GitHub's issue/PR search, which returns nothing for a fine-grained PAT — so on a privilege-minimized token they silently find no PRs. `PR_ALL`, `PR_ASSIGNEE`, `PR_AUTHOR`, and `PR_IDS` avoid search (`PR_ASSIGNEE` and `PR_AUTHOR` list open PRs and match the login themselves), so they work with a PR-read-only token. Use a classic PAT with `repo` scope if you need the search-backed selectors.
